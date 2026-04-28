@@ -142,11 +142,40 @@ impl AptImageRenderer {
         if self.n_lines >= MAX_LINES {
             return;
         }
+        // Try the live-preview write first, but never let a Cairo
+        // failure here strip the line out of the export-state mirror
+        // (`AptImage`). The two are independent rails: the preview
+        // drives the on-screen viewer; the mirror drives PNG export
+        // and auto-record save. A transient surface-data lock
+        // failure should at worst cost us one rendered row in the
+        // live view — it must not silently delete the line from
+        // disk output. Per CR round 3 on PR #571.
+        let preview_ok = self.write_line_to_surface(line);
+        if preview_ok {
+            self.n_lines += 1;
+        }
+
+        // Always mirror into the AptImage for image-wide PNG export,
+        // regardless of preview success. `apt_image::push_line`
+        // honors the sync_quality threshold independently — a line
+        // we drew via the per-line surface may still go to the image
+        // as gap-filled if quality is low. The two paths can
+        // disagree on a borderline line; this is intentional (live
+        // preview is forgiving, export is strict).
+        self.apt_image.push_line(line, std::time::Instant::now());
+    }
+
+    /// Writes one APT line into the persistent ARGB32 surface at
+    /// row `self.n_lines`. Returns `false` (logging a warning) on
+    /// any Cairo failure so the caller can decide what to do —
+    /// `push_line` skips advancing `n_lines` but still mirrors into
+    /// the export image. Per CR round 3 on PR #571.
+    fn write_line_to_surface(&mut self, line: &AptLine) -> bool {
         let stride = match usize::try_from(self.surface.stride()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("APT renderer: invalid surface stride: {e}");
-                return;
+                return false;
             }
         };
         let row_offset = self.n_lines * stride;
@@ -154,7 +183,7 @@ impl AptImageRenderer {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("APT renderer: surface data lock failed: {e}");
-                return;
+                return false;
             }
         };
         for (i, &g) in line.pixels.iter().enumerate() {
@@ -166,15 +195,7 @@ impl AptImageRenderer {
         }
         // `data` guard drops here, flushing the surface for cairo.
         drop(data);
-        self.n_lines += 1;
-
-        // Mirror into the AptImage for image-wide PNG export.
-        // `apt_image::push_line` honors the sync_quality threshold
-        // independently — a line we drew via the per-line surface
-        // may still go to the image as gap-filled if quality is low.
-        // The two paths can disagree on a borderline line; this is
-        // intentional (live preview is forgiving, export is strict).
-        self.apt_image.push_line(line, std::time::Instant::now());
+        true
     }
 
     /// Reset to an empty image. Zeroes the surface bytes (fully

@@ -310,6 +310,17 @@ pub fn low_pass_kaiser(
     let transition_rad = math::hz_to_rads(transition_width, sample_rate);
     let beta = crate::window::kaiser_beta(atten_db);
     let count = crate::window::kaiser_length(atten_db, transition_rad);
+    // A single tap collapses the lowpass to a constant gain
+    // coefficient — silently the wrong filter shape. Reject the
+    // degenerate case so callers see an explicit error instead of a
+    // useless filter. Per CR round 3 on PR #571.
+    if count <= 1 {
+        return Err(DspError::InvalidParameter(format!(
+            "atten_db ({atten_db}) and transition_width ({transition_width}) \
+             yield a degenerate {count}-tap Kaiser design; increase atten_db \
+             or narrow transition_width"
+        )));
+    }
     if count > MAX_TAP_COUNT {
         return Err(DspError::InvalidParameter(format!(
             "Kaiser tap count ({count}) exceeds maximum ({MAX_TAP_COUNT})"
@@ -403,6 +414,16 @@ pub fn low_pass_dc_removal_kaiser(
     let transition_rad = math::hz_to_rads(transition_width, sample_rate);
     let beta = crate::window::kaiser_beta(atten_db);
     let count = crate::window::kaiser_length(atten_db, transition_rad);
+    // A single tap collapses the difference-of-lowpasses to a
+    // constant — the bandpass-with-DC-notch shape is gone. Reject
+    // the degenerate case explicitly. Per CR round 3 on PR #571.
+    if count <= 1 {
+        return Err(DspError::InvalidParameter(format!(
+            "atten_db ({atten_db}) and transition_width ({transition_width}) \
+             yield a degenerate {count}-tap Kaiser design; increase atten_db \
+             or narrow transition_width"
+        )));
+    }
     if count > MAX_TAP_COUNT {
         return Err(DspError::InvalidParameter(format!(
             "Kaiser tap count ({count}) exceeds maximum ({MAX_TAP_COUNT})"

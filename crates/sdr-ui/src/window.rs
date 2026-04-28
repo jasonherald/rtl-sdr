@@ -9638,7 +9638,9 @@ fn connect_satellites_panel(
                 // user-initiated action and works on any catalog
                 // entry. Only the auto-record path filters on
                 // `Some(protocol)`.
-                if let Some((freq_hz, mode, bw_hz, _protocol)) = tune_target_for_pass(&pass) {
+                if let Some((freq_hz, mode, bw_hz, _protocol, _norad_id)) =
+                    tune_target_for_pass(&pass)
+                {
                     let play_btn = gtk4::Button::builder()
                         .icon_name("media-playback-start-symbolic")
                         .tooltip_text(format!(
@@ -10224,6 +10226,7 @@ fn connect_satellites_panel(
         Rc::new(move |action: RecorderAction| match action {
             RecorderAction::StartAutoRecord {
                 satellite,
+                norad_id,
                 freq_hz,
                 mode,
                 bandwidth_hz,
@@ -10340,14 +10343,14 @@ fn connect_satellites_panel(
                         // exact AOS time matters less than "around
                         // when" — `is_ascending` checks the lat
                         // derivative over a 30 s window, which is
-                        // valid anywhere mid-pass. Store the stable
-                        // NORAD id (not the display name) so a
-                        // future catalog rename doesn't break the
-                        // rotation lookup. Per CR round 2 on PR #571.
-                        *state_a.apt_recording_pass.borrow_mut() = sdr_sat::KNOWN_SATELLITES
-                            .iter()
-                            .find(|s| s.name == satellite)
-                            .map(|s| (s.norad_id, chrono::Utc::now()));
+                        // valid anywhere mid-pass. NORAD id arrives
+                        // pre-resolved on the recorder action — no
+                        // name → catalog lookup at this layer means
+                        // no silent rotation breakage if the catalog
+                        // ever picks up alias drift. Per CR round 3
+                        // on PR #571.
+                        *state_a.apt_recording_pass.borrow_mut() =
+                            Some((norad_id, chrono::Utc::now()));
                         // Push the rotate-180 flag down to the
                         // renderer so the toolbar's manual `Export
                         // PNG` button matches the auto-record
@@ -10472,6 +10475,16 @@ fn connect_satellites_panel(
                 let path_for_export = path;
                 let toast_overlay_for_complete = toast_overlay_weak.clone();
                 let state_for_complete = Rc::clone(&state_a);
+                // Snapshot the *current* viewer-window WeakRef BEFORE
+                // spawning the worker. If the user closes the viewer
+                // mid-export and reopens it, `state.apt_viewer_window`
+                // will point at the new window by the time the
+                // callback fires; reading from there could close the
+                // wrong window. Cloning the WeakRef pins the
+                // identity of the window we'll attempt to close, while
+                // staying weak so a closed/dropped window upgrades to
+                // None and we no-op. Per CR round 3 on PR #571.
+                let exported_window_weak = state_a.apt_viewer_window.borrow().as_ref().cloned();
                 view.export_png_full_async(path_for_export, mode, rotate_180, move |result| {
                     let (export_ok, msg) = match result {
                         Ok(()) => {
@@ -10510,17 +10523,18 @@ fn connect_satellites_panel(
                     // in-memory image and manually retry the
                     // export. Per CR round 9 on PR #554.
                     if export_ok {
-                        // Drop the Ref before calling `close()` to
-                        // avoid the `RefCell already borrowed`
-                        // panic the close-request handler would
-                        // otherwise trigger. Per #643 / CR round
-                        // 1 on PR #571.
-                        let window_to_close = state_for_complete
-                            .apt_viewer_window
-                            .borrow()
+                        // Use the WeakRef we snapshotted at export
+                        // start (not the current `state.apt_viewer_window`)
+                        // so a viewer reopen during the async save
+                        // can't trick us into closing the wrong
+                        // window. Upgrade-or-skip — if the user
+                        // already closed it, the upgrade returns None
+                        // and we simply do nothing. Per CR round 3 on
+                        // PR #571.
+                        if let Some(window) = exported_window_weak
                             .as_ref()
-                            .and_then(glib::WeakRef::upgrade);
-                        if let Some(window) = window_to_close {
+                            .and_then(glib::WeakRef::upgrade)
+                        {
                             tracing::info!(
                                 "auto-record LOS: closing APT viewer window after PNG save",
                             );

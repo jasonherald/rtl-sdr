@@ -57,6 +57,27 @@ fn main() {
         "input: {} ch, {} Hz, {} bits/sample, {:?}",
         spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format,
     );
+    // Reject specs the decoder can't ingest before we attempt to read
+    // samples or build the decoder — both would otherwise panic.
+    // `AptDecoder::new` requires sample_rate ≥ 11025 Hz (the working
+    // intermediate rate); integer WAVs are read as `i16` below so any
+    // bit-depth other than 16 trips `samples::<i16>().unwrap()`. Per
+    // CR round 3 on PR #571.
+    const MIN_SAMPLE_RATE_HZ: u32 = 11_025;
+    if spec.sample_rate < MIN_SAMPLE_RATE_HZ {
+        eprintln!(
+            "unsupported sample rate: {} Hz (need >= {} Hz)",
+            spec.sample_rate, MIN_SAMPLE_RATE_HZ,
+        );
+        std::process::exit(2);
+    }
+    if matches!(spec.sample_format, hound::SampleFormat::Int) && spec.bits_per_sample != 16 {
+        eprintln!(
+            "unsupported integer WAV depth: {} bits/sample (need 16-bit PCM)",
+            spec.bits_per_sample,
+        );
+        std::process::exit(2);
+    }
     if spec.channels != 1 {
         eprintln!(
             "note: input is {} channel; averaging to mono",
