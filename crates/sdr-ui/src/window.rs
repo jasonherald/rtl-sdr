@@ -1265,6 +1265,10 @@ fn handle_dsp_message(
         }
         DspToUi::AudioRecordingStarted(path) => {
             tracing::info!(?path, "audio recording started");
+            // Mirror into AppState so is_recording() (used by the
+            // close-to-tray Quit confirmation modal) reflects reality.
+            // Per #512.
+            state.audio_recording_active.set(true);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let name = path
                     .file_name()
@@ -1275,6 +1279,8 @@ fn handle_dsp_message(
         }
         DspToUi::AudioRecordingStopped => {
             tracing::info!("audio recording stopped");
+            // Mirror into AppState. Per #512.
+            state.audio_recording_active.set(false);
             record_audio_row.set_active(false);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let toast = adw::Toast::new("Audio recording saved");
@@ -1283,6 +1289,10 @@ fn handle_dsp_message(
         }
         DspToUi::IqRecordingStarted(path) => {
             tracing::info!(?path, "IQ recording started");
+            // Mirror into AppState so is_recording() (used by the
+            // close-to-tray Quit confirmation modal) reflects reality.
+            // Per #512.
+            state.iq_recording_active.set(true);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let name = path
                     .file_name()
@@ -1293,6 +1303,8 @@ fn handle_dsp_message(
         }
         DspToUi::IqRecordingStopped => {
             tracing::info!("IQ recording stopped");
+            // Mirror into AppState. Per #512.
+            state.iq_recording_active.set(false);
             record_iq_row.set_active(false);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
                 let toast = adw::Toast::new("IQ recording saved");
@@ -10413,6 +10425,10 @@ fn connect_satellites_panel(
                         set_playing_a(true);
                         tune_a(freq_hz, mode, bandwidth_hz);
                         state_a.dispatch_vfo_offset(0.0);
+                        // Mirror into AppState so is_recording() (used by
+                        // the close-to-tray Quit confirmation modal)
+                        // reflects an in-progress LRPT pass. Per #512.
+                        state_a.lrpt_recording_active.set(true);
                     }
                 }
             }
@@ -10737,6 +10753,12 @@ fn connect_satellites_panel(
                         )
                     });
                     post_toast(&toast_overlay_weak_for_save, &result_msg);
+                    // Mark the LRPT pass as no-longer-recording for
+                    // the close-to-tray Quit-confirmation predicate.
+                    // We clear regardless of save_ok — the pass itself
+                    // is over (LOS already happened); save_ok only
+                    // controls whether to close the viewer. Per #512.
+                    state_lrpt_close.lrpt_recording_active.set(false);
                     // Close the LRPT viewer window now that the
                     // PNGs are on disk — resets the viewer for
                     // the next pass instead of carrying stale
