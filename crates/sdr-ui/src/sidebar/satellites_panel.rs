@@ -125,6 +125,97 @@ pub const KEY_AUTO_RECORD_APT: &str = "sat_auto_record_apt";
 /// Pairs with [`KEY_AUTO_RECORD_APT`] — only meaningful when
 /// auto-record is on. Default: `false` (opt-in). Per #533.
 pub const KEY_AUTO_RECORD_AUDIO: &str = "sat_auto_record_audio";
+/// Config key for the auto-record quality threshold (selected
+/// `AutoRecordQuality` tier). Per #511.
+pub const KEY_AUTO_RECORD_QUALITY: &str = "sat_auto_record_quality";
+
+/// Pass-quality tiers that gate the auto-record-on-pass feature.
+/// User-selectable via the `AdwComboRow` next to the auto-record
+/// switch — only passes whose peak elevation meets or exceeds the
+/// chosen tier's `min_elev_deg` actually trigger an auto-record.
+///
+/// Tiers map to the existing pass-quality tags from #507 / PR #508
+/// (winner / good / marginal / barely): "winners only" is the
+/// strictest (≥ 40°), "all passes" is the floor (≥
+/// `MIN_PASS_ELEVATION_DEG` = 5°). Default is `WinnersAndGood` —
+/// the band where APT decode actually produces a recognizable
+/// image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoRecordQuality {
+    /// ≥ 40° peak (winner-tier passes only). Strictest.
+    WinnersOnly,
+    /// ≥ 25° peak (winner + good). Default — matches the previous
+    /// hardcoded constant.
+    WinnersAndGood,
+    /// ≥ 15° peak (+ marginal).
+    MarginalOrBetter,
+    /// ≥ [`MIN_PASS_ELEVATION_DEG`] (5°) — every pass above the floor.
+    AllPasses,
+}
+
+impl AutoRecordQuality {
+    /// Order in the `AdwComboRow` (matching declaration order). New
+    /// variants MUST be appended — existing index → variant
+    /// mappings are persisted in the user's config and an insertion
+    /// in the middle would silently shift the user's selection.
+    pub const ALL: [Self; 4] = [
+        Self::WinnersOnly,
+        Self::WinnersAndGood,
+        Self::MarginalOrBetter,
+        Self::AllPasses,
+    ];
+
+    /// Default tier — `WinnersAndGood`. Matches the previously-
+    /// hardcoded `AUTO_RECORD_MIN_ELEV_DEG = 25.0` so existing
+    /// users get the same behavior on upgrade.
+    pub const DEFAULT: Self = Self::WinnersAndGood;
+
+    /// Minimum peak elevation (degrees) for this tier. The
+    /// recorder's `tick_idle` gate compares
+    /// `pass.max_elevation_deg >= self.min_elev_deg()`.
+    #[must_use]
+    pub fn min_elev_deg(self) -> f64 {
+        match self {
+            Self::WinnersOnly => 40.0,
+            Self::WinnersAndGood => 25.0,
+            Self::MarginalOrBetter => 15.0,
+            Self::AllPasses => MIN_PASS_ELEVATION_DEG,
+        }
+    }
+
+    /// Human-readable label for the `AdwComboRow`'s `string_list`.
+    #[must_use]
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::WinnersOnly => "Winners only (≥ 40°)",
+            Self::WinnersAndGood => "Winners and good (≥ 25°)",
+            Self::MarginalOrBetter => "Marginal or better (≥ 15°)",
+            Self::AllPasses => "All passes (≥ 5°)",
+        }
+    }
+
+    /// Map a u32 combo index back to the variant. Returns
+    /// [`Self::DEFAULT`] for out-of-range indices so a corrupted
+    /// or future-version config can't crash the panel hydration.
+    #[must_use]
+    pub fn from_index(idx: u32) -> Self {
+        usize::try_from(idx)
+            .ok()
+            .and_then(|i| Self::ALL.get(i).copied())
+            .unwrap_or(Self::DEFAULT)
+    }
+
+    /// Map this variant back to its u32 combo index. Inverse of
+    /// `from_index`.
+    #[must_use]
+    pub fn to_index(self) -> u32 {
+        Self::ALL
+            .iter()
+            .position(|v| *v == self)
+            .and_then(|i| u32::try_from(i).ok())
+            .unwrap_or(0)
+    }
+}
 /// Config key for the persisted Doppler-tracking master switch
 /// (Satellites panel). Default `true` so first-launch users get
 /// auto-corrected passes out of the box. Per issue #521.
@@ -204,6 +295,10 @@ pub struct SatellitesPanel {
     /// demodulated audio lands in `~/sdr-recordings/audio-{slug}-
     /// {timestamp}.wav` paired with the PNG. Per #533.
     pub auto_record_audio_switch: adw::SwitchRow,
+    /// Combo row selecting which pass-quality tier triggers
+    /// auto-record. Sensitive only when `auto_record_switch` is
+    /// on. Per #511.
+    pub auto_record_quality_row: adw::ComboRow,
     /// Master switch for Doppler-correction tracking during
     /// satellite passes. Default ON. When OFF, the
     /// `DopplerTracker` stays dormant regardless of frequency
@@ -266,6 +361,8 @@ pub struct SatellitesPanelWeak {
     pub auto_record_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::auto_record_audio_switch`].
     pub auto_record_audio_switch: glib::WeakRef<adw::SwitchRow>,
+    /// Weak ref to [`SatellitesPanel::auto_record_quality_row`].
+    pub auto_record_quality_row: glib::WeakRef<adw::ComboRow>,
     /// Weak ref to [`SatellitesPanel::doppler_switch`].
     pub doppler_switch: glib::WeakRef<adw::SwitchRow>,
     /// Weak ref to [`SatellitesPanel::passes_group`].
@@ -294,6 +391,7 @@ impl SatellitesPanel {
             notify_lead_row: self.notify_lead_row.downgrade(),
             auto_record_switch: self.auto_record_switch.downgrade(),
             auto_record_audio_switch: self.auto_record_audio_switch.downgrade(),
+            auto_record_quality_row: self.auto_record_quality_row.downgrade(),
             doppler_switch: self.doppler_switch.downgrade(),
             passes_group: self.passes_group.downgrade(),
             passes_status_row: self.passes_status_row.downgrade(),
@@ -323,6 +421,7 @@ impl SatellitesPanelWeak {
             notify_lead_row: self.notify_lead_row.upgrade()?,
             auto_record_switch: self.auto_record_switch.upgrade()?,
             auto_record_audio_switch: self.auto_record_audio_switch.upgrade()?,
+            auto_record_quality_row: self.auto_record_quality_row.upgrade()?,
             doppler_switch: self.doppler_switch.upgrade()?,
             passes_group: self.passes_group.upgrade()?,
             passes_status_row: self.passes_status_row.upgrade()?,
@@ -470,6 +569,40 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         .build();
     recording_group.add(&auto_record_switch);
 
+    // Quality threshold combo row — gates which passes are
+    // worth auto-recording. The `AdwComboRow.string_list` indices
+    // match `AutoRecordQuality::ALL` order; if the order ever
+    // changes the persisted u32 indices in the user's config will
+    // silently drift, so don't reorder. Per #511.
+    let quality_strings = gtk4::StringList::new(
+        &AutoRecordQuality::ALL
+            .iter()
+            .map(|q| q.display_label())
+            .collect::<Vec<_>>(),
+    );
+    let auto_record_quality_row = adw::ComboRow::builder()
+        .title("Quality threshold")
+        .subtitle("Only passes with peak elevation at or above the selected tier auto-record.")
+        .model(&quality_strings)
+        .selected(AutoRecordQuality::DEFAULT.to_index())
+        // Combo is only useful when auto-record is on; sensitivity
+        // tracks the switch state below.
+        .sensitive(false)
+        .build();
+    recording_group.add(&auto_record_quality_row);
+
+    // Sync the combo's sensitivity to the auto-record switch.
+    {
+        let combo_clone = auto_record_quality_row.clone();
+        auto_record_switch.connect_active_notify(move |row| {
+            combo_clone.set_sensitive(row.is_active());
+        });
+        // Initial sync — the switch builder above defaulted to
+        // `false`, so this just keeps the two in lockstep if a
+        // future builder change flips the default.
+        auto_record_quality_row.set_sensitive(auto_record_switch.is_active());
+    }
+
     // Pairs with auto-record. Only takes effect when both this
     // and `auto_record_switch` are on; sampled exclusively at
     // AOS so a mid-pass toggle can't leave a half-stopped writer.
@@ -534,6 +667,7 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         notify_lead_row,
         auto_record_switch,
         auto_record_audio_switch,
+        auto_record_quality_row,
         doppler_switch,
         passes_group,
         passes_status_row,
@@ -575,6 +709,20 @@ pub fn load_auto_record_apt(config: &Arc<ConfigManager>) -> bool {
 #[must_use]
 pub fn load_auto_record_audio(config: &Arc<ConfigManager>) -> bool {
     read_bool_or(config, KEY_AUTO_RECORD_AUDIO, false)
+}
+
+/// Read the persisted auto-record quality threshold. Defaults to
+/// [`AutoRecordQuality::DEFAULT`] (`WinnersAndGood`) — matches the
+/// previously-hardcoded `AUTO_RECORD_MIN_ELEV_DEG`. Per #511.
+#[must_use]
+pub fn load_auto_record_quality(config: &Arc<ConfigManager>) -> AutoRecordQuality {
+    let idx = config.read(|v| {
+        v.get(KEY_AUTO_RECORD_QUALITY)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(AutoRecordQuality::DEFAULT.to_index())
+    });
+    AutoRecordQuality::from_index(idx)
 }
 
 /// Load the persisted Doppler-tracking master switch. Defaults
@@ -1403,5 +1551,66 @@ mod tests {
         });
         // Falls back to the default (true), not a panic.
         assert!(load_doppler_tracking_enabled(&config));
+    }
+}
+
+#[cfg(test)]
+mod auto_record_quality_tests {
+    use super::*;
+
+    #[test]
+    fn min_elev_deg_matches_tier_table() {
+        // Pin the four thresholds. If any of these change, the
+        // user-facing labels in `display_label` must change too.
+        assert!((AutoRecordQuality::WinnersOnly.min_elev_deg() - 40.0).abs() < f64::EPSILON);
+        assert!((AutoRecordQuality::WinnersAndGood.min_elev_deg() - 25.0).abs() < f64::EPSILON);
+        assert!((AutoRecordQuality::MarginalOrBetter.min_elev_deg() - 15.0).abs() < f64::EPSILON);
+        assert!(
+            (AutoRecordQuality::AllPasses.min_elev_deg() - MIN_PASS_ELEVATION_DEG).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn default_is_winners_and_good() {
+        assert_eq!(
+            AutoRecordQuality::DEFAULT,
+            AutoRecordQuality::WinnersAndGood
+        );
+        // Critical: the default's threshold must equal the previously-
+        // hardcoded constant so existing users get the same behavior on
+        // upgrade. Per #511.
+        assert!((AutoRecordQuality::DEFAULT.min_elev_deg() - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn from_index_round_trips() {
+        for variant in AutoRecordQuality::ALL {
+            assert_eq!(AutoRecordQuality::from_index(variant.to_index()), variant);
+        }
+    }
+
+    #[test]
+    fn from_index_oob_falls_back_to_default() {
+        assert_eq!(
+            AutoRecordQuality::from_index(99),
+            AutoRecordQuality::DEFAULT
+        );
+        assert_eq!(
+            AutoRecordQuality::from_index(u32::MAX),
+            AutoRecordQuality::DEFAULT
+        );
+    }
+
+    #[test]
+    fn all_indices_are_unique_and_sequential() {
+        // Sanity check on the ALL ordering — if a future maintainer
+        // accidentally adds a duplicate, the round-trip test would
+        // miss it but this catches it directly.
+        let indices: Vec<u32> = AutoRecordQuality::ALL
+            .iter()
+            .map(|v| v.to_index())
+            .collect();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
     }
 }

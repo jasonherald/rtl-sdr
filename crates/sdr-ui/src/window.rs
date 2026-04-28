@@ -9689,12 +9689,13 @@ fn connect_satellites_panel(
     use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
     use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
-        KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG, SatellitesPanelWeak,
-        enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh, format_pass_subtitle,
-        format_pass_title, load_auto_record_apt, load_auto_record_audio, load_notify_lead_min,
-        load_station_alt_m, load_station_lat_deg, load_station_lon_deg, load_watched_satellites,
-        norad_id_for_pass, save_auto_record_apt, save_auto_record_audio, save_f64,
-        save_tle_last_refresh, save_watched_satellites, tune_target_for_pass,
+        AutoRecordQuality, KEY_AUTO_RECORD_QUALITY, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG,
+        KEY_STATION_LON_DEG, SatellitesPanelWeak, enumerate_upcoming_passes, format_downlink_mhz,
+        format_last_refresh, format_pass_subtitle, format_pass_title, load_auto_record_apt,
+        load_auto_record_audio, load_auto_record_quality, load_notify_lead_min, load_station_alt_m,
+        load_station_lat_deg, load_station_lon_deg, load_watched_satellites, norad_id_for_pass,
+        save_auto_record_apt, save_auto_record_audio, save_f64, save_tle_last_refresh,
+        save_watched_satellites, tune_target_for_pass,
     };
     use sidebar::satellites_recorder::{
         Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
@@ -9738,6 +9739,16 @@ fn connect_satellites_panel(
     panel
         .auto_record_audio_switch
         .set_active(load_auto_record_audio(config));
+    let initial_quality = load_auto_record_quality(config);
+    panel
+        .auto_record_quality_row
+        .set_selected(initial_quality.to_index());
+    // Sensitivity tracks the auto-record switch — re-sync after
+    // hydration in case the persisted switch state differs from
+    // the panel's builder default.
+    panel
+        .auto_record_quality_row
+        .set_sensitive(panel.auto_record_switch.is_active());
     panel
         .last_refresh_row
         .set_subtitle(&format_last_refresh(config));
@@ -10028,6 +10039,20 @@ fn connect_satellites_panel(
             .auto_record_audio_switch
             .connect_active_notify(move |sw| {
                 save_auto_record_audio(&config_audio, sw.is_active());
+            });
+    }
+
+    // Persist the quality threshold on change. Per #511.
+    {
+        let config_quality = std::sync::Arc::clone(config);
+        panel
+            .auto_record_quality_row
+            .connect_selected_notify(move |row| {
+                let idx = row.selected();
+                config_quality.write(|v| {
+                    v[KEY_AUTO_RECORD_QUALITY] = serde_json::json!(idx);
+                });
+                tracing::info!(idx, "auto_record_quality persisted");
             });
     }
 
@@ -11191,11 +11216,19 @@ fn connect_satellites_panel(
                 ),
                 fm_if_nr_enabled: fm_if_nr_row_tick.is_active(),
             };
+            // Read the user's selected quality tier on every
+            // tick — cheap (just a ComboRow.selected() call), and
+            // means a mid-pass change applies immediately to the
+            // next eligible pass without a restart. Per #511.
+            let min_elev_deg =
+                AutoRecordQuality::from_index(panel.auto_record_quality_row.selected())
+                    .min_elev_deg();
             let actions = recorder_tick.borrow_mut().tick(
                 now,
                 &passes_snapshot,
                 auto_record_on,
                 audio_record_on,
+                min_elev_deg,
                 now_tune,
             );
             for action in actions {
