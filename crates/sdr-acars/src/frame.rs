@@ -94,7 +94,15 @@ pub struct FrameParser {
     state: State,
     /// Bits accumulated for the current byte (LSB-first).
     out_bits: u8,
-    /// How many bits remain to fill `out_bits`.
+    /// How many bits remain to fill `out_bits`. **Critical**:
+    /// the state machine sets this to 1 in `reset_to_idle` so
+    /// `BitSink::put_bit` per-bit re-syncs (each new bit
+    /// produces a shifted byte candidate the state machine
+    /// re-evaluates). `put_bit` MUST drive `consume_byte`
+    /// synchronously — buffering bytes between MSK demod and
+    /// state machine breaks the re-sync (we lose 7 of every 8
+    /// bit-shift candidates). Mirrors C `acars.c::putbit` +
+    /// `decodeAcars` running per-bit interleaved.
     n_bits: u8,
     /// Bytes accumulated for the current frame: Mode through
     /// the trailing ETX/ETB inclusive. NOT including the
@@ -113,9 +121,11 @@ pub struct FrameParser {
     /// `ChannelBank::process` polls and clears via
     /// `take_polarity_flip()` after each demod block.
     polarity_flip_pending: bool,
-    /// Bytes finished by `BitSink::put_bit` but not yet handed
-    /// to the state machine. `drain(on_message)` walks this.
-    pending_bytes: Vec<u8>,
+    /// Decoded messages awaiting `drain()`. `BitSink::put_bit`
+    /// drives `consume_byte` synchronously (so per-bit re-sync
+    /// works); decoded messages buffer here until the caller
+    /// pulls them out.
+    pending_messages: std::collections::VecDeque<AcarsMessage>,
     /// Channel index to stamp into emitted messages.
     channel_idx: u8,
     /// Channel center frequency to stamp into emitted messages.
@@ -136,7 +146,7 @@ impl FrameParser {
             parity_err_count: 0,
             crc_bytes: [0, 0],
             polarity_flip_pending: false,
-            pending_bytes: Vec::new(),
+            pending_messages: std::collections::VecDeque::new(),
             channel_idx,
             channel_freq_hz,
         }
@@ -147,11 +157,18 @@ impl FrameParser {
     /// (parity-error overrun, frame-too-long, malformed sync,
     /// etc.). Mirrors `acars.c::resetAcars` (L239-244) plus
     /// our own buf/parity-errors clear.
+    ///
+    /// **Critical: does NOT clear `out_bits`.** acarsdec's
+    /// `resetAcars` only touches state + nbits — leaving the
+    /// byte register intact is what makes per-bit re-sync
+    /// work: a new single bit shifts the existing register one
+    /// position, producing a fresh 8-bit candidate the state
+    /// machine evaluates against SYN. Clearing here would
+    /// prevent re-sync from a false-positive SYN.
     fn reset_to_idle(&mut self) {
         self.state = State::WaitingSyn;
         // C `resetAcars` sets nbits=1 (per-bit re-sync).
         self.n_bits = 1;
-        self.out_bits = 0;
         self.buf.clear();
         self.parity_errors.clear();
         self.parity_err_count = 0;
@@ -166,22 +183,26 @@ impl FrameParser {
         std::mem::replace(&mut self.polarity_flip_pending, false)
     }
 
-    /// Drain completed bytes accumulated by `BitSink::put_bit`,
-    /// running each through `consume_byte`. Production callers
-    /// (`ChannelBank::process`) invoke this after every demod
-    /// block. Tests use `feed_bytes()` instead.
+    /// Drain decoded messages buffered by synchronous
+    /// `BitSink::put_bit` → `consume_byte` runs. Production
+    /// callers (`ChannelBank::process`) invoke this after each
+    /// demod block. Tests use `feed_bytes()` instead.
     pub fn drain<F: FnMut(AcarsMessage)>(&mut self, mut on_message: F) {
-        let bytes = std::mem::take(&mut self.pending_bytes);
-        for b in bytes {
-            self.consume_byte(b, &mut on_message);
+        while let Some(msg) = self.pending_messages.pop_front() {
+            on_message(msg);
         }
     }
 
     /// Consume one fully-assembled byte. Drives the state
-    /// machine; emits an `AcarsMessage` via `on_message` when
-    /// CRC2 closes a successful frame. Mirrors the byte-level
-    /// switch in `acars.c::decodeAcars` (L246-388).
-    fn consume_byte<F: FnMut(AcarsMessage)>(&mut self, byte: u8, on_message: &mut F) {
+    /// machine; pushes an `AcarsMessage` onto `pending_messages`
+    /// when CRC2 closes a successful frame. Mirrors the byte-
+    /// level switch in `acars.c::decodeAcars` (L246-388). The C
+    /// `decodeAcars` runs SYNCHRONOUSLY per byte from `putbit` —
+    /// our Rust port does the same via this method being called
+    /// from `BitSink::put_bit` (NOT buffered for later) so the
+    /// `n_bits = 1` per-bit re-sync semantic in `reset_to_idle`
+    /// works correctly.
+    fn consume_byte(&mut self, byte: u8) {
         match self.state {
             // acars.c:252-265
             State::WaitingSyn => {
@@ -263,7 +284,7 @@ impl FrameParser {
                     self.crc_bytes[1] = self.buf[new_len + 1];
                     self.buf.truncate(new_len);
                     // Jump straight to the CRC-verify / putmsg path.
-                    self.finalize_frame(on_message);
+                    self.finalize_frame();
                     return;
                 }
                 if self.buf.len() > MAX_FRAME_LEN {
@@ -281,16 +302,16 @@ impl FrameParser {
             // acars.c:348-373 (putmsg_lbl), then END→reset
             State::Crc2 => {
                 self.crc_bytes[1] = byte;
-                self.finalize_frame(on_message);
+                self.finalize_frame();
             }
         }
     }
 
     /// CRC-verify, optionally FEC-recover, build the
-    /// `AcarsMessage`, hand it to the callback, and reset.
-    /// Shared between the normal CRC2 path and the DLE-escape
-    /// recovery (`acars.c::putmsg_lbl`).
-    fn finalize_frame<F: FnMut(AcarsMessage)>(&mut self, on_message: &mut F) {
+    /// `AcarsMessage`, push it onto `pending_messages`, and
+    /// reset. Shared between the normal CRC2 path and the
+    /// DLE-escape recovery (`acars.c::putmsg_lbl`).
+    fn finalize_frame(&mut self) {
         // Compute the CRC over buf + crc_bytes. acars.c:160-165
         // does this one-shot: fold every byte in `txt` then both
         // BCS bytes; expect 0.
@@ -370,38 +391,44 @@ impl FrameParser {
             text,
             end_of_message,
         };
-        on_message(msg);
+        self.pending_messages.push_back(msg);
         self.reset_to_idle();
     }
 
     /// Convenience: drive the parser with a sequence of fully-
     /// formed bytes — used by unit tests that bypass MSK demod
-    /// and feed hand-crafted byte sequences directly.
+    /// and feed hand-crafted byte sequences directly. Also
+    /// drains the resulting messages into `on_message` for test
+    /// ergonomics.
     pub fn feed_bytes<F: FnMut(AcarsMessage)>(&mut self, bytes: &[u8], mut on_message: F) {
         for &b in bytes {
-            self.consume_byte(b, &mut on_message);
+            self.consume_byte(b);
         }
+        self.drain(&mut on_message);
     }
 }
 
 impl BitSink for FrameParser {
     fn put_bit(&mut self, value: f32) {
-        // Shift the bit into the byte register LSB-first
-        // (matches acarsdec putbit, msk.c:53-63). When the byte
-        // fills, push to `pending_bytes` for the caller's later
-        // `drain(on_message)`. Splitting bit accumulation from
-        // state-machine driving keeps `BitSink::put_bit`
-        // callback-free and lets unit tests bypass the bit path.
+        // LSB-first byte accumulator (acarsdec putbit, msk.c:53-63):
+        // shift right, set bit 7 on a positive sample. When the
+        // count hits 0, hand the assembled byte to consume_byte
+        // SYNCHRONOUSLY — the C does this from inside putbit, and
+        // crucially the state machine sets nbits=1 (per-bit re-sync)
+        // when the candidate doesn't match SYN. Buffering bytes for
+        // a later drain breaks that re-sync (we'd lose 7 of every 8
+        // bit-shift candidates).
         self.out_bits >>= 1;
         if value > 0.0 {
             self.out_bits |= 0x80;
         }
         self.n_bits = self.n_bits.saturating_sub(1);
         if self.n_bits == 0 {
-            self.n_bits = 8;
+            // n_bits is set to 8 (or 1 for re-sync) by consume_byte
+            // via the state-machine transitions; do NOT pre-set it
+            // here.
             let byte = self.out_bits;
-            self.out_bits = 0;
-            self.pending_bytes.push(byte);
+            self.consume_byte(byte);
         }
     }
 }
