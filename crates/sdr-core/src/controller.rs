@@ -1156,6 +1156,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetDemodMode(mode) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDemodMode") {
+                return;
+            }
             tracing::debug!(?mode, "set demod mode");
             on_tune_change(state);
             let old_mode = state.radio.current_mode();
@@ -3983,7 +3986,8 @@ fn apply_acars_geometry(
 /// behind ACARS's back, leaving `acars_bank` decoding stale
 /// geometry while ACARS reads as logically engaged. Caller
 /// invokes this at the top of each geometry-mutating arm
-/// (`Tune` / `SetSampleRate` / `SetDecimation` / `SetVfoOffset`) and
+/// (`Tune` / `SetDemodMode` / `SetSampleRate` / `SetDecimation` /
+/// `SetVfoOffset`) and
 /// `return`s on `true`. CR round 14 on PR #584.
 fn acars_lock_rejects_geometry_change(
     state: &DspState,
