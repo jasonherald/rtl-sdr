@@ -1572,6 +1572,19 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 cleanup(state, dsp_tx);
                 state.running = false;
             }
+            // ACARS source-type gate (epic #474). If ACARS is on
+            // and the new source isn't RTL-SDR, auto-disable
+            // (issue a synthetic disengage so the source-rate /
+            // center / VFO are restored from the snapshot and
+            // the UI gets the ack). Spec section "Source-type
+            // gate" — toggle is greyed for non-RTL-SDR sources.
+            if state.acars_bank.is_some() && source_type != SourceType::RtlSdr {
+                tracing::info!(
+                    ?source_type,
+                    "ACARS auto-disabling: source type changing to non-RTL-SDR"
+                );
+                handle_set_acars_enabled(state, false, dsp_tx);
+            }
             state.source_type = source_type;
             // Force the rtl_tcp status row to reset when switching
             // away from RTL-TCP. Without this, a user mid-session
@@ -2915,6 +2928,16 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // NFM mid-pass) is a *soft* discontinuity and intentionally
     // stays untouched — the user keeps decoding the same pass.
     reset_imaging_decoders(state);
+
+    // ACARS bank cleanup on source-stop (epic #474). Mirror the
+    // LRPT pattern in `reset_imaging_decoders`: drop the bank +
+    // clear the one-shot init flag. The pre-lock snapshot stays
+    // so a subsequent re-enable could read it. NOT placed in
+    // `reset_imaging_decoders` because that function is also
+    // called by the satellite auto-record inter-pass reset
+    // (issue #544), where ACARS state should NOT be dropped.
+    state.acars_bank = None;
+    state.acars_init_failed = false;
 
     tracing::info!("source closed");
 }
