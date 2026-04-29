@@ -2663,6 +2663,7 @@ fn build_layout(
     left_stack.add_named(&panels.scanner.widget, Some("scanner"));
     left_stack.add_named(&page_from_group(&panels.server.widget), Some("share"));
     left_stack.add_named(&panels.satellites.widget, Some("satellites"));
+    left_stack.add_named(&panels.aviation.widget, Some("aviation"));
 
     // Right panel stack — single child today, hosts the real
     // transcript widget (not a placeholder) so transcription keeps
