@@ -37,6 +37,12 @@ use clap::Parser;
 use num_complex::Complex32;
 use sdr_acars::{AcarsError, AcarsMessage, ChannelBank, FrameParser, IF_RATE_HZ, MskDemod};
 
+/// Per-channel WAV-input chunk size, matching acarsdec's
+/// `MAXNBFRAMES = 4096` (soundfile.c). Keeping this aligned
+/// makes the chunked dispatch order byte-equal to acarsdec's,
+/// which is what lets the e2e diff strip only volatile fields.
+const WAV_CHUNK_FRAMES: usize = 4096;
+
 /// US-6 default channel set (matches the spec). Primary-first
 /// order — the same ordering the workspace docs use.
 const US_ACARS_CHANNELS: &[f64] = &[
@@ -187,14 +193,28 @@ fn decode_wav(
         per_channel[i % n_channels].push(f32::from(sample) / f32::from(i16::MAX));
     }
 
+    // Process per-channel samples in synchronized chunks so
+    // messages emerge in time order across channels — matches
+    // acarsdec's `runSoundfileSample` (soundfile.c:60-78), which
+    // reads `MAXNBFRAMES * nbch = 4096 * 4 = 16384` samples per
+    // chunk (= 4096 per channel) and dispatches all channels'
+    // slices through demodMSK before moving on. Matching the
+    // chunk size (`WAV_CHUNK_FRAMES`, declared at module scope)
+    // keeps message ordering byte-equal to acarsdec for the
+    // e2e diff.
+    let total_samples = per_channel.first().map_or(0, Vec::len);
     let mut emit_buf: Vec<AcarsMessage> = Vec::new();
-    for (i, samples) in per_channel.iter().enumerate() {
-        demods[i].process(samples, &mut parsers[i]);
-        emit_buf.clear();
-        parsers[i].drain(|msg| emit_buf.push(msg));
+    let mut start = 0;
+    while start < total_samples {
+        let end = (start + WAV_CHUNK_FRAMES).min(total_samples);
+        for (i, samples) in per_channel.iter().enumerate() {
+            demods[i].process(&samples[start..end], &mut parsers[i]);
+            parsers[i].drain(|msg| emit_buf.push(msg));
+        }
         for msg in emit_buf.drain(..) {
             print_message(&msg, out)?;
         }
+        start = end;
     }
     Ok(())
 }

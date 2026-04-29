@@ -356,7 +356,13 @@ impl FrameParser {
             // construction.
             let _ = aircraft.try_push((b & 0x7F) as char);
         }
-        let ack = self.buf[8] & 0x7F;
+        // NAK character (0x15) is non-printable — normalize to
+        // '!' (0x21) here so consumers can compare against the
+        // printable sentinel. Mirrors `output.c::buildmsg:513-514`.
+        let mut ack = self.buf[8] & 0x7F;
+        if ack == 0x15 {
+            ack = b'!';
+        }
         let mut label = [self.buf[9] & 0x7F, self.buf[10] & 0x7F];
         // DEL (0x7F) in second label byte → 'd' (output.c:520).
         if label[1] == 0x7F {
@@ -364,12 +370,45 @@ impl FrameParser {
         }
         let block_id = self.buf[11] & 0x7F;
         // self.buf[12] is STX (0x02 with parity → 0x82); skipped.
-        // Text body runs from buf[13] up to (but not including)
-        // the trailing ETX/ETB.
+        // Downlink frames (block_id ∈ '0'..='9' per
+        // `output.c::IS_DOWNLINK_BLK`) carry a 4-char message
+        // number then a 6-char flight ID immediately after STX,
+        // before the visible text. Uplinks have no such prefix —
+        // text starts at buf[13]. We extract these here so the
+        // e2e diff against acarsdec's text printer matches.
+        let is_downlink = block_id.is_ascii_digit();
         let text_end = self.buf.len() - 1;
-        let mut text = String::with_capacity(text_end.saturating_sub(13));
-        if text_end > 13 {
-            for &b in &self.buf[13..text_end] {
+        let mut message_no: Option<ArrayString<5>> = None;
+        let mut flight_id: Option<ArrayString<7>> = None;
+        let text_start: usize = if is_downlink && text_end >= 17 {
+            // Reserve room for msgno (4 chars) + flight (6
+            // chars). C bounds-checks each byte: `i < N && k <
+            // blk->len - 1` (output.c:548, 561) — we mirror.
+            let mut no = ArrayString::<5>::new();
+            for &b in &self.buf[13..17.min(text_end)] {
+                let _ = no.try_push((b & 0x7F) as char);
+            }
+            if !no.is_empty() {
+                message_no = Some(no);
+            }
+            let flight_start = 17;
+            let flight_finish = 23.min(text_end);
+            if flight_start < flight_finish {
+                let mut fid = ArrayString::<7>::new();
+                for &b in &self.buf[flight_start..flight_finish] {
+                    let _ = fid.try_push((b & 0x7F) as char);
+                }
+                if !fid.is_empty() {
+                    flight_id = Some(fid);
+                }
+            }
+            flight_finish
+        } else {
+            13
+        };
+        let mut text = String::with_capacity(text_end.saturating_sub(text_start));
+        if text_end > text_start {
+            for &b in &self.buf[text_start..text_end] {
                 text.push((b & 0x7F) as char);
             }
         }
@@ -386,8 +425,8 @@ impl FrameParser {
             block_id,
             ack,
             aircraft,
-            flight_id: None,  // v1 — see #577.
-            message_no: None, // v1 — see #577.
+            flight_id,
+            message_no,
             text,
             end_of_message,
         };
@@ -466,19 +505,19 @@ mod tests {
 
     /// Build a known-good ACARS frame as a byte sequence ready
     /// to feed into `FrameParser`. Address ".N12345", label "H1",
-    /// block "0", text "TEST".
+    /// block `block_id`, text `text`.
     ///
     /// Layout: `[SYN][SYN][SOH][Mode][Addr×7][ACK][Label×2]
     ///          [BlockID][STX][text...][ETX][CRC_lo][CRC_hi]`.
-    fn synthesize_minimal_frame() -> Vec<u8> {
+    fn synthesize_frame(block_id: u8, text: &[u8]) -> Vec<u8> {
         let mut buf = vec![0x16, 0x16, 0x01];
         buf.push(b'2'); // Mode
         buf.extend_from_slice(b".N12345"); // Address (7 bytes)
         buf.push(b'!'); // ACK = 0x21
         buf.extend_from_slice(b"H1"); // Label
-        buf.push(b'0'); // Block ID
+        buf.push(block_id);
         buf.push(0x02); // STX
-        buf.extend_from_slice(b"TEST"); // text
+        buf.extend_from_slice(text);
         buf.push(0x03); // ETX (will get parity bit added below)
         // Apply odd parity over Mode through ETX (the CRC payload).
         let payload_start = 3;
@@ -492,8 +531,19 @@ mod tests {
         buf
     }
 
+    /// Backwards-compatible default: uplink frame (block 'A')
+    /// with a short body. Uplink avoids the
+    /// `msgno`/`flight_id` field-extraction so callers checking
+    /// raw `text` see exactly what they passed in.
+    fn synthesize_minimal_frame() -> Vec<u8> {
+        synthesize_frame(b'A', b"TEST")
+    }
+
     #[test]
-    fn parses_a_known_good_frame() {
+    fn parses_a_known_good_uplink_frame() {
+        // Uplink (block 'A' is not '0'..='9' so IS_DOWNLINK_BLK
+        // is false): no msgno/flight_id extraction; text body is
+        // the entire payload between STX and ETX.
         let bytes = synthesize_minimal_frame();
         let mut parser = FrameParser::new(0, 0.0);
         let mut decoded = Vec::new();
@@ -504,13 +554,33 @@ mod tests {
         assert_eq!(msg.mode, b'2');
         assert_eq!(&msg.aircraft[..], ".N12345");
         assert_eq!(msg.label, *b"H1");
-        assert_eq!(msg.block_id, b'0');
+        assert_eq!(msg.block_id, b'A');
         assert_eq!(msg.ack, b'!');
         assert_eq!(msg.text, "TEST");
         assert!(msg.end_of_message);
         assert_eq!(msg.channel_idx, 0);
-        assert!(msg.flight_id.is_none());
-        assert!(msg.message_no.is_none());
+        assert!(msg.flight_id.is_none(), "uplink has no flight_id");
+        assert!(msg.message_no.is_none(), "uplink has no message_no");
+    }
+
+    #[test]
+    fn parses_a_known_good_downlink_frame() {
+        // Downlink (block '0' ∈ '0'..='9' triggers
+        // IS_DOWNLINK_BLK): text payload starts with 4-char
+        // msgno + 6-char flight_id, then the visible body.
+        // We pass a 14-char payload: "S64A" + "BA031T" + "BODY"
+        // → msgno=S64A, flight=BA031T, text=BODY.
+        let bytes = synthesize_frame(b'0', b"S64ABA031TBODY");
+        let mut parser = FrameParser::new(0, 0.0);
+        let mut decoded = Vec::new();
+        parser.feed_bytes(&bytes, |msg| decoded.push(msg));
+
+        assert_eq!(decoded.len(), 1, "expected exactly one frame");
+        let msg = &decoded[0];
+        assert_eq!(msg.block_id, b'0');
+        assert_eq!(msg.message_no.as_deref(), Some("S64A"));
+        assert_eq!(msg.flight_id.as_deref(), Some("BA031T"));
+        assert_eq!(msg.text, "BODY");
     }
 
     #[test]
