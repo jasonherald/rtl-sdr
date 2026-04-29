@@ -537,16 +537,24 @@ struct DspState {
     /// otherwise. Instantiated by the `SetAcarsEnabled(true)`
     /// arm; dropped by `SetAcarsEnabled(false)`, source-stop,
     /// and source-type-change auto-disable.
+    /// (Consumer lands in T6 `acars_decode_tap`.)
+    #[allow(dead_code)]
     acars_bank: Option<sdr_acars::ChannelBank>,
     /// Snapshot of the prior source config taken at engage.
     /// Used by disengage to restore the user's tuning.
+    /// (Consumer lands in T7 `handle_set_acars_enabled`.)
+    #[allow(dead_code)]
     acars_pre_lock: Option<crate::acars_airband_lock::PreLockSnapshot>,
     /// One-shot guard: a previous `ChannelBank::new` failed.
     /// Mirrors `lrpt_init_failed` — prevents warn-spam on
     /// every subsequent IQ block. Cleared on source-stop.
+    /// (Consumer lands in T6 `acars_decode_tap`.)
+    #[allow(dead_code)]
     acars_init_failed: bool,
     /// Last `DspToUi::AcarsChannelStats` emission timestamp.
     /// Throttles stats emission to ~1 Hz per spec.
+    /// (Consumer lands in T8 stats-throttle in `process_iq_block`.)
+    #[allow(dead_code)]
     acars_stats_emitted_at: std::time::Instant,
 }
 
