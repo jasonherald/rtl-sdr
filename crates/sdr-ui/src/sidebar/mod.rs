@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 pub mod activity_bar;
 pub mod audio_panel;
+pub mod aviation_panel;
 pub mod bookmarks_panel;
 pub mod display_panel;
 pub mod general_panel;
