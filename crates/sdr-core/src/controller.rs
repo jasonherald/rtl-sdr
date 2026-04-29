@@ -543,7 +543,6 @@ struct DspState {
     /// Snapshot of the prior source config taken at engage.
     /// Used by disengage to restore the user's tuning.
     /// (Consumer lands in T7 `handle_set_acars_enabled`.)
-    #[allow(dead_code)]
     acars_pre_lock: Option<crate::acars_airband_lock::PreLockSnapshot>,
     /// One-shot guard: a previous `ChannelBank::new` failed.
     /// Mirrors `lrpt_init_failed` — prevents warn-spam on
@@ -2177,12 +2176,8 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 .handle_event(sdr_scanner::ScannerEvent::UnlockChannel(key));
             apply_scanner_commands(state, dsp_tx, cmds);
         }
-        // ACARS airband lock (epic #474). Full controller
-        // integration is Task 4; this arm satisfies the
-        // exhaustive-match requirement introduced by the
-        // new variant in Task 3.
-        UiToDsp::SetAcarsEnabled(enabled) => {
-            tracing::debug!(enabled, "SetAcarsEnabled received (not yet implemented)");
+        UiToDsp::SetAcarsEnabled(enable) => {
+            handle_set_acars_enabled(state, enable, dsp_tx);
         }
     }
 }
@@ -3582,6 +3577,148 @@ fn process_iq_block(
         Err(e) => {
             tracing::warn!("frontend processing error: {e}");
         }
+    }
+}
+
+/// Handler for `UiToDsp::SetAcarsEnabled`. Engages or
+/// releases the airband lock, instantiates / drops the
+/// `ChannelBank`, and emits an ack via `DspToUi`.
+#[allow(clippy::too_many_lines)]
+fn handle_set_acars_enabled(
+    state: &mut DspState,
+    enable: bool,
+    dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
+) {
+    use crate::acars_airband_lock::{
+        disengage, engage, AcarsEnableError, CurrentSourceState, US_SIX_CHANNELS_HZ,
+    };
+    use crate::messages::DspToUi;
+
+    if enable {
+        if state.acars_bank.is_some() {
+            // Idempotent: already on. Re-ack with current state.
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
+            return;
+        }
+
+        let current = CurrentSourceState {
+            source_rate_hz: state.sample_rate,
+            center_freq_hz: state.center_freq,
+            vfo_offset_hz: state.vfo_offset,
+            source_type: state.source_type,
+            frontend_decim: state.frontend.decim_ratio(),
+        };
+        let plan = match engage(&current) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("ACARS engage rejected: {e}");
+                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(e)));
+                return;
+            }
+        };
+
+        // Apply target geometry to the source. ANY failure
+        // here triggers a full rollback: don't half-engage.
+        if let Some(source) = state.source.as_mut()
+            && let Err(e) = source.set_sample_rate(plan.target_source_rate_hz)
+        {
+            let err = AcarsEnableError::SourceRetuneFailed(e.to_string());
+            tracing::warn!("ACARS engage source-rate failed: {err}");
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+            return;
+        }
+        state.sample_rate = plan.target_source_rate_hz;
+        state.center_freq = plan.target_center_hz;
+        if let Some(source) = state.source.as_mut()
+            && let Err(e) = source.tune(plan.target_center_hz)
+        {
+            // Roll back the rate so we don't leave the source
+            // half-tuned. (`Source::tune` is the trait method
+            // for center-freq retune — see
+            // `crates/sdr-pipeline/src/source_manager.rs`.)
+            if let Some(s) = state.source.as_mut() {
+                let _ = s.set_sample_rate(plan.snapshot.source_rate_hz);
+            }
+            state.sample_rate = plan.snapshot.source_rate_hz;
+            state.center_freq = plan.snapshot.center_freq_hz;
+            let err = AcarsEnableError::SourceRetuneFailed(e.to_string());
+            tracing::warn!("ACARS engage center-freq failed: {err}");
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+            return;
+        }
+        if let Err(e) = state.frontend.set_decimation(plan.target_frontend_decim) {
+            // Roll back rate + center.
+            if let Some(s) = state.source.as_mut() {
+                let _ = s.set_sample_rate(plan.snapshot.source_rate_hz);
+                let _ = s.tune(plan.snapshot.center_freq_hz);
+            }
+            state.sample_rate = plan.snapshot.source_rate_hz;
+            state.center_freq = plan.snapshot.center_freq_hz;
+            let err = AcarsEnableError::FrontendDecimFailed(e.to_string());
+            tracing::warn!("ACARS engage decim failed: {err}");
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+            return;
+        }
+
+        // Geometry locked. Pre-build the ChannelBank now (rather
+        // than on first IQ block) so init failure surfaces in
+        // the engage ack rather than as a quiet `init_failed=true`
+        // state the UI never finds out about.
+        match sdr_acars::ChannelBank::new(
+            plan.target_source_rate_hz,
+            plan.target_center_hz,
+            &US_SIX_CHANNELS_HZ,
+        ) {
+            Ok(bank) => {
+                state.acars_bank = Some(bank);
+                state.acars_init_failed = false;
+                state.acars_pre_lock = Some(plan.snapshot);
+                state.acars_stats_emitted_at = std::time::Instant::now();
+                tracing::info!("ACARS engaged: airband lock active");
+                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
+            }
+            Err(e) => {
+                // Roll back source + decim.
+                if let Some(s) = state.source.as_mut() {
+                    let _ = s.set_sample_rate(plan.snapshot.source_rate_hz);
+                    let _ = s.tune(plan.snapshot.center_freq_hz);
+                }
+                let _ = state.frontend.set_decimation(plan.snapshot.frontend_decim);
+                state.sample_rate = plan.snapshot.source_rate_hz;
+                state.center_freq = plan.snapshot.center_freq_hz;
+                let err = AcarsEnableError::ChannelBankInit(e.to_string());
+                tracing::warn!("ACARS bank init failed: {err}");
+                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+            }
+        }
+    } else {
+        // Disengage. Idempotent: silently OK if already off.
+        let Some(snapshot) = state.acars_pre_lock.take() else {
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+            return;
+        };
+        let restore = disengage(&snapshot);
+        // Drop the bank first so any in-flight messages drain.
+        state.acars_bank = None;
+        state.acars_init_failed = false;
+
+        if let Some(source) = state.source.as_mut() {
+            let _ = source.set_sample_rate(restore.target_source_rate_hz);
+            let _ = source.tune(restore.target_center_hz);
+        }
+        let _ = state.frontend.set_decimation(restore.target_frontend_decim);
+        state.sample_rate = restore.target_source_rate_hz;
+        state.center_freq = restore.target_center_hz;
+        // VFO offset restore. The controller stores it on
+        // `state.vfo_offset` (read by `rebuild_vfo` and the
+        // VFO struct). Mirror the `UiToDsp::SetVfoOffset` arm
+        // (around `controller.rs:1219`).
+        state.vfo_offset = restore.target_vfo_offset_hz;
+        if let Some(vfo) = state.vfo.as_mut() {
+            vfo.set_offset(restore.target_vfo_offset_hz);
+        }
+        tracing::info!("ACARS disengaged: source restored to snapshot");
+        let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
     }
 }
 
