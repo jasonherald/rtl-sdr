@@ -1,0 +1,35 @@
+
+[#X (L:N E:N) --------------------------------
+Mode : E Label : 5V Id : 4 Nak
+Aircraft reg: PH-BXR Flight id: KL1681
+No: S53A
+
+[#X (L:N E:N) --------------------------------
+Mode : E Label : Q0 Id : 6 Nak
+Aircraft reg: LN-DYY Flight id: DY083J
+No: S47A
+
+[#X (L:N E:N) --------------------------------
+Mode : 2 Label : Q0 Id : 4 Nak
+Aircraft reg: LN-DYY Flight id: DY083J
+No: S46A
+
+[#X (L:N E:N) --------------------------------
+Mode : G Label : H1 Id : 3 Nak
+Aircraft reg: F-GTAE Flight id: AF7728
+No: D65C
+#DFB00000/V206,05,124,183,02,00,00000/V3XX,XX,XXX,XXX,XXXX/V4XX,XX,XXX,XXX,XXXX/V5XX,XX,XXX,XXX,XXXX/V6XX,XX,XXX,XXX,XXXX/V7044,078,00081,22222222222111/V8042,083,00061,22222222222111/
+
+[#X (L:N E:N) --------------------------------
+Mode : x Label : _d Id : A Ack : 5
+Aircraft reg: LN-DYY 
+
+[#X (L:N E:N) --------------------------------
+Mode : 2 Label : _d Id : 0 Ack : W
+Aircraft reg: G-DBCK Flight id: BA031T
+No: S64A
+
+[#X (L:N E:N) --------------------------------
+Mode : E Label : Q0 Id : 9 Nak
+Aircraft reg: G-DBCK Flight id: BA031T
+No: S63A
