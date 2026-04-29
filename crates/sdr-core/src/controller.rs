@@ -2364,6 +2364,23 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
         // --- Scanner (#317) ---
         UiToDsp::SetScannerEnabled(enabled) => {
+            // Reject scanner enable while ACARS is engaged. The
+            // reverse direction (refusing ACARS engage while
+            // scanner is running) was added in CR round 16; this
+            // closes the symmetric hole. Without it, enabling
+            // scanner mid-engagement would retune the source via
+            // apply_scanner_commands and violate the airband-lock
+            // invariants the round 14-15 UiToDsp guards protect.
+            // CR round 17 on PR #584.
+            if enabled && state.acars_pre_lock.is_some() {
+                tracing::warn!("scanner enable rejected: ACARS airband lock is active");
+                let _ = dsp_tx.send(DspToUi::Error(
+                    "Scanner enable ignored: ACARS airband lock is active. \
+                     Disable ACARS first."
+                        .to_string(),
+                ));
+                return;
+            }
             if enabled && stop_any_recording(state, dsp_tx) {
                 let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
                     ScannerMutexReason::RecordingStoppedForScanner,
