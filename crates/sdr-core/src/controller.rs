@@ -2969,12 +2969,32 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // signal); `acars_bank.is_some()` is too narrow because the
     // Start path intentionally invalidates the bank for the
     // lazy-rebuild window. CR round 5 on PR #584.
+    let mut acars_forced_off = false;
     if state.acars_pre_lock.is_some() {
         handle_set_acars_enabled(state, false, dsp_tx);
+        // If pre_lock is STILL Some after the call, the disengage
+        // path Err'd (re-stashed the snapshot for retry).
+        // handle_dsp_message in sdr-ui preserves AppState's
+        // `acars_enabled` on Err — by design, since Err doesn't
+        // disambiguate engage-vs-disengage failure (CR round 1).
+        // But we ARE force-clearing the DSP-side session right
+        // below, so we need a definitive Ok(false) ack to keep
+        // the UI toggle in sync; otherwise the user is left with
+        // a latched-on toggle they have to manually flip off.
+        // CR round 7 on PR #584.
+        if state.acars_pre_lock.is_some() {
+            acars_forced_off = true;
+            tracing::warn!(
+                "ACARS disengage Err'd during cleanup; forcing UI off via Ok(false) ack"
+            );
+        }
     }
     state.acars_bank = None;
     state.acars_init_failed = false;
     state.acars_pre_lock = None;
+    if acars_forced_off {
+        let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+    }
 
     if let Some(source) = &mut state.source {
         let _ = source.stop();
