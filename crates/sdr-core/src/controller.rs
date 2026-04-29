@@ -1629,7 +1629,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // usual; the post-cleanup acars_bank=None becomes a
             // harmless re-set since handle_set_acars_enabled
             // already cleared it.
-            if state.acars_bank.is_some() && source_type != SourceType::RtlSdr {
+            // Use `acars_pre_lock.is_some()` (the canonical
+            // "ACARS engaged" signal), NOT `acars_bank.is_some()`.
+            // The Start path intentionally invalidates the bank
+            // for the lazy-rebuild window — bank can be None
+            // while ACARS is still engaged. CR round 5 on PR #584.
+            if state.acars_pre_lock.is_some() && source_type != SourceType::RtlSdr {
                 tracing::info!(
                     ?source_type,
                     "ACARS auto-disabling: source type changing to non-RTL-SDR"
@@ -2954,8 +2959,12 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     //
     // Force-clear the ACARS session state after the call so a
     // disengage Err (rare) doesn't leave a stale snapshot
-    // lingering across the source teardown.
-    if state.acars_bank.is_some() {
+    // lingering across the source teardown. Use
+    // `acars_pre_lock.is_some()` (the canonical "ACARS engaged"
+    // signal); `acars_bank.is_some()` is too narrow because the
+    // Start path intentionally invalidates the bank for the
+    // lazy-rebuild window. CR round 5 on PR #584.
+    if state.acars_pre_lock.is_some() {
         handle_set_acars_enabled(state, false, dsp_tx);
     }
     state.acars_bank = None;
@@ -3784,8 +3793,18 @@ fn handle_set_acars_enabled(
     use crate::messages::DspToUi;
 
     if enable {
-        if state.acars_bank.is_some() {
-            // Idempotent: already on. Re-ack with current state.
+        if state.acars_pre_lock.is_some() {
+            // Idempotent: already engaged. Re-ack with current
+            // state. Use `acars_pre_lock.is_some()` rather than
+            // `acars_bank.is_some()` because the Start path
+            // intentionally invalidates the bank during the
+            // lazy-rebuild window. Without this, a second
+            // SetAcarsEnabled(true) in that window would fall
+            // through, re-snapshot the already-locked
+            // (airband) geometry as if it were the user's prior
+            // config, and a later disengage would restore to
+            // the ACARS lock instead of the user's pre-engage
+            // settings. CR round 5 on PR #584.
             let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
             return;
         }
