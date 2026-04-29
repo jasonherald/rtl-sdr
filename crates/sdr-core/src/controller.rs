@@ -938,26 +938,64 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     tracing::info!("DSP pipeline started");
 
                     // ACARS bank coherence (epic #474). open_source
-                    // may have updated state.sample_rate to the
-                    // hardware-rounded value (especially for the
-                    // enable-while-stopped or startup-replay paths
-                    // where the engage-time bank was built before
-                    // the source was live). Drop the bank so the
-                    // lazy-init path in `acars_decode_tap` rebuilds
-                    // it at the actual streaming rate. The
-                    // `acars_pre_lock.is_some()` check is the
-                    // "ACARS is engaged" signal — bank presence
-                    // alone is insufficient because of this rebuild
-                    // pattern. Per CR round 4 on PR #584.
+                    // may have:
+                    //   - updated state.sample_rate to the hardware-
+                    //     rounded value, AND
+                    //   - auto-selected `frontend.set_decimation(>1)`
+                    //     based on the current demod IF (per the
+                    //     auto_decimation_ratio call inside the
+                    //     Start path).
+                    // The latter breaks the ACARS contract that the
+                    // tap reads post-IqFrontend IQ at SOURCE rate
+                    // (decim=1). Reassert the full airband geometry
+                    // via `apply_acars_geometry` so frontend decim,
+                    // configured_sample_rate, rebuild_frontend,
+                    // rebuild_vfo, and on_tune_change all snap back
+                    // into the locked state. Then drop the bank for
+                    // lazy-rebuild at the now-coherent live rate.
+                    // Per CR rounds 4+8 on PR #584.
                     if state.acars_pre_lock.is_some() {
-                        state.acars_bank = None;
-                        state.acars_init_failed = false;
-                        state.acars_stats_emitted_at = std::time::Instant::now();
-                        tracing::debug!(
-                            sample_rate = state.sample_rate,
-                            center_freq = state.center_freq,
-                            "ACARS bank invalidated post-Start; lazy-init will rebuild at live rate"
-                        );
+                        match apply_acars_geometry(
+                            state,
+                            crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
+                            crate::acars_airband_lock::ACARS_CENTER_HZ,
+                            crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
+                        ) {
+                            Ok(()) => {
+                                state.acars_bank = None;
+                                state.acars_init_failed = false;
+                                state.acars_stats_emitted_at = std::time::Instant::now();
+                                tracing::debug!(
+                                    sample_rate = state.sample_rate,
+                                    center_freq = state.center_freq,
+                                    "ACARS geometry reasserted post-Start; bank lazy-rebuild pending"
+                                );
+                            }
+                            Err(err) => {
+                                // Reassertion failed. The DSP graph
+                                // is in an indeterminate state — best
+                                // path is to disengage ACARS entirely
+                                // so the UI/DSP stay in sync. Drop
+                                // the snapshot (no clean restore is
+                                // possible since we just failed at
+                                // applying airband, never mind
+                                // applying anything else) and emit
+                                // Err so the UI clears its toggle
+                                // via the panel handler when sub-
+                                // project 3 wires it.
+                                tracing::error!("ACARS geometry reassert failed post-Start: {err}");
+                                state.acars_bank = None;
+                                state.acars_init_failed = false;
+                                state.acars_pre_lock = None;
+                                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+                                // Also send a definitive Ok(false)
+                                // so the UI (which preserves state
+                                // on Err per CR round 1) snaps the
+                                // toggle off — same pattern as
+                                // cleanup's forced-off ack (round 7).
+                                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+                            }
+                        }
                     }
 
                     // Send display bandwidth (raw sample rate) so
@@ -2982,11 +3020,33 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
         // the UI toggle in sync; otherwise the user is left with
         // a latched-on toggle they have to manually flip off.
         // CR round 7 on PR #584.
-        if state.acars_pre_lock.is_some() {
+        //
+        // ALSO: copy the snapshot's tuning back into the
+        // controller's in-memory fields BEFORE force-clearing
+        // it. The disengage Err path leaves the controller at
+        // airband geometry (since apply_acars_geometry's restore
+        // failed and the best-effort re-apply re-engages
+        // airband). Without this restore, the next Start would
+        // reopen at `configured_sample_rate = 2.5 MSps` even
+        // though ACARS is now off. CR round 8 on PR #584.
+        if let Some(snapshot) = state.acars_pre_lock.as_ref() {
             acars_forced_off = true;
             tracing::warn!(
-                "ACARS disengage Err'd during cleanup; forcing UI off via Ok(false) ack"
+                source_rate = snapshot.source_rate_hz,
+                center = snapshot.center_freq_hz,
+                vfo_offset = snapshot.vfo_offset_hz,
+                "ACARS disengage Err'd during cleanup; restoring snapshot to \
+                 controller state + forcing UI off via Ok(false) ack"
             );
+            state.configured_sample_rate = snapshot.source_rate_hz;
+            state.center_freq = snapshot.center_freq_hz;
+            state.vfo_offset = snapshot.vfo_offset_hz;
+            // sample_rate stays at whatever apply_acars_geometry
+            // last wrote (likely airband 2.5 MSps from the
+            // best-effort re-engage). It'll be overwritten on
+            // the next Start when open_source picks up
+            // configured_sample_rate. No live source means we
+            // can't read back hardware rate here either way.
         }
     }
     state.acars_bank = None;
