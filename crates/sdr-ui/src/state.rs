@@ -381,6 +381,36 @@ mod tests {
     }
 
     #[test]
+    fn acars_defaults_pin_initializer_contract() {
+        // Pin the ACARS field defaults so a future regression
+        // (e.g. changing the keep-count config helper, swapping
+        // the ChannelStats default, or accidentally pre-loading
+        // a snapshot) fails this test instead of silently
+        // shipping a UI that mis-states ACARS state. Per
+        // CodeRabbit round 3 on PR #584.
+        let state = make_test_state();
+        assert!(!state.acars_enabled.get(), "ACARS toggle defaults off");
+        assert_eq!(state.acars_total_count.get(), 0, "no decoded messages yet");
+        let recent = state.acars_recent.borrow();
+        assert!(recent.is_empty(), "ring is empty on init");
+        assert_eq!(
+            recent.capacity(),
+            crate::acars_config::default_recent_keep() as usize,
+            "ring capacity sourced from acars_config::default_recent_keep, NOT a magic literal"
+        );
+        drop(recent);
+        assert_eq!(
+            state.acars_channel_stats.borrow().len(),
+            sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT,
+            "stats array width sourced from US_SIX_CHANNEL_COUNT"
+        );
+        assert!(
+            state.acars_pre_lock_state.borrow().is_none(),
+            "no snapshot until first engage"
+        );
+    }
+
+    #[test]
     fn last_dispatched_vfo_offset_hz_defaults_to_zero() {
         // Pin the Doppler dispatch baseline default. Per CR
         // round 8 on PR #554 — without this regression test, a

@@ -2919,6 +2919,26 @@ fn open_source(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(
 
 /// Stop the source and release resources.
 fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
+    // ACARS teardown (epic #474). MUST run BEFORE `source.stop()`
+    // so the synthetic disengage can physically retune the live
+    // source back to the user's pre-lock rate/center via
+    // `apply_acars_geometry`. Without this, `Stop → Start` would
+    // re-open at the airband-locked `configured_sample_rate`
+    // (2.5 MSps) but with `acars_bank == None`, which makes
+    // `process_iq_block`'s tap a permanent no-op until the user
+    // toggles ACARS off and on again — the half-enabled state
+    // CodeRabbit flagged on PR #584.
+    //
+    // Force-clear the ACARS session state after the call so a
+    // disengage Err (rare) doesn't leave a stale snapshot
+    // lingering across the source teardown.
+    if state.acars_bank.is_some() {
+        handle_set_acars_enabled(state, false, dsp_tx);
+    }
+    state.acars_bank = None;
+    state.acars_init_failed = false;
+    state.acars_pre_lock = None;
+
     if let Some(source) = &mut state.source {
         let _ = source.stop();
     }
@@ -2962,15 +2982,9 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // stays untouched — the user keeps decoding the same pass.
     reset_imaging_decoders(state);
 
-    // ACARS bank cleanup on source-stop (epic #474). Mirror the
-    // LRPT pattern in `reset_imaging_decoders`: drop the bank +
-    // clear the one-shot init flag. The pre-lock snapshot stays
-    // so a subsequent re-enable could read it. NOT placed in
-    // `reset_imaging_decoders` because that function is also
-    // called by the satellite auto-record inter-pass reset
-    // (issue #544), where ACARS state should NOT be dropped.
-    state.acars_bank = None;
-    state.acars_init_failed = false;
+    // (ACARS teardown happens at the TOP of this function via the
+    // synthetic-disengage path, BEFORE source.stop, so the live
+    // retune can run while the source is still active.)
 
     tracing::info!("source closed");
 }
@@ -3728,6 +3742,7 @@ fn apply_acars_geometry(
 /// releases the airband lock, instantiates / drops the
 /// `ChannelBank`, rebuilds the DSP graph, and emits an ack
 /// via `DspToUi`.
+#[allow(clippy::too_many_lines)]
 fn handle_set_acars_enabled(
     state: &mut DspState,
     enable: bool,
@@ -3829,15 +3844,16 @@ fn handle_set_acars_enabled(
             return;
         };
         let restore = disengage(&snapshot);
-        // Drop the bank first so any in-flight messages drain.
-        state.acars_bank = None;
-        state.acars_init_failed = false;
 
-        // Restore geometry. UNLIKE the previous implementation,
-        // we collect the result and emit Err on failure rather
-        // than silently acking Ok(false) — the UI must know if
-        // restore failed so it doesn't claim ACARS is off while
-        // the hardware/DSP graph is still locked.
+        // Try the restore FIRST, BEFORE tearing down the bank.
+        // If `apply_acars_geometry` fails mid-flight, the
+        // controller may already be partially mutated toward
+        // the snapshot geometry — re-applying the engaged
+        // (airband) geometry as a best-effort rollback keeps
+        // the still-live bank usable, and we emit Err so the
+        // UI knows the disengage didn't take. CR round 3 on
+        // PR #584: don't drop the bank until the restore
+        // path actually succeeds.
         if let Err(err) = apply_acars_geometry(
             state,
             restore.target_source_rate_hz,
@@ -3845,12 +3861,31 @@ fn handle_set_acars_enabled(
             restore.target_frontend_decim,
         ) {
             tracing::error!("ACARS disengage restore failed: {err}");
-            // Re-store the snapshot so a subsequent disengage
-            // attempt can retry. (We took it via `.take()` above.)
+            // Best-effort: re-engage the airband geometry so the
+            // still-live bank can keep decoding at the locked
+            // rate. If THIS also fails the system is half-
+            // broken, but the bank stays alive (UI keeps showing
+            // ACARS on, which is correct since the bank can
+            // theoretically still produce frames).
+            let _ = apply_acars_geometry(
+                state,
+                crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
+                crate::acars_airband_lock::ACARS_CENTER_HZ,
+                crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
+            );
+            // Re-stash the snapshot so a retry can consume it.
             state.acars_pre_lock = Some(snapshot);
             let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
             return;
         }
+
+        // Restore succeeded — NOW it's safe to tear down the
+        // bank. Any in-flight per-block tap calls before this
+        // point would still see the bank as Some and process
+        // normally; after the assignment, subsequent tap calls
+        // see None and short-circuit.
+        state.acars_bank = None;
+        state.acars_init_failed = false;
 
         // VFO offset restore. The controller stores it on
         // `state.vfo_offset` (read by `rebuild_vfo` and the
