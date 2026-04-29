@@ -263,6 +263,17 @@ impl MskDemod {
         self.idx = idx;
         self.msk_phi = p;
     }
+
+    /// Flip the bit-polarity counter (acarsdec `MskS ^= 2`).
+    /// Called by [`crate::channel::ChannelBank`] when the frame
+    /// parser detects an inverted-SYN preamble, indicating the
+    /// demodulator has a 180° phase ambiguity. XOR-ing bit 1 of
+    /// `msk_s` flips the sign of every emitted bit (the
+    /// `MskS & 2` branch in `process()`), restoring correct
+    /// polarity without resetting other state.
+    pub fn toggle_polarity(&mut self) {
+        self.msk_s ^= 2;
+    }
 }
 
 impl Default for MskDemod {
