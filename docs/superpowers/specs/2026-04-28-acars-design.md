@@ -334,7 +334,7 @@ One PR. Estimated ~700–1,000 LOC: `aviation_panel.rs` (~250), `acars_viewer.rs
 4. **Saved-state restore on toggle-off.** Toggle ON snapshots `(source_rate, center_freq, vfo_freq, source_type)`. Toggle OFF restores them. Controls are locked while ACARS is on, so no in-flight user changes to reconcile.
 5. **Rapid toggle.** `SetAcarsEnabled(x)` is idempotent on the DSP side. UI trusts `AcarsEnabledChanged` ack to update visible state.
 6. **Multi-block messages.** ACARS messages > ~220 chars span multiple blocks marked `ETB` instead of `ETX`. v1 displays each block as its own row with `block_id` shown — readers can mentally chain. Reassembly is deferred (issue filed).
-7. **CPU/memory budget.** 6 parallel MSK demods at 12.5 ksps + decimation runs comfortably under 5% of one core (acarsdec runs on a Pi 3). Ring buffer = 500 messages × ~500 bytes = ~250 KB. Negligible.
+7. **CPU/memory budget.** 6 parallel MSK demods at 12.5 ksps + decimation runs comfortably under 5% of one core (as of April 2026; acarsdec runs on a Pi 3). Ring buffer = 500 messages × ~500 bytes = ~250 KB. Negligible.
 
 ## Deferred items (filed as issues under epic #474)
 
