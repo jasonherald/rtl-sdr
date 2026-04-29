@@ -10,9 +10,11 @@ Receive and decode VHF ACARS (Plain Old ACARS) text messages from aircraft on th
 
 ## Decisions made during brainstorming
 
-1. **Multi-channel from day one** (vs single-channel-first). Hardware supports 2.4 MSps over the 2.4 MHz US ACARS cluster (129.125–131.550 MHz centered at 130.45 MHz). Lays the IQ-fork → N-decimator → N-demod pattern that future ADS-B / VDL2 / Iridium epics will reuse.
+1. **Multi-channel from day one** (vs single-channel-first). Hardware supports 2.5 MSps over the 2.425 MHz US ACARS cluster (129.125–131.550 MHz centered at 130.3375 MHz — the midpoint of the channel extremes). Lays the IQ-fork → N-decimator → N-demod pattern that future ADS-B / VDL2 / Iridium epics will reuse.
+
+   > **Geometry note (corrected 2026-04-28).** An earlier draft of this spec said 2.4 MSps centered on 130.45 MHz. That doesn't fit: the cluster span (131.550 − 129.125 = 2.425 MHz) is wider than the 2.4 MHz Nyquist window, so 129.125 MHz would fall outside ±1.2 MHz at any center. The Task 7 implementer caught this when verifying the test config and corrected to 2.5 MSps + 130.3375 MHz, which gives ±1.2125 MHz offsets that fit comfortably in ±1.25 MHz Nyquist. RTL-SDR supports 2.5 MSps stably; that's the canonical airband-mode rate.
 2. **Hybrid decomposition** (vs DSP-first or walking-skeleton). Sub-project 1 ships the full multi-channel `sdr-acars` crate plus a CLI validation tool. Sub-projects 2 and 3 wire it into the live pipeline and UI. Build the right architecture once.
-3. **Source-tap with airband lock** (vs takeover or always-on). When ACARS is on, the dongle is locked to airband config (2.4 MSps, 130.45 MHz center) and the existing radio chain stays functional inside the airband window for voice listening. VFO is fully disabled while ACARS is on (chosen over clamp-and-toast for simplicity).
+3. **Source-tap with airband lock** (vs takeover or always-on). When ACARS is on, the dongle is locked to airband config (2.5 MSps, 130.3375 MHz center) and the existing radio chain stays functional inside the airband window for voice listening. VFO is fully disabled while ACARS is on (chosen over clamp-and-toast for simplicity).
 4. **Streaming log viewer** (vs aircraft-grouped tab). v1 ships a chronological floating "ACARS" window opened from the Aviation activity. Aircraft grouping is deferred — see deferred-items list.
 5. **Activity placement.** New "Aviation" activity (airplane icon) in the left sidebar. Future ADS-B / VDL2 / Iridium each get their own viewer windows under the same Aviation activity.
 
@@ -20,8 +22,8 @@ Receive and decode VHF ACARS (Plain Old ACARS) text messages from aircraft on th
 
 ```
                           ┌────────────────────────────────────────┐
-RTL-SDR @ 2.4 MSps        │ sdr-acars (NEW crate)                  │
-center 130.45 MHz         │  ┌──────────────────────────────────┐  │
+RTL-SDR @ 2.5 MSps        │ sdr-acars (NEW crate)                  │
+center 130.3375 MHz       │  ┌──────────────────────────────────┐  │
         │                 │  │ ChannelBank (N channel oscs +    │  │
         ▼                 │  │  decimators, source 2.4M → IF)   │  │
    Source IQ ─────────────┤  └────────┬───┬───┬───┬───┬──────┬──┘  │
@@ -156,7 +158,7 @@ Output **byte-for-byte matches `acarsdec`'s text mode** (header + Mode/Label/Air
 - Unit tests per module: synthetic MSK tones, hand-crafted frame bytes, CRC roundtrip, syndrom table lookups.
 - Property tests for CRC and parity helpers.
 - Integration test (`tests/e2e_acarsdec_compat.rs`): runs `sdr-acars-cli` and the C `acarsdec` on `original/acarsdec/test.wav`, strips volatile fields, asserts byte-equal output.
-- Multi-channel test: synthesize a 2.4 MSps IQ buffer with two MSK signals at known offsets; confirm both channels decode their respective messages independently with no cross-talk.
+- Multi-channel test: synthesize a 2.5 MSps IQ buffer with two MSK signals at known offsets; confirm both channels decode their respective messages independently with no cross-talk.
 
 ### PR sizing
 
@@ -174,8 +176,8 @@ When `acars_enabled = true`, the DSP thread enforces:
 
 | Setting | Locked value |
 |---|---|
-| Source sample rate | 2.4 MSps |
-| Source center frequency | 130.45 MHz |
+| Source sample rate | 2.5 MSps |
+| Source center frequency | 130.3375 MHz |
 | `IqFrontend` decimation | 1 (pass-through) |
 | VFO | **Fully disabled** (greyed in UI) |
 

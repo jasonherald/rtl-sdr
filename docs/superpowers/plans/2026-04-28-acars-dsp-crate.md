@@ -25,7 +25,7 @@
 | `crates/sdr-acars/src/channel.rs` | `Channel`: source-rate complex IQ → per-channel oscillator+decimator → 12.5 kHz real audio → `MskDemod` → `FrameParser`. `ChannelBank` is `Vec<Channel>` + `process()` orchestrator. |
 | `crates/sdr-acars/src/bin/sdr-acars-cli.rs` | CLI: clap args, WAV-or-IQ dispatch, drives `ChannelBank` (or per-channel `MskDemod` for WAV input), prints in acarsdec text format |
 | `crates/sdr-acars/tests/e2e_acarsdec_compat.rs` | Diff-test harness: runs `sdr-acars-cli` on `original/acarsdec/test.wav`, strips volatile fields, asserts byte-equal against committed snapshot |
-| `crates/sdr-acars/tests/multichannel_synthetic.rs` | Synthesize 2.4 MSps IQ with two MSK signals at known offsets; confirm both channels decode independently with no cross-talk |
+| `crates/sdr-acars/tests/multichannel_synthetic.rs` | Synthesize 2.5 MSps IQ with two MSK signals at known offsets; confirm both channels decode independently with no cross-talk |
 | `crates/sdr-acars/tests/fixtures/acarsdec_test_wav_expected.txt` | Pre-captured acarsdec output for `test.wav`, volatile fields stripped — committed alongside a `REGENERATE.md` documenting how to regenerate |
 
 ---
@@ -1787,7 +1787,7 @@ Replace its body with:
 //! [acarsdec](https://github.com/TLeconte/acarsdec) — pure
 //! DSP + parsing, no GTK, no SDR-driver dependency.
 //!
-//! # Example: multi-channel decode from a 2.4 MSps complex IQ stream
+//! # Example: multi-channel decode from a 2.5 MSps complex IQ stream
 //!
 //! ```no_run
 //! use num_complex::Complex32;
@@ -1799,8 +1799,10 @@ Replace its body with:
 //! ];
 //!
 //! # fn read_iq_block() -> Vec<Complex32> { Vec::new() }
+//! // Center on the midpoint of the channel extremes (130.3375 MHz)
+//! // so the 2.425 MHz cluster fits inside the 2.5 MHz Nyquist window.
 //! let mut bank =
-//!     ChannelBank::new(2_400_000.0, 130_450_000.0, US_ACARS)?;
+//!     ChannelBank::new(2_500_000.0, 130_337_500.0, US_ACARS)?;
 //! loop {
 //!     let iq: Vec<Complex32> = read_iq_block();
 //!     if iq.is_empty() { break; }
@@ -1942,12 +1944,15 @@ struct Cli {
     #[arg(long, value_name = "PATH", conflicts_with = "wav")]
     iq: Option<PathBuf>,
 
-    /// Source sample rate in Hz (IQ mode only).
-    #[arg(long, default_value_t = 2_400_000)]
+    /// Source sample rate in Hz (IQ mode only). Default 2.5 MSps
+    /// matches the airband-mode rate from the spec — fits the
+    /// full US-6 channel cluster (span 2.425 MHz) within Nyquist.
+    #[arg(long, default_value_t = 2_500_000)]
     rate: u32,
 
-    /// Source center frequency in Hz (IQ mode only).
-    #[arg(long, default_value_t = 130_450_000)]
+    /// Source center frequency in Hz (IQ mode only). Default
+    /// 130.3375 MHz is the midpoint of US-6 channel extremes.
+    #[arg(long, default_value_t = 130_337_500)]
     center: u32,
 
     /// Channel list as comma-separated MHz (e.g.
