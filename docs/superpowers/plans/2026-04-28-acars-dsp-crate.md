@@ -637,62 +637,42 @@ EOF
 
 ---
 
-## Task 4: Label name lookup table
+## Task 4: Label module — empty stub for sub-project 1
 
 **Files:**
 - Create: `crates/sdr-acars/src/label.rs`
 
-A static `(label_code, human_name)` table. ACARS labels are 2 ASCII characters; the table maps each known label to a human-readable description. Per-label *field parsers* (extracting structured data from the message body per label) are out of scope here — see issue #577.
+> **REVISED.** The original Task 4 spec assumed `acarsdec/label.c` shipped a `Lbl[]` array of `(code, name)` pairs to translate verbatim. **It doesn't.** Verified by `grep -rn 'Lbl\b\|label_name\|"H1"\|"Q0"' original/acarsdec/` (no matches). acarsdec's `label.c` just runs per-label structured-field parsers and prints raw 2-char codes — no name lookup table anywhere in the reference. The plan was written to a phantom data source.
+>
+> **What changed:** Sub-project 1 is end-to-end CLI parity with `acarsdec`. Since acarsdec doesn't translate codes, we don't either — the e2e diff (Task 10) compares raw `Label : H1` strings. Label-name lookup is genuinely useful in the UI (sub-project 3), and that's where the data should be sourced (community references like sigidwiki, ARINC 618 documentation). Filing label-name population as part of issue #577 (per-label parsers) since both belong to the same "make labels human-friendly" workstream.
 
-C reference: `original/acarsdec/label.c` — search for the `Lbl[]` array (a `struct { char* l; char* n; }` static initializer near the top of the file, ~150 entries).
+This task ships the `label.rs` module shell so the public API surface stays stable: `pub fn lookup(code: [u8; 2]) -> Option<&'static str>` exists but always returns `None` in v1. Sub-project 3 (or follow-up #577) will populate it.
 
-- [ ] **Step 1: Find the table in `label.c`**
-
-```bash
-grep -n 'Lbl\[\]\|^{$\|"Q' original/acarsdec/label.c | head -20
-```
-
-- [ ] **Step 2: Write the failing test**
-
-In `crates/sdr-acars/src/label.rs`:
+- [ ] **Step 1: Replace `crates/sdr-acars/src/label.rs` with the stub**
 
 ```rust
 //! Label name lookup. Each ACARS message carries a 2-byte
-//! label that identifies its category (Q0 = link test, H1 =
-//! crew message, B1 = weather, etc.). This module ships the
-//! human-readable name for each known label. Per-label
-//! structured-field parsers are deferred to issue #577.
+//! label code identifying its category (Q0 = link test, H1 =
+//! crew message, B1 = weather, etc.).
 //!
-//! Faithful port of `original/acarsdec/label.c::Lbl[]`.
-
-/// One row in the label table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LabelEntry {
-    /// 2-byte label code as transmitted (e.g. `b"H1"`).
-    pub code: [u8; 2],
-    /// Human-readable description.
-    pub name: &'static str,
-}
-
-/// All known ACARS labels with descriptions, in the order
-/// `acarsdec` ships them. ~150 entries.
-pub const LABELS: &[LabelEntry] = &[
-    // IMPLEMENTER: paste the translated `Lbl[]` from
-    // `original/acarsdec/label.c` here. Each C entry of the
-    // shape { "H1", "Message to/from terminal" } translates to:
-    //   LabelEntry { code: *b"H1", name: "Message to/from terminal" },
-    // Preserve the C ordering so the table is grep-comparable
-    // against the reference.
-];
+//! v1 ships an EMPTY table — `acarsdec` itself doesn't include a
+//! code→name dictionary, so there's nothing to verbatim-port for
+//! the e2e diff against the reference. Population is queued for
+//! the UI sub-project (where names actually get displayed) and
+//! tracked in issue #577 (which also covers per-label
+//! structured-field parsing). Sources to draw from when the
+//! table lands: ARINC 618 spec, sigidwiki ACARS labels page,
+//! community wikis.
+//!
+//! The public API ([`lookup`]) is kept stable now so downstream
+//! tasks (Task 8 re-exports, Task 9 CLI, sub-project 3 UI) can
+//! call it without code churn when names are added later.
 
 /// Look up the human-readable name for a 2-byte label code.
-/// Returns `None` if the label isn't in the table.
+/// Currently always returns `None` — see module-level docs.
 #[must_use]
-pub fn lookup(code: [u8; 2]) -> Option<&'static str> {
-    LABELS
-        .iter()
-        .find(|entry| entry.code == code)
-        .map(|entry| entry.name)
+pub fn lookup(_code: [u8; 2]) -> Option<&'static str> {
+    None
 }
 
 #[cfg(test)]
@@ -701,58 +681,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn table_is_non_empty() {
-        // Catches the placeholder being left in.
-        assert!(!LABELS.is_empty(), "LABELS table not ported");
-    }
-
-    #[test]
-    fn well_known_labels_resolve() {
-        // Spot-check the most-common labels. If acarsdec's
-        // table renames or removes any of these we want to
-        // know loudly.
-        assert!(lookup(*b"H1").is_some(), "H1 (crew message) missing");
-        assert!(lookup(*b"Q0").is_some(), "Q0 (link test) missing");
-        assert!(lookup(*b"_d").is_some(), "_d (misc downlink) missing");
-        assert!(lookup(*b"B1").is_some(), "B1 (weather) missing");
-    }
-
-    #[test]
-    fn unknown_label_returns_none() {
-        // Sentinel: any non-ASCII pair must miss.
+    fn lookup_returns_none_in_v1() {
+        // Pin the v1 stub. Once #577 populates the table this
+        // test gets replaced with positive `assert_eq!` checks
+        // for known labels (H1, Q0, _d, B1, etc.).
+        assert_eq!(lookup(*b"H1"), None);
+        assert_eq!(lookup(*b"Q0"), None);
         assert_eq!(lookup([0xFF, 0xFF]), None);
     }
 }
 ```
 
-- [ ] **Step 3: Run, see it fail at `table_is_non_empty`**
+- [ ] **Step 2: Run the test**
 
 ```bash
 cargo test -p sdr-acars label::tests
-# Expected: FAIL.
+# Expected: 1 passed.
 ```
 
-- [ ] **Step 4: Translate `Lbl[]` from `label.c`**
-
-Mechanical translation. Preserve order. ~150 entries.
-
-- [ ] **Step 5: Run, expect pass**
-
-```bash
-cargo test -p sdr-acars label::tests
-# Expected: 3 passed.
-```
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add crates/sdr-acars/src/label.rs
 git commit -m "$(cat <<'EOF'
-feat(sdr-acars): port Lbl[] label-name table from acarsdec
+feat(sdr-acars): label.rs API surface (v1 stub, names deferred)
 
-~150 labels with descriptions, lookup() helper, spot-check
-tests for H1/Q0/_d/B1. Per-label structured-field parsers
-deferred to #577.
+Empty `lookup() -> Option<&'static str>` returning None for now.
+Original plan assumed acarsdec/label.c shipped a Lbl[] array of
+(code, name) pairs — that was a fabrication; verified no such
+array exists in the C reference. Names are genuinely useful in
+the UI (sub-project 3) and will be sourced from community
+references (sigidwiki, ARINC 618) under issue #577 alongside
+the per-label structured-field parsers.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -770,11 +730,11 @@ This is the heart of the decoder. Port `original/acarsdec/msk.c` (138 LOC). The 
 
 Internal state: VCO phase, bit clock, `inb[FLEN]` circular buffer of complex baseband samples, matched-filter coefficients `h[FLENO]` (FLENO = FLEN×MFLTOVER+1), PLL frequency offset `MskDf`, sequence counter `MskS`, level accumulator.
 
-Constants:
+Constants (computed via integer arithmetic, matching the C):
 - `INTRATE = 12500` (acarsdec.h:31)
-- `FLEN = INTRATE / 1200 + 1 = 12` (msk.c:25)
+- `FLEN = INTRATE / 1200 + 1 = 11` (msk.c:25, integer division: 12500/1200 = 10, +1 = 11)
 - `MFLTOVER = 12` (msk.c:26)
-- `FLENO = FLEN * MFLTOVER + 1 = 145` (msk.c:27)
+- `FLENO = FLEN * MFLTOVER + 1 = 133` (msk.c:27, 11×12+1)
 - `PLLG = 38e-4`, `PLLC = 0.52` (msk.c:65-66)
 
 C reference:
@@ -801,10 +761,11 @@ In `crates/sdr-acars/src/msk.rs`:
 //!
 //! Consumes real `f32` audio at 12500 Hz (the IF rate after
 //! per-channel decimation). Internally builds a complex
-//! baseband via a 1800 Hz VCO mixer, applies a 145-tap
-//! matched filter, and emits one bit per 5.2 audio samples
-//! (= 12500 / 2400). Bit timing is recovered by a Gardner-
-//! style PLL on the matched-filter quadrature output.
+//! baseband via a 1800 Hz VCO mixer, applies a 133-tap
+//! oversampled matched filter (FLEN=11 × MFLT_OVER=12 + 1),
+//! and emits one bit per 5.2 audio samples (= 12500 / 2400).
+//! Bit timing is recovered by a Gardner-style PLL on the
+//! matched-filter quadrature output.
 //!
 //! Output bits are pushed to a [`BitSink`] one at a time;
 //! the [`crate::frame::FrameParser`] is the production sink.
@@ -857,7 +818,7 @@ pub struct MskDemod {
     /// Bit-count for the current level window.
     pub(crate) bit_count: u32,
     /// Matched-filter coefficients, oversampled.
-    /// One copy per channel — small (145 floats, ~580 bytes).
+    /// One copy per channel — small (133 floats, ~530 bytes).
     /// Acarsdec's static singleton is a C optimization we
     /// don't replicate; the per-channel cost is negligible.
     h: [f32; FLEN_OVERSAMPLED],
@@ -1018,23 +979,48 @@ EOF
 Streaming bit→byte→frame consumer. Implements `BitSink` (so it can be plugged into `MskDemod`). Its state machine:
 
 ```
-WSYN  → seen 0x16  → SYN2
-SYN2  → seen 0x16  → SOH1   (or seen 0xE9 = ~SYN → flip MskS, retry)
-SOH1  → seen 0x01  → TXT
-TXT   → accumulate up to 240 bytes; on 0x03 (ETX) or 0x17 (ETB)
-                    → CRC1
-CRC1  → 1 byte     → CRC2
-CRC2  → 1 byte     → END    (validate parity, CRC, FEC; emit AcarsMessage)
-END   → reset for next frame
+WSYN  → seen 0x16 (SYN)  → SYN2
+WSYN  → seen 0xE9 (~SYN) → SYN2  AND signal polarity flip
+SYN2  → seen 0x16        → SOH1
+SYN2  → seen 0xE9        → signal polarity flip, stay in SYN2
+SOH1  → seen 0x01 (SOH)  → TXT  (allocate buf, reset error counters)
+TXT   → push byte to buf, parity-check;
+        on 0x03 (ETX) or 0x17 (ETB) → CRC1;
+        if parity errors > MAXPERR+1 → reset to WSYN;
+        if buf grows past 240 bytes → reset to WSYN
+CRC1  → record byte as crc[0]    → CRC2
+CRC2  → record byte as crc[1], verify CRC + FEC, emit AcarsMessage,
+        reset to WSYN
 ```
 
-C reference:
-- `original/acarsdec/acars.c:88-90` — state enum
-- `original/acarsdec/acars.c:138` — parity check (`numbits[byte] & 1`)
-- `original/acarsdec/acars.c:159-165` — CRC verify
-- `original/acarsdec/acars.c:225` — message-queue thread (we don't need this in a single-threaded port; just emit synchronously)
-- `original/acarsdec/acars.c:230-end` — main `decodeAcars()`
-- `original/acarsdec/acars.c:259, 274` — invert-SYN handling (toggle `MskS ^= 2` to recover from 180° phase slip)
+C reference (verified line numbers, `acars.c`):
+- L88-90 — state enum (`WSYN, SYN2, SOH1, TXT, CRC1, CRC2, END`)
+- L138 — parity check (`numbits[byte] & 1`)
+- L158-165 — **one-shot CRC verify** (loops `update_crc(crc, blk->txt[i])` over txt[0..len], then folds in `crc[0]` and `crc[1]`; expects `crc == 0`)
+- L225 — message-queue thread (we don't need this — emit synchronously via callback)
+- L246-388 — main `decodeAcars()` byte-level switch
+- L259, 274 — invert-SYN handling (`MskS ^= 2` for 180° phase recovery)
+- L304-309 — parity-error counter abort (`if (blk->err > MAXPERR + 1)` → reset)
+- L325-332 — DLE escape recovery (rare path: if `len > 20 && byte == DLE`, treat the prior 3 bytes as `crc[0]`, `crc[1]`, and ignored padding — this handles a missed-ETX heuristic; port faithfully)
+
+**CRC strategy.** The C uses a **one-shot CRC at CRC2**: loops the entire `blk->txt[0..len]` buffer through `update_crc`, then folds in `blk->crc[0]` and `blk->crc[1]`, and expects the running register to equal 0. **Do the same in Rust** — don't try to maintain a running CRC across the state machine; it's simpler and matches the reference. The `crc: u16` field on `FrameParser` in the template below is **unnecessary** — remove it. (The template originally had it as a "running" accumulator; we discovered during the audit that the C is one-shot.)
+
+**Field extraction at CRC2 success.** The buffer `buf` holds bytes `Mode through ETX/ETB inclusive`. Strip parity (each byte `& 0x7F`) before extracting characters. Byte layout per ARINC 618:
+
+| `buf[i]` (after `& 0x7F`) | Field | AcarsMessage field |
+|---|---|---|
+| `buf[0]` | Mode | `mode: u8` |
+| `buf[1..8]` | Address (".N12345" — leading dot) | `aircraft: ArrayString<8>` |
+| `buf[8]` | ACK ('!' = 0x15 = NAK; otherwise the ack char) | `ack: u8` |
+| `buf[9..11]` | Label (e.g. "H1") | `label: [u8; 2]` |
+| `buf[11]` | Block ID | `block_id: u8` |
+| `buf[12]` | STX (`0x02`) — separator, not stored | (skipped) |
+| `buf[13..buf.len()-1]` | Text body (variable length) | `text: String` |
+| `buf[buf.len()-1]` | ETX (`0x03`) or ETB (`0x17`) — terminator | `end_of_message: bool` (true if ETX) |
+
+Special case: **downlink messages** (`mode == '2'`) include extra fields after the block ID. acarsdec parses these in `output.c` rather than in `decodeAcars`. For v1, treat `text` as the entire `buf[13..len-1]` — downstream parsing of flight ID, message number, etc. is field-extraction work that lives in the deferred per-label parsers (#577). The `flight_id` and `message_no` fields on `AcarsMessage` should be **`None` in v1** unless the byte layout includes them inline (see acarsdec's `output.c::printmsg` for how the C separates them — most paths leave them empty / NULL).
+
+**Label normalisation.** acarsdec at the receive boundary maps `0x7F` (DEL) in the second label byte to ASCII `'d'`. From `output.c`: `if(msg.label[1]==0x7f) msg.label[1]='d';`. Apply the same mapping in `consume_byte`'s CRC2-success branch so labels like `_d` (downlink misc) come out as `_d` instead of `_<DEL>`.
 
 - [ ] **Step 1: Read `acars.c::decodeAcars`**
 
@@ -1123,13 +1109,26 @@ pub struct FrameParser {
     out_bits: u8,
     /// How many bits remain to fill `out_bits`.
     n_bits: u8,
-    /// Bytes accumulated for the current frame (Mode through
-    /// last text byte, NOT including the trailing CRC).
+    /// Bytes accumulated for the current frame: Mode through
+    /// the trailing ETX/ETB inclusive. NOT including the
+    /// 2-byte BCS — those land in `crc_bytes`.
     buf: Vec<u8>,
-    /// Per-character parity error positions in `buf`.
+    /// Per-character parity error positions in `buf`. Used by
+    /// `fix_parity_errors` at CRC2 verify time.
     parity_errors: Vec<usize>,
-    /// Running CRC over `buf` plus the two CRC bytes.
-    crc: u16,
+    /// Running parity-error count (acarsdec `blk->err`). Used
+    /// for the `> MAXPERR + 1` abort check during TXT.
+    parity_err_count: u8,
+    /// The two BCS bytes captured during CRC1 + CRC2 states.
+    /// `[crc_low, crc_high]` matching ACARS wire order.
+    crc_bytes: [u8; 2],
+    /// Polarity-flip flag set when WSYN/SYN2 sees `~SYN` (0xE9).
+    /// `ChannelBank::process` polls and clears via
+    /// `take_polarity_flip()` after each demod block.
+    polarity_flip_pending: bool,
+    /// Bytes finished by `BitSink::put_bit` but not yet handed
+    /// to the state machine. `drain(on_message)` walks this.
+    pending_bytes: Vec<u8>,
     /// Channel index to stamp into emitted messages.
     channel_idx: u8,
     /// Channel center frequency to stamp into emitted messages.
@@ -1147,63 +1146,136 @@ impl FrameParser {
             n_bits: 8,
             buf: Vec::with_capacity(256),
             parity_errors: Vec::new(),
-            crc: 0x0000,  // ACARS uses KERMIT init=0, not X-25 init=0xFFFF — see crc.rs Task 2 implementer notes
+            parity_err_count: 0,
+            crc_bytes: [0, 0],
+            polarity_flip_pending: false,
+            pending_bytes: Vec::new(),
             channel_idx,
             channel_freq_hz,
         }
     }
 
     /// Reset to look for the next frame's preamble. Called
-    /// internally on END or on a hard sync loss.
+    /// internally on END or on a hard sync loss (parity-error
+    /// overrun, frame-too-long, malformed sync, etc.).
     fn reset_to_idle(&mut self) {
         self.state = State::WaitingSyn;
         self.out_bits = 0;
         self.n_bits = 8;
         self.buf.clear();
         self.parity_errors.clear();
-        self.crc = 0x0000;
+        self.parity_err_count = 0;
+        self.crc_bytes = [0, 0];
+    }
+
+    /// Polarity-flip handshake. ChannelBank reads + clears this
+    /// after each `MskDemod::process` round; if true, it calls
+    /// `MskDemod::toggle_polarity()` to recover from 180° phase
+    /// slip detected via the inverted-SYN preamble.
+    pub fn take_polarity_flip(&mut self) -> bool {
+        std::mem::replace(&mut self.polarity_flip_pending, false)
+    }
+
+    /// Drain completed bytes accumulated by `BitSink::put_bit`,
+    /// running each through `consume_byte`. Production callers
+    /// (`ChannelBank::process`) invoke this after every demod
+    /// block. Tests use `feed_bytes()` instead.
+    pub fn drain<F: FnMut(AcarsMessage)>(&mut self, mut on_message: F) {
+        let bytes = std::mem::take(&mut self.pending_bytes);
+        for b in bytes {
+            self.consume_byte(b, &mut on_message);
+        }
     }
 
     /// Consume one fully-assembled byte. Drives the state
     /// machine; emits an `AcarsMessage` via `on_message` when
     /// CRC2 closes a successful frame. Mirrors the byte-level
-    /// switch in acars.c::decodeAcars.
+    /// switch in `acars.c::decodeAcars` (L246-388).
     fn consume_byte<F: FnMut(AcarsMessage)>(
         &mut self,
         byte: u8,
         on_message: &mut F,
     ) {
         // IMPLEMENTER: port the byte-level state machine from
-        // acars.c::decodeAcars. Key transitions:
-        //   * WaitingSyn:  if byte == 0x16, transition to Syn2.
-        //   * Syn2:        if byte == 0x16, transition to SeekingSoh.
-        //                  else if byte == !0x16 (= 0xE9), reset
-        //                  AND signal MSK polarity flip to caller
-        //                  (TODO: how do we communicate this back?
-        //                  store a `polarity_flip_pending: bool`
-        //                  field; FrameParser exposes a public
-        //                  `take_polarity_flip()` that the channel
-        //                  layer polls each `process()` cycle).
-        //   * SeekingSoh:  if byte == 0x01 (SOH), → Text + buf=[byte].
-        //   * Text:        push byte to buf; check parity; on
-        //                  parity error append index to
-        //                  parity_errors. If byte == 0x03 (ETX) or
-        //                  0x17 (ETB), → Crc1.
-        //   * Crc1:        record first CRC byte → Crc2.
-        //   * Crc2:        record second CRC byte; verify CRC over
-        //                  buf+crc1+crc2 == 0; if not, attempt FEC
-        //                  via syndrom::fix_parity_errors (then
-        //                  fix_double_error if still bad). If a
-        //                  good frame falls out, parse the field
-        //                  layout (Mode, Address, ACK, Label, etc.
-        //                  per acars.c) into AcarsMessage and call
-        //                  on_message. Reset to WaitingSyn.
+        // acars.c::decodeAcars. The control flow per state:
+        //
+        //   * WaitingSyn (acars.c:251-269):
+        //       byte == SYN (0x16):    state → Syn2; n_bits=8
+        //       byte == ~SYN (0xE9):   state → Syn2; n_bits=8;
+        //                              polarity_flip_pending=true
+        //       otherwise:             n_bits=1 (re-sync per bit)
+        //
+        //   * Syn2 (acars.c:271-285):
+        //       byte == SYN (0x16):    state → SeekingSoh
+        //       byte == ~SYN (0xE9):   polarity_flip_pending=true,
+        //                              stay in Syn2
+        //       otherwise:             reset_to_idle()
+        //
+        //   * SeekingSoh (acars.c:287-303):
+        //       byte == SOH (0x01):    state → Text; clear buf,
+        //                              parity_errors, parity_err_count
+        //       otherwise:             reset_to_idle()
+        //
+        //   * Text (acars.c:305-340):
+        //       push byte to buf;
+        //       check parity (numbits[byte] & 1) — if even-parity,
+        //         increment parity_err_count and push buf.len()-1
+        //         into parity_errors;
+        //       if parity_err_count > MAXPERR + 1: reset_to_idle();
+        //       if byte == ETX (0x03) || byte == ETB (0x17):
+        //         state → Crc1;
+        //       (DLE escape recovery, acars.c:325-332: if buf.len() > 20
+        //         AND byte == DLE (0x10), back up 3 bytes — buf truncate
+        //         to len-3 — copy out crc[0]+crc[1] from those bytes,
+        //         and goto putmsg_lbl. Rare; port faithfully.)
+        //       if buf.len() > 240: reset_to_idle()
+        //
+        //   * Crc1 (acars.c:343-347):
+        //       crc_bytes[0] = byte; state → Crc2
+        //
+        //   * Crc2 (acars.c:349-371):
+        //       crc_bytes[1] = byte;
+        //       compute CRC: crate::crc::compute(buf.iter()
+        //                       .chain([crc_bytes[0], crc_bytes[1]])
+        //                       .copied().collect::<Vec<u8>>().as_ref());
+        //         (or fold more efficiently via `crc::update` in a loop)
+        //       if crc != 0:
+        //         try crate::syndrom::fix_parity_errors(&mut buf, crc, &parity_errors);
+        //         if !recovered AND parity_errors.is_empty():
+        //           try crate::syndrom::fix_double_error(&mut buf, crc);
+        //         if still not recovered: reset_to_idle();
+        //       on success, extract fields per the field-layout
+        //       table at the top of this Task 6 section:
+        //         mode = buf[0] & 0x7F;
+        //         aircraft = ArrayString::from(&strip_parity(&buf[1..8]));
+        //         ack = buf[8] & 0x7F;
+        //         label = [buf[9] & 0x7F, buf[10] & 0x7F];
+        //         if label[1] == 0x7F { label[1] = b'd'; }  // DEL→'d'
+        //         block_id = buf[11] & 0x7F;
+        //         (skip buf[12] = STX, 0x02);
+        //         text = String::from_utf8_lossy(&strip_parity(&buf[13..buf.len()-1])).into_owned();
+        //         end_of_message = (buf[buf.len()-1] & 0x7F) == 0x03;
+        //         flight_id = None;       // v1 — see #577
+        //         message_no = None;      // v1 — see #577
+        //       build AcarsMessage with channel_idx, channel_freq_hz,
+        //         level_db = 0.0 (set by ChannelBank, not here),
+        //         error_count = parity_err_count,
+        //         timestamp = SystemTime::now();
+        //       on_message(msg); reset_to_idle();
+        //
+        // `numbits[byte] & 1` parity test: write a small helper
+        // `fn has_odd_parity(b: u8) -> bool { b.count_ones() & 1 == 1 }`
+        // — Rust's `u8::count_ones()` matches the C lookup table.
+        //
+        // `strip_parity(&[u8])` helper: maps each byte through `& 0x7F`
+        // and returns a Vec<u8> or writes into a fixed-size buf.
         let _ = (byte, on_message);
         unimplemented!("port acars.c::decodeAcars byte handler here");
     }
 
     /// Convenience: drive the parser with a sequence of fully-
-    /// formed bytes, useful for unit tests.
+    /// formed bytes — used by unit tests that bypass MSK demod
+    /// and feed hand-crafted byte sequences directly.
     pub fn feed_bytes<F: FnMut(AcarsMessage)>(
         &mut self,
         bytes: &[u8],
@@ -1218,10 +1290,11 @@ impl FrameParser {
 impl BitSink for FrameParser {
     fn put_bit(&mut self, value: f32) {
         // Shift the bit into the byte register LSB-first
-        // (matches acarsdec putbit). When the byte fills, hand
-        // it to the state machine. The state machine itself is
-        // driven by `consume_byte` rather than embedded here so
-        // unit tests can inject hand-crafted byte sequences.
+        // (matches acarsdec putbit, msk.c:53-63). When the byte
+        // fills, push to `pending_bytes` for the caller's later
+        // `drain(on_message)`. Splitting bit accumulation from
+        // state-machine driving keeps `BitSink::put_bit`
+        // callback-free and lets unit tests bypass the bit path.
         self.out_bits >>= 1;
         if value > 0.0 {
             self.out_bits |= 0x80;
@@ -1231,47 +1304,19 @@ impl BitSink for FrameParser {
             self.n_bits = 8;
             let byte = self.out_bits;
             self.out_bits = 0;
-            // We need a way to call `consume_byte` here — but
-            // BitSink::put_bit doesn't have access to the
-            // user's `on_message` callback.
-            //
-            // IMPLEMENTER: there are two clean ways to resolve
-            // this (pick one):
-            //
-            //   (a) Buffer completed bytes into `self.buf_pending`
-            //       Vec<u8>; have the caller drain via a
-            //       `FrameParser::drain(on_message)` method
-            //       called after each MskDemod::process round.
-            //
-            //   (b) Make put_bit itself store a callback. This
-            //       requires changing the BitSink trait or
-            //       using Box<dyn FnMut> on the parser.
-            //
-            // RECOMMEND (a) — keeps BitSink simple and matches
-            // the "callback at the API edge" pattern already in
-            // ChannelBank::process. Add a `pending_bytes:
-            // Vec<u8>` field, drain in `drain(on_message)`.
-            //
-            // Update consume_byte's call sites accordingly:
-            // tests call feed_bytes(); production calls
-            // drain(on_message) after each demod block.
-            let _ = byte;
+            self.pending_bytes.push(byte);
         }
     }
 }
 ```
 
-- [ ] **Step 3: Resolve the BitSink↔callback impedance per recommendation (a) above**
+- [ ] **Step 3: Implement `consume_byte` per the C reference + the field-layout table at the top of this section**
 
-Refine the design as recommended in the comment: add a `pending_bytes: Vec<u8>` field and a `pub fn drain<F>(&mut self, on_message: F)`. `BitSink::put_bit` stays callback-free; production code calls `drain` after each `MskDemod::process` round.
+The IMPLEMENTER pseudocode in the template above maps each state to its corresponding `acars.c` line range. Port faithfully — this is the most algorithmically dense module. Read `acars.c:246-388` carefully before writing.
 
-- [ ] **Step 4: Implement `consume_byte` per the C reference**
+The polarity-flip handshake is already wired: `take_polarity_flip()` exists on the parser (added in Step 2's struct definition); ChannelBank polls it.
 
-Port `acars.c:230-end` faithfully. The field-layout parsing inside Crc2's success branch is the meatiest part — read the C carefully.
-
-For the polarity-flip signal (Syn2 sees `~SYN`), expose a `take_polarity_flip(&mut self) -> bool` so the channel layer can read it and update its `MskDemod`'s `MskS` accordingly.
-
-- [ ] **Step 5: Write unit tests with hand-crafted bytes**
+- [ ] **Step 4: Write unit tests with hand-crafted bytes**
 
 ```rust
 #[cfg(test)]
@@ -1365,14 +1410,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 6: Run, expect pass**
+- [ ] **Step 5: Run, expect pass**
 
 ```bash
 cargo test -p sdr-acars frame::tests
 # Expected: 3 passed.
 ```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/sdr-acars/src/frame.rs
@@ -1399,9 +1444,11 @@ EOF
 
 Source-rate complex IQ → per-channel oscillator+decimator → 12.5 kHz real audio → `MskDemod` → `FrameParser`. The oscillator is a pre-computed `Vec<Complex32>` of length `decim_factor` (the number of input samples per output sample). The decimator accumulates `iq[i] * osc[i]` over one decim period and outputs the magnitude (AM detection). `ChannelBank` is a `Vec<Channel>` plus a `process()` orchestrator.
 
-C reference: `original/acarsdec/air.c` and `rtl.c`. Key snippets:
-- `air.c:278-284` — per-channel `wf[]` oscillator init
-- `air.c:300-340` — main per-block loop: complex mixer + accumulator + AM-detect → `dm_buffer` → `demodMSK`
+C reference: `original/acarsdec/rtl.c` (RTL-SDR is what we use) and `air.c` (Airspy, similar pattern). Key snippets:
+- `rtl.c:283-286` — per-channel `wf[]` oscillator init: `AMFreq = 2π * (Fr - Fc) / rtlInRate; wf[ind] = cexp(-i*ind*AMFreq) / rtlMult / 127.5`
+- `rtl.c:rx_callback` (similar shape to `air.c:300-340`) — main per-block loop: complex mixer + accumulator + AM-detect → `dm_buffer` → `demodMSK`
+
+**Magnitude calibration note (level dB only).** The C divides `wf[]` by `rtlMult` (= decim_factor) AND by `127.5` (RTL-SDR's u8 sample normalization). The plan template below does NEITHER — our IQ source already produces normalized `Complex<f32>` (no /127.5 needed), and skipping /decim_factor scales `accum.norm()` up by a constant factor of decim_factor. **This affects only the level-dB metadata reported per message** (which is volatile in the e2e diff and stripped before comparing), not decode correctness — `MskDemod` normalizes the matched-filter output internally. If/when sub-project 2 wants level numbers that match acarsdec's units exactly, scale the oscillator by `1.0 / decim_factor as f32` at build time. v1 leaves this on the floor.
 
 - [ ] **Step 1: Read `air.c` (channel-level decimation)**
 
