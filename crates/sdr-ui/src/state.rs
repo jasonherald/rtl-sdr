@@ -269,6 +269,12 @@ pub struct AppState {
     /// engage ack arrives. Lets the UI display "restoring
     /// to `{prior_freq}`" hints on disengage.
     pub acars_pre_lock_state: RefCell<Option<PreLockSnapshot>>,
+    /// Currently-open ACARS viewer window, or `None` when no
+    /// viewer is open. `glib::WeakRef` so the `AppState` slot
+    /// doesn't keep the window alive past its natural
+    /// lifetime. Set by [`crate::acars_viewer::open_acars_viewer_if_needed`];
+    /// cleared by the window's `close-request` handler.
+    pub acars_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
 }
 
 impl AppState {
@@ -314,6 +320,7 @@ impl AppState {
             acars_total_count: Cell::new(0),
             acars_channel_stats: RefCell::new([ChannelStats::default(); US_SIX_CHANNEL_COUNT]),
             acars_pre_lock_state: RefCell::new(None),
+            acars_viewer_window: RefCell::new(None),
         })
     }
 
@@ -413,6 +420,10 @@ mod tests {
         assert!(
             state.acars_pre_lock_state.borrow().is_none(),
             "no snapshot until first engage"
+        );
+        assert!(
+            state.acars_viewer_window.borrow().is_none(),
+            "no viewer window until first open"
         );
     }
 
