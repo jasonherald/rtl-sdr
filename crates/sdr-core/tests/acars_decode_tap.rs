@@ -6,9 +6,7 @@
 
 use std::sync::mpsc;
 
-use sdr_core::acars_airband_lock::{
-    ACARS_CENTER_HZ, ACARS_SOURCE_RATE_HZ, US_SIX_CHANNELS_HZ,
-};
+use sdr_core::acars_airband_lock::{ACARS_CENTER_HZ, ACARS_SOURCE_RATE_HZ, US_SIX_CHANNELS_HZ};
 use sdr_core::messages::DspToUi;
 use sdr_core::testing::acars_decode_tap;
 use sdr_types::Complex;

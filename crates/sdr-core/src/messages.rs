@@ -1106,9 +1106,9 @@ mod tests {
     #[test]
     fn acars_enabled_changed_carries_error() {
         use crate::acars_airband_lock::AcarsEnableError;
-        let msg = DspToUi::AcarsEnabledChanged(Err(
-            AcarsEnableError::UnsupportedSourceType(crate::messages::SourceType::File),
-        ));
+        let msg = DspToUi::AcarsEnabledChanged(Err(AcarsEnableError::UnsupportedSourceType(
+            crate::messages::SourceType::File,
+        )));
         let s = format!("{msg:?}");
         assert!(s.contains("AcarsEnabledChanged"), "got {s}");
         assert!(s.contains("UnsupportedSourceType"), "got {s}");

@@ -3172,19 +3172,24 @@ fn process_iq_block(
                     // ~1 Hz channel-stats emission throttle.
                     let now = std::time::Instant::now();
                     let elapsed = now.duration_since(state.acars_stats_emitted_at);
-                    if elapsed >= std::time::Duration::from_millis(
-                        crate::acars_airband_lock::ACARS_STATS_EMIT_INTERVAL_MS,
-                    ) && let Some(bank) = state.acars_bank.as_ref()
+                    if elapsed
+                        >= std::time::Duration::from_millis(
+                            crate::acars_airband_lock::ACARS_STATS_EMIT_INTERVAL_MS,
+                        )
+                        && let Some(bank) = state.acars_bank.as_ref()
                     {
                         let ch_stats = bank.channels();
                         if ch_stats.len() == 6 {
                             let arr: [sdr_acars::ChannelStats; 6] = [
-                                ch_stats[0], ch_stats[1], ch_stats[2],
-                                ch_stats[3], ch_stats[4], ch_stats[5],
+                                ch_stats[0],
+                                ch_stats[1],
+                                ch_stats[2],
+                                ch_stats[3],
+                                ch_stats[4],
+                                ch_stats[5],
                             ];
-                            let _ = dsp_tx.send(
-                                crate::messages::DspToUi::AcarsChannelStats(Box::new(arr)),
-                            );
+                            let _ = dsp_tx
+                                .send(crate::messages::DspToUi::AcarsChannelStats(Box::new(arr)));
                             state.acars_stats_emitted_at = now;
                         }
                     }
@@ -3647,7 +3652,7 @@ fn handle_set_acars_enabled(
     dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
 ) {
     use crate::acars_airband_lock::{
-        disengage, engage, AcarsEnableError, CurrentSourceState, US_SIX_CHANNELS_HZ,
+        AcarsEnableError, CurrentSourceState, US_SIX_CHANNELS_HZ, disengage, engage,
     };
     use crate::messages::DspToUi;
 
