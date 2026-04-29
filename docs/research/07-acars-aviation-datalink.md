@@ -140,7 +140,7 @@ Field breakdown:
 - **Block ID**: 1 character, sequential per-aircraft message counter
 - **STX** (Start of Text): `0x02`
 - **Text**: variable-length payload, up to ~220 characters
-- **Suffix**: `ETX` (`0x03`) marks end of message; `ETB` (`0x17`) marks end of block in multi-block messages
+- **Suffix**: `ETX` (`0x03`) marks end of message; `ETB` (`0x17`) marks end of block in multi-block messages. Note: ACARS bytes carry odd parity in bit 7, so the on-the-wire bytes are `0x83` and `0x97` respectively — that is what a parser holding parity-intact bytes (e.g. `crates/sdr-acars/src/frame.rs`) compares against. Strip parity (`& 0x7F`) before comparing if your decoder removes it earlier in the pipeline.
 - **BCS** (Block Check Sequence): 16-bit CRC-CCITT
 
 ### 3.4 Label Codes
@@ -244,7 +244,7 @@ Each character should have odd parity (number of 1 bits is odd). Discard charact
 
 ### 4.6 Frame Assembly
 
-Collect characters between SOH (`0x01`) and ETX (`0x03`). Parse fields according to the frame structure in section 3.3.
+Collect characters between SOH (`0x01`) and ETX (parity-stripped `0x03`, parity-intact `0x83`). Parse fields according to the frame structure in section 3.3. The same caveat applies to ETB (`0x17` / `0x97`): if your byte-level parser still has the parity bit set (as the Rust `frame.rs` does), match against `0x83` / `0x97`, not `0x03` / `0x17`.
 
 ### 4.7 CRC Validation
 

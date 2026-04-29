@@ -25,7 +25,7 @@ Receive and decode VHF ACARS (Plain Old ACARS) text messages from aircraft on th
 RTL-SDR @ 2.5 MSps        │ sdr-acars (NEW crate)                  │
 center 130.3375 MHz       │  ┌──────────────────────────────────┐  │
         │                 │  │ ChannelBank (N channel oscs +    │  │
-        ▼                 │  │  decimators, source 2.4M → IF)   │  │
+        ▼                 │  │  decimators, source 2.5M → IF)   │  │
    Source IQ ─────────────┤  └────────┬───┬───┬───┬───┬──────┬──┘  │
         │                 │           ▼   ▼   ▼   ▼   ▼      ▼     │
         │                 │       ┌─────────────────────────────┐  │
@@ -146,8 +146,8 @@ pub struct AcarsMessage {
 
 ```text
 sdr-acars-cli original/acarsdec/test.wav                 # WAV input
-sdr-acars-cli --iq capture.cs16 --rate 2400000 \         # IQ input
-              --center 130450000 \
+sdr-acars-cli --iq capture.cs16 --rate 2500000 \         # IQ input
+              --center 130337500 \
               --channels 131.550,131.525,130.025,130.425,130.450,129.125
 ```
 
@@ -168,7 +168,7 @@ One PR. Estimated ~2,000 LOC of Rust + tests, all in the new crate, no churn els
 
 ### Tap point
 
-`acars_decode_tap` runs **post-IqFrontend, pre-VFO** (analog of the existing `lrpt_decode_tap` in `crates/sdr-core/src/controller.rs:705`, but at source rate instead of post-VFO 144 ksps). When ACARS is enabled the IqFrontend's decimation factor is forced to 1 so the post-IqFrontend buffer carries the full 2.4 MHz of source IQ.
+`acars_decode_tap` runs **post-IqFrontend, pre-VFO** (analog of the existing `lrpt_decode_tap` in `crates/sdr-core/src/controller.rs:705`, but at source rate instead of post-VFO 144 ksps). When ACARS is enabled the IqFrontend's decimation factor is forced to 1 so the post-IqFrontend buffer carries the full 2.5 MHz of source IQ.
 
 ### Airband-lock mechanism
 

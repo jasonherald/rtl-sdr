@@ -279,9 +279,9 @@ Workflow:
 
 **airframes.io** accepts AERO feeds (via jaero). Feeding contributes to global oceanic flight data.
 
-No equivalent public aggregator for STD-C that I'm aware of; the data is broadcast publicly but there's no central hobby feed. Some private researchers aggregate for weather/maritime analysis.
+As of April 2026, no equivalent public aggregator for STD-C that I'm aware of; the data is broadcast publicly but there's no central hobby feed. Some private researchers aggregate for weather/maritime analysis.
 
-For Iridium, some reverse-engineering communities share data; this is a more research-oriented area than a polished "feed to community" setup.
+For Iridium, as of April 2026 some reverse-engineering communities share data; this remains a more research-oriented area than a polished "feed to community" setup.
 
 ---
 

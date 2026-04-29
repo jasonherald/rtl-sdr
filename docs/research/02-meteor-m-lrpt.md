@@ -229,7 +229,7 @@ Handle the four phase ambiguities: if you don't find the sync marker, try rotati
 
 CCSDS frames are randomized by XORing with a pseudo-random sequence (PN sequence, polynomial `x^8 + x^7 + x^5 + x^3 + 1`). This ensures sufficient bit transitions for the receiver's timing recovery regardless of payload content.
 
-Your descrambler is the exact same XOR operation on the receiver side — generate the PN sequence and XOR it into each frame (skipping the ASM, which is transmitted unscrambled).
+Your descrambler is the same XOR operation on the receiver side — generate the PN sequence and XOR it into each frame (skipping the ASM, which is transmitted unscrambled).
 
 ### 4.8 Reed-Solomon Decoding
 
@@ -237,7 +237,7 @@ Each 1024-byte frame contains **four interleaved RS(255, 223) codewords**. De-in
 
 RS(255, 223):
 - 223 data bytes + 32 parity bytes = 255 bytes per codeword
-- Corrects up to 16 byte errors per codeword
+- Corrects up to 16 symbol errors per codeword (one symbol = one byte)
 - Uses the CCSDS dual-basis representation (slightly different field polynomial than "standard" RS)
 
 Again: use **libfec** (`decode_rs_ccsds`) rather than writing your own. Writing a correct RS decoder for CCSDS is a week's work.

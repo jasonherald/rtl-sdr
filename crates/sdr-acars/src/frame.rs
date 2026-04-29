@@ -283,6 +283,16 @@ impl FrameParser {
                     self.crc_bytes[0] = self.buf[new_len];
                     self.crc_bytes[1] = self.buf[new_len + 1];
                     self.buf.truncate(new_len);
+                    // Drop parity-error offsets that pointed into the
+                    // 3 bytes we just removed; otherwise
+                    // fix_parity_errors would index past frame.len()
+                    // in finalize_frame (panic in debug, wrong-bit
+                    // flip / syndrome OOB in release). Sync the
+                    // running count so the AcarsMessage error_count
+                    // stays accurate.
+                    self.parity_errors.retain(|&pos| pos < new_len);
+                    self.parity_err_count =
+                        u8::try_from(self.parity_errors.len()).unwrap_or(u8::MAX);
                     // Jump straight to the CRC-verify / putmsg path.
                     self.finalize_frame();
                     return;
@@ -613,5 +623,43 @@ mod tests {
         let mut decoded = Vec::new();
         parser.feed_bytes(b"\x00\xFF\x00\xFF\x00", |msg| decoded.push(msg));
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn dle_recovery_drops_stale_parity_offsets() {
+        // Regression: the DLE recovery branch trims `self.buf` by
+        // 3 bytes but used to leave `self.parity_errors` holding
+        // offsets pointing into the now-removed tail. The next
+        // `fix_parity_errors` call would then index `frame[stale]`
+        // past `frame.len()` (panic in debug, wrong-bit-flip /
+        // syndrome OOB in release).
+        //
+        // Construction: drop into Text state, accumulate 22 bytes
+        // with valid odd parity, then 3 even-parity bytes (recorded
+        // at positions 22, 23, 24), then send DLE. The parser
+        // truncates buf to len 22 and goes to finalize_frame; the
+        // CRC is non-zero, so finalize_frame routes through
+        // fix_parity_errors which would panic without the fix.
+        let mut bytes = vec![SYN, SYN, SOH];
+        // 22 odd-parity bytes (0x80 has one 1-bit). Body bytes —
+        // the parser doesn't care about content during Text.
+        bytes.extend(std::iter::repeat_n(0x80, 22));
+        // 3 even-parity bytes that go on parity_errors at
+        // positions 22, 23, 24. NUL is even-parity (0 ones).
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00]);
+        // DLE at position 25 — buf.len()=25 > DLE_ESCAPE_MIN_LEN=20,
+        // triggers the recovery branch.
+        bytes.push(DLE);
+
+        let mut parser = FrameParser::new(0, 0.0);
+        let mut decoded = Vec::new();
+        // The frame must NOT decode (CRC garbage), and the parser
+        // must NOT panic — the only assertion that matters here is
+        // "we got past feed_bytes alive".
+        parser.feed_bytes(&bytes, |msg| decoded.push(msg));
+        assert!(
+            decoded.is_empty(),
+            "synthetic DLE-recovery frame must not decode"
+        );
     }
 }
