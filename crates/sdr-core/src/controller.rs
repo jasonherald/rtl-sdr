@@ -2092,6 +2092,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 .handle_event(sdr_scanner::ScannerEvent::UnlockChannel(key));
             apply_scanner_commands(state, dsp_tx, cmds);
         }
+        // ACARS airband lock (epic #474). Full controller
+        // integration is Task 4; this arm satisfies the
+        // exhaustive-match requirement introduced by the
+        // new variant in Task 3.
+        UiToDsp::SetAcarsEnabled(enabled) => {
+            tracing::debug!(enabled, "SetAcarsEnabled received (not yet implemented)");
+        }
     }
 }
 

@@ -21,6 +21,7 @@ repository.workspace = true
 # until M3 lands the CoreAudio backend).
 
 [dependencies]
+sdr-acars.workspace = true
 sdr-types.workspace = true
 sdr-config.workspace = true
 sdr-dsp.workspace = true
