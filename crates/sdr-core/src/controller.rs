@@ -533,6 +533,21 @@ struct DspState {
     /// log at the IQ block rate (~100 Hz) until source-stop.
     /// Per `CodeRabbit` round 12 on PR #543.
     lrpt_init_failed: bool,
+    /// Active ACARS bank. `Some` while ACARS is on, `None`
+    /// otherwise. Instantiated by the `SetAcarsEnabled(true)`
+    /// arm; dropped by `SetAcarsEnabled(false)`, source-stop,
+    /// and source-type-change auto-disable.
+    acars_bank: Option<sdr_acars::ChannelBank>,
+    /// Snapshot of the prior source config taken at engage.
+    /// Used by disengage to restore the user's tuning.
+    acars_pre_lock: Option<crate::acars_airband_lock::PreLockSnapshot>,
+    /// One-shot guard: a previous `ChannelBank::new` failed.
+    /// Mirrors `lrpt_init_failed` — prevents warn-spam on
+    /// every subsequent IQ block. Cleared on source-stop.
+    acars_init_failed: bool,
+    /// Last `DspToUi::AcarsChannelStats` emission timestamp.
+    /// Throttles stats emission to ~1 Hz per spec.
+    acars_stats_emitted_at: std::time::Instant,
 }
 
 impl DspState {
@@ -623,6 +638,10 @@ impl DspState {
             lrpt_decoder: None,
             lrpt_image: None,
             lrpt_init_failed: false,
+            acars_bank: None,
+            acars_pre_lock: None,
+            acars_init_failed: false,
+            acars_stats_emitted_at: std::time::Instant::now(),
         })
     }
 }
