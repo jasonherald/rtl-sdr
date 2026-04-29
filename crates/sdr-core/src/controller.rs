@@ -533,11 +533,16 @@ struct DspState {
     /// log at the IQ block rate (~100 Hz) until source-stop.
     /// Per `CodeRabbit` round 12 on PR #543.
     lrpt_init_failed: bool,
-    /// Active ACARS bank. `Some` while ACARS is on, `None`
-    /// otherwise. Instantiated by the `SetAcarsEnabled(true)`
-    /// arm; dropped by `SetAcarsEnabled(false)`, source-stop,
-    /// and source-type-change auto-disable.
-    /// (Consumer lands in T6 `acars_decode_tap`.)
+    /// Live ACARS bank. May be temporarily `None` while ACARS
+    /// is still engaged — specifically, the `Start` path
+    /// invalidates this so `acars_decode_tap`'s lazy-init can
+    /// rebuild at the live streaming rate (which differs from
+    /// the engage-time rate when the device rounds). Use
+    /// **`acars_pre_lock.is_some()` as the canonical "ACARS
+    /// engaged" signal**; `acars_bank.is_some()` is only
+    /// meaningful where the bank object itself is needed
+    /// (per-block stats emission, lazy-init self-check inside
+    /// the tap). Per CR rounds 4-5 on PR #584.
     acars_bank: Option<sdr_acars::ChannelBank>,
     /// Snapshot of the prior source config taken at engage.
     /// Used by disengage to restore the user's tuning.
@@ -3774,6 +3779,16 @@ fn apply_acars_geometry(
 
     rebuild_frontend(state).map_err(AcarsEnableError::FrontendRebuildFailed)?;
     rebuild_vfo(state).map_err(AcarsEnableError::VfoRebuildFailed)?;
+
+    // Reset tune-dependent state. ACARS engage/disengage IS a
+    // retune (forced to airband or restored to snapshot), so it
+    // must clear `squelch_was_open`, `transcription_squelch_was_open`,
+    // and the auto-squelch floor — same contract as
+    // `UiToDsp::Tune` / `SetDemodMode` / `SetBandwidth` /
+    // scanner retune. Without this, the first squelch-edge on
+    // the new channel can be suppressed and the restored
+    // channel inherits the wrong floor. CR round 6 on PR #584.
+    on_tune_change(state);
     Ok(())
 }
 
