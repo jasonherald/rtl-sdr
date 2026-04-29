@@ -1051,6 +1051,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                     cleanup(state, dsp_tx);
                                     state.running = false;
                                     let _ = dsp_tx.send(DspToUi::SourceStopped);
+                                    // Early return out of `handle_command`
+                                    // so the Start success epilogue
+                                    // (DisplayBandwidth / DeviceInfo /
+                                    // GainList) doesn't fire on a
+                                    // controller that's no longer
+                                    // running. CR round 11 on PR #584.
+                                    return;
                                 }
                             }
                         }
