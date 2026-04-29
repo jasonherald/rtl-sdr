@@ -3937,6 +3937,63 @@ fn apply_acars_geometry(
     Ok(())
 }
 
+/// Shared failure-handling for both engage failure points
+/// (geometry-apply Err, `ChannelBank::new` Err). Mirrors the
+/// post-Start reassert-failure structure: best-effort rollback
+/// to snapshot tuning; if rollback also fails, restore in-memory
+/// state from snapshot, clear partial ACARS session state, and
+/// tear down the live source if one is active. Always emits
+/// `AcarsEnabledChanged(Err(orig_err))`. CR round 12 on PR #584.
+fn handle_acars_engage_failure(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
+    snapshot: &crate::acars_airband_lock::PreLockSnapshot,
+    orig_err: crate::acars_airband_lock::AcarsEnableError,
+) {
+    use crate::messages::DspToUi;
+
+    // Attempt rollback to snapshot tuning.
+    let rollback = apply_acars_geometry(
+        state,
+        snapshot.source_rate_hz,
+        snapshot.center_freq_hz,
+        snapshot.frontend_decim,
+    );
+
+    if let Err(ref rollback_err) = rollback {
+        tracing::error!("ACARS engage rollback ALSO failed: {rollback_err}");
+        // Patch in-memory state from snapshot so a future Start
+        // reopens at the user's intended rate, even though the
+        // current live graph (if any) is in an indeterminate
+        // state.
+        state.configured_sample_rate = snapshot.source_rate_hz;
+        state.center_freq = snapshot.center_freq_hz;
+        state.vfo_offset = snapshot.vfo_offset_hz;
+    }
+
+    // Defensive: clear any partial ACARS session state. The
+    // engage path doesn't write `acars_pre_lock` / `acars_bank`
+    // until ChannelBank::new succeeds, but this guards against
+    // future refactors that might.
+    state.acars_bank = None;
+    state.acars_init_failed = false;
+    state.acars_pre_lock = None;
+
+    let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(orig_err)));
+
+    // If the live rollback failed AND a source is active, the
+    // live graph is in an indeterminate state we can't recover
+    // from cleanly. Tear down the source so the user gets a
+    // clean re-Start. (For engage-while-stopped, source is None
+    // and there's nothing to tear down — just leave it.)
+    if rollback.is_err() && state.source.is_some() {
+        tracing::error!("tearing down source after unrecoverable ACARS engage failure");
+        cleanup(state, dsp_tx);
+        state.running = false;
+        let _ = dsp_tx.send(DspToUi::SourceStopped);
+    }
+}
+
 /// Handler for `UiToDsp::SetAcarsEnabled`. Engages or
 /// releases the airband lock, instantiates / drops the
 /// `ChannelBank`, rebuilds the DSP graph, and emits an ack
@@ -3991,11 +4048,11 @@ fn handle_set_acars_enabled(
             }
         };
 
-        // Apply target geometry. On any failure, roll back via
-        // a second apply_acars_geometry call against the snapshot
-        // values (best-effort — if the rollback ALSO fails, we log
-        // and emit the ORIGINAL error so the UI sees the actionable
-        // root cause rather than a cascading rebuild error).
+        // Apply target geometry. On any failure, delegate to
+        // `handle_acars_engage_failure` which rolls back to the
+        // snapshot, and if THAT rollback also fails, restores
+        // in-memory state + tears down the source so the live
+        // graph and controller state can't end up diverged.
         if let Err(err) = apply_acars_geometry(
             state,
             plan.target_source_rate_hz,
@@ -4003,15 +4060,7 @@ fn handle_set_acars_enabled(
             plan.target_frontend_decim,
         ) {
             tracing::warn!("ACARS engage geometry-apply failed: {err}");
-            if let Err(rollback_err) = apply_acars_geometry(
-                state,
-                plan.snapshot.source_rate_hz,
-                plan.snapshot.center_freq_hz,
-                plan.snapshot.frontend_decim,
-            ) {
-                tracing::error!("ACARS engage rollback ALSO failed: {rollback_err}");
-            }
-            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+            handle_acars_engage_failure(state, dsp_tx, &plan.snapshot, err);
             return;
         }
 
@@ -4042,15 +4091,7 @@ fn handle_set_acars_enabled(
             Err(e) => {
                 let err = AcarsEnableError::ChannelBankInit(e.to_string());
                 tracing::warn!("ACARS bank init failed: {err}");
-                if let Err(rollback_err) = apply_acars_geometry(
-                    state,
-                    plan.snapshot.source_rate_hz,
-                    plan.snapshot.center_freq_hz,
-                    plan.snapshot.frontend_decim,
-                ) {
-                    tracing::error!("ACARS engage rollback ALSO failed: {rollback_err}");
-                }
-                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+                handle_acars_engage_failure(state, dsp_tx, &plan.snapshot, err);
             }
         }
     } else {
