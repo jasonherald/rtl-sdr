@@ -36,6 +36,7 @@
 // controller module.
 mod controller;
 
+pub mod acars_airband_lock;
 pub mod engine;
 pub mod fft_buffer;
 pub mod messages;

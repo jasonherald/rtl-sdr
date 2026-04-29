@@ -60,6 +60,14 @@ struct Channel {
     parser: FrameParser,
 }
 
+/// No-signal floor (dBFS) used as the idle baseline for a
+/// `ChannelStats` `level_db` field. Below this value is
+/// effectively the noise floor; above it indicates active
+/// RF energy. Single source of truth so `ChannelStats::default()`
+/// and `ChannelBank::new`'s per-channel initialization stay
+/// in lockstep.
+pub const NO_SIGNAL_FLOOR_DB: f32 = -120.0;
+
 /// Per-channel statistics for the UI panel and CLI status.
 #[derive(Clone, Copy, Debug)]
 pub struct ChannelStats {
@@ -76,10 +84,28 @@ pub struct ChannelStats {
     pub lock_state: ChannelLockState,
 }
 
+impl Default for ChannelStats {
+    /// Idle baseline — matches `ChannelBank::new`'s
+    /// per-channel initialization. `level_db` defaults to
+    /// [`NO_SIGNAL_FLOOR_DB`] (the dBFS noise floor), NOT 0.0
+    /// which would inaccurately read as a strong present
+    /// signal in any UI gauge consuming the field.
+    fn default() -> Self {
+        Self {
+            freq_hz: 0.0,
+            last_msg_at: None,
+            msg_count: 0,
+            level_db: NO_SIGNAL_FLOOR_DB,
+            lock_state: ChannelLockState::Idle,
+        }
+    }
+}
+
 /// Three-state indicator for the sidebar glyph (●/○/⚠).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ChannelLockState {
     /// No RF energy detected.
+    #[default]
     Idle,
     /// RF energy present but no decoded frames within the
     /// recent window.
@@ -177,7 +203,7 @@ impl ChannelBank {
                 freq_hz,
                 last_msg_at: None,
                 msg_count: 0,
-                level_db: -120.0,
+                level_db: NO_SIGNAL_FLOOR_DB,
                 lock_state: ChannelLockState::Idle,
             });
         }

@@ -2216,6 +2216,7 @@ version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
 dependencies = [
+ "bytemuck",
  "num-traits",
 ]
 
@@ -3121,6 +3122,8 @@ name = "sdr-core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "num-complex",
+ "sdr-acars",
  "sdr-config",
  "sdr-dsp",
  "sdr-pipeline",
@@ -3160,7 +3163,9 @@ dependencies = [
 name = "sdr-ffi"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "libc",
+ "sdr-acars",
  "sdr-config",
  "sdr-core",
  "sdr-pipeline",
@@ -3415,6 +3420,7 @@ dependencies = [
  "criterion",
  "gtk4",
  "libadwaita",
+ "sdr-acars",
  "sdr-config",
  "sdr-core",
  "sdr-dsp",

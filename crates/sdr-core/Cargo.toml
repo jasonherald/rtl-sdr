@@ -21,6 +21,7 @@ repository.workspace = true
 # until M3 lands the CoreAudio backend).
 
 [dependencies]
+sdr-acars.workspace = true
 sdr-types.workspace = true
 sdr-config.workspace = true
 sdr-dsp.workspace = true
@@ -43,6 +44,7 @@ sdr-sink-network.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
+num-complex.workspace = true
 
 # Audio sink. The base dep is unconditional so `controller.rs`'s
 # `use sdr_sink_audio::AudioSink;` resolves on every target — including

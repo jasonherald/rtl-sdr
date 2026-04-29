@@ -533,6 +533,30 @@ struct DspState {
     /// log at the IQ block rate (~100 Hz) until source-stop.
     /// Per `CodeRabbit` round 12 on PR #543.
     lrpt_init_failed: bool,
+    /// Live ACARS bank. May be temporarily `None` while ACARS
+    /// is still engaged — specifically, the `Start` path
+    /// invalidates this so `acars_decode_tap`'s lazy-init can
+    /// rebuild at the live streaming rate (which differs from
+    /// the engage-time rate when the device rounds). Use
+    /// **`acars_pre_lock.is_some()` as the canonical "ACARS
+    /// engaged" signal**; `acars_bank.is_some()` is only
+    /// meaningful where the bank object itself is needed
+    /// (per-block stats emission, lazy-init self-check inside
+    /// the tap). Per CR rounds 4-5 on PR #584.
+    acars_bank: Option<sdr_acars::ChannelBank>,
+    /// Snapshot of the prior source config taken at engage.
+    /// Used by disengage to restore the user's tuning.
+    /// (Consumer lands in T7 `handle_set_acars_enabled`.)
+    acars_pre_lock: Option<crate::acars_airband_lock::PreLockSnapshot>,
+    /// One-shot guard: a previous `ChannelBank::new` failed.
+    /// Mirrors `lrpt_init_failed` — prevents warn-spam on
+    /// every subsequent IQ block. Cleared on source-stop.
+    /// (Consumer lands in T6 `acars_decode_tap`.)
+    acars_init_failed: bool,
+    /// Last `DspToUi::AcarsChannelStats` emission timestamp.
+    /// Throttles stats emission to ~1 Hz per spec.
+    /// (Consumer lands in T8 stats-throttle in `process_iq_block`.)
+    acars_stats_emitted_at: std::time::Instant,
 }
 
 impl DspState {
@@ -623,6 +647,10 @@ impl DspState {
             lrpt_decoder: None,
             lrpt_image: None,
             lrpt_init_failed: false,
+            acars_bank: None,
+            acars_pre_lock: None,
+            acars_init_failed: false,
+            acars_stats_emitted_at: std::time::Instant::now(),
         })
     }
 }
@@ -760,6 +788,90 @@ fn lrpt_decode_tap(
     decoder.process(radio_input);
 }
 
+/// ACARS decode tap. Mirrors `lrpt_decode_tap`'s shape: takes
+/// the bank slot, init-failed flag, current geometry, IQ
+/// buffer, and `dsp_tx` as separate parameters so the call
+/// site can hold a live borrow of `state.processed_buf`.
+///
+/// Lazy-init: on the first call with `bank.is_none()` and
+/// `*init_failed == false`, builds the `ChannelBank` from
+/// `(source_rate_hz, center_hz, channels)`. If construction
+/// fails, sets `*init_failed = true` and skips subsequent
+/// calls until source-stop clears the flag (matching the
+/// LRPT pattern).
+///
+/// Per-block: feeds `iq` through `bank.process(...)` and
+/// forwards each decoded `AcarsMessage` to `dsp_tx`. The
+/// caller is responsible for periodic `AcarsChannelStats`
+/// emission (handled in `process_iq_block` via the
+/// throttle in `state.acars_stats_emitted_at`).
+///
+/// Visibility: private — same as the analogous
+/// `apt_decode_tap` and `lrpt_decode_tap` siblings. Inline
+/// `#[cfg(test)] mod tests` blocks at the bottom of this file
+/// exercise it directly. End-to-end pipeline integration
+/// (engage → ack → disengage) is covered by the `Engine`-API
+/// tests in `tests/acars_pipeline_integration.rs`.
+fn acars_decode_tap(
+    bank: &mut Option<sdr_acars::ChannelBank>,
+    init_failed: &mut bool,
+    source_rate_hz: f64,
+    center_hz: f64,
+    channels: &[f64],
+    iq: &[sdr_types::Complex],
+    dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
+) {
+    // Compile-time guard: `bytemuck::cast_slice::<Complex, Complex32>`
+    // below is sound because both types are `repr(C) { re: f32, im: f32 }`
+    // with `bytemuck::Pod`. If a future refactor changes either
+    // layout, this assertion fails to compile and surfaces the
+    // drift at the cast site rather than as a runtime panic.
+    const _: () = assert!(
+        std::mem::size_of::<sdr_types::Complex>() == std::mem::size_of::<num_complex::Complex32>(),
+        "sdr_types::Complex and num_complex::Complex32 must have identical size \
+         for the bytemuck zero-copy cast in acars_decode_tap"
+    );
+    const _: () = assert!(
+        std::mem::align_of::<sdr_types::Complex>()
+            == std::mem::align_of::<num_complex::Complex32>(),
+        "sdr_types::Complex and num_complex::Complex32 must have identical \
+         alignment for the bytemuck zero-copy cast in acars_decode_tap"
+    );
+
+    if *init_failed {
+        return;
+    }
+    if bank.is_none() {
+        match sdr_acars::ChannelBank::new(source_rate_hz, center_hz, channels) {
+            Ok(b) => {
+                tracing::info!(
+                    "ACARS bank initialised: source_rate={source_rate_hz} \
+                     center={center_hz} n_channels={}",
+                    channels.len()
+                );
+                *bank = Some(b);
+            }
+            Err(e) => {
+                tracing::warn!("ACARS bank init failed: {e}");
+                *init_failed = true;
+                return;
+            }
+        }
+    }
+    let Some(bank) = bank.as_mut() else { return };
+    // `sdr_types::Complex` and `num_complex::Complex32` share the
+    // same `repr(C)` layout (`{f32, f32}`); both implement
+    // `bytemuck::Pod`, so the cast is zero-copy and safe. The
+    // `const _: () = assert!(...)` guards above pin that contract
+    // at compile time.
+    let iq_c32: &[num_complex::Complex32] = bytemuck::cast_slice(iq);
+    bank.process(iq_c32, |msg| {
+        // Boxed because AcarsMessage is large enough that
+        // unboxed would inflate the DspToUi enum's footprint.
+        let _ = dsp_tx.send(crate::messages::DspToUi::AcarsMessage(Box::new(msg)));
+    });
+}
+
 /// Handle a single UI command.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiToDsp) {
@@ -825,6 +937,157 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     state.running = true;
                     tracing::info!("DSP pipeline started");
 
+                    // ACARS bank coherence (epic #474). open_source
+                    // may have:
+                    //   - updated state.sample_rate to the hardware-
+                    //     rounded value, AND
+                    //   - auto-selected `frontend.set_decimation(>1)`
+                    //     based on the current demod IF (per the
+                    //     auto_decimation_ratio call inside the
+                    //     Start path).
+                    // The latter breaks the ACARS contract that the
+                    // tap reads post-IqFrontend IQ at SOURCE rate
+                    // (decim=1). Reassert the full airband geometry
+                    // via `apply_acars_geometry` so frontend decim,
+                    // configured_sample_rate, rebuild_frontend,
+                    // rebuild_vfo, and on_tune_change all snap back
+                    // into the locked state. Then drop the bank for
+                    // lazy-rebuild at the now-coherent live rate.
+                    // Per CR rounds 4+8 on PR #584.
+                    if state.acars_pre_lock.is_some() {
+                        match apply_acars_geometry(
+                            state,
+                            crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
+                            crate::acars_airband_lock::ACARS_CENTER_HZ,
+                            crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
+                        ) {
+                            Ok(()) => {
+                                state.acars_bank = None;
+                                state.acars_init_failed = false;
+                                state.acars_stats_emitted_at = std::time::Instant::now();
+                                tracing::debug!(
+                                    sample_rate = state.sample_rate,
+                                    center_freq = state.center_freq,
+                                    "ACARS geometry reasserted post-Start; bank lazy-rebuild pending"
+                                );
+                            }
+                            Err(err) => {
+                                // Reassertion failed. The DSP graph
+                                // is in an indeterminate state — the
+                                // partial mutation inside
+                                // `apply_acars_geometry` may have
+                                // already pushed source rate or
+                                // frontend toward airband before
+                                // returning Err, so we can't trust
+                                // the live pipeline matches anything
+                                // coherent.
+                                //
+                                // Best-effort: try to push the live
+                                // graph back to the snapshot tuning
+                                // via a second apply_acars_geometry
+                                // call. If that succeeds, the live
+                                // graph + controller state are both
+                                // at the user's pre-engage values
+                                // and we can continue running with
+                                // ACARS off. If it ALSO fails, the
+                                // graph is unrecoverable: tear down
+                                // the source so the user gets a
+                                // clean re-Start path. CR round 10
+                                // on PR #584.
+                                tracing::error!("ACARS geometry reassert failed post-Start: {err}");
+                                let snapshot_clone = state.acars_pre_lock.clone();
+                                let live_restore = match &snapshot_clone {
+                                    Some(snap) => apply_acars_geometry(
+                                        state,
+                                        snap.source_rate_hz,
+                                        snap.center_freq_hz,
+                                        snap.frontend_decim,
+                                    ),
+                                    None => Ok(()),
+                                };
+
+                                if let Err(restore_err) = &live_restore {
+                                    // Live restore failed too. Patch
+                                    // in-memory state from snapshot
+                                    // anyway so configured_sample_rate
+                                    // reflects user intent for the
+                                    // post-stop re-Start, even though
+                                    // the current live graph won't
+                                    // honor it. (apply_acars_geometry
+                                    // may have left those fields
+                                    // mid-update on its way to Err.)
+                                    if let Some(snap) = &snapshot_clone {
+                                        state.configured_sample_rate = snap.source_rate_hz;
+                                        state.center_freq = snap.center_freq_hz;
+                                        state.vfo_offset = snap.vfo_offset_hz;
+                                    }
+                                    tracing::error!(
+                                        "ACARS live-graph restore ALSO failed: {restore_err}"
+                                    );
+                                } else if let Some(snap) = &snapshot_clone {
+                                    // Live restore succeeded for
+                                    // rate/center/decim, but
+                                    // `apply_acars_geometry` doesn't
+                                    // touch `state.vfo_offset` — it
+                                    // just rebuilds the VFO at
+                                    // whatever offset is currently
+                                    // in state. If the user changed
+                                    // VfoOffset between engage and
+                                    // Start (the airband-lock UI
+                                    // greys it but DSP doesn't
+                                    // enforce in v1), state.vfo_offset
+                                    // could differ from
+                                    // snapshot.vfo_offset_hz. Replay
+                                    // the snapshot's offset so the
+                                    // restored channel comes back at
+                                    // the user's pre-engage tuning,
+                                    // matching the explicit reapply
+                                    // in `handle_set_acars_enabled`'s
+                                    // disengage branch. CR round 13
+                                    // on PR #584.
+                                    state.vfo_offset = snap.vfo_offset_hz;
+                                    if let Some(vfo) = state.vfo.as_mut() {
+                                        vfo.set_offset(snap.vfo_offset_hz);
+                                    }
+                                }
+
+                                state.acars_bank = None;
+                                state.acars_init_failed = false;
+                                state.acars_pre_lock = None;
+                                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+                                // Also send a definitive Ok(false)
+                                // so the UI (which preserves state
+                                // on Err per CR round 1) snaps the
+                                // toggle off — same pattern as
+                                // cleanup's forced-off ack (round 7).
+                                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+
+                                if live_restore.is_err() {
+                                    // Tear down the source so the
+                                    // user gets a clean re-Start.
+                                    // pre_lock is None at this point,
+                                    // so cleanup()'s top-of-function
+                                    // ACARS-disengage guard skips
+                                    // (no infinite recursion through
+                                    // handle_set_acars_enabled).
+                                    tracing::error!(
+                                        "tearing down source after unrecoverable ACARS reassert failure"
+                                    );
+                                    cleanup(state, dsp_tx);
+                                    state.running = false;
+                                    let _ = dsp_tx.send(DspToUi::SourceStopped);
+                                    // Early return out of `handle_command`
+                                    // so the Start success epilogue
+                                    // (DisplayBandwidth / DeviceInfo /
+                                    // GainList) doesn't fire on a
+                                    // controller that's no longer
+                                    // running. CR round 11 on PR #584.
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
                     // Send display bandwidth (raw sample rate) so
                     // the spectrum display shows the full tuner
                     // bandwidth. The FFT is computed on the pre-
@@ -878,6 +1141,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::Tune(freq) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "Tune") {
+                return;
+            }
             tracing::debug!(frequency_hz = freq, "tune command");
             on_tune_change(state);
             state.center_freq = freq;
@@ -890,6 +1156,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetDemodMode(mode) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDemodMode") {
+                return;
+            }
             tracing::debug!(?mode, "set demod mode");
             on_tune_change(state);
             let old_mode = state.radio.current_mode();
@@ -1025,6 +1294,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetSampleRate(rate) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetSampleRate") {
+                return;
+            }
             tracing::debug!(sample_rate = rate, "set sample rate");
             state.configured_sample_rate = rate;
             if let Some(source) = &mut state.source {
@@ -1075,6 +1347,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetDecimation(ratio) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDecimation") {
+                return;
+            }
             tracing::debug!(ratio, "set decimation");
             if let Err(e) = state.frontend.set_decimation(ratio) {
                 tracing::warn!("set decimation failed: {e}");
@@ -1217,6 +1492,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetVfoOffset(offset) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetVfoOffset") {
+                return;
+            }
             // Expanded tracing for the #337 click-to-tune-no-audio
             // investigation: the #337 hypotheses point at a
             // display-span vs. VFO-input-sample-rate mismatch
@@ -1486,10 +1764,54 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetSourceType(source_type) => {
             tracing::info!(?source_type, "switching source type");
+            // ACARS source-type gate (epic #474). MUST run BEFORE
+            // cleanup() — cleanup() drops state.acars_bank, which
+            // would make the `is_some()` check below trivially
+            // false and skip the synthetic disengage entirely
+            // (CR round 2 on PR #584). Running first means the
+            // disengage operates on the live old source: it can
+            // physically retune rate/center back to the snapshot
+            // values, drop the bank, and emit the
+            // AcarsEnabledChanged(Ok(false)) ack the UI is
+            // waiting on. cleanup() then stops the source as
+            // usual; the post-cleanup acars_bank=None becomes a
+            // harmless re-set since handle_set_acars_enabled
+            // already cleared it.
+            // Use `acars_pre_lock.is_some()` (the canonical
+            // "ACARS engaged" signal), NOT `acars_bank.is_some()`.
+            // The Start path intentionally invalidates the bank
+            // for the lazy-rebuild window — bank can be None
+            // while ACARS is still engaged. CR round 5 on PR #584.
+            let acars_outcome =
+                if state.acars_pre_lock.is_some() && source_type != SourceType::RtlSdr {
+                    tracing::info!(
+                        ?source_type,
+                        "ACARS auto-disabling: source type changing to non-RTL-SDR"
+                    );
+                    handle_set_acars_enabled(state, false, dsp_tx)
+                } else {
+                    AcarsHandlerOutcome::Normal
+                };
             let was_running = state.running;
             if was_running {
                 cleanup(state, dsp_tx);
                 state.running = false;
+            }
+            // Honor TeardownNeeded from the auto-disable: if the
+            // disengage hit double-failure AND we didn't already
+            // tear down via the `was_running` branch above, do it
+            // now. The `was_running` guard handles the common case
+            // where ACARS is engaged on a live source — cleanup
+            // already ran. The fallback is for an engaged-but-
+            // somehow-not-running scenario (defensive, shouldn't
+            // happen in practice). CR round 18.
+            if matches!(acars_outcome, AcarsHandlerOutcome::TeardownNeeded) && !was_running {
+                tracing::error!(
+                    "ACARS auto-disable double-failure with !running; tearing down source"
+                );
+                cleanup(state, dsp_tx);
+                state.running = false;
+                let _ = dsp_tx.send(DspToUi::SourceStopped);
             }
             state.source_type = source_type;
             // Force the rtl_tcp status row to reset when switching
@@ -2061,6 +2383,23 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
         // --- Scanner (#317) ---
         UiToDsp::SetScannerEnabled(enabled) => {
+            // Reject scanner enable while ACARS is engaged. The
+            // reverse direction (refusing ACARS engage while
+            // scanner is running) was added in CR round 16; this
+            // closes the symmetric hole. Without it, enabling
+            // scanner mid-engagement would retune the source via
+            // apply_scanner_commands and violate the airband-lock
+            // invariants the round 14-15 UiToDsp guards protect.
+            // CR round 17 on PR #584.
+            if enabled && state.acars_pre_lock.is_some() {
+                tracing::warn!("scanner enable rejected: ACARS airband lock is active");
+                let _ = dsp_tx.send(DspToUi::Error(
+                    "Scanner enable ignored: ACARS airband lock is active. \
+                     Disable ACARS first."
+                        .to_string(),
+                ));
+                return;
+            }
             if enabled && stop_any_recording(state, dsp_tx) {
                 let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
                     ScannerMutexReason::RecordingStoppedForScanner,
@@ -2091,6 +2430,22 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 .scanner
                 .handle_event(sdr_scanner::ScannerEvent::UnlockChannel(key));
             apply_scanner_commands(state, dsp_tx, cmds);
+        }
+        UiToDsp::SetAcarsEnabled(enable) => {
+            // Honor TeardownNeeded — handler signaled an
+            // unrecoverable double-failure, so tear down the
+            // source per the AcarsHandlerOutcome contract.
+            // CR round 18 on PR #584.
+            if matches!(
+                handle_set_acars_enabled(state, enable, dsp_tx),
+                AcarsHandlerOutcome::TeardownNeeded
+            ) && state.running
+            {
+                tracing::error!("ACARS SetAcarsEnabled double-failure; tearing down source");
+                cleanup(state, dsp_tx);
+                state.running = false;
+                let _ = dsp_tx.send(DspToUi::SourceStopped);
+            }
         }
     }
 }
@@ -2789,6 +3144,77 @@ fn open_source(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(
 
 /// Stop the source and release resources.
 fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
+    // ACARS teardown (epic #474). MUST run BEFORE `source.stop()`
+    // so the synthetic disengage can physically retune the live
+    // source back to the user's pre-lock rate/center via
+    // `apply_acars_geometry`. Without this, `Stop → Start` would
+    // re-open at the airband-locked `configured_sample_rate`
+    // (2.5 MSps) but with `acars_bank == None`, which makes
+    // `process_iq_block`'s tap a permanent no-op until the user
+    // toggles ACARS off and on again — the half-enabled state
+    // CodeRabbit flagged on PR #584.
+    //
+    // Force-clear the ACARS session state after the call so a
+    // disengage Err (rare) doesn't leave a stale snapshot
+    // lingering across the source teardown. Use
+    // `acars_pre_lock.is_some()` (the canonical "ACARS engaged"
+    // signal); `acars_bank.is_some()` is too narrow because the
+    // Start path intentionally invalidates the bank for the
+    // lazy-rebuild window. CR round 5 on PR #584.
+    let mut acars_forced_off = false;
+    if state.acars_pre_lock.is_some() {
+        // Cleanup is already tearing the source down, so
+        // intentionally IGNORE any TeardownNeeded outcome from
+        // the synthetic disengage — acting on it would recurse
+        // back into cleanup. The outcome is unused here on
+        // purpose; `let _ = ...` documents the intent. CR round 18.
+        let _ = handle_set_acars_enabled(state, false, dsp_tx);
+        // If pre_lock is STILL Some after the call, the disengage
+        // path Err'd (re-stashed the snapshot for retry).
+        // handle_dsp_message in sdr-ui preserves AppState's
+        // `acars_enabled` on Err — by design, since Err doesn't
+        // disambiguate engage-vs-disengage failure (CR round 1).
+        // But we ARE force-clearing the DSP-side session right
+        // below, so we need a definitive Ok(false) ack to keep
+        // the UI toggle in sync; otherwise the user is left with
+        // a latched-on toggle they have to manually flip off.
+        // CR round 7 on PR #584.
+        //
+        // ALSO: copy the snapshot's tuning back into the
+        // controller's in-memory fields BEFORE force-clearing
+        // it. The disengage Err path leaves the controller at
+        // airband geometry (since apply_acars_geometry's restore
+        // failed and the best-effort re-apply re-engages
+        // airband). Without this restore, the next Start would
+        // reopen at `configured_sample_rate = 2.5 MSps` even
+        // though ACARS is now off. CR round 8 on PR #584.
+        if let Some(snapshot) = state.acars_pre_lock.as_ref() {
+            acars_forced_off = true;
+            tracing::warn!(
+                source_rate = snapshot.source_rate_hz,
+                center = snapshot.center_freq_hz,
+                vfo_offset = snapshot.vfo_offset_hz,
+                "ACARS disengage Err'd during cleanup; restoring snapshot to \
+                 controller state + forcing UI off via Ok(false) ack"
+            );
+            state.configured_sample_rate = snapshot.source_rate_hz;
+            state.center_freq = snapshot.center_freq_hz;
+            state.vfo_offset = snapshot.vfo_offset_hz;
+            // sample_rate stays at whatever apply_acars_geometry
+            // last wrote (likely airband 2.5 MSps from the
+            // best-effort re-engage). It'll be overwritten on
+            // the next Start when open_source picks up
+            // configured_sample_rate. No live source means we
+            // can't read back hardware rate here either way.
+        }
+    }
+    state.acars_bank = None;
+    state.acars_init_failed = false;
+    state.acars_pre_lock = None;
+    if acars_forced_off {
+        let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+    }
+
     if let Some(source) = &mut state.source {
         let _ = source.stop();
     }
@@ -2831,6 +3257,10 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // NFM mid-pass) is a *soft* discontinuity and intentionally
     // stays untouched — the user keeps decoding the same pass.
     reset_imaging_decoders(state);
+
+    // (ACARS teardown happens at the TOP of this function via the
+    // synthetic-disengage path, BEFORE source.stop, so the live
+    // retune can run while the source is still active.)
 
     tracing::info!("source closed");
 }
@@ -3046,6 +3476,57 @@ fn process_iq_block(
             }
 
             if processed_count > 0 {
+                // ACARS decode tap (#474). Runs at source rate
+                // (ACARS forces frontend decim=1). Tapped BEFORE
+                // the VFO so we read the full 2.5 MHz airband
+                // window unchanged. Mirror of `lrpt_decode_tap`
+                // but at source rate vs post-VFO 144 ksps.
+                //
+                // Outer guard is `acars_pre_lock.is_some()` (the
+                // "ACARS engaged" signal), NOT `acars_bank.is_some()`.
+                // Otherwise the lazy-init in `acars_decode_tap`
+                // never runs after the Start path invalidates the
+                // bank for an enable-while-stopped/startup-replay
+                // path (CR round 4 on PR #584).
+                if state.acars_pre_lock.is_some() {
+                    acars_decode_tap(
+                        &mut state.acars_bank,
+                        &mut state.acars_init_failed,
+                        state.sample_rate,
+                        state.center_freq,
+                        &crate::acars_airband_lock::US_SIX_CHANNELS_HZ,
+                        &state.processed_buf[..processed_count],
+                        dsp_tx,
+                    );
+
+                    // ~1 Hz channel-stats emission throttle.
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(state.acars_stats_emitted_at);
+                    if elapsed
+                        >= std::time::Duration::from_millis(
+                            crate::acars_airband_lock::ACARS_STATS_EMIT_INTERVAL_MS,
+                        )
+                        && let Some(bank) = state.acars_bank.as_ref()
+                    {
+                        let ch_stats = bank.channels();
+                        // `<[T; N]>::try_from(&[T])` requires `T: Copy`,
+                        // which `ChannelStats` derives. Returns `Err` if
+                        // the slice length doesn't equal N — silently
+                        // drops the emission rather than panicking, so
+                        // a future channel-set width mismatch fails
+                        // visibly via missing stats updates rather than
+                        // crashing the DSP thread.
+                        if let Ok(arr) = <[sdr_acars::ChannelStats;
+                            crate::acars_airband_lock::US_SIX_CHANNEL_COUNT]>::try_from(
+                            ch_stats
+                        ) {
+                            let _ = dsp_tx
+                                .send(crate::messages::DspToUi::AcarsChannelStats(Box::new(arr)));
+                            state.acars_stats_emitted_at = now;
+                        }
+                    }
+                }
+
                 // Pass through RxVfo: frequency translate, resample, channel filter.
                 let radio_input = if let Some(vfo) = &mut state.vfo {
                     // Size VFO output buffer generously for resampling expansion.
@@ -3493,6 +3974,400 @@ fn process_iq_block(
     }
 }
 
+/// Apply a `(source_rate, center, frontend_decim)` triple to
+/// the controller's DSP graph in the same order `UiToDsp::SetSampleRate`
+/// uses: update `configured_sample_rate` (so re-opens see the locked
+/// rate), retune the live source (rate then center), force frontend
+/// decimation, then rebuild the frontend + VFO. Returns `Err` on the
+/// first failure WITHOUT rolling back — the caller is responsible for
+/// invoking `apply_acars_geometry` again with the prior values.
+///
+/// Used by `handle_set_acars_enabled` for both engage (apply airband)
+/// and disengage (restore snapshot). The symmetric structure keeps
+/// the two paths in lockstep — anything that needs to mutate on engage
+/// gets restored on disengage automatically.
+fn apply_acars_geometry(
+    state: &mut DspState,
+    target_source_rate_hz: f64,
+    target_center_hz: f64,
+    target_frontend_decim: u32,
+) -> Result<(), crate::acars_airband_lock::AcarsEnableError> {
+    use crate::acars_airband_lock::AcarsEnableError;
+
+    state.configured_sample_rate = target_source_rate_hz;
+    state.center_freq = target_center_hz;
+
+    if let Some(source) = state.source.as_mut() {
+        source
+            .set_sample_rate(target_source_rate_hz)
+            .map_err(|e| AcarsEnableError::SourceRetuneFailed(e.to_string()))?;
+        // Read back actual hardware rate (may differ from
+        // requested due to PLL rounding on RTL-SDR).
+        state.sample_rate = source.sample_rate();
+        source
+            .tune(target_center_hz)
+            .map_err(|e| AcarsEnableError::SourceRetuneFailed(e.to_string()))?;
+    } else {
+        state.sample_rate = target_source_rate_hz;
+    }
+
+    state
+        .frontend
+        .set_decimation(target_frontend_decim)
+        .map_err(|e| AcarsEnableError::FrontendDecimFailed(e.to_string()))?;
+
+    rebuild_frontend(state).map_err(AcarsEnableError::FrontendRebuildFailed)?;
+    rebuild_vfo(state).map_err(AcarsEnableError::VfoRebuildFailed)?;
+
+    // Reset tune-dependent state. ACARS engage/disengage IS a
+    // retune (forced to airband or restored to snapshot), so it
+    // must clear `squelch_was_open`, `transcription_squelch_was_open`,
+    // and the auto-squelch floor — same contract as
+    // `UiToDsp::Tune` / `SetDemodMode` / `SetBandwidth` /
+    // scanner retune. Without this, the first squelch-edge on
+    // the new channel can be suppressed and the restored
+    // channel inherits the wrong floor. CR round 6 on PR #584.
+    on_tune_change(state);
+    Ok(())
+}
+
+/// Result from `handle_set_acars_enabled` and friends, telling
+/// the caller whether the helper ran into a double-failure
+/// requiring the caller to tear down the source. Without this,
+/// helpers calling `cleanup()` themselves would either:
+///   - cascade duplicate `SourceStopped` emissions when the
+///     outer caller (e.g. `cleanup` itself, or the `Stop` arm)
+///     also wants to tear down, or
+///   - infinite-recurse when called from inside `cleanup()`
+///     (`cleanup` → `handle_set_acars_enabled` double-fail →
+///     `cleanup` again).
+///
+/// New contract: helpers do their own ACARS-state cleanup
+/// (clear `bank` / `init_failed` / `pre_lock`, restore snapshot
+/// fields, emit `AcarsEnabledChanged` acks) but DO NOT call
+/// `cleanup()` or emit `SourceStopped` themselves. Callers see
+/// `TeardownNeeded` and act per their own context —
+/// `Stop` / `SetAcarsEnabled` callers run the teardown;
+/// `cleanup` ignores the signal since it's already tearing
+/// down. CR round 18 on PR #584.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcarsHandlerOutcome {
+    /// Normal path. Caller proceeds as usual.
+    Normal,
+    /// ACARS lifecycle hit unrecoverable double-failure. Helper
+    /// has already cleared ACARS session state and emitted
+    /// `AcarsEnabledChanged(Err)` + `Ok(false)` so the UI knows.
+    /// Caller should tear down the source (`cleanup` +
+    /// `state.running = false` + `SourceStopped`) UNLESS the
+    /// caller is itself `cleanup()` (which is already handling
+    /// teardown).
+    TeardownNeeded,
+}
+
+/// Headless airband-lock enforcement. The spec ("VFO fully
+/// disabled while ACARS is on") greys these controls UI-side,
+/// but the DSP side must also reject geometry-changing
+/// `UiToDsp` commands while engaged — otherwise a stale
+/// command, an FFI consumer that doesn't know the convention,
+/// or a future scanner re-tune could mutate the live graph
+/// behind ACARS's back, leaving `acars_bank` decoding stale
+/// geometry while ACARS reads as logically engaged. Caller
+/// invokes this at the top of each geometry-mutating arm
+/// (`Tune` / `SetDemodMode` / `SetSampleRate` / `SetDecimation` /
+/// `SetVfoOffset`) and
+/// `return`s on `true`. CR round 14 on PR #584.
+fn acars_lock_rejects_geometry_change(
+    state: &DspState,
+    dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
+    cmd_label: &str,
+) -> bool {
+    if state.acars_pre_lock.is_some() {
+        tracing::warn!(
+            cmd = cmd_label,
+            "ACARS airband-lock active: ignoring {cmd_label} command"
+        );
+        let _ = dsp_tx.send(crate::messages::DspToUi::Error(format!(
+            "{cmd_label} ignored: ACARS airband lock is active. \
+             Disable ACARS to change tuning."
+        )));
+        return true;
+    }
+    false
+}
+
+/// Shared failure-handling for both engage failure points
+/// (geometry-apply Err, `ChannelBank::new` Err). Mirrors the
+/// post-Start reassert-failure structure: best-effort rollback
+/// to snapshot tuning; if rollback also fails, restore in-memory
+/// state from snapshot and clear partial ACARS session state.
+/// Always emits `AcarsEnabledChanged(Err(orig_err))`.
+///
+/// Returns `TeardownNeeded` when the live rollback also failed
+/// AND a source is active — caller tears the source down per
+/// the [`AcarsHandlerOutcome`] contract. CR rounds 12 + 18 on
+/// PR #584.
+fn handle_acars_engage_failure(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
+    snapshot: &crate::acars_airband_lock::PreLockSnapshot,
+    orig_err: crate::acars_airband_lock::AcarsEnableError,
+) -> AcarsHandlerOutcome {
+    use crate::messages::DspToUi;
+
+    // Attempt rollback to snapshot tuning.
+    let rollback = apply_acars_geometry(
+        state,
+        snapshot.source_rate_hz,
+        snapshot.center_freq_hz,
+        snapshot.frontend_decim,
+    );
+
+    if let Err(ref rollback_err) = rollback {
+        tracing::error!("ACARS engage rollback ALSO failed: {rollback_err}");
+        // Patch in-memory state from snapshot so a future Start
+        // reopens at the user's intended rate, even though the
+        // current live graph (if any) is in an indeterminate
+        // state.
+        state.configured_sample_rate = snapshot.source_rate_hz;
+        state.center_freq = snapshot.center_freq_hz;
+        state.vfo_offset = snapshot.vfo_offset_hz;
+    }
+
+    // Defensive: clear any partial ACARS session state. The
+    // engage path doesn't write `acars_pre_lock` / `acars_bank`
+    // until ChannelBank::new succeeds, but this guards against
+    // future refactors that might.
+    state.acars_bank = None;
+    state.acars_init_failed = false;
+    state.acars_pre_lock = None;
+
+    let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(orig_err)));
+
+    // Signal teardown to caller if the live rollback failed AND
+    // a source is active. Caller decides whether to actually
+    // tear down (cleanup() already would, so it ignores this
+    // signal; SetAcarsEnabled / SetSourceType arms act on it).
+    if rollback.is_err() && state.source.is_some() {
+        tracing::error!("ACARS engage double-failure: caller should tear down source");
+        AcarsHandlerOutcome::TeardownNeeded
+    } else {
+        AcarsHandlerOutcome::Normal
+    }
+}
+
+/// Handler for `UiToDsp::SetAcarsEnabled`. Engages or
+/// releases the airband lock, instantiates / drops the
+/// `ChannelBank`, rebuilds the DSP graph, and emits an ack
+/// via `DspToUi`.
+///
+/// Returns `TeardownNeeded` when the lifecycle hits an
+/// unrecoverable double-failure that requires source teardown
+/// per the [`AcarsHandlerOutcome`] contract. Caller MUST honor
+/// the return — see the enum docs for the contract.
+#[allow(clippy::too_many_lines)]
+fn handle_set_acars_enabled(
+    state: &mut DspState,
+    enable: bool,
+    dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
+) -> AcarsHandlerOutcome {
+    use crate::acars_airband_lock::{
+        AcarsEnableError, CurrentSourceState, US_SIX_CHANNELS_HZ, disengage, engage,
+    };
+    use crate::messages::DspToUi;
+
+    if enable {
+        if state.acars_pre_lock.is_some() {
+            // Idempotent: already engaged. Re-ack with current
+            // state. Use `acars_pre_lock.is_some()` rather than
+            // `acars_bank.is_some()` because the Start path
+            // intentionally invalidates the bank during the
+            // lazy-rebuild window. Without this, a second
+            // SetAcarsEnabled(true) in that window would fall
+            // through, re-snapshot the already-locked
+            // (airband) geometry as if it were the user's prior
+            // config, and a later disengage would restore to
+            // the ACARS lock instead of the user's pre-engage
+            // settings. CR round 5 on PR #584.
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
+            return AcarsHandlerOutcome::Normal;
+        }
+
+        // Refuse while the scanner is running. Scanner mutates
+        // source rate / center / decimation directly via
+        // `apply_scanner_commands`, bypassing the UiToDsp
+        // dispatcher and therefore the airband-lock guards on
+        // those commands. The user has to stop the scanner
+        // first — same UI-explainable contract as the source-
+        // type gate. CR round 16 on PR #584.
+        if state.scanner.is_enabled() {
+            tracing::warn!("ACARS engage rejected: scanner is running");
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(
+                AcarsEnableError::ScannerActive,
+            )));
+            return AcarsHandlerOutcome::Normal;
+        }
+
+        // Snapshot the user's PRIOR config. `configured_sample_rate`
+        // (not `sample_rate`) is the right field to capture: it's
+        // the rate the user explicitly set, before any hardware-
+        // rounding from `source.sample_rate()`. Restoring this on
+        // disengage means a subsequent re-open uses the user's
+        // intended rate.
+        let current = CurrentSourceState {
+            source_rate_hz: state.configured_sample_rate,
+            center_freq_hz: state.center_freq,
+            vfo_offset_hz: state.vfo_offset,
+            source_type: state.source_type,
+            frontend_decim: state.frontend.decim_ratio(),
+        };
+        let plan = match engage(&current) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("ACARS engage rejected: {e}");
+                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(e)));
+                return AcarsHandlerOutcome::Normal;
+            }
+        };
+
+        // Apply target geometry. On any failure, delegate to
+        // `handle_acars_engage_failure` which rolls back to the
+        // snapshot, and if THAT rollback also fails, restores
+        // in-memory state + signals teardown to the caller so
+        // the live graph and controller state can't end up
+        // diverged.
+        if let Err(err) = apply_acars_geometry(
+            state,
+            plan.target_source_rate_hz,
+            plan.target_center_hz,
+            plan.target_frontend_decim,
+        ) {
+            tracing::warn!("ACARS engage geometry-apply failed: {err}");
+            return handle_acars_engage_failure(state, dsp_tx, &plan.snapshot, err);
+        }
+
+        // Geometry locked. Pre-build the ChannelBank now (rather
+        // than on first IQ block) so init failure surfaces in
+        // the engage ack rather than as a quiet `init_failed=true`
+        // state the UI never finds out about.
+        //
+        // Use POST-APPLY values (`state.sample_rate` /
+        // `state.center_freq`) — `apply_acars_geometry` already
+        // read back `source.sample_rate()` for the live-source
+        // case, so this picks up any hardware-rounding the device
+        // applied. CR round 4 on PR #584. The Start handler
+        // additionally invalidates the bank when source comes
+        // online for the enable-while-stopped/startup-replay
+        // path; the lazy-init in `acars_decode_tap` rebuilds it
+        // at the actual streaming rate.
+        match sdr_acars::ChannelBank::new(state.sample_rate, state.center_freq, &US_SIX_CHANNELS_HZ)
+        {
+            Ok(bank) => {
+                state.acars_bank = Some(bank);
+                state.acars_init_failed = false;
+                state.acars_pre_lock = Some(plan.snapshot);
+                state.acars_stats_emitted_at = std::time::Instant::now();
+                tracing::info!("ACARS engaged: airband lock active");
+                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
+                AcarsHandlerOutcome::Normal
+            }
+            Err(e) => {
+                let err = AcarsEnableError::ChannelBankInit(e.to_string());
+                tracing::warn!("ACARS bank init failed: {err}");
+                handle_acars_engage_failure(state, dsp_tx, &plan.snapshot, err)
+            }
+        }
+    } else {
+        // Disengage. Idempotent: silently OK if already off.
+        let Some(snapshot) = state.acars_pre_lock.take() else {
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+            return AcarsHandlerOutcome::Normal;
+        };
+        let restore = disengage(&snapshot);
+
+        // Try the restore FIRST, BEFORE tearing down the bank.
+        // If `apply_acars_geometry` fails mid-flight, the
+        // controller may already be partially mutated toward
+        // the snapshot geometry — re-applying the engaged
+        // (airband) geometry as a best-effort rollback keeps
+        // the still-live bank usable, and we emit Err so the
+        // UI knows the disengage didn't take. CR round 3 on
+        // PR #584: don't drop the bank until the restore
+        // path actually succeeds.
+        if let Err(err) = apply_acars_geometry(
+            state,
+            restore.target_source_rate_hz,
+            restore.target_center_hz,
+            restore.target_frontend_decim,
+        ) {
+            tracing::error!("ACARS disengage restore failed: {err}");
+            // Best-effort: re-engage the airband geometry so the
+            // still-live bank can keep decoding at the locked
+            // rate. If THIS also fails the system is half-
+            // broken — both the snapshot's rate/center AND
+            // airband's failed to apply, so the live graph is
+            // in indeterminate state. Signal teardown to the
+            // caller via TeardownNeeded; helper no longer owns
+            // the cleanup() call to avoid recursion when invoked
+            // from inside cleanup() itself. CR rounds 14 + 18.
+            let relock = apply_acars_geometry(
+                state,
+                crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
+                crate::acars_airband_lock::ACARS_CENTER_HZ,
+                crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
+            );
+            if let Err(relock_err) = &relock {
+                tracing::error!("ACARS disengage best-effort re-lock ALSO failed: {relock_err}");
+                // Patch in-memory state from snapshot so the
+                // user's intended tuning persists across the
+                // teardown for next Start.
+                state.configured_sample_rate = snapshot.source_rate_hz;
+                state.center_freq = snapshot.center_freq_hz;
+                state.vfo_offset = snapshot.vfo_offset_hz;
+                // Force-clear ACARS session, ack Err + Ok(false)
+                // so UI snaps the toggle off. Caller will tear
+                // down the source per the TeardownNeeded contract.
+                state.acars_bank = None;
+                state.acars_init_failed = false;
+                state.acars_pre_lock = None;
+                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+                return if state.source.is_some() {
+                    AcarsHandlerOutcome::TeardownNeeded
+                } else {
+                    AcarsHandlerOutcome::Normal
+                };
+            }
+            // Re-lock succeeded. Bank stays alive at airband
+            // rate, snapshot stays for retry, UI sees Err so
+            // it knows the disengage didn't take.
+            state.acars_pre_lock = Some(snapshot);
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+            return AcarsHandlerOutcome::Normal;
+        }
+
+        // Restore succeeded — NOW it's safe to tear down the
+        // bank. Any in-flight per-block tap calls before this
+        // point would still see the bank as Some and process
+        // normally; after the assignment, subsequent tap calls
+        // see None and short-circuit.
+        state.acars_bank = None;
+        state.acars_init_failed = false;
+
+        // VFO offset restore. The controller stores it on
+        // `state.vfo_offset` (read by `rebuild_vfo` and the
+        // VFO struct). Mirror the `UiToDsp::SetVfoOffset` arm
+        // (around `controller.rs:1219`).
+        state.vfo_offset = restore.target_vfo_offset_hz;
+        if let Some(vfo) = state.vfo.as_mut() {
+            vfo.set_offset(restore.target_vfo_offset_hz);
+        }
+        tracing::info!("ACARS disengaged: source restored to snapshot");
+        let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+        AcarsHandlerOutcome::Normal
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::cast_precision_loss)]
 mod tests {
@@ -3637,5 +4512,77 @@ mod tests {
             (400..=600).contains(&count),
             "expected ~500 samples at 50 kHz, got {count}"
         );
+    }
+
+    // ACARS decode-tap unit tests (#474). Inlined here per the
+    // workspace convention (tests at file bottom in
+    // `#[cfg(test)] mod tests`); access `acars_decode_tap`
+    // directly through the module hierarchy. End-to-end
+    // engage→ack→disengage is covered by the `Engine`-API
+    // integration test in `tests/acars_pipeline_integration.rs`.
+
+    use crate::acars_airband_lock::{ACARS_CENTER_HZ, ACARS_SOURCE_RATE_HZ, US_SIX_CHANNELS_HZ};
+
+    #[test]
+    fn acars_tap_lazy_inits_bank_on_first_call_and_stays_silent_for_zero_iq() {
+        let mut bank: Option<sdr_acars::ChannelBank> = None;
+        let mut init_failed = false;
+        let (tx, rx) = mpsc::channel::<DspToUi>();
+        let iq = vec![Complex::default(); 1024];
+
+        super::acars_decode_tap(
+            &mut bank,
+            &mut init_failed,
+            ACARS_SOURCE_RATE_HZ,
+            ACARS_CENTER_HZ,
+            &US_SIX_CHANNELS_HZ,
+            &iq,
+            &tx,
+        );
+        assert!(bank.is_some(), "first call should initialize the bank");
+        assert!(!init_failed);
+        // Silent IQ produces no messages.
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn acars_tap_skips_processing_after_init_failure() {
+        let mut bank: Option<sdr_acars::ChannelBank> = None;
+        let mut init_failed = true; // Simulate prior failure.
+        let (tx, _rx) = mpsc::channel::<DspToUi>();
+        let iq = vec![Complex::default(); 1024];
+
+        super::acars_decode_tap(
+            &mut bank,
+            &mut init_failed,
+            ACARS_SOURCE_RATE_HZ,
+            ACARS_CENTER_HZ,
+            &US_SIX_CHANNELS_HZ,
+            &iq,
+            &tx,
+        );
+        assert!(bank.is_none(), "init_failed=true must short-circuit");
+        assert!(init_failed);
+    }
+
+    #[test]
+    fn acars_tap_records_init_failure_on_invalid_channel_list() {
+        let mut bank: Option<sdr_acars::ChannelBank> = None;
+        let mut init_failed = false;
+        let (tx, _rx) = mpsc::channel::<DspToUi>();
+        let iq = vec![Complex::default(); 1024];
+        let bad_channels: [f64; 6] = [0.0; 6]; // outside source bandwidth
+
+        super::acars_decode_tap(
+            &mut bank,
+            &mut init_failed,
+            ACARS_SOURCE_RATE_HZ,
+            ACARS_CENTER_HZ,
+            &bad_channels,
+            &iq,
+            &tx,
+        );
+        assert!(bank.is_none());
+        assert!(init_failed, "bad channels should set init_failed");
     }
 }

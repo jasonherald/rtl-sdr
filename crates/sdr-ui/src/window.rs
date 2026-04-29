@@ -1954,6 +1954,60 @@ fn handle_dsp_message(
                 overlay.add_toast(adw::Toast::new(message));
             }
         }
+        DspToUi::AcarsMessage(msg) => {
+            // Bounded ring: pop oldest if at cap.
+            let cap = crate::acars_config::default_recent_keep() as usize;
+            let mut ring = state.acars_recent.borrow_mut();
+            if ring.len() >= cap {
+                ring.pop_front();
+            }
+            ring.push_back((*msg).clone());
+            drop(ring);
+            state
+                .acars_total_count
+                .set(state.acars_total_count.get().saturating_add(1));
+            // No UI rendering yet — sub-project 3 wires the
+            // viewer + panel summary off these fields.
+            tracing::trace!(
+                "ACARS msg {} ({}, label {:?})",
+                state.acars_total_count.get(),
+                msg.aircraft.as_str(),
+                msg.label
+            );
+        }
+        DspToUi::AcarsChannelStats(ch_stats) => {
+            *state.acars_channel_stats.borrow_mut() = *ch_stats;
+        }
+        DspToUi::AcarsEnabledChanged(result) => {
+            match result {
+                Ok(true) => {
+                    state.acars_enabled.set(true);
+                    state.acars_total_count.set(0);
+                    state.acars_recent.borrow_mut().clear();
+                    tracing::info!("ACARS engaged");
+                }
+                Ok(false) => {
+                    state.acars_enabled.set(false);
+                    state.acars_recent.borrow_mut().clear();
+                    state.acars_total_count.set(0);
+                    *state.acars_channel_stats.borrow_mut() = [sdr_acars::ChannelStats::default();
+                        sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT];
+                    tracing::info!("ACARS disengaged");
+                }
+                Err(err) => {
+                    tracing::warn!("ACARS enable failed: {err}");
+                    // Preserve the last-known `acars_enabled`
+                    // state — `Err` doesn't tell us whether the
+                    // transition was an engage attempt (so off
+                    // is correct) or a disengage attempt (where
+                    // the DSP may still be locked, so off would
+                    // mis-state the UI). Sub-project 3 wires a
+                    // toast off this and the panel toggle handler
+                    // can clear the state explicitly when it
+                    // knows which transition the user requested.
+                }
+            }
+        }
     }
 }
 

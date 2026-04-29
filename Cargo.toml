@@ -147,6 +147,7 @@ sdr-radio = { path = "crates/sdr-radio" }
 sdr-config = { path = "crates/sdr-config" }
 sdr-radioreference = { path = "crates/sdr-radioreference" }
 sdr-sat = { path = "crates/sdr-sat" }
+sdr-acars = { path = "crates/sdr-acars" }
 sdr-lrpt = { path = "crates/sdr-lrpt" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }
@@ -267,7 +268,10 @@ bytemuck = { version = "1", features = ["derive"] }
 arrayvec = "0.7"
 
 # Complex-number arithmetic for sdr-acars MSK demodulation.
-num-complex = "0.4"
+# The `bytemuck` feature derives `Pod` + `Zeroable` on `Complex32`, enabling
+# zero-copy casts from `sdr_types::Complex` (same repr(C) f32 layout) in the
+# `acars_decode_tap` hot path.
+num-complex = { version = "0.4", features = ["bytemuck"] }
 
 # Command-line argument parsing for the sdr-acars-cli binary
 # (Task 9 of the ACARS DSP crate plan). Derive macros keep the

@@ -68,5 +68,12 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 libc.workspace = true
 
+[dev-dependencies]
+# Test-only deps for the FFI drop-policy tests on ACARS variants
+# (epic #474). Adding here rather than `[dependencies]` keeps the
+# C-ABI link surface free of crates the wire layer never references.
+sdr-acars.workspace = true
+arrayvec.workspace = true
+
 [lints]
 workspace = true

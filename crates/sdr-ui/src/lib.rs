@@ -11,6 +11,7 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod acars_config;
 pub mod antenna;
 pub mod app;
 pub mod apt_viewer;

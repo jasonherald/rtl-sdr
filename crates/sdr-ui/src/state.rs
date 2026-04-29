@@ -1,9 +1,12 @@
 //! Application state shared across GTK closures.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+use sdr_acars::{AcarsMessage, ChannelStats};
+use sdr_core::acars_airband_lock::{PreLockSnapshot, US_SIX_CHANNEL_COUNT};
 use sdr_types::DemodMode;
 
 use crate::messages::UiToDsp;
@@ -250,6 +253,22 @@ pub struct AppState {
     /// Cleared between passes via `LrptImage::clear` rather
     /// than reconstructed.
     pub lrpt_image: sdr_radio::lrpt_image::LrptImage,
+    /// ACARS toggle (mirrors persisted `acars_enabled`).
+    pub acars_enabled: Cell<bool>,
+    /// Bounded ring of recent decoded messages. Cap is set
+    /// from `acars_recent_keep_count` config (default 500).
+    pub acars_recent: RefCell<VecDeque<AcarsMessage>>,
+    /// Cumulative decoded-message count since toggle-on.
+    /// Reset by `SetAcarsEnabled(true)` — gives the UI a
+    /// running counter without scanning the bounded ring.
+    pub acars_total_count: Cell<u64>,
+    /// Latest per-channel stats, populated by the
+    /// `DspToUi::AcarsChannelStats` arm. Defaulted on init.
+    pub acars_channel_stats: RefCell<[ChannelStats; US_SIX_CHANNEL_COUNT]>,
+    /// Mirror of the DSP-side snapshot, populated when the
+    /// engage ack arrives. Lets the UI display "restoring
+    /// to `{prior_freq}`" hints on disengage.
+    pub acars_pre_lock_state: RefCell<Option<PreLockSnapshot>>,
 }
 
 impl AppState {
@@ -288,6 +307,13 @@ impl AppState {
             lrpt_viewer: RefCell::new(None),
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),
+            acars_enabled: Cell::new(false),
+            acars_recent: RefCell::new(VecDeque::with_capacity(
+                crate::acars_config::default_recent_keep() as usize,
+            )),
+            acars_total_count: Cell::new(0),
+            acars_channel_stats: RefCell::new([ChannelStats::default(); US_SIX_CHANNEL_COUNT]),
+            acars_pre_lock_state: RefCell::new(None),
         })
     }
 
@@ -352,6 +378,42 @@ mod tests {
         assert!(!state.is_running.get());
         assert!((state.center_frequency.get() - DEFAULT_CENTER_FREQUENCY_HZ).abs() < f64::EPSILON);
         assert_eq!(state.demod_mode.get(), DemodMode::Wfm);
+    }
+
+    #[test]
+    fn acars_defaults_pin_initializer_contract() {
+        // Pin the ACARS field defaults so a future regression
+        // (e.g. changing the keep-count config helper, swapping
+        // the ChannelStats default, or accidentally pre-loading
+        // a snapshot) fails this test instead of silently
+        // shipping a UI that mis-states ACARS state. Per
+        // CodeRabbit round 3 on PR #584.
+        let state = make_test_state();
+        assert!(!state.acars_enabled.get(), "ACARS toggle defaults off");
+        assert_eq!(state.acars_total_count.get(), 0, "no decoded messages yet");
+        let recent = state.acars_recent.borrow();
+        assert!(recent.is_empty(), "ring is empty on init");
+        // `VecDeque::with_capacity(n)` guarantees AT LEAST n —
+        // the allocator may round up. Pin the lower bound rather
+        // than exact equality so allocator-growth differences
+        // across toolchains don't false-fail this test. Per CR
+        // round 4 on PR #584.
+        assert!(
+            recent.capacity() >= crate::acars_config::default_recent_keep() as usize,
+            "ring capacity sourced from acars_config::default_recent_keep (>= {}, got {})",
+            crate::acars_config::default_recent_keep(),
+            recent.capacity(),
+        );
+        drop(recent);
+        assert_eq!(
+            state.acars_channel_stats.borrow().len(),
+            sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT,
+            "stats array width sourced from US_SIX_CHANNEL_COUNT"
+        );
+        assert!(
+            state.acars_pre_lock_state.borrow().is_none(),
+            "no snapshot until first engage"
+        );
     }
 
     #[test]

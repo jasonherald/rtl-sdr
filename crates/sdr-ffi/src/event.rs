@@ -763,7 +763,13 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         // yet — the macOS frontend will gain a native APT viewer
         // through its own ticket. Drop them here so the Linux UI
         // side can keep emitting without a Mac-side build break.
-        | DspToUi::AptLine(_) => return None,
+        | DspToUi::AptLine(_)
+        // ACARS variants (epic #474) aren't surfaced through the FFI
+        // layer yet — sub-project 3 is Linux-only; macOS will get
+        // its own ticket. Drop here for the same reason as AptLine.
+        | DspToUi::AcarsMessage(_)
+        | DspToUi::AcarsChannelStats(_)
+        | DspToUi::AcarsEnabledChanged(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))
@@ -1239,6 +1245,73 @@ mod tests {
         assert!(
             translate_event(&msg).is_none(),
             "AptLine must not translate to a wire event yet",
+        );
+    }
+
+    /// Build a minimal `AcarsMessage` for the FFI drop-policy
+    /// tests. `AcarsMessage` doesn't derive `Default` because
+    /// `SystemTime` has no canonical default; pin a fixture
+    /// here so the policy tests don't repeat the boilerplate.
+    fn dummy_acars_message() -> sdr_acars::AcarsMessage {
+        sdr_acars::AcarsMessage {
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            channel_idx: 0,
+            freq_hz: 131_550_000.0,
+            level_db: -42.0,
+            error_count: 0,
+            mode: b'2',
+            label: *b"H1",
+            block_id: b'A',
+            ack: b'!',
+            aircraft: arrayvec::ArrayString::from(".TEST123").unwrap_or_default(),
+            flight_id: None,
+            message_no: None,
+            text: String::new(),
+            end_of_message: true,
+        }
+    }
+
+    #[test]
+    fn translate_acars_message_is_dropped_at_ffi_boundary() {
+        // ACARS variants (epic #474) follow the same drop-here
+        // policy as `AptLine` until the macOS frontend ships its
+        // own Aviation viewer. Pin the contract: any future
+        // change that surfaces ACARS through the C ABI without
+        // also wiring the host consumer trips this assert.
+        let msg = DspToUi::AcarsMessage(Box::new(dummy_acars_message()));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsMessage must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
+    fn translate_acars_channel_stats_is_dropped_at_ffi_boundary() {
+        let msg = DspToUi::AcarsChannelStats(Box::new(
+            [sdr_acars::ChannelStats::default();
+                sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT],
+        ));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsChannelStats must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
+    fn translate_acars_enabled_changed_is_dropped_at_ffi_boundary() {
+        let msg = DspToUi::AcarsEnabledChanged(Ok(true));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsEnabledChanged(Ok) must not translate to a wire event yet",
+        );
+        let msg = DspToUi::AcarsEnabledChanged(Err(
+            sdr_core::acars_airband_lock::AcarsEnableError::UnsupportedSourceType(
+                sdr_core::messages::SourceType::File,
+            ),
+        ));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsEnabledChanged(Err) must not translate to a wire event yet",
         );
     }
 

@@ -161,6 +161,17 @@ pub enum DspToUi {
     /// `mpsc::Receiver::try_recv()` hot path that copies the
     /// returned `DspToUi` value once per drain.
     AptLine(Box<AptLine>),
+    /// One decoded ACARS frame. Boxed because `AcarsMessage`
+    /// holds an inline `String` body and `arrayvec` fields,
+    /// so the enum's stack footprint stays small.
+    AcarsMessage(Box<sdr_acars::AcarsMessage>),
+    /// Per-channel ACARS stats. Emitted no more than once per
+    /// `ACARS_STATS_EMIT_INTERVAL_MS` while ACARS is on.
+    AcarsChannelStats(Box<[sdr_acars::ChannelStats; 6]>),
+    /// Ack for `UiToDsp::SetAcarsEnabled`. `Ok(true)` after a
+    /// successful engage; `Ok(false)` after disengage; `Err`
+    /// on any failure (bank init, source retune, etc).
+    AcarsEnabledChanged(Result<bool, crate::acars_airband_lock::AcarsEnableError>),
 }
 
 /// Available source types for IQ input.
@@ -431,6 +442,10 @@ pub enum UiToDsp {
     /// starts with clean decoder state regardless of whether the
     /// source is power-cycled. Per issue #544.
     ResetImagingDecoders,
+    /// Engage or release the ACARS airband lock. `true` snapshots
+    /// the prior source config and forces (2.5 `MSps`, 130.3375 MHz,
+    /// frontend decim=1); `false` restores the snapshot.
+    SetAcarsEnabled(bool),
 }
 
 #[cfg(test)]
@@ -1078,5 +1093,24 @@ mod tests {
     fn test_reset_imaging_decoders_variant() {
         let msg = UiToDsp::ResetImagingDecoders;
         assert!(matches!(msg, UiToDsp::ResetImagingDecoders));
+    }
+
+    #[test]
+    fn acars_set_enabled_round_trips_debug() {
+        let cmd = UiToDsp::SetAcarsEnabled(true);
+        let s = format!("{cmd:?}");
+        assert!(s.contains("SetAcarsEnabled"), "got {s}");
+        assert!(s.contains("true"), "got {s}");
+    }
+
+    #[test]
+    fn acars_enabled_changed_carries_error() {
+        use crate::acars_airband_lock::AcarsEnableError;
+        let msg = DspToUi::AcarsEnabledChanged(Err(AcarsEnableError::UnsupportedSourceType(
+            crate::messages::SourceType::File,
+        )));
+        let s = format!("{msg:?}");
+        assert!(s.contains("AcarsEnabledChanged"), "got {s}");
+        assert!(s.contains("UnsupportedSourceType"), "got {s}");
     }
 }
