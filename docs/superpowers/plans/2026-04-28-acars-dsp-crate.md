@@ -991,7 +991,7 @@ SYN2  → seen 0x16        → SOH1
 SYN2  → seen 0xE9        → signal polarity flip, stay in SYN2
 SOH1  → seen 0x01 (SOH)  → TXT  (allocate buf, reset error counters)
 TXT   → push byte to buf, parity-check;
-        on 0x03 (ETX) or 0x17 (ETB) → CRC1;
+        on 0x83 (ETX with parity bit) or 0x97 (ETB with parity bit) → CRC1;
         if parity errors > MAXPERR+1 → reset to WSYN;
         if buf grows past 240 bytes → reset to WSYN
 CRC1  → record byte as crc[0]    → CRC2
@@ -1163,11 +1163,13 @@ impl FrameParser {
 
     /// Reset to look for the next frame's preamble. Called
     /// internally on END or on a hard sync loss (parity-error
-    /// overrun, frame-too-long, malformed sync, etc.).
+    /// overrun, frame-too-long, malformed sync, etc.). C
+    /// `resetAcars` (acars.c:241-245) sets `nbits = 1` here —
+    /// that's per-bit re-sync, NOT 8. Matches the C exactly.
     fn reset_to_idle(&mut self) {
         self.state = State::WaitingSyn;
         self.out_bits = 0;
-        self.n_bits = 8;
+        self.n_bits = 1; // not 8 — matches acars.c::resetAcars
         self.buf.clear();
         self.parity_errors.clear();
         self.parity_err_count = 0;
@@ -1228,10 +1230,17 @@ impl FrameParser {
         //         increment parity_err_count and push buf.len()-1
         //         into parity_errors;
         //       if parity_err_count > MAXPERR + 1: reset_to_idle();
-        //       if byte == ETX (0x03) || byte == ETB (0x17):
+        //       if byte == ETX (0x83 = 0x03|0x80, parity-applied)
+        //         || byte == ETB (0x97 = 0x17|0x80, parity-applied):
+        //         (acars.c:24-26 defines these with parity bit
+        //         already set, since the receiver compares against
+        //         on-the-wire bytes that carry the parity bit)
         //         state → Crc1;
         //       (DLE escape recovery, acars.c:325-332: if buf.len() > 20
-        //         AND byte == DLE (0x10), back up 3 bytes — buf truncate
+        //         AND byte == DLE (0x7F — note: acars.c uses
+        //         the name "DLE" for the DEL character 0x7F,
+        //         not ASCII Data Link Escape 0x10), back up
+        //         3 bytes — buf truncate
         //         to len-3 — copy out crc[0]+crc[1] from those bytes,
         //         and goto putmsg_lbl. Rare; port faithfully.)
         //       if buf.len() > 240: reset_to_idle()
