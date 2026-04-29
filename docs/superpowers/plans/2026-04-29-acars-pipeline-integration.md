@@ -1732,7 +1732,7 @@ Expected: at least one match. If empty, the install is stale — investigate bef
 
 Show the user this checklist (do NOT launch the binary yourself):
 
-```
+```text
 ACARS pipeline-integration smoke checklist:
 
 1. Launch app. Confirm no panic on startup.

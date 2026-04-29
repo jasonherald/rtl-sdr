@@ -42,6 +42,12 @@ pub const US_SIX_CHANNELS_HZ: [f64; 6] = [
     129_125_000.0,
 ];
 
+/// Cardinality of the v1 ACARS channel set. Single source of
+/// truth for the array width — call sites that resize/reset
+/// `[ChannelStats; N]` reference this rather than hardcoding
+/// `6` so a future channel-set rev only edits one place.
+pub const US_SIX_CHANNEL_COUNT: usize = US_SIX_CHANNELS_HZ.len();
+
 /// Minimum interval between `DspToUi::AcarsChannelStats`
 /// emissions. Spec calls out ~1 Hz cadence.
 pub const ACARS_STATS_EMIT_INTERVAL_MS: u64 = 1_000;
@@ -72,8 +78,11 @@ pub struct PreLockSnapshot {
 /// the UI inside `DspToUi::AcarsEnabledChanged(Err(...))`.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum AcarsEnableError {
-    /// Active source isn't an RTL-SDR (or `rtl_tcp`) — ACARS
-    /// is dongle-only in v1. Spec section "Source-type gate".
+    /// Active source isn't an RTL-SDR — ACARS is local-USB
+    /// only in v1 (network/file/`rtl_tcp` sources are rejected
+    /// by `engage` to avoid retuning a remote dongle the user
+    /// isn't physically driving). Spec section "Source-type
+    /// gate".
     #[error("ACARS reception requires an RTL-SDR source (current: {0:?})")]
     UnsupportedSourceType(SourceType),
 

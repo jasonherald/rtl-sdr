@@ -3163,7 +3163,9 @@ dependencies = [
 name = "sdr-ffi"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "libc",
+ "sdr-acars",
  "sdr-config",
  "sdr-core",
  "sdr-pipeline",

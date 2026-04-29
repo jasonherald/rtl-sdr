@@ -800,7 +800,14 @@ fn lrpt_decode_tap(
 /// caller is responsible for periodic `AcarsChannelStats`
 /// emission (handled in `process_iq_block` via the
 /// throttle in `state.acars_stats_emitted_at`).
-pub fn acars_decode_tap(
+///
+/// Visibility: private — same as the analogous
+/// `apt_decode_tap` and `lrpt_decode_tap` siblings. Inline
+/// `#[cfg(test)] mod tests` blocks at the bottom of this file
+/// exercise it directly. End-to-end pipeline integration
+/// (engage → ack → disengage) is covered by the `Engine`-API
+/// tests in `tests/acars_pipeline_integration.rs`.
+fn acars_decode_tap(
     bank: &mut Option<sdr_acars::ChannelBank>,
     init_failed: &mut bool,
     source_rate_hz: f64,
@@ -809,6 +816,23 @@ pub fn acars_decode_tap(
     iq: &[sdr_types::Complex],
     dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
 ) {
+    // Compile-time guard: `bytemuck::cast_slice::<Complex, Complex32>`
+    // below is sound because both types are `repr(C) { re: f32, im: f32 }`
+    // with `bytemuck::Pod`. If a future refactor changes either
+    // layout, this assertion fails to compile and surfaces the
+    // drift at the cast site rather than as a runtime panic.
+    const _: () = assert!(
+        std::mem::size_of::<sdr_types::Complex>() == std::mem::size_of::<num_complex::Complex32>(),
+        "sdr_types::Complex and num_complex::Complex32 must have identical size \
+         for the bytemuck zero-copy cast in acars_decode_tap"
+    );
+    const _: () = assert!(
+        std::mem::align_of::<sdr_types::Complex>()
+            == std::mem::align_of::<num_complex::Complex32>(),
+        "sdr_types::Complex and num_complex::Complex32 must have identical \
+         alignment for the bytemuck zero-copy cast in acars_decode_tap"
+    );
+
     if *init_failed {
         return;
     }
@@ -832,7 +856,9 @@ pub fn acars_decode_tap(
     let Some(bank) = bank.as_mut() else { return };
     // `sdr_types::Complex` and `num_complex::Complex32` share the
     // same `repr(C)` layout (`{f32, f32}`); both implement
-    // `bytemuck::Pod`, so the cast is zero-copy and safe.
+    // `bytemuck::Pod`, so the cast is zero-copy and safe. The
+    // `const _: () = assert!(...)` guards above pin that contract
+    // at compile time.
     let iq_c32: &[num_complex::Complex32] = bytemuck::cast_slice(iq);
     bank.process(iq_c32, |msg| {
         // Boxed because AcarsMessage is large enough that
@@ -3179,15 +3205,17 @@ fn process_iq_block(
                         && let Some(bank) = state.acars_bank.as_ref()
                     {
                         let ch_stats = bank.channels();
-                        if ch_stats.len() == 6 {
-                            let arr: [sdr_acars::ChannelStats; 6] = [
-                                ch_stats[0],
-                                ch_stats[1],
-                                ch_stats[2],
-                                ch_stats[3],
-                                ch_stats[4],
-                                ch_stats[5],
-                            ];
+                        // `<[T; N]>::try_from(&[T])` requires `T: Copy`,
+                        // which `ChannelStats` derives. Returns `Err` if
+                        // the slice length doesn't equal N — silently
+                        // drops the emission rather than panicking, so
+                        // a future channel-set width mismatch fails
+                        // visibly via missing stats updates rather than
+                        // crashing the DSP thread.
+                        if let Ok(arr) = <[sdr_acars::ChannelStats;
+                            crate::acars_airband_lock::US_SIX_CHANNEL_COUNT]>::try_from(
+                            ch_stats
+                        ) {
                             let _ = dsp_tx
                                 .send(crate::messages::DspToUi::AcarsChannelStats(Box::new(arr)));
                             state.acars_stats_emitted_at = now;
@@ -3928,5 +3956,77 @@ mod tests {
             (400..=600).contains(&count),
             "expected ~500 samples at 50 kHz, got {count}"
         );
+    }
+
+    // ACARS decode-tap unit tests (#474). Inlined here per the
+    // workspace convention (tests at file bottom in
+    // `#[cfg(test)] mod tests`); access `acars_decode_tap`
+    // directly through the module hierarchy. End-to-end
+    // engage→ack→disengage is covered by the `Engine`-API
+    // integration test in `tests/acars_pipeline_integration.rs`.
+
+    use crate::acars_airband_lock::{ACARS_CENTER_HZ, ACARS_SOURCE_RATE_HZ, US_SIX_CHANNELS_HZ};
+
+    #[test]
+    fn acars_tap_lazy_inits_bank_on_first_call_and_stays_silent_for_zero_iq() {
+        let mut bank: Option<sdr_acars::ChannelBank> = None;
+        let mut init_failed = false;
+        let (tx, rx) = mpsc::channel::<DspToUi>();
+        let iq = vec![Complex::default(); 1024];
+
+        super::acars_decode_tap(
+            &mut bank,
+            &mut init_failed,
+            ACARS_SOURCE_RATE_HZ,
+            ACARS_CENTER_HZ,
+            &US_SIX_CHANNELS_HZ,
+            &iq,
+            &tx,
+        );
+        assert!(bank.is_some(), "first call should initialize the bank");
+        assert!(!init_failed);
+        // Silent IQ produces no messages.
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn acars_tap_skips_processing_after_init_failure() {
+        let mut bank: Option<sdr_acars::ChannelBank> = None;
+        let mut init_failed = true; // Simulate prior failure.
+        let (tx, _rx) = mpsc::channel::<DspToUi>();
+        let iq = vec![Complex::default(); 1024];
+
+        super::acars_decode_tap(
+            &mut bank,
+            &mut init_failed,
+            ACARS_SOURCE_RATE_HZ,
+            ACARS_CENTER_HZ,
+            &US_SIX_CHANNELS_HZ,
+            &iq,
+            &tx,
+        );
+        assert!(bank.is_none(), "init_failed=true must short-circuit");
+        assert!(init_failed);
+    }
+
+    #[test]
+    fn acars_tap_records_init_failure_on_invalid_channel_list() {
+        let mut bank: Option<sdr_acars::ChannelBank> = None;
+        let mut init_failed = false;
+        let (tx, _rx) = mpsc::channel::<DspToUi>();
+        let iq = vec![Complex::default(); 1024];
+        let bad_channels: [f64; 6] = [0.0; 6]; // outside source bandwidth
+
+        super::acars_decode_tap(
+            &mut bank,
+            &mut init_failed,
+            ACARS_SOURCE_RATE_HZ,
+            ACARS_CENTER_HZ,
+            &bad_channels,
+            &iq,
+            &tx,
+        );
+        assert!(bank.is_none());
+        assert!(init_failed, "bad channels should set init_failed");
     }
 }

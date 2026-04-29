@@ -1990,15 +1990,21 @@ fn handle_dsp_message(
                     state.acars_enabled.set(false);
                     state.acars_recent.borrow_mut().clear();
                     state.acars_total_count.set(0);
-                    *state.acars_channel_stats.borrow_mut() =
-                        [sdr_acars::ChannelStats::default(); 6];
+                    *state.acars_channel_stats.borrow_mut() = [sdr_acars::ChannelStats::default();
+                        sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT];
                     tracing::info!("ACARS disengaged");
                 }
                 Err(err) => {
                     tracing::warn!("ACARS enable failed: {err}");
-                    state.acars_enabled.set(false);
-                    // Sub-project 3 wires a toast off this; for
-                    // sub-project 2 the warn-log is sufficient.
+                    // Preserve the last-known `acars_enabled`
+                    // state — `Err` doesn't tell us whether the
+                    // transition was an engage attempt (so off
+                    // is correct) or a disengage attempt (where
+                    // the DSP may still be locked, so off would
+                    // mis-state the UI). Sub-project 3 wires a
+                    // toast off this and the panel toggle handler
+                    // can clear the state explicitly when it
+                    // knows which transition the user requested.
                 }
             }
         }

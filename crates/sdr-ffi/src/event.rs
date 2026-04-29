@@ -1248,6 +1248,70 @@ mod tests {
         );
     }
 
+    /// Build a minimal `AcarsMessage` for the FFI drop-policy
+    /// tests. `AcarsMessage` doesn't derive `Default` because
+    /// `SystemTime` has no canonical default; pin a fixture
+    /// here so the policy tests don't repeat the boilerplate.
+    fn dummy_acars_message() -> sdr_acars::AcarsMessage {
+        sdr_acars::AcarsMessage {
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            channel_idx: 0,
+            freq_hz: 131_550_000.0,
+            level_db: -42.0,
+            error_count: 0,
+            mode: b'2',
+            label: *b"H1",
+            block_id: b'A',
+            ack: b'!',
+            aircraft: arrayvec::ArrayString::from(".TEST123").unwrap_or_default(),
+            flight_id: None,
+            message_no: None,
+            text: String::new(),
+            end_of_message: true,
+        }
+    }
+
+    #[test]
+    fn translate_acars_message_is_dropped_at_ffi_boundary() {
+        // ACARS variants (epic #474) follow the same drop-here
+        // policy as `AptLine` until the macOS frontend ships its
+        // own Aviation viewer. Pin the contract: any future
+        // change that surfaces ACARS through the C ABI without
+        // also wiring the host consumer trips this assert.
+        let msg = DspToUi::AcarsMessage(Box::new(dummy_acars_message()));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsMessage must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
+    fn translate_acars_channel_stats_is_dropped_at_ffi_boundary() {
+        let msg = DspToUi::AcarsChannelStats(Box::new([sdr_acars::ChannelStats::default(); 6]));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsChannelStats must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
+    fn translate_acars_enabled_changed_is_dropped_at_ffi_boundary() {
+        let msg = DspToUi::AcarsEnabledChanged(Ok(true));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsEnabledChanged(Ok) must not translate to a wire event yet",
+        );
+        let msg = DspToUi::AcarsEnabledChanged(Err(
+            sdr_core::acars_airband_lock::AcarsEnableError::UnsupportedSourceType(
+                sdr_core::messages::SourceType::File,
+            ),
+        ));
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsEnabledChanged(Err) must not translate to a wire event yet",
+        );
+    }
+
     #[test]
     fn rtl_tcp_state_discriminants_match_header() {
         assert_eq!(SDR_RTL_TCP_STATE_DISCONNECTED, 0);

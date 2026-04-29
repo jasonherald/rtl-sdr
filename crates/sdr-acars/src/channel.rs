@@ -61,7 +61,7 @@ struct Channel {
 }
 
 /// Per-channel statistics for the UI panel and CLI status.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct ChannelStats {
     /// Channel center frequency (Hz).
     pub freq_hz: f64,
@@ -74,6 +74,22 @@ pub struct ChannelStats {
     pub level_db: f32,
     /// Three-state lock indicator for the sidebar glyph.
     pub lock_state: ChannelLockState,
+}
+
+impl Default for ChannelStats {
+    /// Idle baseline — matches `ChannelBank::new`'s
+    /// per-channel initialization (notably `level_db = -120.0`,
+    /// the no-signal floor in dBFS, NOT 0.0 which would
+    /// inaccurately read as a strong present signal).
+    fn default() -> Self {
+        Self {
+            freq_hz: 0.0,
+            last_msg_at: None,
+            msg_count: 0,
+            level_db: -120.0,
+            lock_state: ChannelLockState::Idle,
+        }
+    }
 }
 
 /// Three-state indicator for the sidebar glyph (●/○/⚠).

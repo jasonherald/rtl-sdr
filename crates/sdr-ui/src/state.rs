@@ -308,9 +308,13 @@ impl AppState {
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),
             acars_enabled: Cell::new(false),
-            acars_recent: RefCell::new(VecDeque::with_capacity(512)),
+            acars_recent: RefCell::new(VecDeque::with_capacity(
+                crate::acars_config::default_recent_keep() as usize,
+            )),
             acars_total_count: Cell::new(0),
-            acars_channel_stats: RefCell::new([ChannelStats::default(); 6]),
+            acars_channel_stats: RefCell::new(
+                [ChannelStats::default(); sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT],
+            ),
             acars_pre_lock_state: RefCell::new(None),
         })
     }
