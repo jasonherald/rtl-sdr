@@ -43,6 +43,12 @@ pub mod messages;
 pub mod sink_slot;
 pub mod wav_writer;
 
+/// Test-only re-exports for integration tests in `tests/`.
+#[doc(hidden)]
+pub mod testing {
+    pub use crate::controller::acars_decode_tap;
+}
+
 pub use engine::{Engine, EngineError};
 pub use fft_buffer::SharedFftBuffer;
 pub use messages::{DspToUi, SourceType, UiToDsp};

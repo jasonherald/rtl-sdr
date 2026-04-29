@@ -787,6 +787,64 @@ fn lrpt_decode_tap(
     decoder.process(radio_input);
 }
 
+/// ACARS decode tap. Mirrors `lrpt_decode_tap`'s shape: takes
+/// the bank slot, init-failed flag, current geometry, IQ
+/// buffer, and `dsp_tx` as separate parameters so the call
+/// site can hold a live borrow of `state.processed_buf`.
+///
+/// Lazy-init: on the first call with `bank.is_none()` and
+/// `*init_failed == false`, builds the `ChannelBank` from
+/// `(source_rate_hz, center_hz, channels)`. If construction
+/// fails, sets `*init_failed = true` and skips subsequent
+/// calls until source-stop clears the flag (matching the
+/// LRPT pattern).
+///
+/// Per-block: feeds `iq` through `bank.process(...)` and
+/// forwards each decoded `AcarsMessage` to `dsp_tx`. The
+/// caller is responsible for periodic `AcarsChannelStats`
+/// emission (handled in `process_iq_block` via the
+/// throttle in `state.acars_stats_emitted_at`).
+pub fn acars_decode_tap(
+    bank: &mut Option<sdr_acars::ChannelBank>,
+    init_failed: &mut bool,
+    source_rate_hz: f64,
+    center_hz: f64,
+    channels: &[f64],
+    iq: &[sdr_types::Complex],
+    dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
+) {
+    if *init_failed {
+        return;
+    }
+    if bank.is_none() {
+        match sdr_acars::ChannelBank::new(source_rate_hz, center_hz, channels) {
+            Ok(b) => {
+                tracing::info!(
+                    "ACARS bank initialised: source_rate={source_rate_hz} \
+                     center={center_hz} n_channels={}",
+                    channels.len()
+                );
+                *bank = Some(b);
+            }
+            Err(e) => {
+                tracing::warn!("ACARS bank init failed: {e}");
+                *init_failed = true;
+                return;
+            }
+        }
+    }
+    let Some(bank) = bank.as_mut() else { return };
+    // `sdr_types::Complex` and `num_complex::Complex32` share the
+    // same `repr(C)` layout (`{f32, f32}`); both implement
+    // `bytemuck::Pod`, so the cast is zero-copy and safe.
+    let iq_c32: &[num_complex::Complex32] = bytemuck::cast_slice(iq);
+    bank.process(iq_c32, |msg| {
+        // Boxed because AcarsMessage is large enough that
+        // unboxed would inflate the DspToUi enum's footprint.
+        let _ = dsp_tx.send(crate::messages::DspToUi::AcarsMessage(Box::new(msg)));
+    });
+}
+
 /// Handle a single UI command.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiToDsp) {

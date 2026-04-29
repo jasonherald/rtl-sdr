@@ -44,6 +44,7 @@ sdr-sink-network.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
+num-complex.workspace = true
 
 # Audio sink. The base dep is unconditional so `controller.rs`'s
 # `use sdr_sink_audio::AudioSink;` resolves on every target — including
