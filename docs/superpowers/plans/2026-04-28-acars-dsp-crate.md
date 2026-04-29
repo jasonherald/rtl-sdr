@@ -801,22 +801,28 @@ pub trait BitSink {
 
 /// MSK demodulator state for a single ACARS channel.
 pub struct MskDemod {
-    /// VCO phase (radians).
+    /// VCO phase (radians). C `double MskPhi`.
     msk_phi: f64,
-    /// Bit-clock phase accumulator.
-    msk_clk: f64,
-    /// Bit-position counter (acarsdec MskS).
+    /// Bit-clock phase accumulator. C `float MskClk`.
+    msk_clk: f32,
+    /// Bit-position counter. C `unsigned int MskS`.
     msk_s: u32,
-    /// PLL frequency offset (acarsdec MskDf).
-    msk_df: f32,
+    /// PLL frequency offset (radians/sample). C `double MskDf`.
+    msk_df: f64,
     /// Circular buffer of post-mixer baseband samples.
     inb: [Complex32; FLEN],
-    /// Write index into `inb`.
+    /// Write index into `inb`. C `unsigned int idx`.
     idx: usize,
-    /// Per-frame matched-filter level accumulator.
-    pub(crate) lvl_sum: f32,
-    /// Bit-count for the current level window.
-    pub(crate) bit_count: u32,
+    /// Per-frame matched-filter level accumulator. C `double
+    /// MskLvlSum`. NOTE: the plan's earlier draft had this and
+    /// MskDf swapped (msk_df=f32, lvl_sum=f32) — verified
+    /// against `acarsdec.h:77-82` during the audit; the C
+    /// types are MskPhi=double, MskDf=double, MskClk=float,
+    /// MskLvlSum=double, MskBitCount=int.
+    pub(crate) lvl_sum: f64,
+    /// Bit-count for the current level window. C `int
+    /// MskBitCount`.
+    pub(crate) bit_count: i32,
     /// Matched-filter coefficients, oversampled.
     /// One copy per channel — small (133 floats, ~530 bytes).
     /// Acarsdec's static singleton is a C optimization we
