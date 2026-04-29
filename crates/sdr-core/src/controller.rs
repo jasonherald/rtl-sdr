@@ -973,27 +973,59 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                             }
                             Err(err) => {
                                 // Reassertion failed. The DSP graph
-                                // is in an indeterminate state — best
-                                // path is to disengage ACARS entirely
-                                // so the UI/DSP stay in sync.
+                                // is in an indeterminate state — the
+                                // partial mutation inside
+                                // `apply_acars_geometry` may have
+                                // already pushed source rate or
+                                // frontend toward airband before
+                                // returning Err, so we can't trust
+                                // the live pipeline matches anything
+                                // coherent.
                                 //
-                                // BEFORE force-clearing pre_lock,
-                                // copy the snapshot's tuning back
-                                // into controller state.
-                                // `apply_acars_geometry` already
-                                // mutated configured_sample_rate /
-                                // center_freq toward airband before
-                                // hitting Err, so without this the
-                                // next Start would reopen at the
-                                // airband lock even though ACARS is
-                                // now off. Same fix the cleanup-Err
-                                // branch uses (CR rounds 8 + 9).
+                                // Best-effort: try to push the live
+                                // graph back to the snapshot tuning
+                                // via a second apply_acars_geometry
+                                // call. If that succeeds, the live
+                                // graph + controller state are both
+                                // at the user's pre-engage values
+                                // and we can continue running with
+                                // ACARS off. If it ALSO fails, the
+                                // graph is unrecoverable: tear down
+                                // the source so the user gets a
+                                // clean re-Start path. CR round 10
+                                // on PR #584.
                                 tracing::error!("ACARS geometry reassert failed post-Start: {err}");
-                                if let Some(snapshot) = state.acars_pre_lock.as_ref() {
-                                    state.configured_sample_rate = snapshot.source_rate_hz;
-                                    state.center_freq = snapshot.center_freq_hz;
-                                    state.vfo_offset = snapshot.vfo_offset_hz;
+                                let snapshot_clone = state.acars_pre_lock.clone();
+                                let live_restore = match &snapshot_clone {
+                                    Some(snap) => apply_acars_geometry(
+                                        state,
+                                        snap.source_rate_hz,
+                                        snap.center_freq_hz,
+                                        snap.frontend_decim,
+                                    ),
+                                    None => Ok(()),
+                                };
+
+                                if let Err(restore_err) = &live_restore {
+                                    // Live restore failed too. Patch
+                                    // in-memory state from snapshot
+                                    // anyway so configured_sample_rate
+                                    // reflects user intent for the
+                                    // post-stop re-Start, even though
+                                    // the current live graph won't
+                                    // honor it. (apply_acars_geometry
+                                    // may have left those fields
+                                    // mid-update on its way to Err.)
+                                    if let Some(snap) = &snapshot_clone {
+                                        state.configured_sample_rate = snap.source_rate_hz;
+                                        state.center_freq = snap.center_freq_hz;
+                                        state.vfo_offset = snap.vfo_offset_hz;
+                                    }
+                                    tracing::error!(
+                                        "ACARS live-graph restore ALSO failed: {restore_err}"
+                                    );
                                 }
+
                                 state.acars_bank = None;
                                 state.acars_init_failed = false;
                                 state.acars_pre_lock = None;
@@ -1004,6 +1036,22 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 // toggle off — same pattern as
                                 // cleanup's forced-off ack (round 7).
                                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+
+                                if live_restore.is_err() {
+                                    // Tear down the source so the
+                                    // user gets a clean re-Start.
+                                    // pre_lock is None at this point,
+                                    // so cleanup()'s top-of-function
+                                    // ACARS-disengage guard skips
+                                    // (no infinite recursion through
+                                    // handle_set_acars_enabled).
+                                    tracing::error!(
+                                        "tearing down source after unrecoverable ACARS reassert failure"
+                                    );
+                                    cleanup(state, dsp_tx);
+                                    state.running = false;
+                                    let _ = dsp_tx.send(DspToUi::SourceStopped);
+                                }
                             }
                         }
                     }
