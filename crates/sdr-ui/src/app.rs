@@ -124,6 +124,17 @@ pub fn build_app_with_options(start_hidden: bool) -> adw::Application {
             .tray_first_close_seen
             .set(crate::preferences::general_page::read_tray_first_close_seen(&config));
 
+        // Replay persisted ACARS state. If `acars_enabled = true`
+        // in config, dispatch SetAcarsEnabled(true) so the DSP
+        // re-engages on app start. ACARS-related AppState fields
+        // (acars_enabled, acars_recent, acars_total_count, etc.)
+        // are populated by the DspToUi::AcarsEnabledChanged ack
+        // arm in window.rs, NOT here. Per epic #474 sub-project 2.
+        if crate::acars_config::read_acars_enabled(&config) {
+            tracing::info!("ACARS startup-replay: dispatching SetAcarsEnabled(true)");
+            state.send_dsp(crate::messages::UiToDsp::SetAcarsEnabled(true));
+        }
+
         // Default `present()` unless the autostart path passed
         // --start-hidden AND the tray is actually available. If the
         // tray is unavailable we force-present so the user isn't
