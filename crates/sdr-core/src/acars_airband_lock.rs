@@ -114,6 +114,15 @@ pub enum AcarsEnableError {
     /// resample ratio.
     #[error("VFO rebuild failed: {0}")]
     VfoRebuildFailed(String),
+
+    /// Scanner is currently running. The scanner mutates source
+    /// rate / center / decimation directly via
+    /// `apply_scanner_commands`, bypassing the `UiToDsp` dispatcher
+    /// (and therefore the airband-lock guards on those commands).
+    /// Engage refuses while the scanner is enabled — the user
+    /// must disable the scanner first. CR round 16 on PR #584.
+    #[error("ACARS cannot engage while the scanner is running")]
+    ScannerActive,
 }
 
 /// Current source-side configuration the airband-lock state

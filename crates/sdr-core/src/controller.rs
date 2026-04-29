@@ -4097,6 +4097,21 @@ fn handle_set_acars_enabled(
             return;
         }
 
+        // Refuse while the scanner is running. Scanner mutates
+        // source rate / center / decimation directly via
+        // `apply_scanner_commands`, bypassing the UiToDsp
+        // dispatcher and therefore the airband-lock guards on
+        // those commands. The user has to stop the scanner
+        // first — same UI-explainable contract as the source-
+        // type gate. CR round 16 on PR #584.
+        if state.scanner.is_enabled() {
+            tracing::warn!("ACARS engage rejected: scanner is running");
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(
+                AcarsEnableError::ScannerActive,
+            )));
+            return;
+        }
+
         // Snapshot the user's PRIOR config. `configured_sample_rate`
         // (not `sample_rate`) is the right field to capture: it's
         // the rate the user explicitly set, before any hardware-
