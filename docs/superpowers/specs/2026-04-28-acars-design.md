@@ -145,7 +145,7 @@ pub struct AcarsMessage {
 ### CLI binary
 
 ```text
-sdr-acars-cli original/acarsdec/test.wav                 # WAV input
+sdr-acars-cli crates/sdr-acars/tests/data/acars_test.wav # WAV input
 sdr-acars-cli --iq capture.cs16 --rate 2500000 \         # IQ input
               --center 130337500 \
               --channels 131.550,131.525,130.025,130.425,130.450,129.125
@@ -157,7 +157,7 @@ Output **byte-for-byte matches `acarsdec`'s text mode** (header + Mode/Label/Air
 
 - Unit tests per module: synthetic MSK tones, hand-crafted frame bytes, CRC round-trip, `syndrom` table lookups (spelling matches the C reference's `syndrom.h` and the in-tree `crates/sdr-acars/src/syndrom.rs`).
 - Property tests for CRC and parity helpers.
-- Integration test (`tests/e2e_acarsdec_compat.rs`): runs `sdr-acars-cli` and the C `acarsdec` on `original/acarsdec/test.wav`, strips volatile fields, asserts byte-equal output.
+- Integration test (`tests/e2e_acarsdec_compat.rs`): runs `sdr-acars-cli` and the C `acarsdec` on the vendored fixture `crates/sdr-acars/tests/data/acars_test.wav` (a checked-in copy of `original/acarsdec/test.wav` so the test runs without the gitignored upstream tree), strips volatile fields, asserts byte-equal output.
 - Multi-channel test: synthesize a 2.5 MSps IQ buffer with two MSK signals at known offsets; confirm both channels decode their respective messages independently with no cross-talk.
 
 ### PR sizing
