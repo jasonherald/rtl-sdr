@@ -72,6 +72,7 @@ sdr-rtltcp-discovery.workspace = true
 # Using the path form (not `workspace = true`) because current cargo
 # rejects child-side `default-features = false` when inheriting.
 sdr-server-rtltcp = { path = "../sdr-server-rtltcp", default-features = false }
+sdr-acars.workspace = true
 sdr-tray.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

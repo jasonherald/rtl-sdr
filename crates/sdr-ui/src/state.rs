@@ -1,9 +1,12 @@
 //! Application state shared across GTK closures.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::mpsc;
 
+use sdr_acars::{AcarsMessage, ChannelStats};
+use sdr_core::acars_airband_lock::PreLockSnapshot;
 use sdr_types::DemodMode;
 
 use crate::messages::UiToDsp;
@@ -250,6 +253,22 @@ pub struct AppState {
     /// Cleared between passes via `LrptImage::clear` rather
     /// than reconstructed.
     pub lrpt_image: sdr_radio::lrpt_image::LrptImage,
+    /// ACARS toggle (mirrors persisted `acars_enabled`).
+    pub acars_enabled: Cell<bool>,
+    /// Bounded ring of recent decoded messages. Cap is set
+    /// from `acars_recent_keep_count` config (default 500).
+    pub acars_recent: RefCell<VecDeque<AcarsMessage>>,
+    /// Cumulative decoded-message count since toggle-on.
+    /// Reset by `SetAcarsEnabled(true)` — gives the UI a
+    /// running counter without scanning the bounded ring.
+    pub acars_total_count: Cell<u64>,
+    /// Latest per-channel stats, populated by the
+    /// `DspToUi::AcarsChannelStats` arm. Defaulted on init.
+    pub acars_channel_stats: RefCell<[ChannelStats; 6]>,
+    /// Mirror of the DSP-side snapshot, populated when the
+    /// engage ack arrives. Lets the UI display "restoring
+    /// to `{prior_freq}`" hints on disengage.
+    pub acars_pre_lock_state: RefCell<Option<PreLockSnapshot>>,
 }
 
 impl AppState {
@@ -288,6 +307,11 @@ impl AppState {
             lrpt_viewer: RefCell::new(None),
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),
+            acars_enabled: Cell::new(false),
+            acars_recent: RefCell::new(VecDeque::with_capacity(512)),
+            acars_total_count: Cell::new(0),
+            acars_channel_stats: RefCell::new([ChannelStats::default(); 6]),
+            acars_pre_lock_state: RefCell::new(None),
         })
     }
 

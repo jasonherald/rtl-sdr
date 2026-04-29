@@ -61,7 +61,7 @@ struct Channel {
 }
 
 /// Per-channel statistics for the UI panel and CLI status.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ChannelStats {
     /// Channel center frequency (Hz).
     pub freq_hz: f64,
@@ -77,9 +77,10 @@ pub struct ChannelStats {
 }
 
 /// Three-state indicator for the sidebar glyph (●/○/⚠).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ChannelLockState {
     /// No RF energy detected.
+    #[default]
     Idle,
     /// RF energy present but no decoded frames within the
     /// recent window.
