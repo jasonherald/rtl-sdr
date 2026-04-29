@@ -538,7 +538,6 @@ struct DspState {
     /// arm; dropped by `SetAcarsEnabled(false)`, source-stop,
     /// and source-type-change auto-disable.
     /// (Consumer lands in T6 `acars_decode_tap`.)
-    #[allow(dead_code)]
     acars_bank: Option<sdr_acars::ChannelBank>,
     /// Snapshot of the prior source config taken at engage.
     /// Used by disengage to restore the user's tuning.
@@ -548,12 +547,10 @@ struct DspState {
     /// Mirrors `lrpt_init_failed` — prevents warn-spam on
     /// every subsequent IQ block. Cleared on source-stop.
     /// (Consumer lands in T6 `acars_decode_tap`.)
-    #[allow(dead_code)]
     acars_init_failed: bool,
     /// Last `DspToUi::AcarsChannelStats` emission timestamp.
     /// Throttles stats emission to ~1 Hz per spec.
     /// (Consumer lands in T8 stats-throttle in `process_iq_block`.)
-    #[allow(dead_code)]
     acars_stats_emitted_at: std::time::Instant,
 }
 
@@ -3133,6 +3130,43 @@ fn process_iq_block(
             }
 
             if processed_count > 0 {
+                // ACARS decode tap (#474). Runs at source rate
+                // (ACARS forces frontend decim=1). Tapped BEFORE
+                // the VFO so we read the full 2.5 MHz airband
+                // window unchanged. Mirror of `lrpt_decode_tap`
+                // but at source rate vs post-VFO 144 ksps.
+                if state.acars_bank.is_some() {
+                    acars_decode_tap(
+                        &mut state.acars_bank,
+                        &mut state.acars_init_failed,
+                        state.sample_rate,
+                        state.center_freq,
+                        &crate::acars_airband_lock::US_SIX_CHANNELS_HZ,
+                        &state.processed_buf[..processed_count],
+                        dsp_tx,
+                    );
+
+                    // ~1 Hz channel-stats emission throttle.
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(state.acars_stats_emitted_at);
+                    if elapsed >= std::time::Duration::from_millis(
+                        crate::acars_airband_lock::ACARS_STATS_EMIT_INTERVAL_MS,
+                    ) && let Some(bank) = state.acars_bank.as_ref()
+                    {
+                        let ch_stats = bank.channels();
+                        if ch_stats.len() == 6 {
+                            let arr: [sdr_acars::ChannelStats; 6] = [
+                                ch_stats[0], ch_stats[1], ch_stats[2],
+                                ch_stats[3], ch_stats[4], ch_stats[5],
+                            ];
+                            let _ = dsp_tx.send(
+                                crate::messages::DspToUi::AcarsChannelStats(Box::new(arr)),
+                            );
+                            state.acars_stats_emitted_at = now;
+                        }
+                    }
+                }
+
                 // Pass through RxVfo: frequency translate, resample, channel filter.
                 let radio_input = if let Some(vfo) = &mut state.vfo {
                     // Size VFO output buffer generously for resampling expansion.
