@@ -105,7 +105,7 @@ Paging transmitters are often high-power with wide coverage, so antenna demands 
 
 Transmission is organized as:
 
-```
+```text
 | Preamble        | Frame 1 | Frame 2 | ... | Frame N |
 | 576 bits (all alternating 1010...) | 544 bits each |
 ```
@@ -120,14 +120,16 @@ Each codeword is **32 bits**: 1 flag bit + 31 content bits.
 **Sync codeword** (every frame starts with this): `0x7CD215D8`. Your decoder searches for this pattern to align to frame boundaries.
 
 **Address codeword** (flag bit = 0):
-```
+
+```text
 | 0 | 18-bit pager address (top 18 bits) | 2-bit function code | 10-bit BCH | 1-bit parity |
 ```
 
 The pager's full address is 21 bits: the 18-bit address above, plus the 3-bit frame number (which of the 8 frames in the batch contained this codeword). This means 2^21 ≈ 2 million unique addresses per channel. The 2-bit function code is typically the message type/bank.
 
 **Message codeword** (flag bit = 1):
-```
+
+```text
 | 1 | 20-bit message data | 10-bit BCH | 1-bit parity |
 ```
 
@@ -146,7 +148,7 @@ A well-written BCH decoder gives you significant noise immunity. Raw POCSAG with
 
 ### 3.5 Example Decoded Message
 
-```
+```text
 POCSAG-512: Address: 1234567  Function: 0  Alpha: "CODE BLUE ROOM 412"
 POCSAG-1200: Address: 2345678  Function: 2  Numeric: "555-1234"
 ```
@@ -167,7 +169,7 @@ More complex than POCSAG — designed for higher throughput and better error cor
 
 Each frame is 1.875 seconds long and contains:
 
-```
+```text
 | Sync 1 | Frame Info | Sync 2 | Blocks (11 of them) |
 | 115 bits | 32 bits | 45 bits | 8 codewords each |
 ```
@@ -196,7 +198,7 @@ FLEX uses a **(31,21) BCH code** per codeword, plus **block interleaving** to sp
 
 ## 5. Decoder Pipeline
 
-```
+```text
 IQ samples → FM demod → lowpass → symbol slicing →
 sync word search → codeword extraction → BCH decode →
 address/message parse → text output
@@ -213,7 +215,7 @@ rtl_fm -f 152.840M -s 22050 -g 30 -o 4 - | \
 
 That's the whole pipeline — FM-demodulated PCM audio into multimon, decoded messages out. Output looks like:
 
-```
+```text
 POCSAG1200: Address: 1234567  Function: 0  Alpha: FIRE STATION 3 RESPOND
 FLEX|2026-04-22 14:32:15|1600/2/A|1234567 (GroupMsg)|Test message
 ```

@@ -17,7 +17,7 @@ A **radiosonde** is a small disposable instrument package carried aloft by a wea
 
 And broadcasts all of this via a VHF/UHF radio link on **400–406 MHz** (the "meteorological aids" band). A typical flight profile:
 
-```
+```text
 Launch (ground)
     │ ~5 m/s ascent rate
     ▼
@@ -36,7 +36,7 @@ Radiosondes launch twice daily from ~1,300 sites worldwide at synoptic times:
 - **00:00 UTC** and **12:00 UTC** (main launches)
 - Some sites also at 06:00 and 18:00 UTC
 
-In the US, the NWS operates ~70 upper-air stations. You can see the full list at https://www.weather.gov/upperair/nws_upper. Nearest ones to **Christiansburg, VA** are likely Blacksburg, VA itself, Sterling, VA (Dulles), Greensboro, NC, or Roanoke-area WSR stations. Check current operating sites; the list changes.
+In the US, the NWS operates ~70 upper-air stations (as of April 2026). You can see the full list at https://www.weather.gov/upperair/nws_upper. Nearest ones to **Christiansburg, VA** are likely Blacksburg, VA itself, Sterling, VA (Dulles), Greensboro, NC, or Roanoke-area WSR stations. Check current operating sites; the list changes.
 
 ### 1.3 Common Radiosonde Types
 
@@ -117,7 +117,7 @@ Each bit is a frequency shift: +2.4 kHz above center = 1, -2.4 kHz below = 0 (or
 
 RS41 transmits frames continuously at **2 Hz** (one frame every 500 ms). Each frame contains:
 
-```
+```text
 | Header        | Frame       | CRC | Padding |
 | 0x1016F8C4... | Varies      |     |         |
 ```
@@ -184,7 +184,7 @@ For a first-cut decoder, you can skip calibration and just output raw counts —
 
 ## 4. Decoder Pipeline
 
-```
+```text
 IQ samples → FM demod → bit timing recovery → sync marker search →
 Manchester decode → descramble → frame parse → CRC check →
 GPS position decode → track on map
@@ -222,7 +222,7 @@ So your bitstream is twice as long as the actual data. De-Manchester by taking e
 
 XOR with the RS41 scrambling sequence. The sequence is:
 
-```
+```text
 0x96, 0x83, 0x3E, 0x51, 0xB1, 0x49, 0x08, 0x98, 0x32, 0x05, 0x59, ...
 ```
 

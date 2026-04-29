@@ -77,7 +77,7 @@ The essential resource: **radioreference.com**. It maintains a community databas
 - Talkgroup lists with labels (PD dispatch, EMS, fire, schools, etc.)
 - Encryption status per talkgroup
 
-For **Montgomery County, Virginia** (where Christiansburg is), RadioReference's page will tell you exactly what to expect. Most of Southwest VA public safety is on the **Statewide Agencies Radio System (STARS)**, which is a Motorola Astro P25 Phase 2 trunked system. County EMS and fire may also have local VHF analog or their own systems.
+For **Montgomery County, Virginia** (where Christiansburg is), RadioReference's page will tell you exactly what to expect. Most of Southwest VA public safety is on the **Statewide Agencies Radio System (STARS)** (as of April 2026), which is a Motorola Astro P25 Phase 2 trunked system. County EMS and fire may also have local VHF analog or their own systems.
 
 ### 2.2 FCC License Search
 
@@ -195,7 +195,7 @@ Features:
 - Decodes P25 Phase 1 and Phase 2
 - Control channel decoding → talkgroup tracking
 - Automatic voice channel tuning
-- Encrypts passes are labeled but audio is not played
+- Encrypted passes are labeled but audio is not played
 - Works with a single RTL-SDR for small systems (site bandwidth <2 MHz)
 - Web dashboard showing active talkgroups, units, system stats
 
@@ -273,7 +273,7 @@ For P25:
 
 With OP25 decoding just the control channel, you get a live display:
 
-```
+```text
 Talkgroup    Unit      Duration    Encryption
 45201        1138452   3.2 sec     No
 45203        1138455   12.7 sec    Yes
@@ -311,7 +311,7 @@ Reasons not to:
 
 If you still want to: the stages look like:
 
-```
+```text
 IQ samples → 4FSK/QPSK demodulation → symbol sync → frame sync (NAC/CC) →
 deinterleave → FEC decode (Golay, BPTC, Trellis) → voice frame extraction →
 vocoder → PCM audio

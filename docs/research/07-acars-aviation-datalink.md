@@ -84,7 +84,7 @@ Elsewhere varies. Most commercial airliners in the US will use 131.550 by defaul
 
 Typical `acarsdec` invocation monitoring multiple channels:
 
-```
+```text
 acarsdec -r 0 131.550 131.525 130.025 130.425 130.450 129.125
 ```
 
@@ -122,7 +122,7 @@ ACARS uses **7-bit ASCII with odd parity** — each character is 7 data bits + 1
 
 An ACARS transmission consists of:
 
-```
+```text
 | Pre-key  | Bit sync   | Char sync | SOH | Mode | Address | ACK | Label | Block ID | STX | Text              | Suffix | BCS       |
 | tone     | `++++`     | `**`      | 0x01| 1 B  | 7 B     | 1 B | 2 B   | 1 B      | 0x02| variable, max ~220| ETX+ETB| 2 B CRC   |
 ```
@@ -168,7 +168,7 @@ There are hundreds of label codes in use. The **IATA/ARINC ACARS label list** do
 
 ### 3.5 Example Decoded Messages
 
-```
+```text
 [2026-04-22 14:32:15] 131.550 MHz Level: -23 dB
 .N12345 2 H1 B2 1
 EXAMINED FUEL BURN; REQUEST CLEARANCE TO FL400 FOR EFFICIENCY
@@ -188,7 +188,7 @@ The first is a readable pilot-typed request. The second is an automated performa
 
 ## 4. Decoder Pipeline
 
-```
+```text
 IQ samples → AM/FM demod → audio → MSK demod → bit recovery →
 character framing → parity check → frame assembly → CRC check → parse → output
 ```
@@ -285,12 +285,14 @@ Source: https://github.com/TLeconte/acarsdec
 Install on Arch: AUR (`acarsdec`).
 
 Usage:
-```
+
+```text
 acarsdec -o 4 -j 127.0.0.1:5555 -r 0 131.550 131.525 130.025 130.425
 ```
 
 Output (text mode):
-```
+
+```text
 [#3 (L:-21 E:-) 2026-04-22 14:32:15.123 --------------------------------
 Mode : 2 Label : H1 Id : 9 Ack : !
 Aircraft reg: .N12345 Flight id: AA1234
@@ -298,7 +300,7 @@ No: D23A
 [....MSG TEXT HERE....]
 ```
 
-### 5.2 acarsdec with Acarsdeco2, Planeplotter
+### 5.2 acarsdec with Acarsdeco2, PlanePlotter
 
 Acarsdec can forward decoded frames to aggregators. **acarsdeco2** and **PlanePlotter** are Windows alternatives.
 

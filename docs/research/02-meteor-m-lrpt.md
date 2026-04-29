@@ -18,7 +18,7 @@ LRPT is the digital downlink format used by the Russian Meteor-M weather satelli
 
 Resolution: roughly **1 km/pixel**, six spectral channels, three of which are typically transmitted simultaneously — giving you the raw material for genuine RGB color composites.
 
-### 1.2 Active Satellites (as of 2026)
+### 1.2 Active Satellites (as of April 2026)
 
 | Satellite | Frequency | Status |
 |-----------|-----------|--------|
@@ -76,7 +76,7 @@ An LNA with bandpass filtering is close to mandatory for Meteor-M. Pass rates go
 
 ### 3.1 Frame Structure (top-down)
 
-```
+```text
 Physical layer:     QPSK symbols at 72 ksym/s
   ↓
 Convolutional code: Rate 1/2, constraint length 7, Viterbi decodable
@@ -96,7 +96,7 @@ Final image: multichannel raster
 
 Four phase states, 2 bits per symbol:
 
-```
+```text
 Bits  Phase
 00    45°
 01    135°
@@ -112,7 +112,7 @@ Meteor-M uses **differentially-encoded QPSK** in some variants (to resolve phase
 
 After Viterbi decoding, you get a stream of bytes containing CCSDS Transfer Frames. Each frame is 1024 bytes:
 
-```
+```text
 | ASM    | Frame header | VCDU data field              | RS parity |
 | 4 B    | 6 B          | 882 B                        | 132 B     |
 ```
@@ -134,7 +134,7 @@ Because of the QPSK phase ambiguity (you might lock 90°, 180°, or 270° off fr
 
 Big picture:
 
-```
+```text
 IQ samples → matched filter → timing recovery → carrier recovery →
 QPSK demod → Viterbi decode → sync marker search → descramble →
 Reed-Solomon decode → CCSDS packet extraction → JPEG decode →
@@ -307,7 +307,7 @@ Other options:
 
 Similar structure to NOAA APT:
 
-```
+```text
 gpredict (pass prediction)
      │
      │  trigger on AOS (acquisition of signal)
@@ -329,7 +329,7 @@ SatDump can also run in live mode directly from an RTL-SDR, decoding in real tim
 
 **Specifications:**
 
-- **CCSDS 131.0-B-3** (TM Synchronization and Channel Coding) — covers the ASM, Viterbi, RS, and scrambling. https://public.ccsds.org/Pubs/131x0b4.pdf
+- **CCSDS 131.0-B-4** (TM Synchronization and Channel Coding) — covers the ASM, Viterbi, RS, and scrambling. https://public.ccsds.org/Pubs/131x0b4.pdf
 - **CCSDS 132.0-B-3** (TM Space Data Link Protocol) — frame format
 - **Meteor-M LRPT signal description** — informally documented; primary source is reverse-engineered from working decoders
 

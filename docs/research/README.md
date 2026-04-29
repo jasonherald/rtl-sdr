@@ -2,7 +2,7 @@
 
 Personal research notes covering each radio-reception domain we're (eventually) building support for. Written before implementation as a knowledge dump — protocol details, RF setup, decoder pipelines, prior-art tools, references. Some of this is already shipped in the app; some is for future epics.
 
-| File | Domain | Implementation status |
+| File | Domain | Implementation status (as of April 2026) |
 |---|---|---|
 | `01-noaa-apt-weather-satellites.md` | NOAA APT (137 MHz weather sats) | shipped (epic #468) |
 | `02-meteor-m-lrpt.md` | Meteor-M LRPT (137 MHz Russian weather sats) | shipped (epic #469) |

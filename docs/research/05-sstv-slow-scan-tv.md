@@ -98,7 +98,7 @@ Common modes you'll encounter:
 | **Scottie DX** | 320×256 | 4.5 min | Color RGB | Ham HF (high quality) |
 | **Robot BW** | Various | Various | Monochrome | Legacy |
 
-ISS uses **PD120** most often now; historically it's varied.
+ISS uses **PD120** most often (as of April 2026); historically the choice has varied.
 
 ---
 
@@ -120,7 +120,7 @@ So pixel brightness is the instantaneous audio frequency within 1500–2300 Hz. 
 
 Every SSTV transmission starts with a **VIS code** — a tone sequence identifying the mode:
 
-```
+```text
 | Leader | Break | Leader | VIS start | VIS bits (7+parity+stop) |
 | 1900 Hz, 300 ms | 1200 Hz, 10 ms | 1900 Hz, 300 ms | 1200 Hz, 30 ms | alternating 1100/1300 Hz, 30 ms each |
 ```
@@ -164,7 +164,7 @@ After VIS, image data begins. Each mode has its own scan line format. Example: *
 
 Timing within one PD120 line group:
 
-```
+```text
 | Sync | Porch | Y1        | R-Y       | B-Y       | Y2        |
 | 20 ms (1200 Hz) | 2.08 ms | 218.43 ms | 218.43 ms | 218.43 ms | 218.43 ms |
 ```
@@ -200,7 +200,7 @@ Covering every mode's byte-level structure is ~50 pages of dense detail. The SST
 
 ## 5. Decoder Pipeline
 
-```
+```text
 IQ samples → FM demod → 48 kHz audio → VIS detection → mode identification →
 line sync detection → FM-within-audio demod (1500–2300 Hz → brightness) →
 scan line extraction → color reconstruction → PNG
@@ -290,7 +290,7 @@ As with the other projects, there's a mature decoder. **QSSTV** (Qt SSTV) is the
 - Supports live reception from sound card
 - Command-line version exists for automation
 
-On Arch: `pacman -S qsstv` or from the AUR.
+On Arch (as of April 2026): `pacman -S qsstv` or from the AUR.
 
 For ISS SSTV events, the workflow:
 

@@ -20,7 +20,7 @@ Receive and decode VHF ACARS (Plain Old ACARS) text messages from aircraft on th
 
 ## Architecture overview
 
-```
+```text
                           ┌────────────────────────────────────────┐
 RTL-SDR @ 2.5 MSps        │ sdr-acars (NEW crate)                  │
 center 130.3375 MHz       │  ┌──────────────────────────────────┐  │
@@ -68,7 +68,7 @@ center 130.3375 MHz       │  ┌───────────────�
 
 ### Module structure
 
-```
+```text
 crates/sdr-acars/
   Cargo.toml
   src/
@@ -144,7 +144,7 @@ pub struct AcarsMessage {
 
 ### CLI binary
 
-```
+```text
 sdr-acars-cli original/acarsdec/test.wav                 # WAV input
 sdr-acars-cli --iq capture.cs16 --rate 2400000 \         # IQ input
               --center 130450000 \
@@ -229,7 +229,7 @@ acars_bank: Option<sdr_acars::ChannelBank>,  // None when disabled
 
 ### Persistence (config keys)
 
-```
+```text
 acars_enabled                   bool, default false
 acars_channel_set               enum string, default "us-6" (only value supported in v1)
 acars_recent_keep_count         u32, default 500 (no UI exposure in v1)
@@ -271,7 +271,7 @@ ActivityBarEntry {
 
 Per-channel `AdwActionRow`s showing `<glyph> <freq> <msg count> <level dB> <last msg time>`. Glyphs:
 
-```
+```text
 ●  Locked   — receiving valid frames within last 30s
 ○  Idle     — no signal detected
 ⚠  Signal   — RF energy present but no valid frames decoded
@@ -303,7 +303,7 @@ Updates throttled to 1 Hz via `DspToUi::AcarsChannelStats`.
 
 **Lifecycle of a single decoded message:**
 
-```
+```text
 DSP thread: ChannelBank emits AcarsMessage
   → controller dispatches DspToUi::AcarsMessage(boxed)
   → main loop receives on glib channel
@@ -317,7 +317,7 @@ DSP thread: ChannelBank emits AcarsMessage
 
 ### Persistence (sub-project 3 contributions)
 
-```
+```text
 acars_enabled                   already covered in sub-project 2
 ui_sidebar_left_aviation_open   standard activity-panel persistence
 ```

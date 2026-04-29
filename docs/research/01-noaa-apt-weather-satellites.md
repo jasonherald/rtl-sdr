@@ -12,7 +12,7 @@ APT is an analog image transmission format used by NOAA weather satellites since
 
 The encoding is charmingly primitive: the image brightness modulates the amplitude of a **2400 Hz audio subcarrier**, and that audio is FM-modulated onto the 137 MHz carrier. So the signal chain is:
 
-```
+```text
 Scan line → AM(2400 Hz subcarrier) → FM(137 MHz) → your dongle
 ```
 
@@ -20,7 +20,7 @@ Your decoder reverses this: FM-demodulate to recover the 2400 Hz AM audio, then 
 
 ### 1.2 Active Satellites
 
-As of 2026, the operational fleet is:
+As of April 2026, the operational fleet is:
 
 | Satellite | Frequency | Status |
 |-----------|-----------|--------|
@@ -28,7 +28,7 @@ As of 2026, the operational fleet is:
 | NOAA 18 | 137.9125 MHz | Operational |
 | NOAA 19 | 137.100 MHz | Operational |
 
-**NOAA 15's SBUV instrument and some others have failed.** APT is still working as of early 2026 but the satellite is well past its design life. If you want to catch it, now is the time.
+**NOAA 15's SBUV instrument and some others have failed.** APT is still working as of April 2026 but the satellite is well past its design life. If you want to catch it, now is the time.
 
 The European **Meteor-M series** broadcasts on nearby frequencies (137.1 / 137.9 MHz) but uses **LRPT** (digital QPSK), not APT. That's a separate project — see the LRPT guide.
 
@@ -111,7 +111,7 @@ An LNA (low-noise amplifier) at the antenna base with ~20 dB gain noticeably imp
 
 Every scan line contains two image channels side-by-side, plus sync pulses and telemetry frames. Layout of one 2080-pixel line:
 
-```
+```text
 | Sync A | Space A | Image A | Telemetry A | Sync B | Space B | Image B | Telemetry B |
 | 39 px  | 47 px   | 909 px  | 45 px       | 39 px  | 47 px   | 909 px  | 45 px       |
 ```
@@ -147,7 +147,7 @@ You can ignore these for a first-cut decoder. For calibrated thermal imagery, th
 
 ## 4. Decoder Pipeline
 
-```
+```text
 IQ samples → FM demod → resample to 11,025 Hz → AM demod (envelope) →
 sync detection → line slicing → 2D image buffer → histogram/color map → PNG
 ```
@@ -156,13 +156,13 @@ sync detection → line slicing → 2D image buffer → histogram/color map → 
 
 Standard quadrature FM discriminator. For complex samples `x[n] = I[n] + jQ[n]`:
 
-```
+```text
 audio[n] = atan2(imag(x[n] * conj(x[n-1])), real(x[n] * conj(x[n-1])))
 ```
 
 Equivalently:
 
-```
+```text
 audio[n] = atan2(I[n]*Q[n-1] - Q[n]*I[n-1],
                  I[n]*I[n-1] + Q[n]*Q[n-1])
 ```
@@ -290,7 +290,7 @@ This is what tools like `noaa-apt` (Rust-based modern decoder) and the classic `
 
 The natural architecture:
 
-```
+```text
 gpredict (or schedule script)
      │
      │  triggers on pass prediction
@@ -316,7 +316,7 @@ For a cron-style setup, `wxtrack` and `autowx2` are pre-built Python automation 
 
 ### 7.1 Record Raw IQ During a Pass
 
-```
+```text
 rtl_sdr -f 137912500 -s 2400000 -g 40 noaa18_pass.iq
 ```
 

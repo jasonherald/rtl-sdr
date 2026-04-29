@@ -15,7 +15,7 @@ ACARS over POA (Plain Old ACARS / VHF analog) tops out around **2400 bit/s** sha
 - **Proper network layer** with routing, addressing, reliable delivery
 - **AOA** (ACARS Over AVLC) — carries legacy ACARS traffic while also supporting new services
 
-Rollout began in the early 2000s and is now the primary VHF aviation data link in much of the world. Many aircraft operate VDL2 and POA ACARS simultaneously, using VDL2 where it's available and falling back.
+Rollout began in the early 2000s and (as of April 2026) is the primary VHF aviation data link in much of the world. Many aircraft operate VDL2 and POA ACARS simultaneously, using VDL2 where it's available and falling back.
 
 ### 1.2 Services Carried
 
@@ -103,7 +103,7 @@ An LNA with 136 MHz bandpass filter helps in RF-noisy environments.
 
 Constellation:
 
-```
+```text
       010
   011     001
 100         000
@@ -119,7 +119,7 @@ Differential encoding: if you want to transmit bits `bbb`, the transmitted phase
 
 VDL2 transmissions are **bursts** (not continuous). Each burst:
 
-```
+```text
 | Ramp-up | Synchronization | Transmission length | Header FEC | Data + FEC | Ramp-down |
 | 5 sym   | 16 sym          | 17 bits             | 3 bits     | variable   | 2 sym     |
 ```
@@ -136,7 +136,7 @@ Plus **BCH(32, 26)** on the header. Short, fast, protects the transmission lengt
 
 Above the physical layer, VDL2 uses **AVLC** (Aviation VHF Link Control), adapted from HDLC:
 
-```
+```text
 | Flag | Address | Control | Information | FCS | Flag |
 | 0x7E | 7 B     | 1-2 B   | variable    | 2 B | 0x7E |
 ```
@@ -161,7 +161,7 @@ For a hobbyist decoder, the most interesting content is AOA — same human-reada
 
 ## 4. Decoder Pipeline
 
-```
+```text
 IQ samples → matched filter → symbol timing → differential decode →
 symbol-to-bits → burst detection (sync correlation) → FEC decode (RS) →
 AVLC frame extraction → bit destuffing → FCS check → content parse
@@ -240,12 +240,14 @@ Features:
 Install on Arch: AUR (`dumpvdl2-git`) or build from source.
 
 Usage:
-```
+
+```text
 dumpvdl2 --rtlsdr 0 --gain 40 136725000 136775000 136875000 136900000 136925000 136975000
 ```
 
 Output example:
-```
+
+```text
 [2026-04-22 14:33:15 UTC] [136.975] [-15 dBFS]
 AVLC:
  Src: C01234 (Aircraft), Dst: B01234 (Ground Station)

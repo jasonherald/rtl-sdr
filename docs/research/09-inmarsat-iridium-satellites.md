@@ -139,7 +139,7 @@ EGC messages include:
 
 Sample decoded message:
 
-```
+```text
 EGC Message
 From: LES Burum (Netherlands) 
 To: All ships in MetArea IV
