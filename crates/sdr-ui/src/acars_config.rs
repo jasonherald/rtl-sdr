@@ -55,6 +55,14 @@ pub fn read_acars_channel_set(config: &ConfigManager) -> String {
     })
 }
 
+/// Default ring-buffer cap. Returns the spec default
+/// (`ACARS_RECENT_DEFAULT_KEEP = 500`); sub-project 3 may
+/// extend this to consult `ConfigManager` for an override.
+#[must_use]
+pub const fn default_recent_keep() -> u32 {
+    sdr_core::acars_airband_lock::ACARS_RECENT_DEFAULT_KEEP
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

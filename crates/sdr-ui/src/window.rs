@@ -1954,13 +1954,53 @@ fn handle_dsp_message(
                 overlay.add_toast(adw::Toast::new(message));
             }
         }
-        // ACARS variants (epic #474). Real handlers land in
-        // sub-project-2 Task 11; this stub keeps the match
-        // exhaustive in the meantime.
-        DspToUi::AcarsMessage(_)
-        | DspToUi::AcarsChannelStats(_)
-        | DspToUi::AcarsEnabledChanged(_) => {
-            tracing::trace!("ACARS DspToUi variant received (T11 wiring pending)");
+        DspToUi::AcarsMessage(msg) => {
+            // Bounded ring: pop oldest if at cap.
+            let cap = crate::acars_config::default_recent_keep() as usize;
+            let mut ring = state.acars_recent.borrow_mut();
+            if ring.len() >= cap {
+                ring.pop_front();
+            }
+            ring.push_back((*msg).clone());
+            drop(ring);
+            state
+                .acars_total_count
+                .set(state.acars_total_count.get().saturating_add(1));
+            // No UI rendering yet — sub-project 3 wires the
+            // viewer + panel summary off these fields.
+            tracing::trace!(
+                "ACARS msg {} ({}, label {:?})",
+                state.acars_total_count.get(),
+                msg.aircraft.as_str(),
+                msg.label
+            );
+        }
+        DspToUi::AcarsChannelStats(ch_stats) => {
+            *state.acars_channel_stats.borrow_mut() = *ch_stats;
+        }
+        DspToUi::AcarsEnabledChanged(result) => {
+            match result {
+                Ok(true) => {
+                    state.acars_enabled.set(true);
+                    state.acars_total_count.set(0);
+                    state.acars_recent.borrow_mut().clear();
+                    tracing::info!("ACARS engaged");
+                }
+                Ok(false) => {
+                    state.acars_enabled.set(false);
+                    state.acars_recent.borrow_mut().clear();
+                    state.acars_total_count.set(0);
+                    *state.acars_channel_stats.borrow_mut() =
+                        [sdr_acars::ChannelStats::default(); 6];
+                    tracing::info!("ACARS disengaged");
+                }
+                Err(err) => {
+                    tracing::warn!("ACARS enable failed: {err}");
+                    state.acars_enabled.set(false);
+                    // Sub-project 3 wires a toast off this; for
+                    // sub-project 2 the warn-log is sufficient.
+                }
+            }
         }
     }
 }
