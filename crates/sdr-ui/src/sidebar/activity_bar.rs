@@ -170,6 +170,13 @@ pub const LEFT_ACTIVITIES: &[ActivityBarEntry] = &[
         shortcut_label: "Ctrl+7",
         accelerator: "<Ctrl>7",
     },
+    ActivityBarEntry {
+        name: "aviation",
+        icon_name: "airplane-mode-symbolic",
+        display_name: "Aviation",
+        shortcut_label: "Ctrl+8",
+        accelerator: "<Ctrl>8",
+    },
 ];
 
 /// Canonical right-activity-bar entries — Transcript + Bookmarks.
