@@ -1996,15 +1996,16 @@ fn handle_dsp_message(
                 }
                 Err(err) => {
                     tracing::warn!("ACARS enable failed: {err}");
-                    // Preserve the last-known `acars_enabled`
-                    // state — `Err` doesn't tell us whether the
-                    // transition was an engage attempt (so off
-                    // is correct) or a disengage attempt (where
-                    // the DSP may still be locked, so off would
-                    // mis-state the UI). Sub-project 3 wires a
-                    // toast off this and the panel toggle handler
-                    // can clear the state explicitly when it
-                    // knows which transition the user requested.
+                    // Surface the failure as a toast so the user
+                    // sees the actionable error (e.g. "scanner is
+                    // running" or "RTL-SDR required"). Preserve
+                    // `acars_enabled` per CR round 1 on PR #584:
+                    // Err doesn't disambiguate engage-vs-disengage
+                    // failure, so silently flipping the toggle off
+                    // could mis-state the UI.
+                    if let Some(overlay) = toast_overlay_weak.upgrade() {
+                        overlay.add_toast(adw::Toast::new(&format!("ACARS: {err}")));
+                    }
                 }
             }
         }
