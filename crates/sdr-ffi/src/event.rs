@@ -763,7 +763,13 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         // yet — the macOS frontend will gain a native APT viewer
         // through its own ticket. Drop them here so the Linux UI
         // side can keep emitting without a Mac-side build break.
-        | DspToUi::AptLine(_) => return None,
+        | DspToUi::AptLine(_)
+        // ACARS variants (epic #474) aren't surfaced through the FFI
+        // layer yet — sub-project 3 is Linux-only; macOS will get
+        // its own ticket. Drop here for the same reason as AptLine.
+        | DspToUi::AcarsMessage(_)
+        | DspToUi::AcarsChannelStats(_)
+        | DspToUi::AcarsEnabledChanged(_) => return None,
     };
 
     Some((event, owned_cstring, owned_vec))

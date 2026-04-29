@@ -3121,6 +3121,7 @@ name = "sdr-core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "sdr-acars",
  "sdr-config",
  "sdr-dsp",
  "sdr-pipeline",

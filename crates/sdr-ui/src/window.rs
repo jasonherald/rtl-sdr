@@ -1954,6 +1954,14 @@ fn handle_dsp_message(
                 overlay.add_toast(adw::Toast::new(message));
             }
         }
+        // ACARS variants (epic #474). Real handlers land in
+        // sub-project-2 Task 11; this stub keeps the match
+        // exhaustive in the meantime.
+        DspToUi::AcarsMessage(_)
+        | DspToUi::AcarsChannelStats(_)
+        | DspToUi::AcarsEnabledChanged(_) => {
+            tracing::trace!("ACARS DspToUi variant received (T11 wiring pending)");
+        }
     }
 }
 
