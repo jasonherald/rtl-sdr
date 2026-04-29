@@ -1141,6 +1141,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::Tune(freq) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "Tune") {
+                return;
+            }
             tracing::debug!(frequency_hz = freq, "tune command");
             on_tune_change(state);
             state.center_freq = freq;
@@ -1288,6 +1291,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetSampleRate(rate) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetSampleRate") {
+                return;
+            }
             tracing::debug!(sample_rate = rate, "set sample rate");
             state.configured_sample_rate = rate;
             if let Some(source) = &mut state.source {
@@ -1338,6 +1344,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetDecimation(ratio) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDecimation") {
+                return;
+            }
             tracing::debug!(ratio, "set decimation");
             if let Err(e) = state.frontend.set_decimation(ratio) {
                 tracing::warn!("set decimation failed: {e}");
@@ -1480,6 +1489,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetVfoOffset(offset) => {
+            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetVfoOffset") {
+                return;
+            }
             // Expanded tracing for the #337 click-to-tune-no-audio
             // investigation: the #337 hypotheses point at a
             // display-span vs. VFO-input-sample-rate mismatch
@@ -3962,6 +3974,36 @@ fn apply_acars_geometry(
     Ok(())
 }
 
+/// Headless airband-lock enforcement. The spec ("VFO fully
+/// disabled while ACARS is on") greys these controls UI-side,
+/// but the DSP side must also reject geometry-changing
+/// `UiToDsp` commands while engaged — otherwise a stale
+/// command, an FFI consumer that doesn't know the convention,
+/// or a future scanner re-tune could mutate the live graph
+/// behind ACARS's back, leaving `acars_bank` decoding stale
+/// geometry while ACARS reads as logically engaged. Caller
+/// invokes this at the top of each geometry-mutating arm
+/// (`Tune` / `SetSampleRate` / `SetDecimation` / `SetVfoOffset`) and
+/// `return`s on `true`. CR round 14 on PR #584.
+fn acars_lock_rejects_geometry_change(
+    state: &DspState,
+    dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
+    cmd_label: &str,
+) -> bool {
+    if state.acars_pre_lock.is_some() {
+        tracing::warn!(
+            cmd = cmd_label,
+            "ACARS airband-lock active: ignoring {cmd_label} command"
+        );
+        let _ = dsp_tx.send(crate::messages::DspToUi::Error(format!(
+            "{cmd_label} ignored: ACARS airband lock is active. \
+             Disable ACARS to change tuning."
+        )));
+        return true;
+    }
+    false
+}
+
 /// Shared failure-handling for both engage failure points
 /// (geometry-apply Err, `ChannelBank::new` Err). Mirrors the
 /// post-Start reassert-failure structure: best-effort rollback
@@ -4146,16 +4188,47 @@ fn handle_set_acars_enabled(
             // Best-effort: re-engage the airband geometry so the
             // still-live bank can keep decoding at the locked
             // rate. If THIS also fails the system is half-
-            // broken, but the bank stays alive (UI keeps showing
-            // ACARS on, which is correct since the bank can
-            // theoretically still produce frames).
-            let _ = apply_acars_geometry(
+            // broken — both the snapshot's rate/center AND
+            // airband's failed to apply, so the live graph is
+            // in indeterminate state. Follow the same double-
+            // failure policy as engage / post-Start paths: tear
+            // the source down so the user gets a clean re-Start.
+            // CR round 14 on PR #584.
+            let relock = apply_acars_geometry(
                 state,
                 crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
                 crate::acars_airband_lock::ACARS_CENTER_HZ,
                 crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
             );
-            // Re-stash the snapshot so a retry can consume it.
+            if let Err(relock_err) = &relock {
+                tracing::error!("ACARS disengage best-effort re-lock ALSO failed: {relock_err}");
+                // Patch in-memory state from snapshot so the
+                // user's intended tuning persists across the
+                // teardown for next Start.
+                state.configured_sample_rate = snapshot.source_rate_hz;
+                state.center_freq = snapshot.center_freq_hz;
+                state.vfo_offset = snapshot.vfo_offset_hz;
+                // Force-clear ACARS session, ack Err + Ok(false)
+                // so UI snaps the toggle off, then tear down
+                // the source if one is active.
+                state.acars_bank = None;
+                state.acars_init_failed = false;
+                state.acars_pre_lock = None;
+                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+                if state.source.is_some() {
+                    tracing::error!(
+                        "tearing down source after unrecoverable ACARS disengage double-failure"
+                    );
+                    cleanup(state, dsp_tx);
+                    state.running = false;
+                    let _ = dsp_tx.send(DspToUi::SourceStopped);
+                }
+                return;
+            }
+            // Re-lock succeeded. Bank stays alive at airband
+            // rate, snapshot stays for retry, UI sees Err so
+            // it knows the disengage didn't take.
             state.acars_pre_lock = Some(snapshot);
             let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
             return;
