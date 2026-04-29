@@ -932,6 +932,29 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     state.running = true;
                     tracing::info!("DSP pipeline started");
 
+                    // ACARS bank coherence (epic #474). open_source
+                    // may have updated state.sample_rate to the
+                    // hardware-rounded value (especially for the
+                    // enable-while-stopped or startup-replay paths
+                    // where the engage-time bank was built before
+                    // the source was live). Drop the bank so the
+                    // lazy-init path in `acars_decode_tap` rebuilds
+                    // it at the actual streaming rate. The
+                    // `acars_pre_lock.is_some()` check is the
+                    // "ACARS is engaged" signal — bank presence
+                    // alone is insufficient because of this rebuild
+                    // pattern. Per CR round 4 on PR #584.
+                    if state.acars_pre_lock.is_some() {
+                        state.acars_bank = None;
+                        state.acars_init_failed = false;
+                        state.acars_stats_emitted_at = std::time::Instant::now();
+                        tracing::debug!(
+                            sample_rate = state.sample_rate,
+                            center_freq = state.center_freq,
+                            "ACARS bank invalidated post-Start; lazy-init will rebuild at live rate"
+                        );
+                    }
+
                     // Send display bandwidth (raw sample rate) so
                     // the spectrum display shows the full tuner
                     // bandwidth. The FFT is computed on the pre-
@@ -3205,7 +3228,14 @@ fn process_iq_block(
                 // the VFO so we read the full 2.5 MHz airband
                 // window unchanged. Mirror of `lrpt_decode_tap`
                 // but at source rate vs post-VFO 144 ksps.
-                if state.acars_bank.is_some() {
+                //
+                // Outer guard is `acars_pre_lock.is_some()` (the
+                // "ACARS engaged" signal), NOT `acars_bank.is_some()`.
+                // Otherwise the lazy-init in `acars_decode_tap`
+                // never runs after the Start path invalidates the
+                // bank for an enable-while-stopped/startup-replay
+                // path (CR round 4 on PR #584).
+                if state.acars_pre_lock.is_some() {
                     acars_decode_tap(
                         &mut state.acars_bank,
                         &mut state.acars_init_failed,
@@ -3810,11 +3840,18 @@ fn handle_set_acars_enabled(
         // than on first IQ block) so init failure surfaces in
         // the engage ack rather than as a quiet `init_failed=true`
         // state the UI never finds out about.
-        match sdr_acars::ChannelBank::new(
-            plan.target_source_rate_hz,
-            plan.target_center_hz,
-            &US_SIX_CHANNELS_HZ,
-        ) {
+        //
+        // Use POST-APPLY values (`state.sample_rate` /
+        // `state.center_freq`) — `apply_acars_geometry` already
+        // read back `source.sample_rate()` for the live-source
+        // case, so this picks up any hardware-rounding the device
+        // applied. CR round 4 on PR #584. The Start handler
+        // additionally invalidates the bank when source comes
+        // online for the enable-while-stopped/startup-replay
+        // path; the lazy-init in `acars_decode_tap` rebuilds it
+        // at the actual streaming rate.
+        match sdr_acars::ChannelBank::new(state.sample_rate, state.center_freq, &US_SIX_CHANNELS_HZ)
+        {
             Ok(bank) => {
                 state.acars_bank = Some(bank);
                 state.acars_init_failed = false;

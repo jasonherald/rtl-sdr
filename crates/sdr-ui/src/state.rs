@@ -393,10 +393,16 @@ mod tests {
         assert_eq!(state.acars_total_count.get(), 0, "no decoded messages yet");
         let recent = state.acars_recent.borrow();
         assert!(recent.is_empty(), "ring is empty on init");
-        assert_eq!(
+        // `VecDeque::with_capacity(n)` guarantees AT LEAST n —
+        // the allocator may round up. Pin the lower bound rather
+        // than exact equality so allocator-growth differences
+        // across toolchains don't false-fail this test. Per CR
+        // round 4 on PR #584.
+        assert!(
+            recent.capacity() >= crate::acars_config::default_recent_keep() as usize,
+            "ring capacity sourced from acars_config::default_recent_keep (>= {}, got {})",
+            crate::acars_config::default_recent_keep(),
             recent.capacity(),
-            crate::acars_config::default_recent_keep() as usize,
-            "ring capacity sourced from acars_config::default_recent_keep, NOT a magic literal"
         );
         drop(recent);
         assert_eq!(
