@@ -116,7 +116,7 @@ pub struct AcarsMessage {
     pub freq_hz: f64,
     pub level_db: f32,
     pub error_count: u8,        // bytes corrected by FEC
-    pub mode: char,
+    pub mode: u8,                    // ASCII mode byte (e.g. b'2')
     pub label: [u8; 2],
     pub block_id: u8,
     pub ack: u8,
@@ -359,7 +359,7 @@ Total epic: ~3,600 LOC across 3 PRs.
 
 ## References
 
-- Research doc: `~/Downloads/radio_research/07-acars-aviation-datalink.md`
+- Research doc: `docs/research/07-acars-aviation-datalink.md`
 - C reference: `original/acarsdec/` (cloned from <https://github.com/TLeconte/acarsdec>)
 - LRPT integration pattern (closest in-tree analog): `crates/sdr-core/src/controller.rs:705` (`lrpt_decode_tap`)
 - Activity-bar pattern: `crates/sdr-ui/src/sidebar/activity_bar.rs` (epic #420 redesign)
