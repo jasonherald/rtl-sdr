@@ -16,7 +16,7 @@
 |---|---|
 | `crates/sdr-core/src/acars_airband_lock.rs` | **NEW.** `PreLockSnapshot` struct + pure `engage` / `disengage` functions (compute the deltas; don't apply them). `AcarsEnableError` enum. Fully unit-testable without a controller. |
 | `crates/sdr-core/src/controller.rs` | **MODIFIED.** New fields in `DspState` (`acars_bank`, `acars_pre_lock`, `acars_init_failed`, `acars_stats_emitted_at`). New `acars_decode_tap` function (mirrors `lrpt_decode_tap` shape). New match arm for `UiToDsp::SetAcarsEnabled`. New tap call inside `process_iq_block` between `frontend.process` and the VFO branch. Source-type-change detection that auto-disables ACARS. |
-| `crates/sdr-core/src/messages.rs` | **MODIFIED.** Add `UiToDsp::SetAcarsEnabled(bool)`, `DspToUi::AcarsMessage(Box<AcarsMessage>)`, `DspToUi::AcarsChannelStats(Box<[ChannelStats; 6]>)`, `DspToUi::AcarsEnabledChanged(Result<bool, AcarsEnableError>)`. |
+| `crates/sdr-core/src/messages.rs` | **MODIFIED.** Add `UiToDsp::SetAcarsEnabled(bool)`, `DspToUi::AcarsMessage(Box<AcarsMessage>)`, `DspToUi::AcarsChannelStats(Box<[ChannelStats; US_SIX_CHANNEL_COUNT]>)`, `DspToUi::AcarsEnabledChanged(Result<bool, AcarsEnableError>)`. (`US_SIX_CHANNEL_COUNT = 6` lives in `acars_airband_lock` as the single source of truth.) |
 | `crates/sdr-core/src/lib.rs` | **MODIFIED.** Re-export the new `acars_airband_lock` module (gives external test access). |
 | `crates/sdr-core/Cargo.toml` | **MODIFIED.** Add `sdr-acars = { path = "../sdr-acars" }`. |
 | `crates/sdr-core/tests/acars_pipeline_integration.rs` | **NEW.** Headless harness: build a fixture `DspState`, dispatch `UiToDsp::SetAcarsEnabled(true)`, feed synthetic IQ through `process_iq_block`, assert `DspToUi::AcarsMessage` arrives + `acars_bank` lifecycle is correct. |
@@ -440,7 +440,9 @@ Find `pub enum DspToUi`. Add at the end of the variant list:
     AcarsMessage(Box<sdr_acars::AcarsMessage>),
     /// Per-channel ACARS stats. Emitted no more than once per
     /// `ACARS_STATS_EMIT_INTERVAL_MS` while ACARS is on.
-    AcarsChannelStats(Box<[sdr_acars::ChannelStats; 6]>),
+    AcarsChannelStats(
+        Box<[sdr_acars::ChannelStats; crate::acars_airband_lock::US_SIX_CHANNEL_COUNT]>,
+    ),
     /// Ack for `UiToDsp::SetAcarsEnabled`. `Ok(true)` after a
     /// successful engage; `Ok(false)` after disengage; `Err`
     /// on any failure (bank init, source retune, etc).
@@ -1137,12 +1139,16 @@ Add directly inside `if processed_count > 0 { ... }`, before the `let radio_inpu
                         crate::acars_airband_lock::ACARS_STATS_EMIT_INTERVAL_MS,
                     ) && let Some(bank) = state.acars_bank.as_ref()
                     {
-                        let stats = bank.channels();
-                        if stats.len() == 6 {
-                            let arr: [sdr_acars::ChannelStats; 6] = [
-                                stats[0], stats[1], stats[2],
-                                stats[3], stats[4], stats[5],
-                            ];
+                        let ch_stats = bank.channels();
+                        // `<[T; N]>::try_from(&[T])` requires `T: Copy`,
+                        // which `ChannelStats` derives. Returns `Err`
+                        // on length mismatch — silently drop the
+                        // emission rather than panic, so a future
+                        // channel-set width revision fails visibly via
+                        // missing stats updates rather than crashing.
+                        if let Ok(arr) = <[sdr_acars::ChannelStats;
+                            crate::acars_airband_lock::US_SIX_CHANNEL_COUNT]>::try_from(ch_stats)
+                        {
                             let _ = dsp_tx.send(
                                 crate::messages::DspToUi::AcarsChannelStats(Box::new(arr)),
                             );
@@ -1265,7 +1271,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use sdr_acars::{AcarsMessage, ChannelStats};
-use sdr_core::acars_airband_lock::PreLockSnapshot;
+use sdr_core::acars_airband_lock::{PreLockSnapshot, US_SIX_CHANNEL_COUNT};
 ```
 
 - [ ] **Step 2: Add the fields to `AppState`**
@@ -1284,7 +1290,7 @@ In the `pub struct AppState { ... }` definition, group near the existing imaging
     pub acars_total_count: Cell<u64>,
     /// Latest per-channel stats, populated by the
     /// `DspToUi::AcarsChannelStats` arm. Defaulted on init.
-    pub acars_channel_stats: RefCell<[ChannelStats; 6]>,
+    pub acars_channel_stats: RefCell<[ChannelStats; US_SIX_CHANNEL_COUNT]>,
     /// Mirror of the DSP-side snapshot, populated when the
     /// engage ack arrives. Lets the UI display "restoring
     /// to {prior_freq}" hints on disengage.
@@ -1299,7 +1305,7 @@ Find the `impl AppState { pub fn new(...) -> Self { Self { ... } } }`. Add to th
             acars_enabled: Cell::new(false),
             acars_recent: RefCell::new(VecDeque::with_capacity(512)),
             acars_total_count: Cell::new(0),
-            acars_channel_stats: RefCell::new([ChannelStats::default(); 6]),
+            acars_channel_stats: RefCell::new([ChannelStats::default(); US_SIX_CHANNEL_COUNT]),
             acars_pre_lock_state: RefCell::new(None),
 ```
 
@@ -1392,21 +1398,23 @@ In the `match cmd { ... }` block that handles `DspToUi`, add at the end:
                 }
                 Ok(false) => {
                     state.acars_enabled.set(false);
-                    crate::acars_config::save_acars_enabled(&state.config, false);
                     state.acars_recent.borrow_mut().clear();
                     state.acars_total_count.set(0);
-                    *state.acars_channel_stats.borrow_mut() =
-                        [sdr_acars::ChannelStats::default(); 6];
+                    *state.acars_channel_stats.borrow_mut() = [sdr_acars::ChannelStats::default();
+                        sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT];
                     tracing::info!("ACARS disengaged");
                 }
                 Err(err) => {
                     tracing::warn!("ACARS enable failed: {err}");
-                    state.acars_enabled.set(false);
-                    // Clear the persisted flag so a startup
-                    // attempt won't retry the failing config.
-                    crate::acars_config::save_acars_enabled(&state.config, false);
-                    // Sub-project 3 wires a toast off this; for
-                    // sub-project 2 the warn-log is sufficient.
+                    // Preserve the last-known `acars_enabled`
+                    // state — `Err` doesn't tell us whether the
+                    // transition was an engage attempt (so off
+                    // is correct) or a disengage attempt (where
+                    // the DSP may still be locked, so off would
+                    // mis-state the UI). Sub-project 3 wires a
+                    // toast off this and the panel toggle handler
+                    // can clear the state explicitly when it
+                    // knows which transition the user requested.
                 }
             }
         }

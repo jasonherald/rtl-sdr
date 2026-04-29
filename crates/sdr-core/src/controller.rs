@@ -1593,23 +1593,30 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetSourceType(source_type) => {
             tracing::info!(?source_type, "switching source type");
-            let was_running = state.running;
-            if was_running {
-                cleanup(state, dsp_tx);
-                state.running = false;
-            }
-            // ACARS source-type gate (epic #474). If ACARS is on
-            // and the new source isn't RTL-SDR, auto-disable
-            // (issue a synthetic disengage so the source-rate /
-            // center / VFO are restored from the snapshot and
-            // the UI gets the ack). Spec section "Source-type
-            // gate" — toggle is greyed for non-RTL-SDR sources.
+            // ACARS source-type gate (epic #474). MUST run BEFORE
+            // cleanup() — cleanup() drops state.acars_bank, which
+            // would make the `is_some()` check below trivially
+            // false and skip the synthetic disengage entirely
+            // (CR round 2 on PR #584). Running first means the
+            // disengage operates on the live old source: it can
+            // physically retune rate/center back to the snapshot
+            // values, drop the bank, and emit the
+            // AcarsEnabledChanged(Ok(false)) ack the UI is
+            // waiting on. cleanup() then stops the source as
+            // usual; the post-cleanup acars_bank=None becomes a
+            // harmless re-set since handle_set_acars_enabled
+            // already cleared it.
             if state.acars_bank.is_some() && source_type != SourceType::RtlSdr {
                 tracing::info!(
                     ?source_type,
                     "ACARS auto-disabling: source type changing to non-RTL-SDR"
                 );
                 handle_set_acars_enabled(state, false, dsp_tx);
+            }
+            let was_running = state.running;
+            if was_running {
+                cleanup(state, dsp_tx);
+                state.running = false;
             }
             state.source_type = source_type;
             // Force the rtl_tcp status row to reset when switching
@@ -3670,10 +3677,57 @@ fn process_iq_block(
     }
 }
 
+/// Apply a `(source_rate, center, frontend_decim)` triple to
+/// the controller's DSP graph in the same order `UiToDsp::SetSampleRate`
+/// uses: update `configured_sample_rate` (so re-opens see the locked
+/// rate), retune the live source (rate then center), force frontend
+/// decimation, then rebuild the frontend + VFO. Returns `Err` on the
+/// first failure WITHOUT rolling back — the caller is responsible for
+/// invoking `apply_acars_geometry` again with the prior values.
+///
+/// Used by `handle_set_acars_enabled` for both engage (apply airband)
+/// and disengage (restore snapshot). The symmetric structure keeps
+/// the two paths in lockstep — anything that needs to mutate on engage
+/// gets restored on disengage automatically.
+fn apply_acars_geometry(
+    state: &mut DspState,
+    target_source_rate_hz: f64,
+    target_center_hz: f64,
+    target_frontend_decim: u32,
+) -> Result<(), crate::acars_airband_lock::AcarsEnableError> {
+    use crate::acars_airband_lock::AcarsEnableError;
+
+    state.configured_sample_rate = target_source_rate_hz;
+    state.center_freq = target_center_hz;
+
+    if let Some(source) = state.source.as_mut() {
+        source
+            .set_sample_rate(target_source_rate_hz)
+            .map_err(|e| AcarsEnableError::SourceRetuneFailed(e.to_string()))?;
+        // Read back actual hardware rate (may differ from
+        // requested due to PLL rounding on RTL-SDR).
+        state.sample_rate = source.sample_rate();
+        source
+            .tune(target_center_hz)
+            .map_err(|e| AcarsEnableError::SourceRetuneFailed(e.to_string()))?;
+    } else {
+        state.sample_rate = target_source_rate_hz;
+    }
+
+    state
+        .frontend
+        .set_decimation(target_frontend_decim)
+        .map_err(|e| AcarsEnableError::FrontendDecimFailed(e.to_string()))?;
+
+    rebuild_frontend(state).map_err(AcarsEnableError::FrontendRebuildFailed)?;
+    rebuild_vfo(state).map_err(AcarsEnableError::VfoRebuildFailed)?;
+    Ok(())
+}
+
 /// Handler for `UiToDsp::SetAcarsEnabled`. Engages or
 /// releases the airband lock, instantiates / drops the
-/// `ChannelBank`, and emits an ack via `DspToUi`.
-#[allow(clippy::too_many_lines)]
+/// `ChannelBank`, rebuilds the DSP graph, and emits an ack
+/// via `DspToUi`.
 fn handle_set_acars_enabled(
     state: &mut DspState,
     enable: bool,
@@ -3691,8 +3745,14 @@ fn handle_set_acars_enabled(
             return;
         }
 
+        // Snapshot the user's PRIOR config. `configured_sample_rate`
+        // (not `sample_rate`) is the right field to capture: it's
+        // the rate the user explicitly set, before any hardware-
+        // rounding from `source.sample_rate()`. Restoring this on
+        // disengage means a subsequent re-open uses the user's
+        // intended rate.
         let current = CurrentSourceState {
-            source_rate_hz: state.sample_rate,
+            source_rate_hz: state.configured_sample_rate,
             center_freq_hz: state.center_freq,
             vfo_offset_hz: state.vfo_offset,
             source_type: state.source_type,
@@ -3707,45 +3767,26 @@ fn handle_set_acars_enabled(
             }
         };
 
-        // Apply target geometry to the source. ANY failure
-        // here triggers a full rollback: don't half-engage.
-        if let Some(source) = state.source.as_mut()
-            && let Err(e) = source.set_sample_rate(plan.target_source_rate_hz)
-        {
-            let err = AcarsEnableError::SourceRetuneFailed(e.to_string());
-            tracing::warn!("ACARS engage source-rate failed: {err}");
-            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
-            return;
-        }
-        state.sample_rate = plan.target_source_rate_hz;
-        state.center_freq = plan.target_center_hz;
-        if let Some(source) = state.source.as_mut()
-            && let Err(e) = source.tune(plan.target_center_hz)
-        {
-            // Roll back the rate so we don't leave the source
-            // half-tuned. (`Source::tune` is the trait method
-            // for center-freq retune — see
-            // `crates/sdr-pipeline/src/source_manager.rs`.)
-            if let Some(s) = state.source.as_mut() {
-                let _ = s.set_sample_rate(plan.snapshot.source_rate_hz);
+        // Apply target geometry. On any failure, roll back via
+        // a second apply_acars_geometry call against the snapshot
+        // values (best-effort — if the rollback ALSO fails, we log
+        // and emit the ORIGINAL error so the UI sees the actionable
+        // root cause rather than a cascading rebuild error).
+        if let Err(err) = apply_acars_geometry(
+            state,
+            plan.target_source_rate_hz,
+            plan.target_center_hz,
+            plan.target_frontend_decim,
+        ) {
+            tracing::warn!("ACARS engage geometry-apply failed: {err}");
+            if let Err(rollback_err) = apply_acars_geometry(
+                state,
+                plan.snapshot.source_rate_hz,
+                plan.snapshot.center_freq_hz,
+                plan.snapshot.frontend_decim,
+            ) {
+                tracing::error!("ACARS engage rollback ALSO failed: {rollback_err}");
             }
-            state.sample_rate = plan.snapshot.source_rate_hz;
-            state.center_freq = plan.snapshot.center_freq_hz;
-            let err = AcarsEnableError::SourceRetuneFailed(e.to_string());
-            tracing::warn!("ACARS engage center-freq failed: {err}");
-            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
-            return;
-        }
-        if let Err(e) = state.frontend.set_decimation(plan.target_frontend_decim) {
-            // Roll back rate + center.
-            if let Some(s) = state.source.as_mut() {
-                let _ = s.set_sample_rate(plan.snapshot.source_rate_hz);
-                let _ = s.tune(plan.snapshot.center_freq_hz);
-            }
-            state.sample_rate = plan.snapshot.source_rate_hz;
-            state.center_freq = plan.snapshot.center_freq_hz;
-            let err = AcarsEnableError::FrontendDecimFailed(e.to_string());
-            tracing::warn!("ACARS engage decim failed: {err}");
             let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
             return;
         }
@@ -3768,16 +3809,16 @@ fn handle_set_acars_enabled(
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
             }
             Err(e) => {
-                // Roll back source + decim.
-                if let Some(s) = state.source.as_mut() {
-                    let _ = s.set_sample_rate(plan.snapshot.source_rate_hz);
-                    let _ = s.tune(plan.snapshot.center_freq_hz);
-                }
-                let _ = state.frontend.set_decimation(plan.snapshot.frontend_decim);
-                state.sample_rate = plan.snapshot.source_rate_hz;
-                state.center_freq = plan.snapshot.center_freq_hz;
                 let err = AcarsEnableError::ChannelBankInit(e.to_string());
                 tracing::warn!("ACARS bank init failed: {err}");
+                if let Err(rollback_err) = apply_acars_geometry(
+                    state,
+                    plan.snapshot.source_rate_hz,
+                    plan.snapshot.center_freq_hz,
+                    plan.snapshot.frontend_decim,
+                ) {
+                    tracing::error!("ACARS engage rollback ALSO failed: {rollback_err}");
+                }
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
             }
         }
@@ -3792,13 +3833,25 @@ fn handle_set_acars_enabled(
         state.acars_bank = None;
         state.acars_init_failed = false;
 
-        if let Some(source) = state.source.as_mut() {
-            let _ = source.set_sample_rate(restore.target_source_rate_hz);
-            let _ = source.tune(restore.target_center_hz);
+        // Restore geometry. UNLIKE the previous implementation,
+        // we collect the result and emit Err on failure rather
+        // than silently acking Ok(false) — the UI must know if
+        // restore failed so it doesn't claim ACARS is off while
+        // the hardware/DSP graph is still locked.
+        if let Err(err) = apply_acars_geometry(
+            state,
+            restore.target_source_rate_hz,
+            restore.target_center_hz,
+            restore.target_frontend_decim,
+        ) {
+            tracing::error!("ACARS disengage restore failed: {err}");
+            // Re-store the snapshot so a subsequent disengage
+            // attempt can retry. (We took it via `.take()` above.)
+            state.acars_pre_lock = Some(snapshot);
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
+            return;
         }
-        let _ = state.frontend.set_decimation(restore.target_frontend_decim);
-        state.sample_rate = restore.target_source_rate_hz;
-        state.center_freq = restore.target_center_hz;
+
         // VFO offset restore. The controller stores it on
         // `state.vfo_offset` (read by `rebuild_vfo` and the
         // VFO struct). Mirror the `UiToDsp::SetVfoOffset` arm

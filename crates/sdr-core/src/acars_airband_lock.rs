@@ -100,6 +100,20 @@ pub enum AcarsEnableError {
     /// Frontend rejected the forced decimation factor.
     #[error("frontend rejected decim={ACARS_FRONTEND_DECIM}: {0}")]
     FrontendDecimFailed(String),
+
+    /// `rebuild_frontend` failed after rate/center change. The
+    /// `IqFrontend`'s filter taps + DC blocker are sized off the
+    /// active sample rate, so a rate change without a rebuild
+    /// leaves the DSP graph configured for the wrong geometry.
+    #[error("frontend rebuild failed: {0}")]
+    FrontendRebuildFailed(String),
+
+    /// `rebuild_vfo` failed after frontend rebuild. The `RxVfo`
+    /// resamples from frontend-effective rate to demod IF rate,
+    /// so a rate change requires a fresh VFO with the new
+    /// resample ratio.
+    #[error("VFO rebuild failed: {0}")]
+    VfoRebuildFailed(String),
 }
 
 /// Current source-side configuration the airband-lock state

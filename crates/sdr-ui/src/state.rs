@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 
 use sdr_acars::{AcarsMessage, ChannelStats};
-use sdr_core::acars_airband_lock::PreLockSnapshot;
+use sdr_core::acars_airband_lock::{PreLockSnapshot, US_SIX_CHANNEL_COUNT};
 use sdr_types::DemodMode;
 
 use crate::messages::UiToDsp;
@@ -264,7 +264,7 @@ pub struct AppState {
     pub acars_total_count: Cell<u64>,
     /// Latest per-channel stats, populated by the
     /// `DspToUi::AcarsChannelStats` arm. Defaulted on init.
-    pub acars_channel_stats: RefCell<[ChannelStats; 6]>,
+    pub acars_channel_stats: RefCell<[ChannelStats; US_SIX_CHANNEL_COUNT]>,
     /// Mirror of the DSP-side snapshot, populated when the
     /// engage ack arrives. Lets the UI display "restoring
     /// to `{prior_freq}`" hints on disengage.
@@ -312,9 +312,7 @@ impl AppState {
                 crate::acars_config::default_recent_keep() as usize,
             )),
             acars_total_count: Cell::new(0),
-            acars_channel_stats: RefCell::new(
-                [ChannelStats::default(); sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT],
-            ),
+            acars_channel_stats: RefCell::new([ChannelStats::default(); US_SIX_CHANNEL_COUNT]),
             acars_pre_lock_state: RefCell::new(None),
         })
     }
