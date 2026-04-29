@@ -46,6 +46,21 @@ pub trait BitSink {
     /// is a binary 0 (acarsdec convention — see
     /// `msk.c::putbit`).
     fn put_bit(&mut self, value: f32);
+
+    /// Polled by `MskDemod::process` after each `put_bit`.
+    /// Returning `true` tells the demodulator to toggle its
+    /// internal polarity (acarsdec `MskS ^= 2`) immediately.
+    /// ACARS uses this to recover from 180° phase slip detected
+    /// via inverted-SYN preamble — the C does the toggle
+    /// directly inside `decodeAcars` (called from `putbit`),
+    /// which means the very next bit emerges from the demod
+    /// with inverted polarity. Sinks that don't track polarity
+    /// (synthetic-test capturers, etc.) keep the default
+    /// `false`. Default is non-breaking for existing test
+    /// stubs.
+    fn take_polarity_flip(&mut self) -> bool {
+        false
+    }
 }
 
 /// MSK demodulator state for a single ACARS channel.
@@ -248,6 +263,21 @@ impl MskDemod {
                     sink.put_bit(-vo);
                 } else {
                     sink.put_bit(vo);
+                }
+                // Per-bit polarity-flip handshake: the C does
+                // `MskS ^= 2` directly inside `decodeAcars`
+                // (called from `putbit`), so the very next bit
+                // emerges with inverted polarity. Mirror that
+                // synchronous timing — `take_polarity_flip`
+                // queries the sink for a pending flip set in
+                // its byte-level state machine. Without this
+                // (we previously polled per-block via
+                // ChannelBank), the WAV-input path never
+                // recovers from inverted-SYN preambles and
+                // loses every frame on weak channels with
+                // initial 180° phase slip.
+                if sink.take_polarity_flip() {
+                    self.msk_s ^= 2;
                 }
                 self.msk_s = self.msk_s.wrapping_add(1);
 

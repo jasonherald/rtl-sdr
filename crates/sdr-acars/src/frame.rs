@@ -409,6 +409,14 @@ impl FrameParser {
 }
 
 impl BitSink for FrameParser {
+    fn take_polarity_flip(&mut self) -> bool {
+        // Delegate to the inherent method (also kept public so
+        // ChannelBank's pre-existing per-block poll keeps
+        // working — though per-block polling is now redundant
+        // for ACARS since MskDemod polls per-bit).
+        FrameParser::take_polarity_flip(self)
+    }
+
     fn put_bit(&mut self, value: f32) {
         // LSB-first byte accumulator (acarsdec putbit, msk.c:53-63):
         // shift right, set bit 7 on a positive sample. When the
