@@ -16,6 +16,7 @@ hound = { workspace = true }
 num-complex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # (Empty for now; tests use std-only assertions plus workspace fixtures.)
