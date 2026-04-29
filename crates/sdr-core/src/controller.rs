@@ -1782,17 +1782,36 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // The Start path intentionally invalidates the bank
             // for the lazy-rebuild window — bank can be None
             // while ACARS is still engaged. CR round 5 on PR #584.
-            if state.acars_pre_lock.is_some() && source_type != SourceType::RtlSdr {
-                tracing::info!(
-                    ?source_type,
-                    "ACARS auto-disabling: source type changing to non-RTL-SDR"
-                );
-                handle_set_acars_enabled(state, false, dsp_tx);
-            }
+            let acars_outcome =
+                if state.acars_pre_lock.is_some() && source_type != SourceType::RtlSdr {
+                    tracing::info!(
+                        ?source_type,
+                        "ACARS auto-disabling: source type changing to non-RTL-SDR"
+                    );
+                    handle_set_acars_enabled(state, false, dsp_tx)
+                } else {
+                    AcarsHandlerOutcome::Normal
+                };
             let was_running = state.running;
             if was_running {
                 cleanup(state, dsp_tx);
                 state.running = false;
+            }
+            // Honor TeardownNeeded from the auto-disable: if the
+            // disengage hit double-failure AND we didn't already
+            // tear down via the `was_running` branch above, do it
+            // now. The `was_running` guard handles the common case
+            // where ACARS is engaged on a live source — cleanup
+            // already ran. The fallback is for an engaged-but-
+            // somehow-not-running scenario (defensive, shouldn't
+            // happen in practice). CR round 18.
+            if matches!(acars_outcome, AcarsHandlerOutcome::TeardownNeeded) && !was_running {
+                tracing::error!(
+                    "ACARS auto-disable double-failure with !running; tearing down source"
+                );
+                cleanup(state, dsp_tx);
+                state.running = false;
+                let _ = dsp_tx.send(DspToUi::SourceStopped);
             }
             state.source_type = source_type;
             // Force the rtl_tcp status row to reset when switching
@@ -2413,7 +2432,20 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             apply_scanner_commands(state, dsp_tx, cmds);
         }
         UiToDsp::SetAcarsEnabled(enable) => {
-            handle_set_acars_enabled(state, enable, dsp_tx);
+            // Honor TeardownNeeded — handler signaled an
+            // unrecoverable double-failure, so tear down the
+            // source per the AcarsHandlerOutcome contract.
+            // CR round 18 on PR #584.
+            if matches!(
+                handle_set_acars_enabled(state, enable, dsp_tx),
+                AcarsHandlerOutcome::TeardownNeeded
+            ) && state.running
+            {
+                tracing::error!("ACARS SetAcarsEnabled double-failure; tearing down source");
+                cleanup(state, dsp_tx);
+                state.running = false;
+                let _ = dsp_tx.send(DspToUi::SourceStopped);
+            }
         }
     }
 }
@@ -3131,7 +3163,12 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // lazy-rebuild window. CR round 5 on PR #584.
     let mut acars_forced_off = false;
     if state.acars_pre_lock.is_some() {
-        handle_set_acars_enabled(state, false, dsp_tx);
+        // Cleanup is already tearing the source down, so
+        // intentionally IGNORE any TeardownNeeded outcome from
+        // the synthetic disengage — acting on it would recurse
+        // back into cleanup. The outcome is unused here on
+        // purpose; `let _ = ...` documents the intent. CR round 18.
+        let _ = handle_set_acars_enabled(state, false, dsp_tx);
         // If pre_lock is STILL Some after the call, the disengage
         // path Err'd (re-stashed the snapshot for retry).
         // handle_dsp_message in sdr-ui preserves AppState's
@@ -3994,6 +4031,40 @@ fn apply_acars_geometry(
     Ok(())
 }
 
+/// Result from `handle_set_acars_enabled` and friends, telling
+/// the caller whether the helper ran into a double-failure
+/// requiring the caller to tear down the source. Without this,
+/// helpers calling `cleanup()` themselves would either:
+///   - cascade duplicate `SourceStopped` emissions when the
+///     outer caller (e.g. `cleanup` itself, or the `Stop` arm)
+///     also wants to tear down, or
+///   - infinite-recurse when called from inside `cleanup()`
+///     (`cleanup` → `handle_set_acars_enabled` double-fail →
+///     `cleanup` again).
+///
+/// New contract: helpers do their own ACARS-state cleanup
+/// (clear `bank` / `init_failed` / `pre_lock`, restore snapshot
+/// fields, emit `AcarsEnabledChanged` acks) but DO NOT call
+/// `cleanup()` or emit `SourceStopped` themselves. Callers see
+/// `TeardownNeeded` and act per their own context —
+/// `Stop` / `SetAcarsEnabled` callers run the teardown;
+/// `cleanup` ignores the signal since it's already tearing
+/// down. CR round 18 on PR #584.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcarsHandlerOutcome {
+    /// Normal path. Caller proceeds as usual.
+    Normal,
+    /// ACARS lifecycle hit unrecoverable double-failure. Helper
+    /// has already cleared ACARS session state and emitted
+    /// `AcarsEnabledChanged(Err)` + `Ok(false)` so the UI knows.
+    /// Caller should tear down the source (`cleanup` +
+    /// `state.running = false` + `SourceStopped`) UNLESS the
+    /// caller is itself `cleanup()` (which is already handling
+    /// teardown).
+    TeardownNeeded,
+}
+
 /// Headless airband-lock enforcement. The spec ("VFO fully
 /// disabled while ACARS is on") greys these controls UI-side,
 /// but the DSP side must also reject geometry-changing
@@ -4029,15 +4100,19 @@ fn acars_lock_rejects_geometry_change(
 /// (geometry-apply Err, `ChannelBank::new` Err). Mirrors the
 /// post-Start reassert-failure structure: best-effort rollback
 /// to snapshot tuning; if rollback also fails, restore in-memory
-/// state from snapshot, clear partial ACARS session state, and
-/// tear down the live source if one is active. Always emits
-/// `AcarsEnabledChanged(Err(orig_err))`. CR round 12 on PR #584.
+/// state from snapshot and clear partial ACARS session state.
+/// Always emits `AcarsEnabledChanged(Err(orig_err))`.
+///
+/// Returns `TeardownNeeded` when the live rollback also failed
+/// AND a source is active — caller tears the source down per
+/// the [`AcarsHandlerOutcome`] contract. CR rounds 12 + 18 on
+/// PR #584.
 fn handle_acars_engage_failure(
     state: &mut DspState,
     dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
     snapshot: &crate::acars_airband_lock::PreLockSnapshot,
     orig_err: crate::acars_airband_lock::AcarsEnableError,
-) {
+) -> AcarsHandlerOutcome {
     use crate::messages::DspToUi;
 
     // Attempt rollback to snapshot tuning.
@@ -4069,16 +4144,15 @@ fn handle_acars_engage_failure(
 
     let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(orig_err)));
 
-    // If the live rollback failed AND a source is active, the
-    // live graph is in an indeterminate state we can't recover
-    // from cleanly. Tear down the source so the user gets a
-    // clean re-Start. (For engage-while-stopped, source is None
-    // and there's nothing to tear down — just leave it.)
+    // Signal teardown to caller if the live rollback failed AND
+    // a source is active. Caller decides whether to actually
+    // tear down (cleanup() already would, so it ignores this
+    // signal; SetAcarsEnabled / SetSourceType arms act on it).
     if rollback.is_err() && state.source.is_some() {
-        tracing::error!("tearing down source after unrecoverable ACARS engage failure");
-        cleanup(state, dsp_tx);
-        state.running = false;
-        let _ = dsp_tx.send(DspToUi::SourceStopped);
+        tracing::error!("ACARS engage double-failure: caller should tear down source");
+        AcarsHandlerOutcome::TeardownNeeded
+    } else {
+        AcarsHandlerOutcome::Normal
     }
 }
 
@@ -4086,12 +4160,17 @@ fn handle_acars_engage_failure(
 /// releases the airband lock, instantiates / drops the
 /// `ChannelBank`, rebuilds the DSP graph, and emits an ack
 /// via `DspToUi`.
+///
+/// Returns `TeardownNeeded` when the lifecycle hits an
+/// unrecoverable double-failure that requires source teardown
+/// per the [`AcarsHandlerOutcome`] contract. Caller MUST honor
+/// the return — see the enum docs for the contract.
 #[allow(clippy::too_many_lines)]
 fn handle_set_acars_enabled(
     state: &mut DspState,
     enable: bool,
     dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
-) {
+) -> AcarsHandlerOutcome {
     use crate::acars_airband_lock::{
         AcarsEnableError, CurrentSourceState, US_SIX_CHANNELS_HZ, disengage, engage,
     };
@@ -4111,7 +4190,7 @@ fn handle_set_acars_enabled(
             // the ACARS lock instead of the user's pre-engage
             // settings. CR round 5 on PR #584.
             let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
-            return;
+            return AcarsHandlerOutcome::Normal;
         }
 
         // Refuse while the scanner is running. Scanner mutates
@@ -4126,7 +4205,7 @@ fn handle_set_acars_enabled(
             let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(
                 AcarsEnableError::ScannerActive,
             )));
-            return;
+            return AcarsHandlerOutcome::Normal;
         }
 
         // Snapshot the user's PRIOR config. `configured_sample_rate`
@@ -4147,15 +4226,16 @@ fn handle_set_acars_enabled(
             Err(e) => {
                 tracing::warn!("ACARS engage rejected: {e}");
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(e)));
-                return;
+                return AcarsHandlerOutcome::Normal;
             }
         };
 
         // Apply target geometry. On any failure, delegate to
         // `handle_acars_engage_failure` which rolls back to the
         // snapshot, and if THAT rollback also fails, restores
-        // in-memory state + tears down the source so the live
-        // graph and controller state can't end up diverged.
+        // in-memory state + signals teardown to the caller so
+        // the live graph and controller state can't end up
+        // diverged.
         if let Err(err) = apply_acars_geometry(
             state,
             plan.target_source_rate_hz,
@@ -4163,8 +4243,7 @@ fn handle_set_acars_enabled(
             plan.target_frontend_decim,
         ) {
             tracing::warn!("ACARS engage geometry-apply failed: {err}");
-            handle_acars_engage_failure(state, dsp_tx, &plan.snapshot, err);
-            return;
+            return handle_acars_engage_failure(state, dsp_tx, &plan.snapshot, err);
         }
 
         // Geometry locked. Pre-build the ChannelBank now (rather
@@ -4190,18 +4269,19 @@ fn handle_set_acars_enabled(
                 state.acars_stats_emitted_at = std::time::Instant::now();
                 tracing::info!("ACARS engaged: airband lock active");
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
+                AcarsHandlerOutcome::Normal
             }
             Err(e) => {
                 let err = AcarsEnableError::ChannelBankInit(e.to_string());
                 tracing::warn!("ACARS bank init failed: {err}");
-                handle_acars_engage_failure(state, dsp_tx, &plan.snapshot, err);
+                handle_acars_engage_failure(state, dsp_tx, &plan.snapshot, err)
             }
         }
     } else {
         // Disengage. Idempotent: silently OK if already off.
         let Some(snapshot) = state.acars_pre_lock.take() else {
             let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
-            return;
+            return AcarsHandlerOutcome::Normal;
         };
         let restore = disengage(&snapshot);
 
@@ -4226,10 +4306,10 @@ fn handle_set_acars_enabled(
             // rate. If THIS also fails the system is half-
             // broken — both the snapshot's rate/center AND
             // airband's failed to apply, so the live graph is
-            // in indeterminate state. Follow the same double-
-            // failure policy as engage / post-Start paths: tear
-            // the source down so the user gets a clean re-Start.
-            // CR round 14 on PR #584.
+            // in indeterminate state. Signal teardown to the
+            // caller via TeardownNeeded; helper no longer owns
+            // the cleanup() call to avoid recursion when invoked
+            // from inside cleanup() itself. CR rounds 14 + 18.
             let relock = apply_acars_geometry(
                 state,
                 crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
@@ -4245,29 +4325,25 @@ fn handle_set_acars_enabled(
                 state.center_freq = snapshot.center_freq_hz;
                 state.vfo_offset = snapshot.vfo_offset_hz;
                 // Force-clear ACARS session, ack Err + Ok(false)
-                // so UI snaps the toggle off, then tear down
-                // the source if one is active.
+                // so UI snaps the toggle off. Caller will tear
+                // down the source per the TeardownNeeded contract.
                 state.acars_bank = None;
                 state.acars_init_failed = false;
                 state.acars_pre_lock = None;
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
-                if state.source.is_some() {
-                    tracing::error!(
-                        "tearing down source after unrecoverable ACARS disengage double-failure"
-                    );
-                    cleanup(state, dsp_tx);
-                    state.running = false;
-                    let _ = dsp_tx.send(DspToUi::SourceStopped);
-                }
-                return;
+                return if state.source.is_some() {
+                    AcarsHandlerOutcome::TeardownNeeded
+                } else {
+                    AcarsHandlerOutcome::Normal
+                };
             }
             // Re-lock succeeded. Bank stays alive at airband
             // rate, snapshot stays for retry, UI sees Err so
             // it knows the disengage didn't take.
             state.acars_pre_lock = Some(snapshot);
             let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
-            return;
+            return AcarsHandlerOutcome::Normal;
         }
 
         // Restore succeeded — NOW it's safe to tear down the
@@ -4288,6 +4364,7 @@ fn handle_set_acars_enabled(
         }
         tracing::info!("ACARS disengaged: source restored to snapshot");
         let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
+        AcarsHandlerOutcome::Normal
     }
 }
 
