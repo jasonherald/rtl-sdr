@@ -975,15 +975,25 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 // Reassertion failed. The DSP graph
                                 // is in an indeterminate state — best
                                 // path is to disengage ACARS entirely
-                                // so the UI/DSP stay in sync. Drop
-                                // the snapshot (no clean restore is
-                                // possible since we just failed at
-                                // applying airband, never mind
-                                // applying anything else) and emit
-                                // Err so the UI clears its toggle
-                                // via the panel handler when sub-
-                                // project 3 wires it.
+                                // so the UI/DSP stay in sync.
+                                //
+                                // BEFORE force-clearing pre_lock,
+                                // copy the snapshot's tuning back
+                                // into controller state.
+                                // `apply_acars_geometry` already
+                                // mutated configured_sample_rate /
+                                // center_freq toward airband before
+                                // hitting Err, so without this the
+                                // next Start would reopen at the
+                                // airband lock even though ACARS is
+                                // now off. Same fix the cleanup-Err
+                                // branch uses (CR rounds 8 + 9).
                                 tracing::error!("ACARS geometry reassert failed post-Start: {err}");
+                                if let Some(snapshot) = state.acars_pre_lock.as_ref() {
+                                    state.configured_sample_rate = snapshot.source_rate_hz;
+                                    state.center_freq = snapshot.center_freq_hz;
+                                    state.vfo_offset = snapshot.vfo_offset_hz;
+                                }
                                 state.acars_bank = None;
                                 state.acars_init_failed = false;
                                 state.acars_pre_lock = None;
