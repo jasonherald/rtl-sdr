@@ -22,8 +22,9 @@
 | `crates/sdr-core/tests/acars_pipeline_integration.rs` | **NEW.** Headless harness: build a fixture `DspState`, dispatch `UiToDsp::SetAcarsEnabled(true)`, feed synthetic IQ through `process_iq_block`, assert `DspToUi::AcarsMessage` arrives + `acars_bank` lifecycle is correct. |
 | `crates/sdr-ui/src/state.rs` | **MODIFIED.** New AppState fields: `acars_enabled`, `acars_recent`, `acars_total_count`, `acars_channel_stats`, `acars_pre_lock_state`. (Defer `acars_viewer_window` to sub-project 3.) |
 | `crates/sdr-ui/src/dsp_messages.rs` (or wherever DspToUi is dispatched on the UI side — confirm in Task 0) | **MODIFIED.** New match arms for the three new `DspToUi` variants — push `AcarsMessage` into the bounded ring, increment counter, store stats, log toast on `AcarsEnabledChanged(Err)`. |
-| `crates/sdr-ui/src/sidebar/acars_panel.rs` | **NEW (config-only stub).** Holds `KEY_ACARS_ENABLED`, `KEY_ACARS_CHANNEL_SET`, `KEY_ACARS_RECENT_KEEP_COUNT` constants + `read_acars_enabled` / `save_acars_enabled` helpers. **No GTK widgets in this sub-project** — the Aviation activity panel is sub-project 3. We just need the config keys defined so startup persistence works. |
-| `crates/sdr-ui/src/app.rs` (or wherever the post-DSP-ready UiToDsp dispatch lives — confirm in Task 0) | **MODIFIED.** On startup, after the DSP thread is ready, read `acars_enabled` and dispatch `SetAcarsEnabled(true)` if set. On `AcarsEnabledChanged(Err)`, clear the persisted flag. |
+| `crates/sdr-ui/src/acars_config.rs` | **NEW (config-only helper module, root-level — like `autostart.rs`).** Holds `KEY_ACARS_ENABLED`, `KEY_ACARS_CHANNEL_SET`, `KEY_ACARS_RECENT_KEEP_COUNT` constants + `read_acars_enabled` / `save_acars_enabled` helpers. **No GTK widgets in this sub-project** — the Aviation activity panel ships as `crates/sdr-ui/src/sidebar/aviation_panel.rs` in sub-project 3. We just need the config keys defined so startup persistence works. |
+| `crates/sdr-ui/src/window.rs:~1442` (`DspToUi::FftData` match arm) | **MODIFIED.** Adds three new arms (`AcarsMessage`, `AcarsChannelStats`, `AcarsEnabledChanged`). |
+| `crates/sdr-ui/src/app.rs:~78` (`app.connect_activate` callback) | **MODIFIED.** On startup, after the DSP thread is ready, read `acars_enabled` and dispatch `SetAcarsEnabled(true)` if set. On `AcarsEnabledChanged(Err)`, clear the persisted flag. (Lives alongside the existing `read_close_to_tray` startup hydration around `app.rs:120`.) |
 
 ---
 
@@ -509,30 +510,33 @@ git commit -m "feat(sdr-core): UiToDsp::SetAcarsEnabled + 3 DspToUi ACARS varian
 ## Task 4: Config keys for ACARS
 
 **Files:**
-- Create: `crates/sdr-ui/src/sidebar/acars_panel.rs`
-- Modify: `crates/sdr-ui/src/sidebar/mod.rs` (add `pub mod acars_panel;`)
+- Create: `crates/sdr-ui/src/acars_config.rs` (root-level helper, not under `sidebar/` — analog of `crates/sdr-ui/src/autostart.rs`)
+- Modify: `crates/sdr-ui/src/lib.rs` (add `pub mod acars_config;`)
 
-This task adds **only** the config-key constants and read/save helpers — no GTK widgets. The Aviation activity panel is sub-project 3.
+This task adds **only** the config-key constants and read/save helpers — no GTK widgets. The Aviation activity panel ships at `sidebar/aviation_panel.rs` in sub-project 3. We pick a root-level module name (`acars_config.rs`) rather than `sidebar/acars_panel.rs` so we don't collide with the sub-project-3 panel and so the file's responsibility is unambiguous (config persistence, not widgets).
+
+> **API note.** `sdr_config::ConfigManager` does NOT expose `get_bool` / `set_bool`. Its only accessors are the closure-based `read<F, R>(&self, f: F) -> R` and `write<F, R>(&self, f: F) -> R`. Mirror the existing `read_close_to_tray` pattern in `crates/sdr-ui/src/preferences/general_page.rs:37-43`.
 
 - [ ] **Step 1: Add the module declaration**
 
-Open `crates/sdr-ui/src/sidebar/mod.rs`. Find the existing `pub mod ...;` block. Add (alphabetical):
+Open `crates/sdr-ui/src/lib.rs`. Find the existing `pub mod ...;` block (alphabetical). Add:
 
 ```rust
-pub mod acars_panel;
+pub mod acars_config;
 ```
 
 - [ ] **Step 2: Create the new module**
 
-Create `crates/sdr-ui/src/sidebar/acars_panel.rs`:
+Create `crates/sdr-ui/src/acars_config.rs`:
 
 ```rust
 //! ACARS config-key holders + read/save helpers.
 //!
 //! This module deliberately holds no GTK widgets — the
 //! Aviation activity panel ships in sub-project 3 of epic
-//! #474. Sub-project 2 (pipeline integration) only needs
-//! the keys + helpers so app startup persistence works.
+//! #474 as `crates/sdr-ui/src/sidebar/aviation_panel.rs`.
+//! Sub-project 2 (pipeline integration) only needs the
+//! keys + helpers so app startup persistence works.
 
 use sdr_config::ConfigManager;
 
@@ -552,27 +556,35 @@ const DEFAULT_ACARS_ENABLED: bool = false;
 const DEFAULT_ACARS_CHANNEL_SET: &str = "us-6";
 
 /// Read the persisted ACARS-enabled flag, defaulting to
-/// `DEFAULT_ACARS_ENABLED` if absent.
+/// `DEFAULT_ACARS_ENABLED` if absent. Mirrors the
+/// `read_close_to_tray` callback pattern in
+/// `crates/sdr-ui/src/preferences/general_page.rs`.
 #[must_use]
 pub fn read_acars_enabled(config: &ConfigManager) -> bool {
-    config
-        .get_bool(KEY_ACARS_ENABLED)
-        .unwrap_or(DEFAULT_ACARS_ENABLED)
+    config.read(|v| {
+        v.get(KEY_ACARS_ENABLED)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(DEFAULT_ACARS_ENABLED)
+    })
 }
 
-/// Persist the ACARS-enabled flag.
+/// Persist the ACARS-enabled flag via `ConfigManager::write`.
 pub fn save_acars_enabled(config: &ConfigManager, value: bool) {
-    config.set_bool(KEY_ACARS_ENABLED, value);
+    config.write(|v| {
+        v[KEY_ACARS_ENABLED] = serde_json::json!(value);
+    });
 }
 
 /// Read the persisted channel-set string. Returns the default
 /// (`"us-6"`) if absent or empty.
 #[must_use]
 pub fn read_acars_channel_set(config: &ConfigManager) -> String {
-    config
-        .get_string(KEY_ACARS_CHANNEL_SET)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_ACARS_CHANNEL_SET.to_string())
+    config.read(|v| {
+        v.get(KEY_ACARS_CHANNEL_SET)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| DEFAULT_ACARS_CHANNEL_SET.to_string(), str::to_string)
+    })
 }
 
 #[cfg(test)]
@@ -605,26 +617,18 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Verify the `ConfigManager` test constructor matches**
+- [ ] **Step 3: Run tests**
 
 ```bash
-grep -rn "ConfigManager::in_memory\|ConfigManager::new" crates/sdr-ui/src/sidebar/ crates/sdr-config/src/ | head -10
-```
-
-If the rest of the workspace uses a different test constructor (e.g. `ConfigManager::test()` or `ConfigManager::with_path`), update the `fresh_config()` helper to match. Do not invent a new constructor — use whatever `crates/sdr-ui/src/sidebar/general_page.rs` or `audio_panel.rs` use in their tests.
-
-- [ ] **Step 4: Run tests**
-
-```bash
-cargo test -p sdr-ui --lib sidebar::acars_panel 2>&1 | tail -10
+cargo test -p sdr-ui --lib acars_config 2>&1 | tail -10
 ```
 
 Expected: 2 tests pass.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add crates/sdr-ui/src/sidebar/acars_panel.rs crates/sdr-ui/src/sidebar/mod.rs
+git add crates/sdr-ui/src/acars_config.rs crates/sdr-ui/src/lib.rs
 git commit -m "feat(sdr-ui): ACARS config keys (acars_enabled / channel_set / keep_count)"
 ```
 
@@ -1357,7 +1361,7 @@ In the `match cmd { ... }` block that handles `DspToUi`, add at the end:
 ```rust
         DspToUi::AcarsMessage(msg) => {
             // Bounded ring: pop oldest if at cap.
-            let cap = sidebar::acars_panel::default_recent_keep() as usize;
+            let cap = crate::acars_config::default_recent_keep() as usize;
             let mut ring = state.acars_recent.borrow_mut();
             if ring.len() >= cap {
                 ring.pop_front();
@@ -1383,12 +1387,12 @@ In the `match cmd { ... }` block that handles `DspToUi`, add at the end:
             match result {
                 Ok(true) => {
                     state.acars_enabled.set(true);
-                    sidebar::acars_panel::save_acars_enabled(&state.config, true);
+                    crate::acars_config::save_acars_enabled(&state.config, true);
                     tracing::info!("ACARS engaged");
                 }
                 Ok(false) => {
                     state.acars_enabled.set(false);
-                    sidebar::acars_panel::save_acars_enabled(&state.config, false);
+                    crate::acars_config::save_acars_enabled(&state.config, false);
                     state.acars_recent.borrow_mut().clear();
                     state.acars_total_count.set(0);
                     *state.acars_channel_stats.borrow_mut() =
@@ -1400,7 +1404,7 @@ In the `match cmd { ... }` block that handles `DspToUi`, add at the end:
                     state.acars_enabled.set(false);
                     // Clear the persisted flag so a startup
                     // attempt won't retry the failing config.
-                    sidebar::acars_panel::save_acars_enabled(&state.config, false);
+                    crate::acars_config::save_acars_enabled(&state.config, false);
                     // Sub-project 3 wires a toast off this; for
                     // sub-project 2 the warn-log is sufficient.
                 }
@@ -1410,7 +1414,7 @@ In the `match cmd { ... }` block that handles `DspToUi`, add at the end:
 
 - [ ] **Step 2: Add a helper for the keep-count default**
 
-In `crates/sdr-ui/src/sidebar/acars_panel.rs`, append:
+In `crates/sdr-ui/src/acars_config.rs`, append:
 
 ```rust
 /// Default ring-buffer cap. Honors a config override of
@@ -1475,7 +1479,7 @@ The plan's "post-DSP-ready" path is wherever the UI sends `UiToDsp::Start` after
 // re-engages on app start. On failure, the
 // `AcarsEnabledChanged(Err(_))` arm clears the persisted
 // flag so a subsequent restart won't retry.
-if sidebar::acars_panel::read_acars_enabled(&state.config) {
+if crate::acars_config::read_acars_enabled(&state.config) {
     let _ = ui_to_dsp_tx.send(UiToDsp::SetAcarsEnabled(true));
     tracing::info!("ACARS startup-replay: dispatching SetAcarsEnabled(true)");
 }
