@@ -248,23 +248,25 @@ Collect characters between SOH (`0x01`) and ETX (`0x03`). Parse fields according
 
 ### 4.7 CRC Validation
 
-The last 2 bytes are a **CRC-CCITT-16** over the frame (from Mode through text, not including BCS itself). Polynomial: `0x1021`, initial value: `0xFFFF`.
+The last 2 bytes are a **CRC-CCITT-16 (KERMIT variant)** over the frame (from Mode through ETX/ETB inclusive). Polynomial `0x1021` reflected (= `0x8408`), initial value `0x0000`. ACARS feeds bytes LSB-first, so the receiver folds the entire frame including the trailing 2-byte BCS through the same CRC and expects the register to read 0 on a valid frame. This is the variant `acarsdec` uses (`acars.c:159`: `crc = 0;`) and what the Rust port implements (`crates/sdr-acars/src/crc.rs`); an earlier draft of this section had it as the X-25 variant (`init = 0xFFFF`, MSB-first), which is a different CRC and would never validate ACARS frames.
 
 ```python
-def crc_ccitt(data, initial=0xFFFF):
+def crc_ccitt_kermit(data, initial=0x0000):
+    """CRC-CCITT-16 KERMIT — LSB-first byte feed, reflected
+    polynomial 0x8408. Yields 0 over `frame + bcs_lo + bcs_hi`
+    for a valid ACARS frame."""
     crc = initial
     for byte in data:
-        crc ^= byte << 8
+        crc ^= byte
         for _ in range(8):
-            if crc & 0x8000:
-                crc = (crc << 1) ^ 0x1021
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0x8408
             else:
-                crc = crc << 1
-            crc &= 0xFFFF
+                crc = crc >> 1
     return crc
 ```
 
-(Bit order within bytes matters — consult the ARINC 618 spec for exact convention; some implementations use reflected CRC.)
+(For the canonical KERMIT check string `"123456789"` with init=0, this returns `0x2189`. The published "0x8921" check value is the same number byte-swapped, reflecting the protocol's convention of transmitting BCS low byte first; ACARS uses the same low-byte-first wire order.)
 
 ### 4.8 Multi-Block Messages
 

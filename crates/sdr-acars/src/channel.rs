@@ -117,6 +117,18 @@ impl ChannelBank {
             ));
         }
         let if_rate = f64::from(IF_RATE_HZ);
+        // Reject zero / negative / NaN source rates up front.
+        // Without this guard, `source_rate_hz == 0.0` passes the
+        // integer-multiple check (decim_f = 0.0, fract = 0.0),
+        // produces `decim_factor == 0`, builds a zero-length
+        // oscillator, and crashes `process()` on the first sample
+        // access. Library-crate rule: surface as a typed error,
+        // not a deferred panic. Per CR round 1 on PR #583.
+        if !source_rate_hz.is_finite() || source_rate_hz <= 0.0 {
+            return Err(AcarsError::InvalidChannelConfig(format!(
+                "source rate {source_rate_hz} Hz must be finite and positive"
+            )));
+        }
         let decim_f = source_rate_hz / if_rate;
         if decim_f.fract().abs() > 1e-6 {
             return Err(AcarsError::NonIntegerDecimation {
@@ -183,7 +195,7 @@ impl ChannelBank {
     /// `MskDemod::toggle_polarity`) handles 180° phase slip
     /// detected on inverted-SYN.
     pub fn process<F: FnMut(AcarsMessage)>(&mut self, iq: &[Complex32], mut on_message: F) {
-        for ch in &mut self.channels {
+        for (idx, ch) in self.channels.iter_mut().enumerate() {
             ch.if_buffer.clear();
             for &sample in iq {
                 let osc = ch.oscillator[ch.osc_idx];
@@ -202,9 +214,25 @@ impl ChannelBank {
             // Drive the MSK demod with the decimated IF.
             ch.msk.process(&ch.if_buffer, &mut ch.parser);
             // Drain any complete bytes accumulated in the
-            // parser. The closure forwards to the user
-            // callback.
-            ch.parser.drain(&mut on_message);
+            // parser. Stamp live stats (msg_count, last_msg_at,
+            // level_db) on every emitted message so
+            // `channels()` reflects real state, not the
+            // construction placeholders. Per CR round 1 on
+            // PR #583.
+            let stats = &mut self.stats[idx];
+            ch.parser.drain(|msg| {
+                stats.msg_count = stats.msg_count.saturating_add(1);
+                stats.last_msg_at = Some(msg.timestamp);
+                // level_db on the message is currently 0.0
+                // (filled in by future sub-projects from MSK
+                // matched-filter output); keep stats.level_db
+                // pinned to the latest emitted value so the
+                // contract stays "stats reflect the latest
+                // decoded message" once levels start landing.
+                stats.level_db = msg.level_db;
+                stats.lock_state = ChannelLockState::Locked;
+                on_message(msg);
+            });
             // Apply pending polarity flip if the parser
             // detected an inverted-SYN at frame start
             // (`acars.c:259,274`).
@@ -243,6 +271,19 @@ mod tests {
             Err(AcarsError::InvalidChannelConfig(_)) => {}
             Err(other) => panic!("expected InvalidChannelConfig, got {other:?}"),
             Ok(_) => panic!("expected InvalidChannelConfig, got Ok"),
+        }
+    }
+
+    #[test]
+    fn rejects_zero_or_negative_source_rate() {
+        // Per CR round 1 on PR #583: zero/negative/NaN rates
+        // would silently produce decim_factor=0 and crash later.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            match ChannelBank::new(bad, 130_337_500.0, &[131_550_000.0]) {
+                Err(AcarsError::InvalidChannelConfig(_)) => {}
+                Err(other) => panic!("rate={bad}: expected InvalidChannelConfig, got {other:?}"),
+                Ok(_) => panic!("rate={bad}: expected error, got Ok"),
+            }
         }
     }
 

@@ -13,14 +13,31 @@
 //! CRC-CCITT, not the more common X-25 variant which inits to
 //! `0xFFFF`.
 
+/// Initial value of the CRC register at frame start. KERMIT
+/// variant — `acars.c:159` (`crc = 0;`) before the message-
+/// byte loop. The X-25 variant uses `0xFFFF`; ACARS does not.
+pub const ACARS_CRC_INIT: u16 = 0x0000;
+
+/// Reflected polynomial (`0x1021` reflected). Used by the
+/// LSB-first byte-feed update step.
+pub const ACARS_CRC_POLY_REFLECTED: u16 = 0x8408;
+
+/// Bits per byte. Exists so the CRC update loop reads as
+/// "for each bit in the byte" rather than `for _ in 0..8`.
+const BITS_PER_BYTE: usize = 8;
+
+/// Mask for the CRC register's least-significant bit, the
+/// "tap" the LSB-first algorithm checks each iteration.
+const CRC_LSB_MASK: u16 = 0x0001;
+
 /// Update a running CRC-CCITT-16 register with one byte.
 /// Bytes are consumed LSB-first (ACARS wire convention).
 #[must_use]
 pub fn update(crc: u16, byte: u8) -> u16 {
     let mut crc = crc ^ u16::from(byte);
-    for _ in 0..8 {
-        if crc & 0x0001 != 0 {
-            crc = (crc >> 1) ^ 0x8408; // 0x1021 reflected
+    for _ in 0..BITS_PER_BYTE {
+        if crc & CRC_LSB_MASK != 0 {
+            crc = (crc >> 1) ^ ACARS_CRC_POLY_REFLECTED;
         } else {
             crc >>= 1;
         }
@@ -29,10 +46,10 @@ pub fn update(crc: u16, byte: u8) -> u16 {
 }
 
 /// Compute CRC over a slice from the standard ACARS init value
-/// (`0x0000`).
+/// (`ACARS_CRC_INIT`).
 #[must_use]
 pub fn compute(bytes: &[u8]) -> u16 {
-    bytes.iter().fold(0x0000_u16, |crc, &b| update(crc, b))
+    bytes.iter().fold(ACARS_CRC_INIT, |crc, &b| update(crc, b))
 }
 
 #[cfg(test)]

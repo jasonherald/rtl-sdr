@@ -380,18 +380,26 @@ impl FrameParser {
         let text_end = self.buf.len() - 1;
         let mut message_no: Option<ArrayString<5>> = None;
         let mut flight_id: Option<ArrayString<7>> = None;
-        let text_start: usize = if is_downlink && text_end >= 17 {
-            // Reserve room for msgno (4 chars) + flight (6
-            // chars). C bounds-checks each byte: `i < N && k <
-            // blk->len - 1` (output.c:548, 561) — we mirror.
-            let mut no = ArrayString::<5>::new();
-            for &b in &self.buf[13..17.min(text_end)] {
-                let _ = no.try_push((b & 0x7F) as char);
+        // Downlink prefix is up to 4 msgno bytes then up to 6
+        // flight-id bytes. Each field is independently
+        // bounds-checked against `text_end`, so a partial
+        // msgno (text_end < 17) still extracts what's there
+        // — mirrors the C's per-byte `i < N && k < blk->len
+        // - 1` guards in `output.c:548, 561`. Per CR round 1
+        // on PR #583 — was previously gated on `text_end >=
+        // 17` which dropped partial-prefix downlink frames.
+        let text_start: usize = if is_downlink && text_end > 13 {
+            let msgno_finish = 17.min(text_end);
+            if msgno_finish > 13 {
+                let mut no = ArrayString::<5>::new();
+                for &b in &self.buf[13..msgno_finish] {
+                    let _ = no.try_push((b & 0x7F) as char);
+                }
+                if !no.is_empty() {
+                    message_no = Some(no);
+                }
             }
-            if !no.is_empty() {
-                message_no = Some(no);
-            }
-            let flight_start = 17;
+            let flight_start = msgno_finish;
             let flight_finish = 23.min(text_end);
             if flight_start < flight_finish {
                 let mut fid = ArrayString::<7>::new();

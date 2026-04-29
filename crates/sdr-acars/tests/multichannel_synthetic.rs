@@ -26,30 +26,44 @@ use sdr_acars::ChannelBank;
 const SOURCE_RATE_HZ: f64 = 2_500_000.0;
 const CENTER_HZ: f64 = 130_337_500.0;
 
-/// Synthesize `seconds` of complex IQ at `SOURCE_RATE_HZ`
-/// containing nothing but low-level white noise. Used as a
-/// baseline: noise alone must not produce decoded messages.
-fn synth_noise(seconds: f64) -> Vec<Complex32> {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let n = (seconds * SOURCE_RATE_HZ) as usize;
-    let mut out = Vec::with_capacity(n);
-    // Deterministic LCG (Knuth's MMIX constants) so the test is
-    // reproducible across platforms and CI runs.
-    let mut s: u64 = 0xDEAD_BEEF_CAFE_BABE;
-    for _ in 0..n {
-        s = s
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        #[allow(clippy::cast_precision_loss)]
-        let i = (s as f32) / (u64::MAX as f32) - 0.5;
-        s = s
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        #[allow(clippy::cast_precision_loss)]
-        let q = (s as f32) / (u64::MAX as f32) - 0.5;
-        out.push(Complex32::new(i * 0.01, q * 0.01)); // ~-40 dBFS noise
+/// Streamed-noise chunk size (~100 ms at 2.5 `MSps`). Keeps peak
+/// memory bounded and exercises chunk-boundary state in
+/// `ChannelBank::process`.
+const NOISE_CHUNK_SAMPLES: usize = 250_000;
+/// Total noise duration for the no-decode sanity check.
+const NOISE_TEST_SECONDS: usize = 2;
+
+/// Stateful noise generator (Knuth MMIX LCG) yielding one IQ
+/// sample per `next()`. Reusing a single state across chunks
+/// means the test exercises chunk-boundary behaviour in
+/// `ChannelBank::process` without holding ~5 M samples in
+/// memory at once. Per CR round 1 on PR #583.
+struct NoiseGen {
+    state: u64,
+}
+
+impl NoiseGen {
+    fn new() -> Self {
+        Self {
+            state: 0xDEAD_BEEF_CAFE_BABE,
+        }
     }
-    out
+
+    fn next_sample(&mut self) -> Complex32 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        #[allow(clippy::cast_precision_loss)]
+        let i = (self.state as f32) / (u64::MAX as f32) - 0.5;
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        #[allow(clippy::cast_precision_loss)]
+        let q = (self.state as f32) / (u64::MAX as f32) - 0.5;
+        Complex32::new(i * 0.01, q * 0.01) // ~-40 dBFS noise
+    }
 }
 
 #[test]
@@ -57,10 +71,27 @@ fn synth_noise(seconds: f64) -> Vec<Complex32> {
 fn pure_noise_produces_no_messages() {
     let mut bank = ChannelBank::new(SOURCE_RATE_HZ, CENTER_HZ, &[131_550_000.0, 131_525_000.0])
         .expect("valid 2-channel config");
-    let noise = synth_noise(2.0);
-    bank.process(&noise, |msg| {
-        panic!("noise should not decode: {msg:?}");
-    });
+    // Process noise in chunks (NOISE_CHUNK_SAMPLES at a time).
+    // Streaming keeps peak memory bounded and exercises the
+    // chunk-boundary state in ChannelBank::process — important
+    // since the production live-radio path will also feed IQ
+    // in chunks.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let total_samples = NOISE_TEST_SECONDS * SOURCE_RATE_HZ as usize;
+    let mut noise = NoiseGen::new();
+    let mut chunk: Vec<Complex32> = Vec::with_capacity(NOISE_CHUNK_SAMPLES);
+    let mut produced = 0;
+    while produced < total_samples {
+        chunk.clear();
+        let take = NOISE_CHUNK_SAMPLES.min(total_samples - produced);
+        for _ in 0..take {
+            chunk.push(noise.next_sample());
+        }
+        bank.process(&chunk, |msg| {
+            panic!("noise should not decode: {msg:?}");
+        });
+        produced += take;
+    }
 }
 
 // IMPLEMENTER NOTE: a proper "decode a synthesized MSK signal"

@@ -183,38 +183,51 @@ fn decode_wav(
         })
         .collect();
 
-    // hound returns interleaved samples — split per channel.
-    let mut per_channel: Vec<Vec<f32>> = vec![Vec::with_capacity(8192); n_channels];
+    // Stream the WAV reader and accumulate one chunk per
+    // channel at a time, matching acarsdec's
+    // `runSoundfileSample` (soundfile.c:60-78). Demuxing on the
+    // fly via `i % n_channels` keeps peak memory bounded to
+    // `WAV_CHUNK_FRAMES * n_channels * f32` (~16 KB for the
+    // default 4096 frames × 1 channel) regardless of recording
+    // length. Per CR round 1 on PR #583 — was previously
+    // O(file) RAM because we materialized every sample first.
+    let mut per_channel: Vec<Vec<f32>> = (0..n_channels)
+        .map(|_| Vec::with_capacity(WAV_CHUNK_FRAMES))
+        .collect();
+    let mut emit_buf: Vec<AcarsMessage> = Vec::new();
     for (i, sample_result) in reader.samples::<i16>().enumerate() {
         let sample = sample_result.map_err(|e| AcarsError::Io {
             path: path.to_path_buf(),
             source: std::io::Error::other(e),
         })?;
-        per_channel[i % n_channels].push(f32::from(sample) / f32::from(i16::MAX));
+        let ch_idx = i % n_channels;
+        per_channel[ch_idx].push(f32::from(sample) / f32::from(i16::MAX));
+        // After every n_channels samples we've completed one
+        // frame across all channels; check whether the chunk
+        // is full. The first channel reaches WAV_CHUNK_FRAMES
+        // exactly when every other channel does too (assuming
+        // the WAV file has a complete number of frames, which
+        // hound guarantees via header validation).
+        if ch_idx == n_channels - 1 && per_channel[0].len() == WAV_CHUNK_FRAMES {
+            for (idx, samples) in per_channel.iter_mut().enumerate() {
+                demods[idx].process(samples, &mut parsers[idx]);
+                parsers[idx].drain(|msg| emit_buf.push(msg));
+                samples.clear();
+            }
+            for msg in emit_buf.drain(..) {
+                print_message(&msg, out)?;
+            }
+        }
     }
-
-    // Process per-channel samples in synchronized chunks so
-    // messages emerge in time order across channels — matches
-    // acarsdec's `runSoundfileSample` (soundfile.c:60-78), which
-    // reads `MAXNBFRAMES * nbch = 4096 * 4 = 16384` samples per
-    // chunk (= 4096 per channel) and dispatches all channels'
-    // slices through demodMSK before moving on. Matching the
-    // chunk size (`WAV_CHUNK_FRAMES`, declared at module scope)
-    // keeps message ordering byte-equal to acarsdec for the
-    // e2e diff.
-    let total_samples = per_channel.first().map_or(0, Vec::len);
-    let mut emit_buf: Vec<AcarsMessage> = Vec::new();
-    let mut start = 0;
-    while start < total_samples {
-        let end = (start + WAV_CHUNK_FRAMES).min(total_samples);
-        for (i, samples) in per_channel.iter().enumerate() {
-            demods[i].process(&samples[start..end], &mut parsers[i]);
-            parsers[i].drain(|msg| emit_buf.push(msg));
+    // Flush any tail samples (last partial chunk).
+    if !per_channel[0].is_empty() {
+        for (idx, samples) in per_channel.iter_mut().enumerate() {
+            demods[idx].process(samples, &mut parsers[idx]);
+            parsers[idx].drain(|msg| emit_buf.push(msg));
         }
         for msg in emit_buf.drain(..) {
             print_message(&msg, out)?;
         }
-        start = end;
     }
     Ok(())
 }
@@ -238,6 +251,16 @@ fn decode_iq(
     let mut buf = vec![0_u8; 4096 * 4];
     let mut block: Vec<Complex32> = Vec::with_capacity(4096);
     let mut emit_buf: Vec<AcarsMessage> = Vec::new();
+    // Carry holds a partial sample (1-3 bytes) when a `read`
+    // boundary lands mid-sample. `std::io::Read::read()` is
+    // allowed to return short — even on regular files near EOF
+    // — so we can't assume each `read` lands on a 4-byte
+    // boundary. Per CR round 1 on PR #583 — previously rejected
+    // valid IQ files whose underlying read happened to return
+    // a non-multiple-of-4. Carry up to 3 bytes (max possible
+    // partial sample); EOF with non-empty carry is a real
+    // truncation error.
+    let mut carry: Vec<u8> = Vec::with_capacity(4);
 
     loop {
         let n = reader.read(&mut buf).map_err(|e| AcarsError::Io {
@@ -245,15 +268,27 @@ fn decode_iq(
             source: e,
         })?;
         if n == 0 {
+            if !carry.is_empty() {
+                return Err(AcarsError::InvalidInput(format!(
+                    "IQ file ended with {} byte(s) of partial sample (expected multiples of 4)",
+                    carry.len()
+                )));
+            }
             break;
         }
-        if !n.is_multiple_of(4) {
-            return Err(AcarsError::InvalidInput(format!(
-                "IQ file size mod 4 != 0 (got partial sample, read {n} bytes)"
-            )));
-        }
+        // Combine carry + new bytes into a single contiguous
+        // view, parse complete 4-byte samples, stash the
+        // remainder back into carry. Keeps the alignment math
+        // in one place and avoids off-by-one bugs from
+        // splitting parsing into "parse-from-carry then
+        // parse-from-buf" branches.
+        let mut combined: Vec<u8> = Vec::with_capacity(carry.len() + n);
+        combined.extend_from_slice(&carry);
+        combined.extend_from_slice(&buf[..n]);
+        carry.clear();
+        let usable = combined.len() - (combined.len() % 4);
         block.clear();
-        for chunk in buf[..n].chunks_exact(4) {
+        for chunk in combined[..usable].chunks_exact(4) {
             let i = i16::from_le_bytes([chunk[0], chunk[1]]);
             let q = i16::from_le_bytes([chunk[2], chunk[3]]);
             block.push(Complex32::new(
@@ -261,9 +296,12 @@ fn decode_iq(
                 f32::from(q) / f32::from(i16::MAX),
             ));
         }
-        bank.process(&block, |msg| emit_buf.push(msg));
-        for msg in emit_buf.drain(..) {
-            print_message(&msg, out)?;
+        carry.extend_from_slice(&combined[usable..]);
+        if !block.is_empty() {
+            bank.process(&block, |msg| emit_buf.push(msg));
+            for msg in emit_buf.drain(..) {
+                print_message(&msg, out)?;
+            }
         }
     }
     Ok(())
