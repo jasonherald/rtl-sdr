@@ -1024,6 +1024,31 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                     tracing::error!(
                                         "ACARS live-graph restore ALSO failed: {restore_err}"
                                     );
+                                } else if let Some(snap) = &snapshot_clone {
+                                    // Live restore succeeded for
+                                    // rate/center/decim, but
+                                    // `apply_acars_geometry` doesn't
+                                    // touch `state.vfo_offset` — it
+                                    // just rebuilds the VFO at
+                                    // whatever offset is currently
+                                    // in state. If the user changed
+                                    // VfoOffset between engage and
+                                    // Start (the airband-lock UI
+                                    // greys it but DSP doesn't
+                                    // enforce in v1), state.vfo_offset
+                                    // could differ from
+                                    // snapshot.vfo_offset_hz. Replay
+                                    // the snapshot's offset so the
+                                    // restored channel comes back at
+                                    // the user's pre-engage tuning,
+                                    // matching the explicit reapply
+                                    // in `handle_set_acars_enabled`'s
+                                    // disengage branch. CR round 13
+                                    // on PR #584.
+                                    state.vfo_offset = snap.vfo_offset_hz;
+                                    if let Some(vfo) = state.vfo.as_mut() {
+                                        vfo.set_offset(snap.vfo_offset_hz);
+                                    }
                                 }
 
                                 state.acars_bank = None;
