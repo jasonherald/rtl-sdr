@@ -470,6 +470,98 @@ fn label_2z(text: &str) -> Option<Oooi> {
     o.has_any().then_some(o)
 }
 
+fn label_33(text: &str) -> Option<Oooi> {
+    // C: txt[0]==',' && txt[20]==',' → sa(21); txt[25]==',' → da(26).
+    if byte_at(text, 0) != Some(b',') {
+        return None;
+    }
+    if byte_at(text, 20) != Some(b',') {
+        return None;
+    }
+    let sa = slice4(text, 21);
+    if byte_at(text, 25) != Some(b',') {
+        return None;
+    }
+    let da = slice4(text, 26);
+    let o = Oooi {
+        sa,
+        da,
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_39(text: &str) -> Option<Oooi> {
+    // C: prefix "GTA01"; then txt[15]=='/' → sa(24), da(28).
+    if !text.starts_with("GTA01") {
+        return None;
+    }
+    if byte_at(text, 15) != Some(b'/') {
+        return None;
+    }
+    let o = Oooi {
+        sa: slice4(text, 24),
+        da: slice4(text, 28),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_44(text: &str) -> Option<Oooi> {
+    // C: optional "00" prefix shifts the slice base by 2;
+    // then prefix in {"POS0", "ETA0"}; txt[4] in {'2','3'};
+    // txt[23..29..33..38..43..]: separator commas; eta is
+    // overwritten — first at offset 29, then again at 44 (the
+    // C source assigns oooi->eta twice; last write wins).
+    let base = text.strip_prefix("00").unwrap_or(text);
+    if !base.starts_with("POS0") && !base.starts_with("ETA0") {
+        return None;
+    }
+    let kind_byte = byte_at(base, 4);
+    if kind_byte != Some(b'2') && kind_byte != Some(b'3') {
+        return None;
+    }
+    if byte_at(base, 23) != Some(b',') {
+        return None;
+    }
+    let da = slice4(base, 24);
+    if byte_at(base, 28) != Some(b',') {
+        return None;
+    }
+    // First eta extraction. Will be overwritten below if the
+    // remaining separators match (mirrors C's double-assign).
+    #[allow(unused_assignments)]
+    let mut eta = slice4(base, 29);
+    if byte_at(base, 33) != Some(b',') {
+        return None;
+    }
+    if byte_at(base, 38) != Some(b',') {
+        return None;
+    }
+    if byte_at(base, 43) != Some(b',') {
+        return None;
+    }
+    eta = slice4(base, 44);
+    let o = Oooi {
+        da,
+        eta,
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_45(text: &str) -> Option<Oooi> {
+    // C: txt[0]=='A' → da(1).
+    if byte_at(text, 0) != Some(b'A') {
+        return None;
+    }
+    let o = Oooi {
+        da: slice4(text, 1),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
 /// Decode the OOOI metadata for an ACARS message. Returns
 /// `Some(Oooi)` when:
 ///
@@ -500,6 +592,16 @@ pub fn decode_label(label: [u8; 2], text: &str) -> Option<Oooi> {
             b'6' => label_26(text),
             b'N' => label_2n(text),
             b'Z' => label_2z(text),
+            _ => None,
+        },
+        b'3' => match label[1] {
+            b'3' => label_33(text),
+            b'9' => label_39(text),
+            _ => None,
+        },
+        b'4' => match label[1] {
+            b'4' => label_44(text),
+            b'5' => label_45(text),
             _ => None,
         },
         b'Q' => match label[1] {
@@ -970,5 +1072,79 @@ mod tests {
         let o = decode_label([b'2', b'Z'], txt).unwrap();
         assert_eq!(o.da.as_deref(), Some("KSFO"));
         assert!(o.sa.is_none());
+    }
+
+    #[test]
+    fn label_33_extracts_sa_da_with_three_commas() {
+        // Offsets: comma(0), skip 1..20, comma(20), sa(21..25),
+        // comma(25), da(26..30).
+        let txt = ",___________________,KORD,KSFO";
+        let o = decode_label([b'3', b'3'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_39_extracts_sa_da_after_gta01_with_slash() {
+        // Offsets: "GTA01" 0..5, skip 5..15, '/' at 15, skip
+        // 16..24, sa(24..28), da(28..32).
+        let txt = "GTA01__________/________KORDKSFO";
+        let o = decode_label([b'3', b'9'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_44_extracts_da_and_eta_with_pos02_prefix() {
+        // Layout (after no "00" shift):
+        //   POS0 (0..4)
+        //   '2'  (4)
+        //   skip 5..23
+        //   ',' (23)
+        //   da   (24..28)
+        //   ','  (28)
+        //   eta1 (29..33) — overwritten
+        //   ','  (33)
+        //   skip 34..38
+        //   ','  (38)
+        //   skip 39..43
+        //   ','  (43)
+        //   eta2 (44..48) — final
+        let txt = "POS02__________________,KSFO,XXXX,____,____,0830";
+        let o = decode_label([b'4', b'4'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.eta.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn label_44_with_00_prefix_shifts_base() {
+        let txt = "00POS02__________________,KSFO,XXXX,____,____,0830";
+        let o = decode_label([b'4', b'4'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.eta.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn label_44_unsupported_kind_byte_returns_none() {
+        // txt[4] must be '2' or '3'; '5' rejected.
+        assert!(
+            decode_label(
+                [b'4', b'4'],
+                "POS05__________________,KSFO,XXXX,____,____,0830"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn label_45_extracts_da_after_a_prefix() {
+        let txt = "AKSFO";
+        let o = decode_label([b'4', b'5'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_45_no_a_prefix_returns_none() {
+        assert!(decode_label([b'4', b'5'], "BKSFO").is_none());
     }
 }
