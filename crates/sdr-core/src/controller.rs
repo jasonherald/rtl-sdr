@@ -230,7 +230,9 @@ fn poll_rtl_tcp_connection_state(state: &mut DspState, dsp_tx: &mpsc::Sender<Dsp
 /// JSONL writer, UDP feeder, station ID, and per-writer
 /// warn-rate-limit timestamps together so the
 /// `acars_decode_tap` signature stays narrow. Issue #578.
-#[allow(dead_code)] // removed in Task 8 when handlers wire the fields
+/// `jsonl_warn_at` and `udp_warn_at` are consumed in Task 9's
+/// tap-closure rate-limiter; suppress the lint until then.
+#[allow(dead_code)]
 struct AcarsOutputs {
     jsonl: Option<crate::acars_output::JsonlWriter>,
     udp: Option<crate::acars_output::UdpFeeder>,
@@ -607,9 +609,8 @@ struct DspState {
     acars_region: crate::acars_airband_lock::AcarsRegion,
     /// Output-writer bundle: JSONL log, UDP feeder, station
     /// ID, and per-writer warn-rate-limit timestamps.
-    /// Handlers land in Task 8; tap wiring in Task 9.
+    /// Tap wiring (`jsonl_warn_at` / `udp_warn_at`) lands in Task 9.
     /// Issue #578.
-    #[allow(dead_code)] // removed in Task 8 when handlers wire the field
     acars_outputs: AcarsOutputs,
 }
 
@@ -2535,21 +2536,21 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 state.acars_region = region;
             }
         }
-        // --- ACARS output commands (#578) — handlers land in Task 8 ---
-        UiToDsp::SetAcarsJsonlEnabled(_enabled) => {
-            // TODO Task 8: open/close JsonlWriter.
+        // --- ACARS output commands (#578) ---
+        UiToDsp::SetAcarsJsonlEnabled(enabled) => {
+            handle_set_acars_jsonl_enabled(state, dsp_tx, enabled);
         }
-        UiToDsp::SetAcarsJsonlPath(_path) => {
-            // TODO Task 8: persist pending_jsonl_path.
+        UiToDsp::SetAcarsJsonlPath(path) => {
+            handle_set_acars_jsonl_path(state, dsp_tx, &path);
         }
-        UiToDsp::SetAcarsNetworkEnabled(_enabled) => {
-            // TODO Task 8: open/close UdpFeeder.
+        UiToDsp::SetAcarsNetworkEnabled(enabled) => {
+            handle_set_acars_network_enabled(state, dsp_tx, enabled);
         }
-        UiToDsp::SetAcarsNetworkAddr(_addr) => {
-            // TODO Task 8: persist pending_network_addr.
+        UiToDsp::SetAcarsNetworkAddr(addr) => {
+            handle_set_acars_network_addr(state, dsp_tx, &addr);
         }
-        UiToDsp::SetAcarsStationId(_station_id) => {
-            // TODO Task 8: persist station_id on AcarsOutputs.
+        UiToDsp::SetAcarsStationId(id) => {
+            handle_set_acars_station_id(state, id);
         }
     }
 }
@@ -4260,6 +4261,146 @@ fn handle_acars_engage_failure(
     }
 }
 
+// ---------------------------------------------------------------------------
+// ACARS output helpers + handlers (Issue #578)
+// ---------------------------------------------------------------------------
+
+/// Resolve a JSONL path string. Empty ⇒ default
+/// `~/sdr-recordings/acars.jsonl`.
+fn resolve_jsonl_path(path: &str) -> std::path::PathBuf {
+    if path.is_empty() {
+        dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("sdr-recordings")
+            .join("acars.jsonl")
+    } else {
+        std::path::PathBuf::from(path)
+    }
+}
+
+/// Default JSONL path for the current `AcarsOutputs`. Resolves
+/// the user's pending path when set; falls back to the home-
+/// derived default when unset.
+fn jsonl_path_for(outputs: &AcarsOutputs) -> std::path::PathBuf {
+    resolve_jsonl_path(outputs.pending_jsonl_path.as_deref().unwrap_or(""))
+}
+
+/// Default UDP feeder address for the current `AcarsOutputs`.
+/// Returns the user's pending addr when set; falls back to
+/// airframes.io's default when unset.
+fn network_addr_for(outputs: &AcarsOutputs) -> String {
+    outputs
+        .pending_network_addr
+        .clone()
+        .unwrap_or_else(|| "feed.airframes.io:5550".to_string())
+}
+
+/// Open the JSONL writer; on failure log + emit
+/// `DspToUi::AcarsOutputError` toast.
+fn open_jsonl(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, path: &std::path::Path) {
+    match crate::acars_output::JsonlWriter::open(path) {
+        Ok(w) => {
+            tracing::info!("acars jsonl writer opened at {}", path.display());
+            state.acars_outputs.jsonl = Some(w);
+        }
+        Err(e) => {
+            let message = format!("Could not open {}: {e}", path.display());
+            tracing::warn!("acars jsonl open failed: {message}");
+            let _ = dsp_tx.send(DspToUi::AcarsOutputError {
+                kind: "jsonl",
+                message,
+            });
+        }
+    }
+}
+
+/// Open the UDP feeder; on failure log + emit
+/// `DspToUi::AcarsOutputError` toast.
+fn open_udp(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, addr: &str) {
+    match crate::acars_output::UdpFeeder::open(addr) {
+        Ok(f) => {
+            tracing::info!("acars udp feeder opened at {addr}");
+            state.acars_outputs.udp = Some(f);
+        }
+        Err(e) => {
+            let message = format!("Could not open feeder at {addr}: {e}");
+            tracing::warn!("acars udp open failed: {message}");
+            let _ = dsp_tx.send(DspToUi::AcarsOutputError {
+                kind: "udp",
+                message,
+            });
+        }
+    }
+}
+
+fn handle_set_acars_jsonl_enabled(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    enabled: bool,
+) {
+    if !enabled {
+        if let Some(mut w) = state.acars_outputs.jsonl.take()
+            && let Err(e) = w.flush()
+        {
+            tracing::warn!("acars jsonl flush on disable failed: {e}");
+        }
+        return;
+    }
+    // Already open? No-op.
+    if state.acars_outputs.jsonl.is_some() {
+        return;
+    }
+    let path = jsonl_path_for(&state.acars_outputs);
+    open_jsonl(state, dsp_tx, &path);
+}
+
+fn handle_set_acars_jsonl_path(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, path: &str) {
+    state.acars_outputs.pending_jsonl_path = Some(path.to_string());
+    let was_open = state.acars_outputs.jsonl.is_some();
+    if let Some(mut w) = state.acars_outputs.jsonl.take()
+        && let Err(e) = w.flush()
+    {
+        tracing::warn!("acars jsonl flush on path-change failed: {e}");
+    }
+    if was_open {
+        let resolved = resolve_jsonl_path(path);
+        open_jsonl(state, dsp_tx, &resolved);
+    }
+}
+
+fn handle_set_acars_network_enabled(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    enabled: bool,
+) {
+    if !enabled {
+        state.acars_outputs.udp = None;
+        return;
+    }
+    if state.acars_outputs.udp.is_some() {
+        return;
+    }
+    let addr = network_addr_for(&state.acars_outputs);
+    open_udp(state, dsp_tx, &addr);
+}
+
+fn handle_set_acars_network_addr(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, addr: &str) {
+    state.acars_outputs.pending_network_addr = Some(addr.to_string());
+    let was_open = state.acars_outputs.udp.is_some();
+    state.acars_outputs.udp = None;
+    if was_open {
+        open_udp(state, dsp_tx, addr);
+    }
+}
+
+fn handle_set_acars_station_id(state: &mut DspState, station_id: String) {
+    state.acars_outputs.station_id = if station_id.is_empty() {
+        None
+    } else {
+        Some(station_id)
+    };
+}
+
 /// Handler for `UiToDsp::SetAcarsEnabled`. Engages or
 /// releases the airband lock, instantiates / drops the
 /// `ChannelBank`, rebuilds the DSP graph, and emits an ack
@@ -4463,6 +4604,16 @@ fn handle_set_acars_enabled(
         // see None and short-circuit.
         state.acars_bank = None;
         state.acars_init_failed = false;
+
+        // Flush + drop output writers. They get reopened on
+        // the next `SetAcarsJsonlEnabled(true)` / `SetAcarsNetworkEnabled(true)`
+        // command. Issue #578.
+        if let Some(mut w) = state.acars_outputs.jsonl.take()
+            && let Err(e) = w.flush()
+        {
+            tracing::warn!("acars jsonl flush on disengage failed: {e}");
+        }
+        state.acars_outputs.udp = None;
 
         // VFO offset restore. The controller stores it on
         // `state.vfo_offset` (read by `rebuild_vfo` and the
