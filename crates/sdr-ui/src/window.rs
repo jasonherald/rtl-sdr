@@ -12043,10 +12043,19 @@ fn connect_aviation_panel(
     // dispatch. The explicit send_dsp block at the end delivers the
     // persisted state to the controller unconditionally.
 
-    // Seed text fields first.
-    panel
-        .station_id_row
-        .set_text(&crate::acars_config::read_acars_station_id(config));
+    // Seed text fields first. Station ID is normalized to
+    // the same 8-char cap the DSP enforces (see
+    // `controller.rs::handle_set_acars_station_id`), and
+    // healed back to config when the persisted value is over
+    // the cap — otherwise the field, the config, and the
+    // DSP would briefly hold three different values until
+    // the user touches the row. CR round 5 on PR #595.
+    let raw_station_id = crate::acars_config::read_acars_station_id(config);
+    let normalized_station_id: String = raw_station_id.chars().take(8).collect();
+    if normalized_station_id != raw_station_id {
+        crate::acars_config::save_acars_station_id(config, &normalized_station_id);
+    }
+    panel.station_id_row.set_text(&normalized_station_id);
     panel
         .jsonl_path_row
         .set_text(&crate::acars_config::read_acars_jsonl_path(config));
@@ -12246,8 +12255,11 @@ fn connect_aviation_panel(
     // writers reopen on launch if previously enabled. Path/addr/station_id
     // are dispatched BEFORE enabled so the controller's handler finds the
     // pending paths already set when it processes the enabled flags.
+    // Use the (already-normalized) row text rather than the
+    // raw config value so the initial DSP-side state matches
+    // exactly what the user sees. CR round 5 on PR #595.
     state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsStationId(
-        crate::acars_config::read_acars_station_id(config),
+        panel.station_id_row.text().to_string(),
     ));
     state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(
         crate::acars_config::read_acars_jsonl_path(config),

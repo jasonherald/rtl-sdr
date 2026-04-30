@@ -4362,6 +4362,12 @@ fn open_jsonl(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, path: &std::
         Ok(w) => {
             tracing::info!("acars jsonl writer opened at {}", path.display());
             state.acars_outputs.jsonl = Some(w);
+            // Reset the warn throttle so the first failure
+            // against this newly-opened destination logs
+            // immediately rather than getting silenced by the
+            // 30 s window from the previous destination.
+            // CR round 5 on PR #595.
+            state.acars_outputs.jsonl_warn_at = None;
         }
         Err(e) => {
             let message = format!("Could not open {}: {e}", path.display());
@@ -4381,6 +4387,9 @@ fn open_udp(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, addr: &str) {
         Ok(f) => {
             tracing::info!("acars udp feeder opened at {addr}");
             state.acars_outputs.udp = Some(f);
+            // Reset the warn throttle — same reason as
+            // open_jsonl above. CR round 5 on PR #595.
+            state.acars_outputs.udp_warn_at = None;
         }
         Err(e) => {
             let message = format!("Could not open feeder at {addr}: {e}");
