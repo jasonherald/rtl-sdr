@@ -149,15 +149,32 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     let filter_entry = gtk4::SearchEntry::builder()
         .placeholder_text("Filter aircraft / label / text…")
         .build();
-    let status_label = gtk4::Label::builder().label("0 / 0 messages").build();
+
+    // ─── Column view ───
+    let store = gtk4::gio::ListStore::new::<AcarsMessageObject>();
+    // Hydrate from the running ACARS ring so reopening the
+    // viewer mid-session shows the retained backlog instead of
+    // an empty table. Window.rs keeps `state.acars_recent`
+    // populated regardless of viewer lifetime; the ring is
+    // already bounded by `default_recent_keep`, which is the
+    // same cap the append site enforces on `store` (CR round 1
+    // on PR #587), so this can't push the store past its cap.
+    {
+        let recent = state.acars_recent.borrow();
+        for msg in recent.iter().cloned() {
+            store.append(&AcarsMessageObject::new(msg));
+        }
+    }
+    let initial_count = store.n_items();
+    let status_label = gtk4::Label::builder()
+        .label(format!("{initial_count} / {initial_count} messages"))
+        .build();
 
     header.pack_start(&pause_button);
     header.pack_start(&clear_button);
     header.set_title_widget(Some(&filter_entry));
     header.pack_end(&status_label);
 
-    // ─── Column view ───
-    let store = gtk4::gio::ListStore::new::<AcarsMessageObject>();
     let filter = gtk4::CustomFilter::new(|_obj| true);
     let filter_model = gtk4::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
     let selection = gtk4::NoSelection::new(Some(filter_model.clone()));
