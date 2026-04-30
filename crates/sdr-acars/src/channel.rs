@@ -266,7 +266,7 @@ impl ChannelBank {
             let stats = &mut self.stats[idx];
             ch.parser.drain(|msg| {
                 let now = msg.timestamp;
-                for emitted in ch.assembler.observe(msg, now) {
+                for mut emitted in ch.assembler.observe(msg, now) {
                     stats.msg_count = stats.msg_count.saturating_add(1);
                     stats.last_msg_at = Some(emitted.timestamp);
                     // level_db on the message is currently 0.0
@@ -277,6 +277,11 @@ impl ChannelBank {
                     // decoded message" once levels start landing.
                     stats.level_db = emitted.level_db;
                     stats.lock_state = ChannelLockState::Locked;
+                    // Populate OOOI metadata after reassembly so the
+                    // parser sees the full concatenated text for
+                    // multi-block messages. Issue #577.
+                    emitted.parsed =
+                        crate::label_parsers::decode_label(emitted.label, &emitted.text);
                     on_message(emitted);
                 }
             });
@@ -289,11 +294,15 @@ impl ChannelBank {
             // iteration capped at MAX_PENDING_MESSAGES) and
             // runs at IQ-block cadence, well above the 30 s
             // recency window. Issue #580 / CR round 1 on PR #593.
-            for emitted in ch.assembler.drain_timeouts(std::time::SystemTime::now()) {
+            for mut emitted in ch.assembler.drain_timeouts(std::time::SystemTime::now()) {
                 stats.msg_count = stats.msg_count.saturating_add(1);
                 stats.last_msg_at = Some(emitted.timestamp);
                 stats.level_db = emitted.level_db;
                 stats.lock_state = ChannelLockState::Locked;
+                // Populate OOOI metadata after reassembly so the
+                // parser sees the full concatenated text for
+                // multi-block messages. Issue #577.
+                emitted.parsed = crate::label_parsers::decode_label(emitted.label, &emitted.text);
                 on_message(emitted);
             }
             // Apply pending polarity flip if the parser
