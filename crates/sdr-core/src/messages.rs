@@ -1156,4 +1156,27 @@ mod tests {
         assert!(s.contains("AcarsEnabledChanged"), "got {s}");
         assert!(s.contains("UnsupportedSourceType"), "got {s}");
     }
+
+    #[test]
+    fn acars_output_error_variant_constructs() {
+        let msg = DspToUi::AcarsOutputError {
+            kind: "jsonl",
+            message: "Could not open /tmp/acars.jsonl: permission denied".to_string(),
+        };
+        assert!(matches!(
+            msg,
+            DspToUi::AcarsOutputError { kind: "jsonl", .. }
+        ));
+    }
+
+    #[test]
+    fn acars_output_ui_to_dsp_variants_construct() {
+        // Pin the wire-level shape of the 5 SetAcars* output
+        // commands. Catches accidental signature drift.
+        let _: UiToDsp = UiToDsp::SetAcarsJsonlEnabled(true);
+        let _: UiToDsp = UiToDsp::SetAcarsJsonlPath("x.jsonl".to_string());
+        let _: UiToDsp = UiToDsp::SetAcarsNetworkEnabled(true);
+        let _: UiToDsp = UiToDsp::SetAcarsNetworkAddr("127.0.0.1:5550".to_string());
+        let _: UiToDsp = UiToDsp::SetAcarsStationId("STN1".to_string());
+    }
 }

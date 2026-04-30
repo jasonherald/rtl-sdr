@@ -233,6 +233,14 @@ fn poll_rtl_tcp_connection_state(state: &mut DspState, dsp_tx: &mpsc::Sender<Dsp
 struct AcarsOutputs {
     jsonl: Option<crate::acars_output::JsonlWriter>,
     udp: Option<crate::acars_output::UdpFeeder>,
+    /// User's enable intent for the JSONL writer. Persists
+    /// across disengage / open-failure so path changes can
+    /// trigger reopen, and ACARS re-engage can restore the
+    /// writer. Issue #578.
+    jsonl_enabled: bool,
+    /// User's enable intent for the UDP feeder. Same pattern
+    /// as `jsonl_enabled`.
+    network_enabled: bool,
     station_id: Option<String>,
     /// Last warn timestamp for JSONL write failures. 30 s
     /// rate limit prevents log spam from a misconfigured
@@ -253,6 +261,8 @@ impl AcarsOutputs {
         Self {
             jsonl: None,
             udp: None,
+            jsonl_enabled: false,
+            network_enabled: false,
             station_id: None,
             jsonl_warn_at: None,
             udp_warn_at: None,
@@ -4365,6 +4375,7 @@ fn handle_set_acars_jsonl_enabled(
     dsp_tx: &mpsc::Sender<DspToUi>,
     enabled: bool,
 ) {
+    state.acars_outputs.jsonl_enabled = enabled;
     if !enabled {
         if let Some(mut w) = state.acars_outputs.jsonl.take()
             && let Err(e) = w.flush()
@@ -4382,15 +4393,19 @@ fn handle_set_acars_jsonl_enabled(
 }
 
 fn handle_set_acars_jsonl_path(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, path: &str) {
-    state.acars_outputs.pending_jsonl_path = Some(path.to_string());
-    let was_open = state.acars_outputs.jsonl.is_some();
+    state.acars_outputs.pending_jsonl_path = if path.trim().is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    };
+    let should_reopen = state.acars_outputs.jsonl_enabled;
     if let Some(mut w) = state.acars_outputs.jsonl.take()
         && let Err(e) = w.flush()
     {
         tracing::warn!("acars jsonl flush on path-change failed: {e}");
     }
-    if was_open {
-        let resolved = resolve_jsonl_path(path);
+    if should_reopen {
+        let resolved = jsonl_path_for(&state.acars_outputs);
         open_jsonl(state, dsp_tx, &resolved);
     }
 }
@@ -4400,6 +4415,7 @@ fn handle_set_acars_network_enabled(
     dsp_tx: &mpsc::Sender<DspToUi>,
     enabled: bool,
 ) {
+    state.acars_outputs.network_enabled = enabled;
     if !enabled {
         state.acars_outputs.udp = None;
         return;
@@ -4412,11 +4428,16 @@ fn handle_set_acars_network_enabled(
 }
 
 fn handle_set_acars_network_addr(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, addr: &str) {
-    state.acars_outputs.pending_network_addr = Some(addr.to_string());
-    let was_open = state.acars_outputs.udp.is_some();
+    state.acars_outputs.pending_network_addr = if addr.trim().is_empty() {
+        None
+    } else {
+        Some(addr.to_string())
+    };
+    let should_reopen = state.acars_outputs.network_enabled;
     state.acars_outputs.udp = None;
-    if was_open {
-        open_udp(state, dsp_tx, addr);
+    if should_reopen {
+        let resolved = network_addr_for(&state.acars_outputs);
+        open_udp(state, dsp_tx, &resolved);
     }
 }
 
@@ -4540,6 +4561,19 @@ fn handle_set_acars_enabled(
                 state.acars_init_failed = false;
                 state.acars_pre_lock = Some(plan.snapshot);
                 state.acars_stats_emitted_at = std::time::Instant::now();
+                // Reopen output writers if user previously
+                // toggled them on. CR round 1 on PR #595 —
+                // intent persists across disengage, so engage
+                // restores the writers without requiring the
+                // user to toggle off+on. Issue #578.
+                if state.acars_outputs.jsonl_enabled && state.acars_outputs.jsonl.is_none() {
+                    let path = jsonl_path_for(&state.acars_outputs);
+                    open_jsonl(state, dsp_tx, &path);
+                }
+                if state.acars_outputs.network_enabled && state.acars_outputs.udp.is_none() {
+                    let addr = network_addr_for(&state.acars_outputs);
+                    open_udp(state, dsp_tx, &addr);
+                }
                 tracing::info!("ACARS engaged: airband lock active");
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
                 AcarsHandlerOutcome::Normal

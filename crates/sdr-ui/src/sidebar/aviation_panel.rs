@@ -189,10 +189,7 @@ pub fn build_aviation_panel() -> AviationPanel {
     let station_id_row = adw::EntryRow::builder().title("Station ID").build();
     output_group.add(&station_id_row);
 
-    let jsonl_enable_row = adw::SwitchRow::builder()
-        .title("Write JSON log")
-        .subtitle("Off")
-        .build();
+    let jsonl_enable_row = adw::SwitchRow::builder().title("Write JSON log").build();
     output_group.add(&jsonl_enable_row);
 
     let jsonl_path_row = adw::EntryRow::builder().title("Log file path").build();
@@ -201,7 +198,6 @@ pub fn build_aviation_panel() -> AviationPanel {
 
     let network_enable_row = adw::SwitchRow::builder()
         .title("Forward to network feeder")
-        .subtitle("Off")
         .build();
     output_group.add(&network_enable_row);
 

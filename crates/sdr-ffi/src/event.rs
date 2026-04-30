@@ -1320,6 +1320,18 @@ mod tests {
     }
 
     #[test]
+    fn translate_acars_output_error_is_dropped_at_ffi_boundary() {
+        let msg = DspToUi::AcarsOutputError {
+            kind: "udp",
+            message: "could not resolve host".to_string(),
+        };
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsOutputError must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
     fn rtl_tcp_state_discriminants_match_header() {
         assert_eq!(SDR_RTL_TCP_STATE_DISCONNECTED, 0);
         assert_eq!(SDR_RTL_TCP_STATE_CONNECTING, 1);

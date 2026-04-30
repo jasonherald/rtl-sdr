@@ -12063,6 +12063,39 @@ fn connect_aviation_panel(
         .network_enable_row
         .set_active(crate::acars_config::read_acars_network_enabled(config));
 
+    // Set subtitle to match current toggle state — signal
+    // handlers only fire on user-initiated changes, so we
+    // need to seed the subtitle explicitly. CR round 1 on
+    // PR #595.
+    {
+        let path = panel.jsonl_path_row.text();
+        let active = panel.jsonl_enable_row.is_active();
+        let subtitle = if active {
+            if path.is_empty() {
+                "~/sdr-recordings/acars.jsonl".to_string()
+            } else {
+                path.to_string()
+            }
+        } else {
+            "Off".to_string()
+        };
+        panel.jsonl_enable_row.set_subtitle(&subtitle);
+    }
+    {
+        let addr = panel.network_addr_row.text();
+        let active = panel.network_enable_row.is_active();
+        let subtitle = if active {
+            if addr.is_empty() {
+                "feed.airframes.io:5550".to_string()
+            } else {
+                addr.to_string()
+            }
+        } else {
+            "Off".to_string()
+        };
+        panel.network_enable_row.set_subtitle(&subtitle);
+    }
+
     // Wire station_id_row — apply on Enter / focus-out.
     {
         let state = Rc::clone(state);
@@ -12081,15 +12114,22 @@ fn connect_aviation_panel(
         let path_row = panel.jsonl_path_row.clone();
         panel.jsonl_enable_row.connect_active_notify(move |row| {
             let active = row.is_active();
+            let path = path_row.text().to_string();
+            // Dispatch the latest path FIRST so when DSP
+            // opens the writer, it uses the current text.
+            // CR round 1 on PR #595.
+            if active {
+                crate::acars_config::save_acars_jsonl_path(&config, &path);
+                state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(path.clone()));
+            }
             crate::acars_config::save_acars_jsonl_enabled(&config, active);
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlEnabled(active));
             // Subtitle reflects current path or "Off".
             let subtitle = if active {
-                let p = path_row.text();
-                if p.is_empty() {
+                if path.is_empty() {
                     "~/sdr-recordings/acars.jsonl".to_string()
                 } else {
-                    p.to_string()
+                    path
                 }
             } else {
                 "Off".to_string()
@@ -12116,15 +12156,24 @@ fn connect_aviation_panel(
         let addr_row = panel.network_addr_row.clone();
         panel.network_enable_row.connect_active_notify(move |row| {
             let active = row.is_active();
+            let addr = addr_row.text().to_string();
+            // Dispatch the latest addr FIRST so when DSP
+            // opens the feeder, it uses the current text.
+            // CR round 1 on PR #595.
+            if active {
+                crate::acars_config::save_acars_network_addr(&config, &addr);
+                state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkAddr(
+                    addr.clone(),
+                ));
+            }
             crate::acars_config::save_acars_network_enabled(&config, active);
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkEnabled(active));
             // Subtitle reflects current addr or "Off".
             let subtitle = if active {
-                let a = addr_row.text();
-                if a.is_empty() {
+                if addr.is_empty() {
                     "feed.airframes.io:5550".to_string()
                 } else {
-                    a.to_string()
+                    addr
                 }
             } else {
                 "Off".to_string()
