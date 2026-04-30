@@ -290,6 +290,13 @@ pub struct AppState {
     /// so the UI has to remember the snapshot itself. `None`
     /// when ACARS is disengaged.
     pub acars_saved_freq_hz: Cell<Option<u64>>,
+    /// `true` if ACARS was engaged when a satellite auto-record
+    /// pass started, captured in the `StartAutoRecord` action
+    /// arm so the LOS `RestoreTune` arm can re-engage. Mirrors
+    /// the way the recorder saves the user's pre-AOS tune in
+    /// `SavedTune` and replays it at LOS — ACARS is just
+    /// another piece of pre-AOS state that needs to round-trip.
+    pub acars_was_engaged_pre_pass: Cell<bool>,
 }
 
 impl AppState {
@@ -338,6 +345,7 @@ impl AppState {
             acars_viewer_window: RefCell::new(None),
             acars_viewer_handles: RefCell::new(None),
             acars_saved_freq_hz: Cell::new(None),
+            acars_was_engaged_pre_pass: Cell::new(false),
         })
     }
 

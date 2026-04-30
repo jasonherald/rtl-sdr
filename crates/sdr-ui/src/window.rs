@@ -10641,6 +10641,17 @@ fn connect_satellites_panel(
                 tracing::info!(
                     "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz, protocol {protocol:?}",
                 );
+                // If ACARS is engaged, auto-disengage it so the
+                // satellite tune isn't rejected by the airband
+                // lock (rounds 14-15 on PR #584). Stash the
+                // pre-pass engaged state so the LOS RestoreTune
+                // arm can re-engage. Mirrors how SavedTune
+                // captures other pre-AOS state for round-trip.
+                if state_a.acars_enabled.get() {
+                    tracing::info!("auto-record AOS: auto-disabling ACARS for the pass");
+                    state_a.acars_was_engaged_pre_pass.set(true);
+                    state_a.send_dsp(UiToDsp::SetAcarsEnabled(false));
+                }
                 // Per-protocol viewer dispatch. Adding a new
                 // protocol means adding a match arm here +
                 // flipping `imaging_protocol` on the catalog
@@ -11342,6 +11353,14 @@ fn connect_satellites_panel(
                 // bar when the DSP echoes the change, so we
                 // don't have to mirror those widgets manually.
                 state_a.dispatch_vfo_offset(saved.vfo_offset_hz);
+                // Re-engage ACARS if it was on before the pass.
+                // Goes after the tune so the airband lock retunes
+                // from the user's just-restored freq rather than
+                // racing against it. Symmetric with the AOS arm.
+                if state_a.acars_was_engaged_pre_pass.replace(false) {
+                    tracing::info!("auto-record LOS: re-engaging ACARS (was on pre-pass)");
+                    state_a.send_dsp(UiToDsp::SetAcarsEnabled(true));
+                }
                 // If the user had playback off pre-AOS, we
                 // started the radio at AOS to make audio flow —
                 // honour that round trip and stop it now. A user
