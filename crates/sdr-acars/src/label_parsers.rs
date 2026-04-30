@@ -180,6 +180,105 @@ fn label_qh(text: &str) -> Option<Oooi> {
     o.has_any().then_some(o)
 }
 
+fn label_qk(text: &str) -> Option<Oooi> {
+    // C: sa(0), won(4), da(8)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        won: slice4(text, 4),
+        da: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_ql(text: &str) -> Option<Oooi> {
+    // C: da(0), gin(8), sa(13).
+    // Note: skips bytes 4..8 (some separator) and byte 12.
+    let o = Oooi {
+        da: slice4(text, 0),
+        gin: slice4(text, 8),
+        sa: slice4(text, 13),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qm(text: &str) -> Option<Oooi> {
+    // C: da(0), sa(8). Skips bytes 4..8.
+    let o = Oooi {
+        da: slice4(text, 0),
+        sa: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qn(text: &str) -> Option<Oooi> {
+    // C: da(4), eta(8). Skips bytes 0..4.
+    let o = Oooi {
+        da: slice4(text, 4),
+        eta: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qp(text: &str) -> Option<Oooi> {
+    // C: sa(0), da(4), gout(8)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        da: slice4(text, 4),
+        gout: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qq(text: &str) -> Option<Oooi> {
+    // C: sa(0), da(4), woff(8)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        da: slice4(text, 4),
+        woff: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qr(text: &str) -> Option<Oooi> {
+    // C: sa(0), da(4), won(8)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        da: slice4(text, 4),
+        won: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qs(text: &str) -> Option<Oooi> {
+    // C: sa(0), da(4), gin(8)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        da: slice4(text, 4),
+        gin: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qt(text: &str) -> Option<Oooi> {
+    // C: sa(0), da(4), gout(8), gin(12)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        da: slice4(text, 4),
+        gout: slice4(text, 8),
+        gin: slice4(text, 12),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
 /// Decode the OOOI metadata for an ACARS message. Returns
 /// `Some(Oooi)` when:
 ///
@@ -206,6 +305,15 @@ pub fn decode_label(label: [u8; 2], text: &str) -> Option<Oooi> {
             b'F' => label_qf(text),
             b'G' => label_qg(text),
             b'H' => label_qh(text),
+            b'K' => label_qk(text),
+            b'L' => label_ql(text),
+            b'M' => label_qm(text),
+            b'N' => label_qn(text),
+            b'P' => label_qp(text),
+            b'Q' => label_qq(text),
+            b'R' => label_qr(text),
+            b'S' => label_qs(text),
+            b'T' => label_qt(text),
             _ => None,
         },
         _ => None,
@@ -409,5 +517,97 @@ mod tests {
                 second as char
             );
         }
+    }
+
+    #[test]
+    fn label_qk_extracts_sa_won_da() {
+        let txt = "KORD1020KSFO";
+        let o = decode_label([b'Q', b'K'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.won.as_deref(), Some("1020"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_ql_extracts_da_gin_sa() {
+        // Offsets: da(0..4) skip(4..8) gin(8..12) skip(12) sa(13..17)
+        let txt = "KSFO____1245_KORD";
+        let o = decode_label([b'Q', b'L'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.gin.as_deref(), Some("1245"));
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+    }
+
+    #[test]
+    fn label_qm_extracts_da_and_sa() {
+        // Offsets: da(0..4) skip(4..8) sa(8..12)
+        let txt = "KSFO____KORD";
+        let o = decode_label([b'Q', b'M'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+    }
+
+    #[test]
+    fn label_qn_extracts_da_and_eta() {
+        // Offsets: skip(0..4) da(4..8) eta(8..12)
+        let txt = "____KSFO0830";
+        let o = decode_label([b'Q', b'N'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.eta.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn label_qp_extracts_sa_da_gout() {
+        let txt = "KORDKSFO0830";
+        let o = decode_label([b'Q', b'P'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.gout.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn label_qq_extracts_sa_da_woff() {
+        let txt = "KORDKSFO0945";
+        let o = decode_label([b'Q', b'Q'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.woff.as_deref(), Some("0945"));
+    }
+
+    #[test]
+    fn label_qr_extracts_sa_da_won() {
+        let txt = "KORDKSFO1020";
+        let o = decode_label([b'Q', b'R'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.won.as_deref(), Some("1020"));
+    }
+
+    #[test]
+    fn label_qs_extracts_sa_da_gin() {
+        let txt = "KORDKSFO1245";
+        let o = decode_label([b'Q', b'S'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.gin.as_deref(), Some("1245"));
+    }
+
+    #[test]
+    fn label_qt_extracts_sa_da_gout_gin() {
+        let txt = "KORDKSFO08301245";
+        let o = decode_label([b'Q', b'T'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.gout.as_deref(), Some("0830"));
+        assert_eq!(o.gin.as_deref(), Some("1245"));
+    }
+
+    #[test]
+    fn q_unknown_second_char_returns_none() {
+        // Q4 / QI / QJ / QU etc. don't have parsers.
+        assert!(decode_label([b'Q', b'4'], "anything").is_none());
+        assert!(decode_label([b'Q', b'I'], "anything").is_none());
+        assert!(decode_label([b'Q', b'J'], "anything").is_none());
+        assert!(decode_label([b'Q', b'U'], "anything").is_none());
     }
 }
