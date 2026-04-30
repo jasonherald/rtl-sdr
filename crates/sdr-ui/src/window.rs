@@ -12142,10 +12142,24 @@ fn connect_aviation_panel(
     {
         let state = Rc::clone(state);
         let config = std::sync::Arc::clone(config);
+        let enable_row = panel.jsonl_enable_row.clone();
         panel.jsonl_path_row.connect_apply(move |row| {
             let value = row.text().to_string();
             crate::acars_config::save_acars_jsonl_path(&config, &value);
-            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(value));
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(
+                value.clone(),
+            ));
+            // Keep the enable-row subtitle in sync — when the
+            // toggle is on, the subtitle shows the current
+            // path. CR round 2 on PR #595.
+            if enable_row.is_active() {
+                let subtitle = if value.is_empty() {
+                    "~/sdr-recordings/acars.jsonl".to_string()
+                } else {
+                    value
+                };
+                enable_row.set_subtitle(&subtitle);
+            }
         });
     }
 
@@ -12186,10 +12200,24 @@ fn connect_aviation_panel(
     {
         let state = Rc::clone(state);
         let config = std::sync::Arc::clone(config);
+        let enable_row = panel.network_enable_row.clone();
         panel.network_addr_row.connect_apply(move |row| {
             let value = row.text().to_string();
             crate::acars_config::save_acars_network_addr(&config, &value);
-            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkAddr(value));
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkAddr(
+                value.clone(),
+            ));
+            // Keep the enable-row subtitle in sync — when the
+            // toggle is on, the subtitle shows the current
+            // addr. CR round 2 on PR #595.
+            if enable_row.is_active() {
+                let subtitle = if value.is_empty() {
+                    "feed.airframes.io:5550".to_string()
+                } else {
+                    value
+                };
+                enable_row.set_subtitle(&subtitle);
+            }
         });
     }
 

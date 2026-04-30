@@ -187,6 +187,18 @@ pub fn build_aviation_panel() -> AviationPanel {
         .build();
 
     let station_id_row = adw::EntryRow::builder().title("Station ID").build();
+    // 8-char cap matches acarsdec's `idstation` field width
+    // (output.c uses an 8-byte char array for the station_id
+    // embedded in JSON output). `AdwEntryRow` doesn't expose
+    // `set_max_length` directly, so we truncate on `changed`.
+    // CR round 2 on PR #595.
+    station_id_row.connect_changed(|row| {
+        let text = row.text();
+        if text.chars().count() > 8 {
+            let truncated: String = text.chars().take(8).collect();
+            row.set_text(&truncated);
+        }
+    });
     output_group.add(&station_id_row);
 
     let jsonl_enable_row = adw::SwitchRow::builder().title("Write JSON log").build();

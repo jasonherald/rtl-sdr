@@ -1154,6 +1154,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 state.acars_bank = None;
                                 state.acars_init_failed = false;
                                 state.acars_pre_lock = None;
+                                // Forced-off path also closes
+                                // output writers — intent flags
+                                // persist for the next engage.
+                                // CR round 2 on PR #595.
+                                close_acars_outputs(&mut state.acars_outputs);
                                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
                                 // Also send a definitive Ok(false)
                                 // so the UI (which preserves state
@@ -3353,6 +3358,10 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     state.acars_init_failed = false;
     state.acars_pre_lock = None;
     if acars_forced_off {
+        // Close output writers on forced-off cleanup. Intent
+        // flags persist so a future engage reopens. CR round 2
+        // on PR #595.
+        close_acars_outputs(&mut state.acars_outputs);
         let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
     }
 
@@ -4284,6 +4293,12 @@ fn handle_acars_engage_failure(
     state.acars_init_failed = false;
     state.acars_pre_lock = None;
 
+    // Output writers may have been opened by an earlier engage;
+    // close them on forced-off so file/socket handles don't
+    // leak. Intent flags persist for the next engage.
+    // CR round 2 on PR #595.
+    close_acars_outputs(&mut state.acars_outputs);
+
     let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(orig_err)));
 
     // Signal teardown to caller if the live rollback failed AND
@@ -4370,6 +4385,22 @@ fn open_udp(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, addr: &str) {
     }
 }
 
+/// Flush + drop the JSONL writer and the UDP feeder. Used by
+/// every ACARS "forced-off" path (successful disengage, post-
+/// Start reassert failure, disengage double-failure, and the
+/// `cleanup()` forced-off branch). Intent flags
+/// (`jsonl_enabled` / `network_enabled`) stay untouched so a
+/// subsequent re-engage reopens the writers automatically.
+/// CR round 2 on PR #595.
+fn close_acars_outputs(outputs: &mut AcarsOutputs) {
+    if let Some(mut w) = outputs.jsonl.take()
+        && let Err(e) = w.flush()
+    {
+        tracing::warn!("acars jsonl flush on close failed: {e}");
+    }
+    outputs.udp = None;
+}
+
 fn handle_set_acars_jsonl_enabled(
     state: &mut DspState,
     dsp_tx: &mpsc::Sender<DspToUi>,
@@ -4393,7 +4424,8 @@ fn handle_set_acars_jsonl_enabled(
 }
 
 fn handle_set_acars_jsonl_path(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, path: &str) {
-    state.acars_outputs.pending_jsonl_path = if path.trim().is_empty() {
+    let path = path.trim();
+    state.acars_outputs.pending_jsonl_path = if path.is_empty() {
         None
     } else {
         Some(path.to_string())
@@ -4428,7 +4460,8 @@ fn handle_set_acars_network_enabled(
 }
 
 fn handle_set_acars_network_addr(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, addr: &str) {
-    state.acars_outputs.pending_network_addr = if addr.trim().is_empty() {
+    let addr = addr.trim();
+    state.acars_outputs.pending_network_addr = if addr.is_empty() {
         None
     } else {
         Some(addr.to_string())
@@ -4642,6 +4675,10 @@ fn handle_set_acars_enabled(
                 state.acars_bank = None;
                 state.acars_init_failed = false;
                 state.acars_pre_lock = None;
+                // Forced-off — close output writers (intent
+                // flags persist for next engage). CR round 2
+                // on PR #595.
+                close_acars_outputs(&mut state.acars_outputs);
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
                 return if state.source.is_some() {
@@ -4666,15 +4703,11 @@ fn handle_set_acars_enabled(
         state.acars_bank = None;
         state.acars_init_failed = false;
 
-        // Flush + drop output writers. They get reopened on
-        // the next `SetAcarsJsonlEnabled(true)` / `SetAcarsNetworkEnabled(true)`
-        // command. Issue #578.
-        if let Some(mut w) = state.acars_outputs.jsonl.take()
-            && let Err(e) = w.flush()
-        {
-            tracing::warn!("acars jsonl flush on disengage failed: {e}");
-        }
-        state.acars_outputs.udp = None;
+        // Flush + drop output writers. Intent flags
+        // (`jsonl_enabled` / `network_enabled`) stay set so a
+        // subsequent `SetAcarsEnabled(true)` re-engage reopens
+        // them automatically. Issue #578.
+        close_acars_outputs(&mut state.acars_outputs);
 
         // VFO offset restore. The controller stores it on
         // `state.vfo_offset` (read by `rebuild_vfo` and the
