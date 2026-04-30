@@ -562,6 +562,80 @@ fn label_45(text: &str) -> Option<Oooi> {
     o.has_any().then_some(o)
 }
 
+fn label_80(text: &str) -> Option<Oooi> {
+    // C: memcmp(&txt[6], "/DEST/", 5) → only first 5 chars
+    // compared, so check `text[6..11] == "/DEST"`. Then da(12).
+    if text.get(6..11) != Some("/DEST") {
+        return None;
+    }
+    let o = Oooi {
+        da: slice4(text, 12),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_83(text: &str) -> Option<Oooi> {
+    // C: txt[4]==',' → sa(0), da(5).
+    if byte_at(text, 4) != Some(b',') {
+        return None;
+    }
+    let o = Oooi {
+        sa: slice4(text, 0),
+        da: slice4(text, 5),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_8d(text: &str) -> Option<Oooi> {
+    // C: txt[4]==',' && txt[35]==',' → sa(36); txt[40]==',' →
+    // da(41).
+    if byte_at(text, 4) != Some(b',') {
+        return None;
+    }
+    if byte_at(text, 35) != Some(b',') {
+        return None;
+    }
+    let sa = slice4(text, 36);
+    if byte_at(text, 40) != Some(b',') {
+        return None;
+    }
+    let da = slice4(text, 41);
+    let o = Oooi {
+        sa,
+        da,
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_8e(text: &str) -> Option<Oooi> {
+    // C: txt[4]==',' → da(0), eta(5).
+    if byte_at(text, 4) != Some(b',') {
+        return None;
+    }
+    let o = Oooi {
+        da: slice4(text, 0),
+        eta: slice4(text, 5),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_8s(text: &str) -> Option<Oooi> {
+    // C: txt[4]==',' → da(0), eta(5). Same body as label_8e.
+    if byte_at(text, 4) != Some(b',') {
+        return None;
+    }
+    let o = Oooi {
+        da: slice4(text, 0),
+        eta: slice4(text, 5),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
 /// Decode the OOOI metadata for an ACARS message. Returns
 /// `Some(Oooi)` when:
 ///
@@ -602,6 +676,14 @@ pub fn decode_label(label: [u8; 2], text: &str) -> Option<Oooi> {
         b'4' => match label[1] {
             b'4' => label_44(text),
             b'5' => label_45(text),
+            _ => None,
+        },
+        b'8' => match label[1] {
+            b'0' => label_80(text),
+            b'3' => label_83(text),
+            b'D' => label_8d(text),
+            b'E' => label_8e(text),
+            b'S' => label_8s(text),
             _ => None,
         },
         b'Q' => match label[1] {
@@ -1146,5 +1228,61 @@ mod tests {
     #[test]
     fn label_45_no_a_prefix_returns_none() {
         assert!(decode_label([b'4', b'5'], "BKSFO").is_none());
+    }
+
+    #[test]
+    fn label_80_extracts_da_after_dest_prefix() {
+        // Offsets: skip 0..6, "/DEST" 6..11, skip 11, da(12..16).
+        // Note: C compares 5 bytes against "/DEST/" so only
+        // "/DEST" matters; the trailing slash is irrelevant.
+        let txt = "______/DEST_KSFO";
+        let o = decode_label([b'8', b'0'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_80_no_dest_prefix_returns_none() {
+        assert!(decode_label([b'8', b'0'], "______/SRCE_KSFO").is_none());
+    }
+
+    #[test]
+    fn label_83_extracts_sa_and_da_with_comma() {
+        let txt = "KORD,KSFO";
+        let o = decode_label([b'8', b'3'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_8d_extracts_sa_da_with_three_commas() {
+        // Offsets: skip 0..4, ',' at 4, skip 5..35, ',' at 35,
+        // sa(36..40), ',' at 40, da(41..45).
+        let txt = "____,______________________________,KORD,KSFO";
+        let o = decode_label([b'8', b'D'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_8e_extracts_da_and_eta_with_comma() {
+        // Offsets: da(0..4), ',' at 4, eta(5..9).
+        let txt = "KSFO,0830";
+        let o = decode_label([b'8', b'E'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.eta.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn label_8s_extracts_da_and_eta_with_comma() {
+        let txt = "KSFO,0830";
+        let o = decode_label([b'8', b'S'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.eta.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn eight_family_unknown_second_char_returns_none() {
+        assert!(decode_label([b'8', b'1'], "anything").is_none());
+        assert!(decode_label([b'8', b'X'], "anything").is_none());
     }
 }
