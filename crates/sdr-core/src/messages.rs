@@ -172,6 +172,16 @@ pub enum DspToUi {
     /// successful engage; `Ok(false)` after disengage; `Err`
     /// on any failure (bank init, source retune, etc).
     AcarsEnabledChanged(Result<bool, crate::acars_airband_lock::AcarsEnableError>),
+    /// Surfaces an output writer's open / DNS / I/O error to
+    /// the UI for toast display. Sent on `JsonlWriter::open`
+    /// or `UdpFeeder::open` failure. Issue #578.
+    AcarsOutputError {
+        /// `"jsonl"` or `"udp"` — used to scope the toast.
+        kind: &'static str,
+        /// Human-readable error message (already includes
+        /// the file path or host:port).
+        message: String,
+    },
 }
 
 /// Available source types for IQ input.
@@ -446,6 +456,15 @@ pub enum UiToDsp {
     /// the prior source config and forces (2.5 `MSps`, 130.3375 MHz,
     /// frontend decim=1); `false` restores the snapshot.
     SetAcarsEnabled(bool),
+    /// Toggle the ACARS JSONL log writer on/off. Issue #578.
+    SetAcarsJsonlEnabled(bool),
+    /// Update the JSONL log path. Empty string ⇒ default
+    /// path (`~/sdr-recordings/acars.jsonl`). Issue #578.
+    SetAcarsJsonlPath(String),
+    /// Toggle the ACARS UDP JSON feeder on/off. Issue #578.
+    SetAcarsNetworkEnabled(bool),
+    /// Update the feeder host:port. Issue #578.
+    SetAcarsNetworkAddr(String),
     /// Switch the ACARS channel set / region (issue #581). The
     /// DSP records this on `DspState::acars_region`; the next
     /// `SetAcarsEnabled(true)` consults it to pick channels and
@@ -453,6 +472,10 @@ pub enum UiToDsp {
     /// airband lock rejects geometry mutations); the user
     /// disengages, switches region, then re-engages.
     SetAcarsRegion(crate::acars_airband_lock::AcarsRegion),
+    /// Update the operator station ID embedded in the JSON's
+    /// `station_id` field. Empty string ⇒ field omitted.
+    /// Issue #578.
+    SetAcarsStationId(String),
 }
 
 #[cfg(test)]

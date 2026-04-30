@@ -769,7 +769,10 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         // its own ticket. Drop here for the same reason as AptLine.
         | DspToUi::AcarsMessage(_)
         | DspToUi::AcarsChannelStats(_)
-        | DspToUi::AcarsEnabledChanged(_) => return None,
+        | DspToUi::AcarsEnabledChanged(_)
+        // Output-error toast (issue #578) — Linux-only writer path;
+        // macOS ticket will handle when FFI layer gets ACARS output.
+        | DspToUi::AcarsOutputError { .. } => return None,
     };
 
     Some((event, owned_cstring, owned_vec))

@@ -226,6 +226,48 @@ fn poll_rtl_tcp_connection_state(state: &mut DspState, dsp_tx: &mpsc::Sender<Dsp
     }
 }
 
+/// Output-writer bundle owned by `DspState`. Keeps the
+/// JSONL writer, UDP feeder, station ID, and per-writer
+/// warn-rate-limit timestamps together so the
+/// `acars_decode_tap` signature stays narrow. Issue #578.
+#[allow(dead_code)] // removed in Task 8 when handlers wire the fields
+struct AcarsOutputs {
+    jsonl: Option<crate::acars_output::JsonlWriter>,
+    udp: Option<crate::acars_output::UdpFeeder>,
+    station_id: Option<String>,
+    /// Last warn timestamp for JSONL write failures. 30 s
+    /// rate limit prevents log spam from a misconfigured
+    /// path. Issue #578.
+    jsonl_warn_at: Option<std::time::Instant>,
+    /// Last warn timestamp for UDP send failures.
+    udp_warn_at: Option<std::time::Instant>,
+    /// Latest user-set JSONL path (resolved when opening).
+    /// `None` ⇒ use default `~/sdr-recordings/acars.jsonl`.
+    pending_jsonl_path: Option<String>,
+    /// Latest user-set feeder addr. `None` ⇒ default
+    /// `feed.airframes.io:5550`.
+    pending_network_addr: Option<String>,
+}
+
+impl AcarsOutputs {
+    const fn new() -> Self {
+        Self {
+            jsonl: None,
+            udp: None,
+            station_id: None,
+            jsonl_warn_at: None,
+            udp_warn_at: None,
+            pending_jsonl_path: None,
+            pending_network_addr: None,
+        }
+    }
+}
+
+/// Minimum interval between repeated warn-log emissions for
+/// the same writer. Issue #578.
+#[allow(dead_code)] // consumed in Task 9's tap-closure rate-limiter
+const ACARS_OUTPUT_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Mutable state owned by the DSP thread.
 ///
 /// This is a god-struct that holds every piece of DSP-thread state by
@@ -563,6 +605,12 @@ struct DspState {
     /// `UiToDsp::SetAcarsRegion` before engage; read at
     /// engage time to pick channels + center.
     acars_region: crate::acars_airband_lock::AcarsRegion,
+    /// Output-writer bundle: JSONL log, UDP feeder, station
+    /// ID, and per-writer warn-rate-limit timestamps.
+    /// Handlers land in Task 8; tap wiring in Task 9.
+    /// Issue #578.
+    #[allow(dead_code)] // removed in Task 8 when handlers wire the field
+    acars_outputs: AcarsOutputs,
 }
 
 impl DspState {
@@ -658,6 +706,7 @@ impl DspState {
             acars_init_failed: false,
             acars_stats_emitted_at: std::time::Instant::now(),
             acars_region: crate::acars_airband_lock::AcarsRegion::default(),
+            acars_outputs: AcarsOutputs::new(),
         })
     }
 }
@@ -2485,6 +2534,22 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 );
                 state.acars_region = region;
             }
+        }
+        // --- ACARS output commands (#578) — handlers land in Task 8 ---
+        UiToDsp::SetAcarsJsonlEnabled(_enabled) => {
+            // TODO Task 8: open/close JsonlWriter.
+        }
+        UiToDsp::SetAcarsJsonlPath(_path) => {
+            // TODO Task 8: persist pending_jsonl_path.
+        }
+        UiToDsp::SetAcarsNetworkEnabled(_enabled) => {
+            // TODO Task 8: open/close UdpFeeder.
+        }
+        UiToDsp::SetAcarsNetworkAddr(_addr) => {
+            // TODO Task 8: persist pending_network_addr.
+        }
+        UiToDsp::SetAcarsStationId(_station_id) => {
+            // TODO Task 8: persist station_id on AcarsOutputs.
         }
     }
 }

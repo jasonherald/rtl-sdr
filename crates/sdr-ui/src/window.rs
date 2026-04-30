@@ -2262,6 +2262,18 @@ fn handle_dsp_message(
                 }
             }
         }
+        // Output-writer errors (issue #578). Handler wired in Task 8;
+        // stub here keeps the match exhaustive. Surfaces the kind-scoped
+        // message as a toast so the user sees misconfigured paths / DNS
+        // failures without having to consult the log.
+        DspToUi::AcarsOutputError { kind, message } => {
+            tracing::warn!(kind, message, "ACARS output error");
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                overlay.add_toast(adw::Toast::new(&format!(
+                    "ACARS {kind} output error: {message}"
+                )));
+            }
+        }
     }
 }
 
