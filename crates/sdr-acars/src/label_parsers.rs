@@ -39,8 +39,13 @@ impl Oooi {
     /// parser must surface at least one populated field for the
     /// result to be meaningful, otherwise the dispatch returns
     /// `None`.
+    ///
+    /// Crate-internal visibility — this is parser bookkeeping,
+    /// not part of the public OOOI API. External consumers can
+    /// inspect the seven `Option<ArrayString<4>>` fields
+    /// directly.
     #[must_use]
-    pub fn has_any(&self) -> bool {
+    pub(crate) fn has_any(&self) -> bool {
         self.sa.is_some()
             || self.da.is_some()
             || self.gout.is_some()

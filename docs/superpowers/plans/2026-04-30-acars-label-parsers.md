@@ -1730,8 +1730,11 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `crates/sdr-acars/src/frame.rs:39` (struct definition)
-- Modify: `crates/sdr-acars/src/frame.rs:442` (FrameParser::emit construction)
-- Modify: `crates/sdr-acars/src/reassembly.rs:413` (test helper construction)
+- Modify: `crates/sdr-acars/src/frame.rs:442` (FrameParser::emit construction — explicit, needs `parsed: None`)
+- Modify: `crates/sdr-acars/src/reassembly.rs:413` (test helper construction — explicit, needs `parsed: None`)
+- Modify: `crates/sdr-ffi/src/event.rs:1256` (`dummy_acars_message()` test fixture — explicit, needs `parsed: None`)
+
+The other `AcarsMessage` constructor in the codebase is `crates/sdr-acars/src/reassembly.rs:319` — `combine`'s defensive fallback. It uses struct-update syntax `..etx`, so it inherits the new `parsed` field automatically and needs no change. Verify with `grep -n "AcarsMessage {" crates/` after the edits — the result should match the four sites above plus the spread-syntax site.
 
 - [ ] **Step 9.1: Add field to struct**
 
@@ -1813,7 +1816,21 @@ In `crates/sdr-acars/src/reassembly.rs` around line 413, update `make_msg` simil
 
 (The `combine` and `combine_partial` paths use `..etx` / clone-then-mutate so they pick up `parsed` from the source message automatically.)
 
-- [ ] **Step 9.4: Run gates**
+- [ ] **Step 9.4: Update `dummy_acars_message()` fixture in `sdr-ffi`**
+
+In `crates/sdr-ffi/src/event.rs`, locate the `dummy_acars_message()` test fixture (around line 1256) — it builds an `AcarsMessage` explicitly for the `tests` module. Add `parsed: None,` immediately after `reassembled_block_count: 1,`:
+
+```rust
+        AcarsMessage {
+            /* existing fields ... */
+            reassembled_block_count: 1,
+            parsed: None,
+        }
+```
+
+(This crate doesn't construct `AcarsMessage` outside the test fixture, so this is the only edit needed in `sdr-ffi`.)
+
+- [ ] **Step 9.5: Run gates**
 
 ```bash
 cargo build --workspace --features sdr-transcription/whisper-cpu
@@ -1822,19 +1839,20 @@ cargo clippy --workspace --features sdr-transcription/whisper-cpu --all-targets 
 cargo fmt --all -- --check
 ```
 
-Expected: workspace builds, all sdr-acars tests pass, clippy clean across the whole workspace (the new field has `pub` visibility so consumer crates compile against it without changes — they don't construct `AcarsMessage` directly).
+Expected: workspace builds, all sdr-acars tests pass, clippy clean across the whole workspace.
 
-- [ ] **Step 9.5: Commit**
+- [ ] **Step 9.6: Commit**
 
 ```bash
-git add crates/sdr-acars/src/frame.rs crates/sdr-acars/src/reassembly.rs
+git add crates/sdr-acars/src/frame.rs crates/sdr-acars/src/reassembly.rs crates/sdr-ffi/src/event.rs
 git commit -m "feat(sdr-acars): add AcarsMessage.parsed: Option<Oooi> field
 
 Issue #577. Adds the OOOI metadata field to AcarsMessage,
-default-None at FrameParser construction. Test helper in
-reassembly.rs updated to match. Reassembly's combine /
-combine_partial paths use ..etx / clone-then-mutate so they
-inherit parsed automatically — no changes needed there.
+default-None at FrameParser construction. Test helpers in
+reassembly.rs and sdr-ffi/src/event.rs updated to match.
+Reassembly's combine / combine_partial paths use ..etx /
+clone-then-mutate so they inherit parsed automatically — no
+changes needed there.
 
 Population deferred to ChannelBank::process (next task) so
 multi-block reassembled text parses once on the final
@@ -1872,7 +1890,7 @@ Locate the block:
 
 ```rust
             for emitted in ch.assembler.observe(msg, now) {
-                stats.total_messages = stats.total_messages.saturating_add(1);
+                stats.msg_count = stats.msg_count.saturating_add(1);
                 stats.last_msg_at = Some(emitted.timestamp);
                 /* ... */
                 stats.level_db = emitted.level_db;
@@ -1886,7 +1904,7 @@ Replace with (the only changes are `let mut emitted = emitted;` at the top of th
 ```rust
             for emitted in ch.assembler.observe(msg, now) {
                 let mut emitted = emitted;
-                stats.total_messages = stats.total_messages.saturating_add(1);
+                stats.msg_count = stats.msg_count.saturating_add(1);
                 stats.last_msg_at = Some(emitted.timestamp);
                 /* ... */
                 stats.level_db = emitted.level_db;
@@ -1918,7 +1936,7 @@ Apply the same two-line change:
 ```rust
             for emitted in ch.assembler.drain_timeouts(std::time::SystemTime::now()) {
                 let mut emitted = emitted;
-                stats.total_messages = stats.total_messages.saturating_add(1);
+                stats.msg_count = stats.msg_count.saturating_add(1);
                 stats.last_msg_at = Some(emitted.timestamp);
                 stats.level_db = emitted.level_db;
                 /* ... */
