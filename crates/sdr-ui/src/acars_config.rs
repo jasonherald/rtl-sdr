@@ -19,9 +19,30 @@ pub const KEY_ACARS_CHANNEL_SET: &str = "acars_channel_set";
 /// constant has one home.
 pub const KEY_ACARS_RECENT_KEEP_COUNT: &str = "acars_recent_keep_count";
 
+/// JSONL writer toggle. Default `false`. Issue #578.
+pub const KEY_ACARS_JSONL_ENABLED: &str = "acars_jsonl_enabled";
+
+/// JSONL log file path. Empty ⇒ `~/sdr-recordings/acars.jsonl`
+/// at writer-open time. Issue #578.
+pub const KEY_ACARS_JSONL_PATH: &str = "acars_jsonl_path";
+
+/// UDP feeder toggle. Default `false`. Issue #578.
+pub const KEY_ACARS_NETWORK_ENABLED: &str = "acars_network_enabled";
+
+/// UDP feeder host:port. Default `feed.airframes.io:5550`.
+/// Issue #578.
+pub const KEY_ACARS_NETWORK_ADDR: &str = "acars_network_addr";
+
+/// Operator station identifier embedded in the JSON's
+/// `station_id` field. Empty ⇒ field omitted. Issue #578.
+pub const KEY_ACARS_STATION_ID: &str = "acars_station_id";
+
 /// Default value used when a key is missing from the config.
 const DEFAULT_ACARS_ENABLED: bool = false;
 const DEFAULT_ACARS_CHANNEL_SET: &str = "us-6";
+const DEFAULT_ACARS_JSONL_ENABLED: bool = false;
+const DEFAULT_ACARS_NETWORK_ENABLED: bool = false;
+const DEFAULT_ACARS_NETWORK_ADDR: &str = "feed.airframes.io:5550";
 
 /// Read the persisted ACARS-enabled flag, defaulting to
 /// `DEFAULT_ACARS_ENABLED` if absent. Mirrors the
@@ -61,6 +82,84 @@ pub fn read_acars_channel_set(config: &ConfigManager) -> String {
 pub fn save_acars_channel_set(config: &ConfigManager, value: &str) {
     config.write(|v| {
         v[KEY_ACARS_CHANNEL_SET] = serde_json::json!(value);
+    });
+}
+
+#[must_use]
+pub fn read_acars_jsonl_enabled(config: &ConfigManager) -> bool {
+    config.read(|v| {
+        v.get(KEY_ACARS_JSONL_ENABLED)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(DEFAULT_ACARS_JSONL_ENABLED)
+    })
+}
+
+pub fn save_acars_jsonl_enabled(config: &ConfigManager, value: bool) {
+    config.write(|v| {
+        v[KEY_ACARS_JSONL_ENABLED] = serde_json::json!(value);
+    });
+}
+
+#[must_use]
+pub fn read_acars_jsonl_path(config: &ConfigManager) -> String {
+    config.read(|v| {
+        v.get(KEY_ACARS_JSONL_PATH)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default()
+    })
+}
+
+pub fn save_acars_jsonl_path(config: &ConfigManager, value: &str) {
+    config.write(|v| {
+        v[KEY_ACARS_JSONL_PATH] = serde_json::json!(value);
+    });
+}
+
+#[must_use]
+pub fn read_acars_network_enabled(config: &ConfigManager) -> bool {
+    config.read(|v| {
+        v.get(KEY_ACARS_NETWORK_ENABLED)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(DEFAULT_ACARS_NETWORK_ENABLED)
+    })
+}
+
+pub fn save_acars_network_enabled(config: &ConfigManager, value: bool) {
+    config.write(|v| {
+        v[KEY_ACARS_NETWORK_ENABLED] = serde_json::json!(value);
+    });
+}
+
+#[must_use]
+pub fn read_acars_network_addr(config: &ConfigManager) -> String {
+    config.read(|v| {
+        v.get(KEY_ACARS_NETWORK_ADDR)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| DEFAULT_ACARS_NETWORK_ADDR.to_string(), str::to_string)
+    })
+}
+
+pub fn save_acars_network_addr(config: &ConfigManager, value: &str) {
+    config.write(|v| {
+        v[KEY_ACARS_NETWORK_ADDR] = serde_json::json!(value);
+    });
+}
+
+#[must_use]
+pub fn read_acars_station_id(config: &ConfigManager) -> String {
+    config.read(|v| {
+        v.get(KEY_ACARS_STATION_ID)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default()
+    })
+}
+
+pub fn save_acars_station_id(config: &ConfigManager, value: &str) {
+    config.write(|v| {
+        v[KEY_ACARS_STATION_ID] = serde_json::json!(value);
     });
 }
 
@@ -107,5 +206,30 @@ mod tests {
         assert_eq!(read_acars_channel_set(&cfg), "europe");
         save_acars_channel_set(&cfg, "us-6");
         assert_eq!(read_acars_channel_set(&cfg), "us-6");
+    }
+
+    #[test]
+    fn output_keys_default_when_unset() {
+        let cfg = fresh_config();
+        assert!(!read_acars_jsonl_enabled(&cfg));
+        assert_eq!(read_acars_jsonl_path(&cfg), "");
+        assert!(!read_acars_network_enabled(&cfg));
+        assert_eq!(read_acars_network_addr(&cfg), "feed.airframes.io:5550");
+        assert_eq!(read_acars_station_id(&cfg), "");
+    }
+
+    #[test]
+    fn output_keys_round_trip() {
+        let cfg = fresh_config();
+        save_acars_jsonl_enabled(&cfg, true);
+        save_acars_jsonl_path(&cfg, "/tmp/foo.jsonl");
+        save_acars_network_enabled(&cfg, true);
+        save_acars_network_addr(&cfg, "127.0.0.1:5550");
+        save_acars_station_id(&cfg, "TEST1");
+        assert!(read_acars_jsonl_enabled(&cfg));
+        assert_eq!(read_acars_jsonl_path(&cfg), "/tmp/foo.jsonl");
+        assert!(read_acars_network_enabled(&cfg));
+        assert_eq!(read_acars_network_addr(&cfg), "127.0.0.1:5550");
+        assert_eq!(read_acars_station_id(&cfg), "TEST1");
     }
 }
