@@ -54,9 +54,10 @@ impl Oooi {
 /// Read a single byte at `idx`. `None` if the text is too
 /// short. Mirrors C's `txt[idx]` access without the UB.
 //
-// Dead-code allowed: this helper is called by parser match arms
-// that land in subsequent tasks. Remove when the first parser
-// lands (it will call this from non-test code).
+// byte_at is called from tests and will be exercised by
+// non-Q parsers in subsequent tasks (label.c uses index-based
+// char checks in several label families). Keep the allow until
+// those parsers land.
 #[allow(dead_code)]
 fn byte_at(text: &str, idx: usize) -> Option<u8> {
     text.as_bytes().get(idx).copied()
@@ -67,12 +68,116 @@ fn byte_at(text: &str, idx: usize) -> Option<u8> {
 /// UTF-8 char boundary. ACARS payloads are 7-bit ASCII so the
 /// boundary case is unreachable in practice but `text.get(..)`
 /// returns `None` safely either way.
-//
-// Dead-code allowed: same rationale as `byte_at` above.
-#[allow(dead_code)]
 fn slice4(text: &str, start: usize) -> Option<ArrayString<4>> {
     text.get(start..start + 4)
         .and_then(|s| ArrayString::from(s).ok())
+}
+
+fn label_q1(text: &str) -> Option<Oooi> {
+    // C: sa(0), gout(4), woff(8), won(12), gin(16), da(24)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        gout: slice4(text, 4),
+        woff: slice4(text, 8),
+        won: slice4(text, 12),
+        gin: slice4(text, 16),
+        da: slice4(text, 24),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_q2(text: &str) -> Option<Oooi> {
+    // C: sa(0), eta(4)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        eta: slice4(text, 4),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qa(text: &str) -> Option<Oooi> {
+    // C: sa(0), gout(4)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        gout: slice4(text, 4),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qb(text: &str) -> Option<Oooi> {
+    // C: sa(0), woff(4)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        woff: slice4(text, 4),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qc(text: &str) -> Option<Oooi> {
+    // C: sa(0), won(4)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        won: slice4(text, 4),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qd(text: &str) -> Option<Oooi> {
+    // C: sa(0), gin(4)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        gin: slice4(text, 4),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qe(text: &str) -> Option<Oooi> {
+    // C: sa(0), gout(4), da(8)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        gout: slice4(text, 4),
+        da: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qf(text: &str) -> Option<Oooi> {
+    // C: sa(0), woff(4), da(8)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        woff: slice4(text, 4),
+        da: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qg(text: &str) -> Option<Oooi> {
+    // C: sa(0), gout(4), gin(8)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        gout: slice4(text, 4),
+        gin: slice4(text, 8),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_qh(text: &str) -> Option<Oooi> {
+    // C: sa(0), gout(4)
+    let o = Oooi {
+        sa: slice4(text, 0),
+        gout: slice4(text, 4),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
 }
 
 /// Decode the OOOI metadata for an ACARS message. Returns
@@ -89,9 +194,22 @@ fn slice4(text: &str, start: usize) -> Option<ArrayString<4>> {
 /// (succeeded).
 #[must_use]
 pub fn decode_label(label: [u8; 2], text: &str) -> Option<Oooi> {
-    // Stub — populated as parsers land in subsequent tasks.
-    let _ = (label, text);
-    None
+    match label[0] {
+        b'Q' => match label[1] {
+            b'1' => label_q1(text),
+            b'2' => label_q2(text),
+            b'A' => label_qa(text),
+            b'B' => label_qb(text),
+            b'C' => label_qc(text),
+            b'D' => label_qd(text),
+            b'E' => label_qe(text),
+            b'F' => label_qf(text),
+            b'G' => label_qg(text),
+            b'H' => label_qh(text),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -188,5 +306,108 @@ mod tests {
     fn decode_label_unknown_returns_none() {
         assert!(decode_label([b'X', b'X'], "anything").is_none());
         assert!(decode_label([b'Z', b'Z'], "").is_none());
+    }
+
+    #[test]
+    fn label_q1_extracts_six_fields() {
+        // Offsets: sa(0..4) gout(4..8) woff(8..12) won(12..16)
+        //          gin(16..20) skip(20..24) da(24..28)
+        let txt = "KORD08300945102012450000KSFO";
+        let o = decode_label([b'Q', b'1'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.gout.as_deref(), Some("0830"));
+        assert_eq!(o.woff.as_deref(), Some("0945"));
+        assert_eq!(o.won.as_deref(), Some("1020"));
+        assert_eq!(o.gin.as_deref(), Some("1245"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert!(o.eta.is_none());
+    }
+
+    #[test]
+    fn label_q2_extracts_sa_and_eta() {
+        let txt = "KORD0830";
+        let o = decode_label([b'Q', b'2'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.eta.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn label_qa_extracts_sa_and_gout() {
+        let txt = "KORD0830";
+        let o = decode_label([b'Q', b'A'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.gout.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn label_qb_extracts_sa_and_woff() {
+        let txt = "KORD0945";
+        let o = decode_label([b'Q', b'B'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.woff.as_deref(), Some("0945"));
+    }
+
+    #[test]
+    fn label_qc_extracts_sa_and_won() {
+        let txt = "KORD1020";
+        let o = decode_label([b'Q', b'C'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.won.as_deref(), Some("1020"));
+    }
+
+    #[test]
+    fn label_qd_extracts_sa_and_gin() {
+        let txt = "KORD1245";
+        let o = decode_label([b'Q', b'D'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.gin.as_deref(), Some("1245"));
+    }
+
+    #[test]
+    fn label_qe_extracts_sa_gout_da() {
+        let txt = "KORD0830KSFO";
+        let o = decode_label([b'Q', b'E'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.gout.as_deref(), Some("0830"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_qf_extracts_sa_woff_da() {
+        let txt = "KORD0945KSFO";
+        let o = decode_label([b'Q', b'F'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.woff.as_deref(), Some("0945"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_qg_extracts_sa_gout_gin() {
+        let txt = "KORD08301245";
+        let o = decode_label([b'Q', b'G'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.gout.as_deref(), Some("0830"));
+        assert_eq!(o.gin.as_deref(), Some("1245"));
+    }
+
+    #[test]
+    fn label_qh_extracts_sa_and_gout() {
+        let txt = "KORD0830";
+        let o = decode_label([b'Q', b'H'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.gout.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn q_family_short_text_returns_none() {
+        // All Q-family parsers should bail when text is too short
+        // for even the first slice4.
+        for second in [b'1', b'2', b'A', b'B', b'C', b'D', b'E', b'F', b'G', b'H'] {
+            assert!(
+                decode_label([b'Q', second], "AB").is_none(),
+                "Q{} should be None for short text",
+                second as char
+            );
+        }
     }
 }
