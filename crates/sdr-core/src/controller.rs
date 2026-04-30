@@ -1065,6 +1065,28 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 state.acars_bank = None;
                                 state.acars_init_failed = false;
                                 state.acars_stats_emitted_at = std::time::Instant::now();
+                                // Mirror the engage-path output reopen
+                                // hook for the enable-while-stopped /
+                                // startup-replay flow: if writers were
+                                // intended-on but failed to open during
+                                // the engage (or never got a chance),
+                                // retry now that the source is going
+                                // live. Without this the session would
+                                // silently run with no JSONL / UDP until
+                                // the user toggles or reapplies the
+                                // destination. CR round 6 on PR #595.
+                                if state.acars_outputs.jsonl_enabled
+                                    && state.acars_outputs.jsonl.is_none()
+                                {
+                                    let path = jsonl_path_for(&state.acars_outputs);
+                                    open_jsonl(state, dsp_tx, &path);
+                                }
+                                if state.acars_outputs.network_enabled
+                                    && state.acars_outputs.udp.is_none()
+                                {
+                                    let addr = network_addr_for(&state.acars_outputs);
+                                    open_udp(state, dsp_tx, &addr);
+                                }
                                 tracing::debug!(
                                     sample_rate = state.sample_rate,
                                     center_freq = state.center_freq,
