@@ -197,7 +197,7 @@ impl MessageAssembler {
     pub fn flush(&mut self) -> Vec<AcarsMessage> {
         self.pending
             .drain()
-            .map(|(_, pending)| combine_partial(pending.blocks))
+            .filter_map(|(_, pending)| combine_partial(pending.blocks))
             .collect()
     }
 
@@ -241,7 +241,7 @@ impl MessageAssembler {
             .filter_map(|key| {
                 self.pending
                     .remove(&key)
-                    .map(|p| (p.first_seen, combine_partial(p.blocks)))
+                    .and_then(|p| combine_partial(p.blocks).map(|m| (p.first_seen, m)))
             })
             .collect();
         entries.sort_by_key(|(t, _)| *t);
@@ -290,15 +290,27 @@ fn build_key(msg: &AcarsMessage) -> Option<ReassemblyKey> {
 /// it represents "the message as it became fully observed."
 /// `block_id` keeps the ETX's value (highest by definition) so
 /// downstream consumers see the final block's identifier.
+///
+/// Non-panicking by contract: if `pending` and `etx` together
+/// somehow produce an empty iterator (impossible by
+/// construction — we just pushed `etx`), fall back to the
+/// passed-in `etx` rather than panic. The library-crate rule
+/// in CLAUDE.md forbids `unwrap`/`panic!`; CR round 2 on PR
+/// #593 flagged the previous `expect("non-empty by
+/// construction")` even though the invariant holds.
 fn combine(mut pending: Vec<AcarsMessage>, etx: AcarsMessage) -> AcarsMessage {
-    pending.push(etx);
+    pending.push(etx.clone());
     pending.sort_by_key(|m| m.block_id);
     let block_count: u8 = u8::try_from(pending.len()).unwrap_or(u8::MAX);
-    // Combine text in block-id order. `concat_text` clones the
-    // last block (which has the freshest timestamp + ETX flag)
-    // and replaces its `text` with the joined body.
     let mut iter = pending.into_iter();
-    let first = iter.next().expect("non-empty by construction");
+    let Some(first) = iter.next() else {
+        // Defensive fallback — unreachable in practice because
+        // we pushed `etx` above, so `pending.len() >= 1`.
+        return AcarsMessage {
+            reassembled_block_count: 1,
+            ..etx
+        };
+    };
     let mut out = first.clone();
     let mut combined = first.text;
     for next in iter {
@@ -329,11 +341,18 @@ fn combine(mut pending: Vec<AcarsMessage>, etx: AcarsMessage) -> AcarsMessage {
 /// did arrive in `block_id` order and preserves
 /// `end_of_message = false` on the result so downstream
 /// consumers can tell the message was incomplete.
-fn combine_partial(mut pending: Vec<AcarsMessage>) -> AcarsMessage {
+///
+/// Returns `None` if `pending` is empty. Callers (the `flush`
+/// and `sweep_timeouts` paths) hold non-empty buckets by
+/// construction, but the library-crate rule in CLAUDE.md
+/// forbids `unwrap`/`panic!` so the empty case is surfaced as
+/// `None` rather than enforced via `expect`. CR round 2 on
+/// PR #593.
+fn combine_partial(mut pending: Vec<AcarsMessage>) -> Option<AcarsMessage> {
     pending.sort_by_key(|m| m.block_id);
     let block_count: u8 = u8::try_from(pending.len()).unwrap_or(u8::MAX);
     let mut iter = pending.into_iter();
-    let first = iter.next().expect("flush only called on non-empty buckets");
+    let first = iter.next()?;
     let mut out = first.clone();
     let mut combined = first.text;
     for next in iter {
@@ -354,7 +373,7 @@ fn combine_partial(mut pending: Vec<AcarsMessage>) -> AcarsMessage {
     // smoke tests) can distinguish "complete N-block" from
     // "timeout-flushed partial".
     debug_assert!(!out.end_of_message);
-    out
+    Some(out)
 }
 
 #[cfg(test)]
@@ -538,8 +557,7 @@ mod tests {
             let aircraft = format!(".N{i:05}");
             let msg_no = format!("M{i:03}");
             let m = make_msg(&aircraft, &msg_no, 1, false, "X");
-            let now =
-                base + Duration::from_millis(u64::try_from(i).expect("loop bound fits u64"));
+            let now = base + Duration::from_millis(u64::try_from(i).expect("loop bound fits u64"));
             let _ = a.observe(m, now);
         }
         assert_eq!(a.pending_count(), MAX_PENDING_MESSAGES);

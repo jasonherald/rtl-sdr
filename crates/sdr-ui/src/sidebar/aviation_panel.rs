@@ -97,7 +97,7 @@ pub fn build_aviation_panel() -> AviationPanel {
     let acars_group = adw::PreferencesGroup::builder()
         .title("ACARS")
         .description(
-            "Decode aircraft text-message broadcasts (130 MHz US airband). \
+            "Decode aircraft text-message broadcasts on ACARS airband channels. \
              Forces 2.5 MSps source rate and disables the VFO while on.",
         )
         .build();
