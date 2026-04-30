@@ -4318,16 +4318,24 @@ fn handle_acars_engage_failure(
 // ---------------------------------------------------------------------------
 
 /// Resolve a JSONL path string. Empty ⇒ default
-/// `~/sdr-recordings/acars.jsonl`.
+/// `~/sdr-recordings/acars.jsonl`. A leading `~/` (or just
+/// `~`) is expanded to the user's home directory so the
+/// documented default — which is what users will copy from
+/// the placeholder text in the entry row — round-trips
+/// without targeting a literal `~` directory. CR round 4 on
+/// PR #595.
 fn resolve_jsonl_path(path: &str) -> std::path::PathBuf {
+    let home = || dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     if path.is_empty() {
-        dirs_next::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("sdr-recordings")
-            .join("acars.jsonl")
-    } else {
-        std::path::PathBuf::from(path)
+        return home().join("sdr-recordings").join("acars.jsonl");
     }
+    if path == "~" {
+        return home();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home().join(rest);
+    }
+    std::path::PathBuf::from(path)
 }
 
 /// Default JSONL path for the current `AcarsOutputs`. Resolves

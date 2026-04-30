@@ -12096,11 +12096,18 @@ fn connect_aviation_panel(
         panel.network_enable_row.set_subtitle(&subtitle);
     }
 
-    // Wire station_id_row — apply on Enter / focus-out.
+    // Wire station_id_row — per-keystroke save + dispatch.
+    // Station ID changes are cheap on the DSP side (just
+    // updates a string field, no reopen), so live updates
+    // are fine and match the codebase's existing pattern for
+    // text-row config (server_panel.rs nickname,
+    // source_panel.rs file path). CR round 4 on PR #595 —
+    // `connect_apply` only fires on Enter, so it would lose
+    // edits committed via focus-out or app close.
     {
         let state = Rc::clone(state);
         let config = std::sync::Arc::clone(config);
-        panel.station_id_row.connect_apply(move |row| {
+        panel.station_id_row.connect_changed(move |row| {
             let value = row.text().to_string();
             crate::acars_config::save_acars_station_id(&config, &value);
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsStationId(value));
@@ -12138,14 +12145,24 @@ fn connect_aviation_panel(
         });
     }
 
-    // Wire jsonl_path_row — apply on Enter / focus-out.
+    // Wire jsonl_path_row — per-keystroke save to config so
+    // edits never get lost on focus-out / app close, plus
+    // explicit-commit DSP dispatch on Enter (apply) so we
+    // don't reopen the writer 17 times while the user types
+    // a path. Toggle handlers read the live row text
+    // separately, so toggling on after typing without Enter
+    // dispatches the latest value too. CR round 4 on PR #595.
+    {
+        let config = std::sync::Arc::clone(config);
+        panel.jsonl_path_row.connect_changed(move |row| {
+            crate::acars_config::save_acars_jsonl_path(&config, &row.text());
+        });
+    }
     {
         let state = Rc::clone(state);
-        let config = std::sync::Arc::clone(config);
         let enable_row = panel.jsonl_enable_row.clone();
         panel.jsonl_path_row.connect_apply(move |row| {
             let value = row.text().to_string();
-            crate::acars_config::save_acars_jsonl_path(&config, &value);
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(
                 value.clone(),
             ));
@@ -12194,14 +12211,20 @@ fn connect_aviation_panel(
         });
     }
 
-    // Wire network_addr_row — apply on Enter / focus-out.
+    // Wire network_addr_row — same split as jsonl_path_row:
+    // per-keystroke save to config (no DNS/dial spam), DSP
+    // dispatch on apply. CR round 4 on PR #595.
+    {
+        let config = std::sync::Arc::clone(config);
+        panel.network_addr_row.connect_changed(move |row| {
+            crate::acars_config::save_acars_network_addr(&config, &row.text());
+        });
+    }
     {
         let state = Rc::clone(state);
-        let config = std::sync::Arc::clone(config);
         let enable_row = panel.network_enable_row.clone();
         panel.network_addr_row.connect_apply(move |row| {
             let value = row.text().to_string();
-            crate::acars_config::save_acars_network_addr(&config, &value);
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkAddr(
                 value.clone(),
             ));
