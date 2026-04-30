@@ -368,6 +368,108 @@ fn label_1g(text: &str) -> Option<Oooi> {
     o.has_any().then_some(o)
 }
 
+fn label_20(text: &str) -> Option<Oooi> {
+    // C: prefix "RST"; then sa(22), da(26).
+    if !text.starts_with("RST") {
+        return None;
+    }
+    let o = Oooi {
+        sa: slice4(text, 22),
+        da: slice4(text, 26),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_21(text: &str) -> Option<Oooi> {
+    // C: txt[6]==',' → sa(7); txt[11]==',' → da(12).
+    if byte_at(text, 6) != Some(b',') {
+        return None;
+    }
+    let sa = slice4(text, 7);
+    if byte_at(text, 11) != Some(b',') {
+        return None;
+    }
+    let da = slice4(text, 12);
+    let o = Oooi {
+        sa,
+        da,
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_26(text: &str) -> Option<Oooi> {
+    // C: prefix "VER/077"; find first '\n'; check "SCH/"; find
+    // next '/'; sa(p+1), da(p+6); find next '\n'; check "ETA/";
+    // eta(p+4). Each "find" failing past the SCH point still
+    // returns 1 with sa/da populated.
+    if !text.starts_with("VER/077") {
+        return None;
+    }
+    let nl1 = text.find('\n')?;
+    let after_nl1 = &text[nl1 + 1..];
+    if !after_nl1.starts_with("SCH/") {
+        return None;
+    }
+    // Walk past "SCH/" (4 chars) and find the next '/'.
+    let after_sch = &after_nl1[4..];
+    let slash_off = after_sch.find('/')?;
+    let after_slash = &after_sch[slash_off + 1..];
+    let sa = slice4(after_slash, 0);
+    let da = slice4(after_slash, 5);
+    // Look for an optional "\nETA/...". Absence means we still
+    // succeed with sa/da populated.
+    let o = if let Some(nl2) = after_slash.find('\n') {
+        let after_nl2 = &after_slash[nl2 + 1..];
+        if after_nl2.starts_with("ETA/") {
+            let eta = slice4(after_nl2, 4);
+            Oooi {
+                sa,
+                da,
+                eta,
+                ..Oooi::default()
+            }
+        } else {
+            // C: returns 0 if "\n" present but next line isn't
+            // "ETA/". Mirror that.
+            return None;
+        }
+    } else {
+        Oooi {
+            sa,
+            da,
+            ..Oooi::default()
+        }
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_2n(text: &str) -> Option<Oooi> {
+    // C: prefix "TKO01"; then txt[11]=='/' → sa(20), da(24).
+    if !text.starts_with("TKO01") {
+        return None;
+    }
+    if byte_at(text, 11) != Some(b'/') {
+        return None;
+    }
+    let o = Oooi {
+        sa: slice4(text, 20),
+        da: slice4(text, 24),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
+fn label_2z(text: &str) -> Option<Oooi> {
+    // C: da(0)
+    let o = Oooi {
+        da: slice4(text, 0),
+        ..Oooi::default()
+    };
+    o.has_any().then_some(o)
+}
+
 /// Decode the OOOI metadata for an ACARS message. Returns
 /// `Some(Oooi)` when:
 ///
@@ -390,6 +492,14 @@ pub fn decode_label(label: [u8; 2], text: &str) -> Option<Oooi> {
             b'5' => label_15(text),
             b'7' => label_17(text),
             b'G' => label_1g(text),
+            _ => None,
+        },
+        b'2' => match label[1] {
+            b'0' => label_20(text),
+            b'1' => label_21(text),
+            b'6' => label_26(text),
+            b'N' => label_2n(text),
+            b'Z' => label_2z(text),
             _ => None,
         },
         b'Q' => match label[1] {
@@ -781,5 +891,74 @@ mod tests {
         let o = decode_label([b'1', b'G'], txt).unwrap();
         assert_eq!(o.sa.as_deref(), Some("KORD"));
         assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_20_extracts_sa_da_after_rst_prefix() {
+        // Offsets: "RST" 0..3, skip 3..22, sa(22..26), da(26..30).
+        let txt = "RST___________________KORDKSFO";
+        let o = decode_label([b'2', b'0'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_20_no_rst_prefix_returns_none() {
+        assert!(decode_label([b'2', b'0'], "XXX___________________KORDKSFO").is_none());
+    }
+
+    #[test]
+    fn label_21_extracts_sa_da_with_commas() {
+        // Offsets: skip 0..6, comma(6), sa(7..11), comma(11), da(12..16).
+        let txt = "______,KORD,KSFO";
+        let o = decode_label([b'2', b'1'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_26_extracts_sa_da_eta_through_multiline_walk() {
+        // Layout:
+        //   line 1: VER/077 ...
+        //   line 2: SCH/<anything>/<sa><skip><da><...>
+        //   line 3: ETA/<eta>
+        let txt = "VER/077\nSCH/X/KORD KSFO\nETA/0830";
+        let o = decode_label([b'2', b'6'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.eta.as_deref(), Some("0830"));
+    }
+
+    #[test]
+    fn label_26_without_eta_line_still_succeeds() {
+        // No third line — sa/da only.
+        let txt = "VER/077\nSCH/X/KORD KSFO";
+        let o = decode_label([b'2', b'6'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert!(o.eta.is_none());
+    }
+
+    #[test]
+    fn label_26_no_ver_077_prefix_returns_none() {
+        assert!(decode_label([b'2', b'6'], "VER/078\nSCH/X/KORD KSFO").is_none());
+    }
+
+    #[test]
+    fn label_2n_extracts_sa_da_after_tko01() {
+        // Offsets: "TKO01" 0..5, skip 5..11, '/' at 11, skip
+        // 12..20, sa(20..24), da(24..28).
+        let txt = "TKO01______/________KORDKSFO";
+        let o = decode_label([b'2', b'N'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+    }
+
+    #[test]
+    fn label_2z_extracts_da_only() {
+        let txt = "KSFO";
+        let o = decode_label([b'2', b'Z'], txt).unwrap();
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert!(o.sa.is_none());
     }
 }
