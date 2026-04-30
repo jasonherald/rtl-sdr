@@ -12115,13 +12115,13 @@ fn connect_aviation_panel(
         panel.jsonl_enable_row.connect_active_notify(move |row| {
             let active = row.is_active();
             let path = path_row.text().to_string();
-            // Dispatch the latest path FIRST so when DSP
-            // opens the writer, it uses the current text.
-            // CR round 1 on PR #595.
-            if active {
-                crate::acars_config::save_acars_jsonl_path(&config, &path);
-                state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(path.clone()));
-            }
+            // Persist + dispatch the latest path on EVERY
+            // toggle edge so an edit-then-toggle-off sequence
+            // doesn't leave config / DSP holding the old
+            // value. The user's typed text is always the
+            // source of truth. CR round 3 on PR #595.
+            crate::acars_config::save_acars_jsonl_path(&config, &path);
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(path.clone()));
             crate::acars_config::save_acars_jsonl_enabled(&config, active);
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlEnabled(active));
             // Subtitle reflects current path or "Off".
@@ -12171,15 +12171,13 @@ fn connect_aviation_panel(
         panel.network_enable_row.connect_active_notify(move |row| {
             let active = row.is_active();
             let addr = addr_row.text().to_string();
-            // Dispatch the latest addr FIRST so when DSP
-            // opens the feeder, it uses the current text.
-            // CR round 1 on PR #595.
-            if active {
-                crate::acars_config::save_acars_network_addr(&config, &addr);
-                state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkAddr(
-                    addr.clone(),
-                ));
-            }
+            // Persist + dispatch the latest addr on EVERY
+            // toggle edge — same pattern as jsonl above.
+            // CR round 3 on PR #595.
+            crate::acars_config::save_acars_network_addr(&config, &addr);
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkAddr(
+                addr.clone(),
+            ));
             crate::acars_config::save_acars_network_enabled(&config, active);
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkEnabled(active));
             // Subtitle reflects current addr or "Off".

@@ -2591,7 +2591,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             handle_set_acars_network_addr(state, dsp_tx, &addr);
         }
         UiToDsp::SetAcarsStationId(id) => {
-            handle_set_acars_station_id(state, id);
+            handle_set_acars_station_id(state, &id);
         }
     }
 }
@@ -4474,11 +4474,17 @@ fn handle_set_acars_network_addr(state: &mut DspState, dsp_tx: &mpsc::Sender<Dsp
     }
 }
 
-fn handle_set_acars_station_id(state: &mut DspState, station_id: String) {
-    state.acars_outputs.station_id = if station_id.is_empty() {
+fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
+    // Trim and bound at the DSP boundary so non-UI callers
+    // (config replay, future FFI, integration tests) can't
+    // leak whitespace-only or oversized IDs into emitted JSON.
+    // 8-char cap matches acarsdec's `idstation` field width.
+    // CR round 3 on PR #595.
+    let trimmed = station_id.trim();
+    state.acars_outputs.station_id = if trimmed.is_empty() {
         None
     } else {
-        Some(station_id)
+        Some(trimmed.chars().take(8).collect())
     };
 }
 
