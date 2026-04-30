@@ -215,6 +215,33 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     content.append(&scroll);
     window.set_content(Some(&content));
 
+    // Hoist handles so all signal handlers below can clone from it.
+    let handles = Rc::new(ViewerHandles {
+        store,
+        filter,
+        filter_model,
+        status_label: status_label.clone(),
+        pause_button: pause_button.clone(),
+        filter_entry: filter_entry.clone(),
+    });
+    *state.acars_viewer_handles.borrow_mut() = Some(Rc::clone(&handles));
+
+    // ── Clear button ──────────────────────────────────────────────
+    {
+        let state = Rc::clone(state);
+        let handles = Rc::clone(&handles);
+        clear_button.connect_clicked(move |_| {
+            handles.store.remove_all();
+            state.acars_recent.borrow_mut().clear();
+            // Don't reset acars_total_count — that's the
+            // running total since toggle-on, distinct from the
+            // visible count. Status label refresh in the
+            // items_changed handler recomputes "filtered / total"
+            // from the now-empty filter_model + total_count.
+            handles.status_label.set_label("0 / 0 messages");
+        });
+    }
+
     // Wire close-request to clear the `AppState` weak-ref slot AND
     // the per-viewer handles slot (so the message-append site in
     // `window.rs` sees a clean disengage state on next open).
@@ -226,16 +253,6 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
             glib::Propagation::Proceed
         });
     }
-
-    let handles = Rc::new(ViewerHandles {
-        store,
-        filter,
-        filter_model,
-        status_label: status_label.clone(),
-        pause_button: pause_button.clone(),
-        filter_entry: filter_entry.clone(),
-    });
-    *state.acars_viewer_handles.borrow_mut() = Some(handles);
 
     window
 }
