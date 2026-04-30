@@ -931,7 +931,12 @@ fn acars_decode_tap(
     // at compile time.
     let iq_c32: &[num_complex::Complex32] = bytemuck::cast_slice(iq);
     bank.process(iq_c32, |msg| {
-        // JSONL write — log warn (rate-limited) on failure.
+        // JSONL write — log warn + toast (both rate-limited)
+        // on failure. Without the toast, a disk-full or
+        // permission-loss after open would silently drop
+        // future messages from the user's perspective while
+        // ACARS decoding continues normally. CR round 7 on
+        // PR #595.
         if let Some(w) = outputs.jsonl.as_mut()
             && let Err(e) = w.write(&msg, outputs.station_id.as_deref())
         {
@@ -940,12 +945,17 @@ fn acars_decode_tap(
                 .jsonl_warn_at
                 .map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
             if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
-                tracing::warn!("acars jsonl write failed (warn-rate-limited 30s): {e}");
+                let message = format!("acars jsonl write failed: {e}");
+                tracing::warn!("{message} (rate-limited 30s)");
                 outputs.jsonl_warn_at = Some(now);
+                let _ = dsp_tx.send(crate::messages::DspToUi::AcarsOutputError {
+                    kind: "jsonl",
+                    message,
+                });
             }
         }
 
-        // UDP send — same warn pattern.
+        // UDP send — same warn + toast pattern.
         if let Some(f) = outputs.udp.as_ref()
             && let Err(e) = f.send(&msg, outputs.station_id.as_deref())
         {
@@ -954,8 +964,13 @@ fn acars_decode_tap(
                 .udp_warn_at
                 .map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
             if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
-                tracing::warn!("acars udp send failed (warn-rate-limited 30s): {e}");
+                let message = format!("acars udp send failed: {e}");
+                tracing::warn!("{message} (rate-limited 30s)");
                 outputs.udp_warn_at = Some(now);
+                let _ = dsp_tx.send(crate::messages::DspToUi::AcarsOutputError {
+                    kind: "udp",
+                    message,
+                });
             }
         }
 
