@@ -692,10 +692,6 @@ pub fn decode_label(label: [u8; 2], text: &str) -> Option<Oooi> {
             b'S' => label_8s(text),
             _ => None,
         },
-        b'R' => match label[1] {
-            b'B' => label_26(text),
-            _ => None,
-        },
         b'Q' => match label[1] {
             b'1' => label_q1(text),
             b'2' => label_q2(text),
@@ -716,6 +712,10 @@ pub fn decode_label(label: [u8; 2], text: &str) -> Option<Oooi> {
             b'R' => label_qr(text),
             b'S' => label_qs(text),
             b'T' => label_qt(text),
+            _ => None,
+        },
+        b'R' => match label[1] {
+            b'B' => label_26(text),
             _ => None,
         },
         _ => None,

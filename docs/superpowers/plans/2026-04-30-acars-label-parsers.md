@@ -1684,7 +1684,7 @@ C source: `original/acarsdec/label.c:397-400`. `RB` aliases to `label_26`'s body
         },
 ```
 
-(Insert after `b'8'`, before `b'Q'` in the top-level match — alphabetical.)
+(Insert after `b'Q'` at the end of the top-level match — ASCII-ascending order: 1, 2, 3, 4, 8, Q, R.)
 
 - [ ] **Step 8.2: Add 1 unit test**
 
