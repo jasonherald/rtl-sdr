@@ -115,10 +115,11 @@ impl MessageAssembler {
     }
 
     /// Number of pending multi-block buckets. Test-only
-    /// observability.
+    /// observability — kept off the public API to avoid widening
+    /// the library crate's semver surface. CR round 4 on PR #593.
+    #[cfg(test)]
     #[must_use]
-    #[doc(hidden)]
-    pub fn pending_count(&self) -> usize {
+    fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
@@ -365,12 +366,23 @@ fn combine_partial(mut pending: Vec<AcarsMessage>) -> Option<AcarsMessage> {
     let mut out = first.clone();
     let mut combined = first.text;
     for next in iter {
+        // Mirror the metadata merge in `combine` so the timeout/
+        // flush path reports the same fields the ETX path would.
+        // Otherwise a later ETB could contribute fresher text but
+        // the emitted partial row would still carry stale mode /
+        // label / ack and miss a later flight_id. CR round 4 on
+        // PR #593.
         out.timestamp = next.timestamp;
         out.channel_idx = next.channel_idx;
         out.freq_hz = next.freq_hz;
         out.level_db = next.level_db;
         out.error_count = next.error_count;
+        out.mode = next.mode;
+        out.label = next.label;
         out.block_id = next.block_id;
+        out.ack = next.ack;
+        out.flight_id = next.flight_id.or(out.flight_id);
+        out.message_no = next.message_no.or(out.message_no);
         // `end_of_message` deliberately NOT updated to true —
         // partial reassembly preserves the false flag.
         combined.push_str(&next.text);
