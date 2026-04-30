@@ -73,6 +73,28 @@ pub fn serialize_message(msg: &AcarsMessage, station_id: Option<&str>) -> String
         obj.insert("msgno".to_string(), Value::from(n.as_str()));
     }
 
+    // text — omit when empty.
+    if !msg.text.is_empty() {
+        obj.insert("text".to_string(), Value::from(msg.text.as_str()));
+    }
+
+    // end — emit only when the closing byte was ETX (final
+    // block).
+    if msg.end_of_message {
+        obj.insert("end".to_string(), Value::from(true));
+    }
+
+    // Our extension: reassembled multi-block count, only when
+    // > 1 (single-block messages are the default and don't
+    // need to surface the count). airframes.io ignores unknown
+    // fields.
+    if msg.reassembled_block_count > 1 {
+        obj.insert(
+            "reassembled_blocks".to_string(),
+            Value::from(msg.reassembled_block_count),
+        );
+    }
+
     // App identity — `acarsdec` emits "acarsdec"; we emit our
     // own crate name + version so downstream consumers can
     // distinguish.
@@ -227,5 +249,41 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("flight").is_none());
         assert!(v.get("msgno").is_none());
+    }
+
+    #[test]
+    fn omits_empty_text_field() {
+        let msg = make_uplink_msg(); // text is empty
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("text").is_none());
+    }
+
+    #[test]
+    fn end_field_only_when_end_of_message() {
+        let mut msg = make_uplink_msg();
+        msg.end_of_message = false;
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("end").is_none());
+
+        msg.end_of_message = true;
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["end"], Value::from(true));
+    }
+
+    #[test]
+    fn reassembled_blocks_field_only_when_gt_one() {
+        let mut msg = make_uplink_msg();
+        msg.reassembled_block_count = 1;
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("reassembled_blocks").is_none());
+
+        msg.reassembled_block_count = 3;
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["reassembled_blocks"].as_u64().unwrap(), 3);
     }
 }
