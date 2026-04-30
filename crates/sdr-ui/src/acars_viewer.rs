@@ -13,8 +13,23 @@ use gtk4::glib;
 use gtk4::glib::subclass::prelude::ObjectSubclassIsExt;
 use gtk4::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::AdwWindowExt;
 
 use crate::state::AppState;
+
+/// Per-viewer handles needed by the `DspToUi::AcarsMessage`
+/// append site in `window.rs::handle_dsp_message`. Stored on
+/// `AppState` (a sibling field of `acars_viewer_window`) so the
+/// append site can fetch them without re-walking the widget
+/// tree. Cleared on the window's close-request.
+pub struct ViewerHandles {
+    pub store: gtk4::gio::ListStore,
+    pub filter: gtk4::CustomFilter,
+    pub filter_model: gtk4::FilterListModel,
+    pub status_label: gtk4::Label,
+    pub pause_button: gtk4::ToggleButton,
+    pub filter_entry: gtk4::SearchEntry,
+}
 
 /// Default window dimensions (per spec `acars_viewer.rs` budget).
 const ACARS_VIEWER_WINDOW_WIDTH: i32 = 1100;
@@ -90,15 +105,156 @@ pub fn open_acars_viewer_if_needed(state: &Rc<AppState>) {
     window.present();
 }
 
-// (build_acars_viewer_window + per-feature wiring lands in
-// Tasks 8-12; this task ships only the wrapper + open helper.)
+/// Column descriptor: (title, render function, expand).
+type ColumnSpec = (&'static str, fn(&sdr_acars::AcarsMessage) -> String, bool);
 
-fn build_acars_viewer_window(_state: &Rc<AppState>) -> adw::Window {
-    // Placeholder — Task 8 fills this in.
-    adw::Window::builder()
+#[allow(clippy::too_many_lines)]
+fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
+    let window = adw::Window::builder()
         .title("ACARS")
         .default_width(ACARS_VIEWER_WINDOW_WIDTH)
         .default_height(ACARS_VIEWER_WINDOW_HEIGHT)
         .modal(false)
-        .build()
+        .build();
+
+    // ─── Header bar ───
+    let header = adw::HeaderBar::new();
+    let pause_button = gtk4::ToggleButton::builder()
+        .icon_name("media-playback-pause-symbolic")
+        .tooltip_text("Pause appending new messages (existing rows stay visible)")
+        .build();
+    let clear_button = gtk4::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Clear all messages from the view (does not disable ACARS)")
+        .build();
+    let filter_entry = gtk4::SearchEntry::builder()
+        .placeholder_text("Filter aircraft / label / text…")
+        .build();
+    let status_label = gtk4::Label::builder().label("0 / 0 messages").build();
+
+    header.pack_start(&pause_button);
+    header.pack_start(&clear_button);
+    header.set_title_widget(Some(&filter_entry));
+    header.pack_end(&status_label);
+
+    // ─── Column view ───
+    let store = gtk4::gio::ListStore::new::<AcarsMessageObject>();
+    let filter = gtk4::CustomFilter::new(|_obj| true);
+    let filter_model = gtk4::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
+    let selection = gtk4::NoSelection::new(Some(filter_model.clone()));
+    let column_view = gtk4::ColumnView::builder()
+        .model(&selection)
+        .show_column_separators(true)
+        .show_row_separators(true)
+        .build();
+
+    // Seven columns per spec section "Content":
+    //   Time | Freq | Aircraft | Mode | Label | Block | Text
+    let columns: [ColumnSpec; 7] = [
+        ("Time", render_time, false),
+        ("Freq", render_freq, false),
+        ("Aircraft", render_aircraft, false),
+        ("Mode", render_mode, false),
+        ("Label", render_label, false),
+        ("Block", render_block, false),
+        ("Text", render_text, true),
+    ];
+
+    for (title, render, expand) in columns {
+        let factory = gtk4::SignalListItemFactory::new();
+        factory.connect_setup(move |_factory, item| {
+            let label = gtk4::Label::builder()
+                .xalign(0.0)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .build();
+            item.downcast_ref::<gtk4::ListItem>()
+                .expect("setup item is a ListItem")
+                .set_child(Some(&label));
+        });
+        factory.connect_bind(move |_factory, item| {
+            let item = item
+                .downcast_ref::<gtk4::ListItem>()
+                .expect("bind item is a ListItem");
+            let label = item
+                .child()
+                .and_then(|w| w.downcast::<gtk4::Label>().ok())
+                .expect("setup installed a Label child");
+            let obj = item
+                .item()
+                .and_then(|o| o.downcast::<AcarsMessageObject>().ok())
+                .expect("model row is an AcarsMessageObject");
+            if let Some(msg) = obj.message() {
+                label.set_text(&render(&msg));
+            }
+        });
+        let column = gtk4::ColumnViewColumn::builder()
+            .title(title)
+            .factory(&factory)
+            .resizable(true)
+            .expand(expand)
+            .build();
+        column_view.append_column(&column);
+    }
+
+    let scroll = gtk4::ScrolledWindow::builder()
+        .child(&column_view)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content.append(&header);
+    content.append(&scroll);
+    window.set_content(Some(&content));
+
+    // Wire close-request to clear the `AppState` weak-ref slot AND
+    // the per-viewer handles slot (so the message-append site in
+    // `window.rs` sees a clean disengage state on next open).
+    {
+        let state = Rc::clone(state);
+        window.connect_close_request(move |_| {
+            *state.acars_viewer_window.borrow_mut() = None;
+            *state.acars_viewer_handles.borrow_mut() = None;
+            glib::Propagation::Proceed
+        });
+    }
+
+    let handles = Rc::new(ViewerHandles {
+        store,
+        filter,
+        filter_model,
+        status_label: status_label.clone(),
+        pause_button: pause_button.clone(),
+        filter_entry: filter_entry.clone(),
+    });
+    *state.acars_viewer_handles.borrow_mut() = Some(handles);
+
+    window
+}
+
+fn render_time(msg: &sdr_acars::AcarsMessage) -> String {
+    let dt: chrono::DateTime<chrono::Local> = msg.timestamp.into();
+    dt.format("%H:%M:%S").to_string()
+}
+fn render_freq(msg: &sdr_acars::AcarsMessage) -> String {
+    format!("{:.3}", msg.freq_hz / 1_000_000.0)
+}
+fn render_aircraft(msg: &sdr_acars::AcarsMessage) -> String {
+    msg.aircraft.to_string()
+}
+fn render_mode(msg: &sdr_acars::AcarsMessage) -> String {
+    char::from(msg.mode).to_string()
+}
+fn render_label(msg: &sdr_acars::AcarsMessage) -> String {
+    let raw = std::str::from_utf8(&msg.label).unwrap_or("??").to_string();
+    match sdr_acars::label::lookup(msg.label) {
+        Some(name) => format!("{raw} ({name})"),
+        None => raw,
+    }
+}
+fn render_block(msg: &sdr_acars::AcarsMessage) -> String {
+    char::from(msg.block_id).to_string()
+}
+fn render_text(msg: &sdr_acars::AcarsMessage) -> String {
+    msg.text.clone()
 }

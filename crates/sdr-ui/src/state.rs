@@ -275,6 +275,14 @@ pub struct AppState {
     /// lifetime. Set by [`crate::acars_viewer::open_acars_viewer_if_needed`];
     /// cleared by the window's `close-request` handler.
     pub acars_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
+    /// Per-viewer mutable handles (column-view store, filter,
+    /// status label, etc). `Some` only while a viewer window
+    /// is open. Set by `acars_viewer::build_acars_viewer_window`;
+    /// cleared by the window's close-request handler alongside
+    /// `acars_viewer_window`. Held in `Rc` so the close-request
+    /// closure and the message-append site in `window.rs` can
+    /// both reach it without lifetime juggling.
+    pub acars_viewer_handles: RefCell<Option<Rc<crate::acars_viewer::ViewerHandles>>>,
 }
 
 impl AppState {
@@ -321,6 +329,7 @@ impl AppState {
             acars_channel_stats: RefCell::new([ChannelStats::default(); US_SIX_CHANNEL_COUNT]),
             acars_pre_lock_state: RefCell::new(None),
             acars_viewer_window: RefCell::new(None),
+            acars_viewer_handles: RefCell::new(None),
         })
     }
 
@@ -424,6 +433,10 @@ mod tests {
         assert!(
             state.acars_viewer_window.borrow().is_none(),
             "no viewer window until first open"
+        );
+        assert!(
+            state.acars_viewer_handles.borrow().is_none(),
+            "no viewer handles until first open"
         );
     }
 
