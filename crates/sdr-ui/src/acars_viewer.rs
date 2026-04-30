@@ -123,6 +123,14 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         .icon_name("media-playback-pause-symbolic")
         .tooltip_text("Pause appending new messages (existing rows stay visible)")
         .build();
+    // PAUSE SEMANTIC: when active, the message-append site in
+    // `window.rs::handle_dsp_message` skips pushing into `store`.
+    // The bounded ring (`AppState::acars_recent`) keeps growing
+    // — pausing the view does NOT pause the DSP. Resume appends
+    // from that point forward; we deliberately do NOT drain
+    // gap messages from the ring (simpler + matches user
+    // intuition; deferred-item issue if drain-on-resume is
+    // wanted later).
     let clear_button = gtk4::Button::builder()
         .icon_name("user-trash-symbolic")
         .tooltip_text("Clear all messages from the view (does not disable ACARS)")
