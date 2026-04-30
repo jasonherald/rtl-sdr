@@ -283,13 +283,18 @@ pub struct AppState {
     /// closure and the message-append site in `window.rs` can
     /// both reach it without lifetime juggling.
     pub acars_viewer_handles: RefCell<Option<Rc<crate::acars_viewer::ViewerHandles>>>,
-    /// Pre-engage center frequency (Hz), captured by the
-    /// `AcarsEnabledChanged(Ok(true))` arm so the disengage path
-    /// can restore the header frequency selector display. The
-    /// DSP retunes silently on engage/disengage (no `Tune` ack),
-    /// so the UI has to remember the snapshot itself. `None`
-    /// when ACARS is disengaged.
-    pub acars_saved_freq_hz: Cell<Option<u64>>,
+    /// Pre-engage tune snapshot (`(center_freq_hz, vfo_offset_hz)`),
+    /// captured by the `AcarsEnabledChanged(Ok(true))` arm so the
+    /// disengage path can restore the header frequency selector,
+    /// spectrum center, and VFO marker together. The DSP retunes
+    /// silently on engage/disengage (no `Tune` / `VfoOffsetChanged`
+    /// ack), and the controller's restore path explicitly reapplies
+    /// the snapshot offset (CR round 13 on PR #584), so the UI
+    /// snapshot needs both fields — collapsing into a single
+    /// displayed-frequency value would leave `state.center_frequency`
+    /// stale after disengage when a non-zero VFO offset was active
+    /// pre-engage. `None` when ACARS is disengaged.
+    pub acars_saved_tune: Cell<Option<(f64, f64)>>,
     /// `true` if ACARS was engaged when a satellite auto-record
     /// pass started, captured in the `StartAutoRecord` action
     /// arm so the LOS `RestoreTune` arm can re-engage. Mirrors
@@ -356,7 +361,7 @@ impl AppState {
             acars_pre_lock_state: RefCell::new(None),
             acars_viewer_window: RefCell::new(None),
             acars_viewer_handles: RefCell::new(None),
-            acars_saved_freq_hz: Cell::new(None),
+            acars_saved_tune: Cell::new(None),
             acars_was_engaged_pre_pass: Cell::new(false),
             acars_pending: Cell::new(false),
         })
@@ -464,8 +469,8 @@ mod tests {
             "no viewer window until first open"
         );
         assert!(
-            state.acars_saved_freq_hz.get().is_none(),
-            "no saved pre-engage freq until first engage"
+            state.acars_saved_tune.get().is_none(),
+            "no saved pre-engage tune (center, offset) until first engage"
         );
         assert!(
             !state.acars_was_engaged_pre_pass.get(),

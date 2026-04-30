@@ -60,8 +60,9 @@ mod imp {
 glib::wrapper! {
     /// Glib subclass wrapping an `AcarsMessage`. `GListStore`
     /// requires a `glib::Object` model type; the viewer's
-    /// column-view factories pull the inner `AcarsMessage`
-    /// back out via `obj.message().expect(...)` per render.
+    /// column-view factories + filter predicate read the inner
+    /// `AcarsMessage` via `obj.imp().inner.borrow()` (no-clone
+    /// hot path) and fail closed if the slot is empty.
     pub struct AcarsMessageObject(ObjectSubclass<imp::AcarsMessageObject>);
 }
 
@@ -181,28 +182,41 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     for (title, render, expand) in columns {
         let factory = gtk4::SignalListItemFactory::new();
         factory.connect_setup(move |_factory, item| {
+            // Fail closed on unexpected item type rather than
+            // panic — these callbacks fire during model churn /
+            // teardown, and a panic here would crash the whole
+            // UI process.
+            let Some(item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
             let label = gtk4::Label::builder()
                 .xalign(0.0)
                 .ellipsize(gtk4::pango::EllipsizeMode::End)
                 .build();
-            item.downcast_ref::<gtk4::ListItem>()
-                .expect("setup item is a ListItem")
-                .set_child(Some(&label));
+            item.set_child(Some(&label));
         });
         factory.connect_bind(move |_factory, item| {
-            let item = item
-                .downcast_ref::<gtk4::ListItem>()
-                .expect("bind item is a ListItem");
-            let label = item
-                .child()
-                .and_then(|w| w.downcast::<gtk4::Label>().ok())
-                .expect("setup installed a Label child");
-            let obj = item
+            let Some(item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let Some(label) = item.child().and_then(|w| w.downcast::<gtk4::Label>().ok()) else {
+                return;
+            };
+            let Some(obj) = item
                 .item()
                 .and_then(|o| o.downcast::<AcarsMessageObject>().ok())
-                .expect("model row is an AcarsMessageObject");
-            if let Some(msg) = obj.message() {
-                label.set_text(&render(&msg));
+            else {
+                return;
+            };
+            // Borrow rather than clone the inner message —
+            // factory.connect_bind fires on every visible row
+            // every store change; cloning the full
+            // `AcarsMessage` (with String + ArrayString fields)
+            // here would be wasted work when the render fns
+            // only need a borrow.
+            let inner = obj.imp().inner.borrow();
+            if let Some(msg) = inner.as_ref() {
+                label.set_text(&render(msg));
             }
         });
         let column = gtk4::ColumnViewColumn::builder()
@@ -262,7 +276,13 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
                 let Some(obj) = obj.downcast_ref::<AcarsMessageObject>() else {
                     return false;
                 };
-                let Some(msg) = obj.message() else {
+                // Borrow the inner message — the filter predicate
+                // fires for every row on every keystroke + every
+                // append, so cloning the full message here would
+                // be a measurable hot-path cost on long-running
+                // sessions.
+                let inner = obj.imp().inner.borrow();
+                let Some(msg) = inner.as_ref() else {
                     return false;
                 };
                 if needle_str.is_empty() {
@@ -280,18 +300,22 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     // ── Status label: <filtered> / <total> ───────────────────────
     // Re-evaluated on every store change. `items-changed` fires on
     // append AND on filter re-evaluation, so this catches both.
+    //
+    // Read the filter-model count off the signal's `model`
+    // argument rather than capturing a strong clone — the latter
+    // creates a self-reference (model owns the handler, handler
+    // owns the model) that would keep the viewer model + store
+    // alive past window close.
     {
         let status = handles.status_label.clone();
-        let filter_model = handles.filter_model.clone();
         let store = handles.store.clone();
-        let refresh = move || {
-            let filtered = filter_model.n_items();
-            let total = store.n_items();
-            status.set_label(&format!("{filtered} / {total} messages"));
-        };
         handles
             .filter_model
-            .connect_items_changed(move |_, _, _, _| refresh());
+            .connect_items_changed(move |model, _, _, _| {
+                let filtered = model.n_items();
+                let total = store.n_items();
+                status.set_label(&format!("{filtered} / {total} messages"));
+            });
     }
 
     // Wire close-request to clear the `AppState` weak-ref slot AND

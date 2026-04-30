@@ -2021,14 +2021,21 @@ fn handle_dsp_message(
                     state.acars_recent.borrow_mut().clear();
                     // Mirror the DSP's silent retune to airband
                     // center on the header freq selector + status
-                    // bar, and disable user input on the selector
+                    // bar + spectrum, and disable user input
                     // since DSP rejects geometry commands while
                     // engaged (round 14 on PR #584). Stash the
-                    // pre-engage freq so disengage can restore it.
-                    state
-                        .acars_saved_freq_hz
-                        .set(Some(freq_selector.frequency()));
+                    // pre-engage `(center, vfo_offset)` tuple
+                    // so disengage can restore both — the
+                    // controller's restore path reapplies the
+                    // snapshot offset (CR round 13 on PR #584)
+                    // and `state.center_frequency` would
+                    // otherwise drift from the DSP snapshot.
+                    state.acars_saved_tune.set(Some((
+                        state.center_frequency.get(),
+                        spectrum_handle.vfo_offset_hz(),
+                    )));
                     let center_hz = sdr_core::acars_airband_lock::ACARS_CENTER_HZ;
+                    state.center_frequency.set(center_hz);
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                     freq_selector.set_frequency(center_hz as u64);
                     spectrum_handle.set_center_frequency(center_hz);
@@ -2050,16 +2057,24 @@ fn handle_dsp_message(
                     state.acars_total_count.set(0);
                     *state.acars_channel_stats.borrow_mut() = [sdr_acars::ChannelStats::default();
                         sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT];
-                    // Restore the freq selector display + status
-                    // bar to the pre-engage value (DSP retuned
-                    // back to the snapshot but doesn't emit a
-                    // Tune ack), and re-enable user input.
-                    if let Some(prev) = state.acars_saved_freq_hz.take() {
-                        freq_selector.set_frequency(prev);
-                        #[allow(clippy::cast_precision_loss)]
-                        let prev_f64 = prev as f64;
-                        spectrum_handle.set_center_frequency(prev_f64);
-                        status_bar.update_frequency(prev_f64);
+                    // Restore the pre-engage tune snapshot. DSP
+                    // retunes silently and reapplies its own
+                    // snapshot offset, but doesn't emit Tune /
+                    // VfoOffsetChanged echoes — so restore the
+                    // UI mirrors here. Order matches what a
+                    // user-driven `Tune` would do:
+                    // `state.center_frequency`, spectrum center,
+                    // then offset (which the freq selector +
+                    // status bar derive from `center + offset`).
+                    if let Some((center_hz, offset_hz)) = state.acars_saved_tune.take() {
+                        state.center_frequency.set(center_hz);
+                        spectrum_handle.set_center_frequency(center_hz);
+                        spectrum_handle.set_vfo_offset(offset_hz);
+                        let tuned_hz = center_hz + offset_hz;
+                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                        let tuned_u64 = tuned_hz.max(0.0) as u64;
+                        freq_selector.set_frequency(tuned_u64);
+                        status_bar.update_frequency(tuned_hz);
                     }
                     freq_selector.widget.set_sensitive(true);
                     demod_dropdown.set_sensitive(true);
