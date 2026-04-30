@@ -1998,6 +1998,20 @@ fn handle_dsp_message(
                     state.acars_enabled.set(true);
                     state.acars_total_count.set(0);
                     state.acars_recent.borrow_mut().clear();
+                    // Mirror the DSP's silent retune to airband
+                    // center on the header freq selector + status
+                    // bar, and disable user input on the selector
+                    // since DSP rejects geometry commands while
+                    // engaged (round 14 on PR #584). Stash the
+                    // pre-engage freq so disengage can restore it.
+                    state
+                        .acars_saved_freq_hz
+                        .set(Some(freq_selector.frequency()));
+                    let center_hz = sdr_core::acars_airband_lock::ACARS_CENTER_HZ;
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    freq_selector.set_frequency(center_hz as u64);
+                    freq_selector.widget.set_sensitive(false);
+                    status_bar.update_frequency(center_hz);
                     tracing::info!("ACARS engaged");
                 }
                 Ok(false) => {
@@ -2006,6 +2020,16 @@ fn handle_dsp_message(
                     state.acars_total_count.set(0);
                     *state.acars_channel_stats.borrow_mut() = [sdr_acars::ChannelStats::default();
                         sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT];
+                    // Restore the freq selector display + status
+                    // bar to the pre-engage value (DSP retuned
+                    // back to the snapshot but doesn't emit a
+                    // Tune ack), and re-enable user input.
+                    if let Some(prev) = state.acars_saved_freq_hz.take() {
+                        freq_selector.set_frequency(prev);
+                        #[allow(clippy::cast_precision_loss)]
+                        status_bar.update_frequency(prev as f64);
+                    }
+                    freq_selector.widget.set_sensitive(true);
                     tracing::info!("ACARS disengaged");
                 }
                 Err(err) => {

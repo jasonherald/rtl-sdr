@@ -283,6 +283,13 @@ pub struct AppState {
     /// closure and the message-append site in `window.rs` can
     /// both reach it without lifetime juggling.
     pub acars_viewer_handles: RefCell<Option<Rc<crate::acars_viewer::ViewerHandles>>>,
+    /// Pre-engage center frequency (Hz), captured by the
+    /// `AcarsEnabledChanged(Ok(true))` arm so the disengage path
+    /// can restore the header frequency selector display. The
+    /// DSP retunes silently on engage/disengage (no `Tune` ack),
+    /// so the UI has to remember the snapshot itself. `None`
+    /// when ACARS is disengaged.
+    pub acars_saved_freq_hz: Cell<Option<u64>>,
 }
 
 impl AppState {
@@ -330,6 +337,7 @@ impl AppState {
             acars_pre_lock_state: RefCell::new(None),
             acars_viewer_window: RefCell::new(None),
             acars_viewer_handles: RefCell::new(None),
+            acars_saved_freq_hz: Cell::new(None),
         })
     }
 
@@ -433,6 +441,10 @@ mod tests {
         assert!(
             state.acars_viewer_window.borrow().is_none(),
             "no viewer window until first open"
+        );
+        assert!(
+            state.acars_saved_freq_hz.get().is_none(),
+            "no saved pre-engage freq until first engage"
         );
         assert!(
             state.acars_viewer_handles.borrow().is_none(),
