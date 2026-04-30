@@ -242,6 +242,48 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         });
     }
 
+    // ── Filter: live substring match on aircraft + label + text ──
+    {
+        let filter = handles.filter.clone();
+        let entry = handles.filter_entry.clone();
+        entry.connect_search_changed(move |entry| {
+            let needle_str: String = entry.text().as_str().to_lowercase();
+            filter.set_filter_func(move |obj| {
+                let Some(obj) = obj.downcast_ref::<AcarsMessageObject>() else {
+                    return false;
+                };
+                let Some(msg) = obj.message() else {
+                    return false;
+                };
+                if needle_str.is_empty() {
+                    return true;
+                }
+                let needle = &needle_str;
+                msg.aircraft.to_lowercase().contains(needle)
+                    || std::str::from_utf8(&msg.label)
+                        .is_ok_and(|s| s.to_lowercase().contains(needle))
+                    || msg.text.to_lowercase().contains(needle)
+            });
+        });
+    }
+
+    // ── Status label: <filtered> / <total> ───────────────────────
+    // Re-evaluated on every store change. `items-changed` fires on
+    // append AND on filter re-evaluation, so this catches both.
+    {
+        let status = handles.status_label.clone();
+        let filter_model = handles.filter_model.clone();
+        let store = handles.store.clone();
+        let refresh = move || {
+            let filtered = filter_model.n_items();
+            let total = store.n_items();
+            status.set_label(&format!("{filtered} / {total} messages"));
+        };
+        handles
+            .filter_model
+            .connect_items_changed(move |_, _, _, _| refresh());
+    }
+
     // Wire close-request to clear the `AppState` weak-ref slot AND
     // the per-viewer handles slot (so the message-append site in
     // `window.rs` sees a clean disengage state on next open).
