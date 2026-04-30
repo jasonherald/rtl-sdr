@@ -1149,7 +1149,7 @@ Add (alphabetically, after the `b'1'` arm):
         },
 ```
 
-- [ ] **Step 5.3: Add 8 unit tests**
+- [ ] **Step 5.3: Add 9 unit tests**
 
 ```rust
     #[test]
@@ -1204,6 +1204,16 @@ Add (alphabetically, after the `b'1'` arm):
     }
 
     #[test]
+    fn label_26_second_line_not_eta_returns_none() {
+        // Per C source (label.c:194-200): if a second \n is
+        // present but the line doesn't start with "ETA/", the
+        // parser returns 0. Pin that behavior so future edits
+        // don't silently relax it to "succeed with sa/da only".
+        let txt = "VER/077\nSCH/X/KORD KSFO\nXXX/0830";
+        assert!(decode_label([b'2', b'6'], txt).is_none());
+    }
+
+    #[test]
     fn label_2n_extracts_sa_da_after_tko01() {
         // Offsets: "TKO01" 0..5, skip 5..11, '/' at 11, skip
         // 12..20, sa(20..24), da(24..28).
@@ -1230,7 +1240,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 46 tests pass (38 prior + 8 new).
+Expected: 47 tests pass (38 prior + 9 new).
 
 - [ ] **Step 5.5: Commit**
 
@@ -1453,7 +1463,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 53 tests pass (46 prior + 7 new).
+Expected: 54 tests pass (47 prior + 7 new).
 
 - [ ] **Step 6.5: Commit**
 
@@ -1639,7 +1649,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 60 tests pass (53 prior + 7 new).
+Expected: 61 tests pass (54 prior + 7 new).
 
 - [ ] **Step 7.5: Commit**
 
@@ -1698,7 +1708,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 61 tests pass (60 prior + 1 new). Dispatch is now complete — every C parser path has a Rust counterpart.
+Expected: 62 tests pass (61 prior + 1 new). Dispatch is now complete — every C parser path has a Rust counterpart.
 
 - [ ] **Step 8.4: Commit**
 
@@ -1845,7 +1855,7 @@ The two emit sites in `ChannelBank::process` are the `assembler.observe(...)` lo
 - [ ] **Step 10.1: Find the assembler.observe emit site**
 
 ```bash
-grep -n "for emitted in ch.assembler.observe" /data/source/rtl-sdr/crates/sdr-acars/src/channel.rs
+grep -n "for emitted in ch.assembler.observe" crates/sdr-acars/src/channel.rs
 ```
 
 Expected output (line number may shift slightly):
@@ -1894,7 +1904,7 @@ Replace with (the only changes are `let mut emitted = emitted;` at the top of th
 - [ ] **Step 10.3: Find and patch the drain_timeouts emit site**
 
 ```bash
-grep -n "for emitted in ch.assembler.drain_timeouts" /data/source/rtl-sdr/crates/sdr-acars/src/channel.rs
+grep -n "for emitted in ch.assembler.drain_timeouts" crates/sdr-acars/src/channel.rs
 ```
 
 Expected:
@@ -1981,7 +1991,7 @@ cargo test --workspace --features sdr-transcription/whisper-cpu
 cargo fmt --all -- --check
 ```
 
-Expected: all green. Test count: `label_parsers` should have ~61 tests; full sdr-acars suite ~97+.
+Expected: all green. Test count: `label_parsers` should have ~62 tests; full sdr-acars suite ~98+.
 
 - [ ] **Step 11.4: Re-confirm no regressions in reassembly tests**
 
@@ -2007,7 +2017,7 @@ gh pr create --title "feat(sdr-acars): per-label OOOI parsers (#577)" --body "$(
 
 - Faithful Rust port of \`original/acarsdec/label.c\`. New \`crates/sdr-acars/src/label_parsers.rs\` module with single \`Oooi\` struct (7 \`Option<ArrayString<4>>\` fields), public \`decode_label\` dispatch, 39 private per-label parser fns + 1 alias (\`RB\` → \`label_26\`).
 - \`AcarsMessage\` gains \`parsed: Option<Oooi>\`. Populated at \`ChannelBank::process\` emit sites so multi-block reassembly text parses once on the final concatenated body.
-- ~58 unit tests, one per parser plus dispatch + bounds-safety coverage.
+- ~62 unit tests, one per parser plus dispatch + bounds-safety coverage.
 
 Closes #577. Foundation for #578 (JSON output) and #579 (aircraft-grouped tab).
 
