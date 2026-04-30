@@ -418,7 +418,7 @@ In `serialize_message`, after the `msgno` block and before `app`, add:
     // Our extension: reassembled multi-block count, only when
     // > 1 (single-block messages are the default and don't
     // need to surface the count). airframes.io ignores unknown
-    // fields.
+    // fields (as of April 2026).
     if msg.reassembled_block_count > 1 {
         obj.insert(
             "reassembled_blocks".to_string(),

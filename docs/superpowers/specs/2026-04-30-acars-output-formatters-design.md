@@ -27,7 +27,7 @@ independently from the Aviation activity panel.
 - **File rotation.** Single rolling JSONL file; users with
   log-rotation needs use logrotate or rename externally.
 - **TLS / authentication on the feeder.** airframes.io accepts
-  unauthenticated UDP-JSON; v1 matches that.
+  unauthenticated UDP-JSON (as of April 2026); v1 matches that.
 - **Supervisor / line-format outputs** (acarsdec's `Netoutsv`,
   `Netoutpp`). JSON only.
 - **Aircraft-grouped tab.** Owned by issue #579.
@@ -106,7 +106,7 @@ verbatim where fields overlap, plus one extension field:
 | `wloff` | string | `msg.parsed.woff`, gated on `Some` | acarsdec parity |
 | `wlin` | string | `msg.parsed.won`, gated on `Some` | acarsdec parity |
 | `app` | object | `{ name: "sdr-rs", ver: env!("CARGO_PKG_VERSION") }` | acarsdec uses `"acarsdec"` — we use our own name |
-| `reassembled_blocks` | u8 | only if `msg.reassembled_block_count > 1` | our extension; airframes.io ignores unknown fields |
+| `reassembled_blocks` | u8 | only if `msg.reassembled_block_count > 1` | our extension; airframes.io ignores unknown fields (as of April 2026) |
 
 #### Tests
 
