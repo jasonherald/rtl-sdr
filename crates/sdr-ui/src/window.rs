@@ -3553,6 +3553,7 @@ fn connect_sidebar_panels(
         set_playing,
         status_bar,
     );
+    connect_aviation_panel(&panels.aviation, state);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -11536,6 +11537,108 @@ const DOPPLER_TRIGGER_TICK: Duration = Duration::from_secs(1);
 /// filter, slow enough that the bus + status-bar updates
 /// don't hammer GTK.
 const DOPPLER_RECOMPUTE_TICK: Duration = Duration::from_millis(250);
+
+/// Wire the Aviation sidebar panel: toggle switch → DSP, 4 Hz tick
+/// for status/channel-row refresh, and the open-viewer button stub.
+fn connect_aviation_panel(panel: &sidebar::aviation_panel::AviationPanel, state: &Rc<AppState>) {
+    use crate::sidebar::aviation_panel::{
+        GLYPH_IDLE, GLYPH_LOCKED, GLYPH_SIGNAL, SIDEBAR_STATUS_REFRESH_MS,
+    };
+    use sdr_acars::ChannelLockState;
+
+    // ─── Toggle: switch-row → SetAcarsEnabled ───
+    {
+        let state = Rc::clone(state);
+        panel.enable_switch.connect_active_notify(move |row| {
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsEnabled(
+                row.is_active(),
+            ));
+        });
+    }
+
+    // ─── 4 Hz tick: AppState → switch row + status subtitle + per-channel rows ───
+    let switch = panel.enable_switch.clone();
+    let status = panel.status_row.clone();
+    let rows = panel.channel_rows.clone();
+    let state_for_tick = Rc::clone(state);
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(SIDEBAR_STATUS_REFRESH_MS),
+        move || {
+            let enabled = state_for_tick.acars_enabled.get();
+
+            // Mirror Cell→switch one direction only (manual toggles
+            // round-trip through `SetAcarsEnabled` already; setting
+            // the same value is a GTK no-op so no feedback loop).
+            if switch.is_active() != enabled {
+                switch.set_active(enabled);
+            }
+
+            // Status subtitle.
+            let total = state_for_tick.acars_total_count.get();
+            let last_label = state_for_tick
+                .acars_recent
+                .borrow()
+                .back()
+                .map(|m| format!("Last: {}", format_relative_age(m.timestamp)));
+            let subtitle = if enabled {
+                match last_label {
+                    Some(s) => format!("Decoded {total} · {s}"),
+                    None => format!("Decoded {total} · Awaiting first message"),
+                }
+            } else {
+                "Disabled".to_string()
+            };
+            status.set_subtitle(&subtitle);
+
+            // Per-channel rows.
+            let channel_stats = state_for_tick.acars_channel_stats.borrow();
+            for (idx, ch) in channel_stats.iter().enumerate() {
+                let row = &rows[idx];
+                let glyph = match ch.lock_state {
+                    ChannelLockState::Locked => GLYPH_LOCKED,
+                    ChannelLockState::Idle => GLYPH_IDLE,
+                    ChannelLockState::Signal => GLYPH_SIGNAL,
+                };
+                row.set_title(&format!("{glyph}  {:.3} MHz", ch.freq_hz / 1_000_000.0));
+                row.set_subtitle(&format!(
+                    "{} msgs · {:.1} dB · {}",
+                    ch.msg_count,
+                    ch.level_db,
+                    ch.last_msg_at
+                        .map_or_else(|| "—".to_string(), format_relative_age)
+                ));
+            }
+            glib::ControlFlow::Continue
+        },
+    );
+
+    // ─── Open ACARS window button ───
+    // The viewer module is created in T7; for now log a placeholder.
+    // T7 will replace this with `crate::acars_viewer::open_acars_viewer_if_needed(&state)`.
+    {
+        let _state = Rc::clone(state);
+        panel.open_viewer_button.connect_clicked(move |_| {
+            tracing::info!("ACARS viewer open requested (stub — viewer module not yet wired)");
+        });
+    }
+}
+
+/// Format a `SystemTime` as a relative age string ("5s ago",
+/// "2m ago", "1h ago"). Returns "—" if the timestamp is in the
+/// future or unrepresentable.
+fn format_relative_age(ts: std::time::SystemTime) -> String {
+    let Ok(elapsed) = ts.elapsed() else {
+        return "—".to_string();
+    };
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
 
 /// Minimum |Δoffset| (Hz) before re-dispatching `SetVfoOffset`
 /// from the 4 Hz recompute tick. Sub-5-Hz changes are below
