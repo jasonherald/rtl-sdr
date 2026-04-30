@@ -230,9 +230,6 @@ fn poll_rtl_tcp_connection_state(state: &mut DspState, dsp_tx: &mpsc::Sender<Dsp
 /// JSONL writer, UDP feeder, station ID, and per-writer
 /// warn-rate-limit timestamps together so the
 /// `acars_decode_tap` signature stays narrow. Issue #578.
-/// `jsonl_warn_at` and `udp_warn_at` are consumed in Task 9's
-/// tap-closure rate-limiter; suppress the lint until then.
-#[allow(dead_code)]
 struct AcarsOutputs {
     jsonl: Option<crate::acars_output::JsonlWriter>,
     udp: Option<crate::acars_output::UdpFeeder>,
@@ -267,7 +264,6 @@ impl AcarsOutputs {
 
 /// Minimum interval between repeated warn-log emissions for
 /// the same writer. Issue #578.
-#[allow(dead_code)] // consumed in Task 9's tap-closure rate-limiter
 const ACARS_OUTPUT_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Mutable state owned by the DSP thread.
@@ -869,6 +865,7 @@ fn lrpt_decode_tap(
 /// exercise it directly. End-to-end pipeline integration
 /// (engage → ack → disengage) is covered by the `Engine`-API
 /// tests in `tests/acars_pipeline_integration.rs`.
+#[allow(clippy::too_many_arguments)]
 fn acars_decode_tap(
     bank: &mut Option<sdr_acars::ChannelBank>,
     init_failed: &mut bool,
@@ -877,6 +874,7 @@ fn acars_decode_tap(
     channels: &[f64],
     iq: &[sdr_types::Complex],
     dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
+    outputs: &mut AcarsOutputs,
 ) {
     // Compile-time guard: `bytemuck::cast_slice::<Complex, Complex32>`
     // below is sound because both types are `repr(C) { re: f32, im: f32 }`
@@ -923,6 +921,34 @@ fn acars_decode_tap(
     // at compile time.
     let iq_c32: &[num_complex::Complex32] = bytemuck::cast_slice(iq);
     bank.process(iq_c32, |msg| {
+        // JSONL write — log warn (rate-limited) on failure.
+        if let Some(w) = outputs.jsonl.as_mut()
+            && let Err(e) = w.write(&msg, outputs.station_id.as_deref())
+        {
+            let now = std::time::Instant::now();
+            let elapsed = outputs
+                .jsonl_warn_at
+                .map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
+            if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
+                tracing::warn!("acars jsonl write failed (warn-rate-limited 30s): {e}");
+                outputs.jsonl_warn_at = Some(now);
+            }
+        }
+
+        // UDP send — same warn pattern.
+        if let Some(f) = outputs.udp.as_ref()
+            && let Err(e) = f.send(&msg, outputs.station_id.as_deref())
+        {
+            let now = std::time::Instant::now();
+            let elapsed = outputs
+                .udp_warn_at
+                .map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
+            if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
+                tracing::warn!("acars udp send failed (warn-rate-limited 30s): {e}");
+                outputs.udp_warn_at = Some(now);
+            }
+        }
+
         // Boxed because AcarsMessage is large enough that
         // unboxed would inflate the DspToUi enum's footprint.
         let _ = dsp_tx.send(crate::messages::DspToUi::AcarsMessage(Box::new(msg)));
@@ -3602,6 +3628,7 @@ fn process_iq_block(
                         &state.acars_region.channels(),
                         &state.processed_buf[..processed_count],
                         dsp_tx,
+                        &mut state.acars_outputs,
                     );
 
                     // ~1 Hz channel-stats emission throttle.
@@ -4790,6 +4817,7 @@ mod tests {
         let mut init_failed = false;
         let (tx, rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
+        let mut outputs = super::AcarsOutputs::new();
 
         super::acars_decode_tap(
             &mut bank,
@@ -4799,6 +4827,7 @@ mod tests {
             &US_SIX_CHANNELS_HZ,
             &iq,
             &tx,
+            &mut outputs,
         );
         assert!(bank.is_some(), "first call should initialize the bank");
         assert!(!init_failed);
@@ -4812,6 +4841,7 @@ mod tests {
         let mut init_failed = true; // Simulate prior failure.
         let (tx, _rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
+        let mut outputs = super::AcarsOutputs::new();
 
         super::acars_decode_tap(
             &mut bank,
@@ -4821,6 +4851,7 @@ mod tests {
             &US_SIX_CHANNELS_HZ,
             &iq,
             &tx,
+            &mut outputs,
         );
         assert!(bank.is_none(), "init_failed=true must short-circuit");
         assert!(init_failed);
@@ -4833,6 +4864,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
         let bad_channels: [f64; 6] = [0.0; 6]; // outside source bandwidth
+        let mut outputs = super::AcarsOutputs::new();
 
         super::acars_decode_tap(
             &mut bank,
@@ -4842,6 +4874,7 @@ mod tests {
             &bad_channels,
             &iq,
             &tx,
+            &mut outputs,
         );
         assert!(bank.is_none());
         assert!(init_failed, "bad channels should set init_failed");
