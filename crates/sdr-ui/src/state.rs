@@ -297,6 +297,18 @@ pub struct AppState {
     /// `SavedTune` and replays it at LOS — ACARS is just
     /// another piece of pre-AOS state that needs to round-trip.
     pub acars_was_engaged_pre_pass: Cell<bool>,
+    /// `true` while a `UiToDsp::SetAcarsEnabled(_)` is in flight
+    /// (sent by the Aviation panel toggle, awaiting an
+    /// `AcarsEnabledChanged` ack). The 4 Hz panel refresh tick
+    /// reads this to skip the switch-state mirror while a
+    /// transition is pending — without it, the tick would see
+    /// the not-yet-updated `acars_enabled` cell, flip the
+    /// switch back to the old value, and re-enter
+    /// `connect_active_notify` with the inverse command (race
+    /// against controller latency). Cleared in every
+    /// `AcarsEnabledChanged` arm (`Ok(true)` / `Ok(false)` /
+    /// `Err`).
+    pub acars_pending: Cell<bool>,
 }
 
 impl AppState {
@@ -346,6 +358,7 @@ impl AppState {
             acars_viewer_handles: RefCell::new(None),
             acars_saved_freq_hz: Cell::new(None),
             acars_was_engaged_pre_pass: Cell::new(false),
+            acars_pending: Cell::new(false),
         })
     }
 
@@ -453,6 +466,14 @@ mod tests {
         assert!(
             state.acars_saved_freq_hz.get().is_none(),
             "no saved pre-engage freq until first engage"
+        );
+        assert!(
+            !state.acars_was_engaged_pre_pass.get(),
+            "auto-record pre-pass ACARS flag defaults false"
+        );
+        assert!(
+            !state.acars_pending.get(),
+            "no SetAcarsEnabled command in flight at construction"
         );
         assert!(
             state.acars_viewer_handles.borrow().is_none(),

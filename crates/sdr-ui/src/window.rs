@@ -1978,9 +1978,23 @@ fn handle_dsp_message(
             // `acars_viewer.rs::build_acars_viewer_window`:
             // toggle active = skip append; the bounded ring keeps
             // growing regardless.
+            //
+            // Bounded retention: cap the visible store at the same
+            // ceiling as `acars_recent` so multi-hour sessions
+            // don't grow UI memory + filter cost without bound.
+            // Splice from the front (oldest first) before append
+            // so the new row lands at the bottom.
             if let Some(handles) = state.acars_viewer_handles.borrow().as_ref()
                 && !handles.pause_button.is_active()
             {
+                let cap = crate::acars_config::default_recent_keep();
+                let n = handles.store.n_items();
+                if n >= cap {
+                    let excess = n - cap + 1;
+                    handles
+                        .store
+                        .splice(0, excess, &[] as &[gtk4::glib::Object]);
+                }
                 handles
                     .store
                     .append(&crate::acars_viewer::AcarsMessageObject::new(
@@ -2002,6 +2016,7 @@ fn handle_dsp_message(
             match result {
                 Ok(true) => {
                     state.acars_enabled.set(true);
+                    state.acars_pending.set(false);
                     state.acars_total_count.set(0);
                     state.acars_recent.borrow_mut().clear();
                     // Mirror the DSP's silent retune to airband
@@ -2016,6 +2031,7 @@ fn handle_dsp_message(
                     let center_hz = sdr_core::acars_airband_lock::ACARS_CENTER_HZ;
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                     freq_selector.set_frequency(center_hz as u64);
+                    spectrum_handle.set_center_frequency(center_hz);
                     freq_selector.widget.set_sensitive(false);
                     // Mirror the DSP's airband lock on the other
                     // geometry-mutating widgets (rounds 14-15 on
@@ -2029,6 +2045,7 @@ fn handle_dsp_message(
                 }
                 Ok(false) => {
                     state.acars_enabled.set(false);
+                    state.acars_pending.set(false);
                     state.acars_recent.borrow_mut().clear();
                     state.acars_total_count.set(0);
                     *state.acars_channel_stats.borrow_mut() = [sdr_acars::ChannelStats::default();
@@ -2040,7 +2057,9 @@ fn handle_dsp_message(
                     if let Some(prev) = state.acars_saved_freq_hz.take() {
                         freq_selector.set_frequency(prev);
                         #[allow(clippy::cast_precision_loss)]
-                        status_bar.update_frequency(prev as f64);
+                        let prev_f64 = prev as f64;
+                        spectrum_handle.set_center_frequency(prev_f64);
+                        status_bar.update_frequency(prev_f64);
                     }
                     freq_selector.widget.set_sensitive(true);
                     demod_dropdown.set_sensitive(true);
@@ -2050,13 +2069,20 @@ fn handle_dsp_message(
                 }
                 Err(err) => {
                     tracing::warn!("ACARS enable failed: {err}");
+                    // Clear the in-flight flag so the panel
+                    // refresh tick stops suppressing the
+                    // switch-state mirror. State.acars_enabled
+                    // is intentionally NOT mutated here per CR
+                    // round 1 on PR #584 — Err doesn't
+                    // disambiguate engage-vs-disengage failure.
+                    // The next refresh tick will resync the
+                    // switch to the unchanged
+                    // `state.acars_enabled` value, undoing the
+                    // user's failed toggle.
+                    state.acars_pending.set(false);
                     // Surface the failure as a toast so the user
                     // sees the actionable error (e.g. "scanner is
-                    // running" or "RTL-SDR required"). Preserve
-                    // `acars_enabled` per CR round 1 on PR #584:
-                    // Err doesn't disambiguate engage-vs-disengage
-                    // failure, so silently flipping the toggle off
-                    // could mis-state the UI.
+                    // running" or "RTL-SDR required").
                     if let Some(overlay) = toast_overlay_weak.upgrade() {
                         overlay.add_toast(adw::Toast::new(&format!("ACARS: {err}")));
                     }
@@ -11620,9 +11646,17 @@ fn connect_aviation_panel(panel: &sidebar::aviation_panel::AviationPanel, state:
     use sdr_acars::ChannelLockState;
 
     // ─── Toggle: switch-row → SetAcarsEnabled ───
+    // Set `acars_pending` BEFORE dispatching so the 4 Hz mirror
+    // tick (below) skips the switch-state mirror until the
+    // AcarsEnabledChanged ack lands. Without this, the tick can
+    // see the not-yet-updated `acars_enabled` cell, flip the
+    // switch back to its old state, and re-enter this same
+    // notify handler with the inverse SetAcarsEnabled —
+    // racing the original request.
     {
         let state = Rc::clone(state);
         panel.enable_switch.connect_active_notify(move |row| {
+            state.acars_pending.set(true);
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsEnabled(
                 row.is_active(),
             ));
@@ -11630,19 +11664,35 @@ fn connect_aviation_panel(panel: &sidebar::aviation_panel::AviationPanel, state:
     }
 
     // ─── 4 Hz tick: AppState → switch row + status subtitle + per-channel rows ───
-    let switch = panel.enable_switch.clone();
-    let status = panel.status_row.clone();
-    let rows = panel.channel_rows.clone();
+    // Hold weak refs only so closing the window drops the panel
+    // widgets and the timer self-cancels via Break on the next
+    // fire. Strong refs would keep the panel + AppState alive
+    // for the rest of the process.
+    let switch_weak = panel.enable_switch.downgrade();
+    let status_weak = panel.status_row.downgrade();
+    let row_weaks: Vec<gtk4::glib::WeakRef<adw::ActionRow>> = panel
+        .channel_rows
+        .iter()
+        .map(gtk4::prelude::ObjectExt::downgrade)
+        .collect();
     let state_for_tick = Rc::clone(state);
     glib::timeout_add_local(
         std::time::Duration::from_millis(SIDEBAR_STATUS_REFRESH_MS),
         move || {
+            let (Some(switch), Some(status)) = (switch_weak.upgrade(), status_weak.upgrade())
+            else {
+                return glib::ControlFlow::Break;
+            };
+
             let enabled = state_for_tick.acars_enabled.get();
 
-            // Mirror Cell→switch one direction only (manual toggles
-            // round-trip through `SetAcarsEnabled` already; setting
-            // the same value is a GTK no-op so no feedback loop).
-            if switch.is_active() != enabled {
+            // Mirror Cell→switch one direction only — but only
+            // when no SetAcarsEnabled is in flight. While
+            // pending, the user's just-typed switch value is
+            // authoritative; mirroring back from the still-old
+            // `enabled` Cell would race the in-flight command.
+            // Cleared by every AcarsEnabledChanged arm.
+            if !state_for_tick.acars_pending.get() && switch.is_active() != enabled {
                 switch.set_active(enabled);
             }
 
@@ -11666,7 +11716,9 @@ fn connect_aviation_panel(panel: &sidebar::aviation_panel::AviationPanel, state:
             // Per-channel rows.
             let channel_stats = state_for_tick.acars_channel_stats.borrow();
             for (idx, ch) in channel_stats.iter().enumerate() {
-                let row = &rows[idx];
+                let Some(row) = row_weaks[idx].upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
                 let glyph = match ch.lock_state {
                     ChannelLockState::Locked => GLYPH_LOCKED,
                     ChannelLockState::Idle => GLYPH_IDLE,

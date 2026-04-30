@@ -123,6 +123,13 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         .icon_name("media-playback-pause-symbolic")
         .tooltip_text("Pause appending new messages (existing rows stay visible)")
         .build();
+    // Icon-only buttons need an explicit accessible label —
+    // tooltips are not surfaced to assistive tech (project
+    // convention; same pattern as `apt_viewer.rs`,
+    // `server_panel.rs`).
+    pause_button.update_property(&[gtk4::accessible::Property::Label(
+        "Pause appending new ACARS messages",
+    )]);
     // PAUSE SEMANTIC: when active, the message-append site in
     // `window.rs::handle_dsp_message` skips pushing into `store`.
     // The bounded ring (`AppState::acars_recent`) keeps growing
@@ -135,6 +142,9 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         .icon_name("user-trash-symbolic")
         .tooltip_text("Clear all messages from the view (does not disable ACARS)")
         .build();
+    clear_button.update_property(&[gtk4::accessible::Property::Label(
+        "Clear ACARS message list",
+    )]);
     let filter_entry = gtk4::SearchEntry::builder()
         .placeholder_text("Filter aircraft / label / text…")
         .build();

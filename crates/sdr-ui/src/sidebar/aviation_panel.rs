@@ -9,6 +9,7 @@
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT;
 
 /// Per-channel row glyphs for the lock-state column. Per spec
 /// section "Group 2 — Channels":
@@ -42,10 +43,13 @@ pub struct AviationPanel {
     /// "Open ACARS Window" button — drives
     /// `crate::acars_viewer::open_acars_viewer_if_needed`.
     pub open_viewer_button: gtk4::Button,
-    /// Six per-channel rows (one per US-6 channel). Subtitles
-    /// are live-updated from `DspToUi::AcarsChannelStats`
-    /// arrivals (~1 Hz cadence per the DSP-side throttle).
-    pub channel_rows: [adw::ActionRow; 6],
+    /// Per-channel rows (one per US-6 channel). Width sourced
+    /// from `sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT`
+    /// so it stays in lock-step with the DSP-side channel array.
+    /// Subtitles are live-updated from
+    /// `DspToUi::AcarsChannelStats` arrivals (~1 Hz cadence per
+    /// the DSP-side throttle).
+    pub channel_rows: [adw::ActionRow; US_SIX_CHANNEL_COUNT],
 }
 
 /// Build the Aviation activity panel. Pure widget assembly.
@@ -96,7 +100,7 @@ pub fn build_aviation_panel() -> AviationPanel {
         ))
         .build();
 
-    let channel_rows: [adw::ActionRow; 6] = std::array::from_fn(|_| {
+    let channel_rows: [adw::ActionRow; US_SIX_CHANNEL_COUNT] = std::array::from_fn(|_| {
         let row = adw::ActionRow::builder().title("—").subtitle("—").build();
         channels_group.add(&row);
         row
