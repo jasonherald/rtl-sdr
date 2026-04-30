@@ -1269,6 +1269,7 @@ mod tests {
             text: String::new(),
             end_of_message: true,
             reassembled_block_count: 1,
+            parsed: None,
         }
     }
 
