@@ -79,6 +79,13 @@ pub struct AcarsMessage {
     /// merged into a single logical message. Surfaced for the
     /// viewer's "[N blocks]" indicator. Issue #580.
     pub reassembled_block_count: u8,
+    /// OOOI metadata (origin/destination airports + event
+    /// times) extracted from `text` based on `label`. `None`
+    /// if the label has no parser, validation failed, or the
+    /// text was too short. Populated post-reassembly by
+    /// [`crate::ChannelBank::process`] so multi-block messages
+    /// parse the concatenated text. Issue #577.
+    pub parsed: Option<crate::label_parsers::Oooi>,
 }
 
 /// Internal state of the byte-level state machine. Mirrors
@@ -459,6 +466,10 @@ impl FrameParser {
             // logical messages happens later, in
             // `crate::reassembly::MessageAssembler`. Issue #580.
             reassembled_block_count: 1,
+            // Population deferred to ChannelBank::process so
+            // multi-block reassembly text is parsed once on the
+            // final concatenated body. Issue #577.
+            parsed: None,
         };
         self.pending_messages.push_back(msg);
         self.reset_to_idle();

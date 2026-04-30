@@ -429,6 +429,7 @@ mod tests {
             text: text.to_string(),
             end_of_message: etx,
             reassembled_block_count: 1,
+            parsed: None,
         }
     }
 
