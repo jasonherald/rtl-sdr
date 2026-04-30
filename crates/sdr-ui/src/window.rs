@@ -1966,8 +1966,22 @@ fn handle_dsp_message(
             state
                 .acars_total_count
                 .set(state.acars_total_count.get().saturating_add(1));
-            // No UI rendering yet — sub-project 3 wires the
-            // viewer + panel summary off these fields.
+
+            // Mirror to the viewer store if a viewer is open and
+            // not paused. Pause semantic per
+            // `acars_viewer.rs::build_acars_viewer_window`:
+            // toggle active = skip append; the bounded ring keeps
+            // growing regardless.
+            if let Some(handles) = state.acars_viewer_handles.borrow().as_ref()
+                && !handles.pause_button.is_active()
+            {
+                handles
+                    .store
+                    .append(&crate::acars_viewer::AcarsMessageObject::new(
+                        (*msg).clone(),
+                    ));
+            }
+
             tracing::trace!(
                 "ACARS msg {} ({}, label {:?})",
                 state.acars_total_count.get(),
@@ -11613,12 +11627,10 @@ fn connect_aviation_panel(panel: &sidebar::aviation_panel::AviationPanel, state:
     );
 
     // ─── Open ACARS window button ───
-    // The viewer module is created in T7; for now log a placeholder.
-    // T7 will replace this with `crate::acars_viewer::open_acars_viewer_if_needed(&state)`.
     {
-        let _state = Rc::clone(state);
+        let state = Rc::clone(state);
         panel.open_viewer_button.connect_clicked(move |_| {
-            tracing::info!("ACARS viewer open requested (stub — viewer module not yet wired)");
+            crate::acars_viewer::open_acars_viewer_if_needed(&state);
         });
     }
 }
