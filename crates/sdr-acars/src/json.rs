@@ -95,6 +95,32 @@ pub fn serialize_message(msg: &AcarsMessage, station_id: Option<&str>) -> String
         );
     }
 
+    // OOOI metadata — emit each present Oooi field under its
+    // acarsdec JSON key. Mirrors output.c:281-294.
+    if let Some(oooi) = &msg.parsed {
+        if let Some(v) = &oooi.sa {
+            obj.insert("depa".to_string(), Value::from(v.as_str()));
+        }
+        if let Some(v) = &oooi.da {
+            obj.insert("dsta".to_string(), Value::from(v.as_str()));
+        }
+        if let Some(v) = &oooi.eta {
+            obj.insert("eta".to_string(), Value::from(v.as_str()));
+        }
+        if let Some(v) = &oooi.gout {
+            obj.insert("gtout".to_string(), Value::from(v.as_str()));
+        }
+        if let Some(v) = &oooi.gin {
+            obj.insert("gtin".to_string(), Value::from(v.as_str()));
+        }
+        if let Some(v) = &oooi.woff {
+            obj.insert("wloff".to_string(), Value::from(v.as_str()));
+        }
+        if let Some(v) = &oooi.won {
+            obj.insert("wlin".to_string(), Value::from(v.as_str()));
+        }
+    }
+
     // App identity — `acarsdec` emits "acarsdec"; we emit our
     // own crate name + version so downstream consumers can
     // distinguish.
@@ -285,5 +311,41 @@ mod tests {
         let out = serialize_message(&msg, None);
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["reassembled_blocks"].as_u64().unwrap(), 3);
+    }
+
+    #[test]
+    fn oooi_fields_appear_when_parsed_some() {
+        use crate::label_parsers::Oooi;
+
+        let mut msg = make_downlink_msg();
+        msg.parsed = Some(Oooi {
+            sa: Some(ArrayString::from("KORD").unwrap()),
+            da: Some(ArrayString::from("KSFO").unwrap()),
+            eta: Some(ArrayString::from("0830").unwrap()),
+            gout: Some(ArrayString::from("0700").unwrap()),
+            gin: None,
+            woff: Some(ArrayString::from("0715").unwrap()),
+            won: Some(ArrayString::from("1015").unwrap()),
+        });
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["depa"].as_str().unwrap(), "KORD");
+        assert_eq!(v["dsta"].as_str().unwrap(), "KSFO");
+        assert_eq!(v["eta"].as_str().unwrap(), "0830");
+        assert_eq!(v["gtout"].as_str().unwrap(), "0700");
+        assert_eq!(v["wloff"].as_str().unwrap(), "0715");
+        assert_eq!(v["wlin"].as_str().unwrap(), "1015");
+        assert!(v.get("gtin").is_none()); // gin was None
+    }
+
+    #[test]
+    fn oooi_fields_omitted_when_parsed_none() {
+        let msg = make_uplink_msg();
+        assert!(msg.parsed.is_none());
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        for key in ["depa", "dsta", "eta", "gtout", "gtin", "wloff", "wlin"] {
+            assert!(v.get(key).is_none(), "{key} should be absent");
+        }
     }
 }
