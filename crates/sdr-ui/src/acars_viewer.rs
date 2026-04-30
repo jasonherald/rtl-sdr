@@ -308,7 +308,22 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     // `Ordering::Equal` when the slot is empty (model churn).
     // Issue #585.
     let sorters: [gtk4::CustomSorter; 7] = [
-        make_message_sorter(|a, b| a.timestamp.cmp(&b.timestamp)),
+        // Time column sorts on the wrapper's `last_seen`, not
+        // the original frame timestamp. After a collapse hit,
+        // `record_duplicate` advances `last_seen` in place
+        // without moving the row in the store; sorting on
+        // `inner.timestamp` would leave the refreshed row
+        // stranded at its original position. Issue #586 / CR
+        // round 1 on PR #591.
+        gtk4::CustomSorter::new(|a, b| {
+            let Some(a_obj) = a.downcast_ref::<AcarsMessageObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            let Some(b_obj) = b.downcast_ref::<AcarsMessageObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            a_obj.last_seen().cmp(&b_obj.last_seen()).into()
+        }),
         make_message_sorter(|a, b| {
             a.freq_hz
                 .partial_cmp(&b.freq_hz)

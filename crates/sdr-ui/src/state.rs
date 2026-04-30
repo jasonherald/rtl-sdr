@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 
 use sdr_acars::{AcarsMessage, ChannelStats};
@@ -330,32 +330,44 @@ pub struct AppState {
     /// auto-restore doesn't write 0.0 back to config or
     /// re-enter `send_dsp` from the value-changed handler.
     pub suppress_volume_notify: Cell<bool>,
-    /// Stash for a satellite auto-record `StartAutoRecord`
-    /// action that arrived while ACARS was engaged. The arm in
-    /// `connect_satellites_panel`'s `interpret_action` parks
-    /// the action here, dispatches `SetAcarsEnabled(false)`, and
-    /// returns. The `AcarsEnabledChanged(Ok(false))` handler
-    /// then drains it and replays it through the stashed
-    /// `recorder_action_interpreter` (see below). On `Err` the
-    /// stash is dropped and the pass aborted with a toast.
-    /// Issue #589.
-    pub pending_aos_action: RefCell<Option<sdr_ui_recorder_action::RecorderAction>>,
-    /// Late-bound clone of `connect_satellites_panel`'s
+    /// Stash for the **full batch** of `RecorderAction`s a
+    /// recorder tick yielded when ACARS was engaged. The
+    /// recorder tick site detects a `StartAutoRecord` in the
+    /// batch, stashes the entire `Vec` (including any
+    /// `StartAutoAudioRecord`, `ResetImagingDecoders`, etc.
+    /// that fire alongside) here, and dispatches
+    /// `SetAcarsEnabled(false)`. The
+    /// `AcarsEnabledChanged(Ok(false))` handler drains the
+    /// `Vec` and replays each action through the stashed
+    /// `recorder_action_interpreter`. On `Err` the entire
+    /// batch is dropped and the pass aborted with a toast.
+    /// Storing the whole batch — not just the
+    /// `StartAutoRecord` — is what makes the disengage ack a
+    /// real gate (CR round 1 on PR #591). Issue #589.
+    pub pending_aos_actions: RefCell<Option<Vec<sdr_ui_recorder_action::RecorderAction>>>,
+    /// Late-bound `Weak` handle to `connect_satellites_panel`'s
     /// `interpret_action` closure so the
-    /// `AcarsEnabledChanged(Ok(false))` arm can replay a stashed
-    /// `pending_aos_action` without `handle_dsp_message` having
-    /// to plumb the closure through its already-long parameter
-    /// list. Set once during sidebar wiring; cleared on window
-    /// close (the closure captures widgets that drop with the
-    /// window). Issue #589.
-    pub recorder_action_interpreter: RefCell<Option<RecorderActionInterpreter>>,
+    /// `AcarsEnabledChanged(Ok(false))` arm can replay deferred
+    /// AOS actions without `handle_dsp_message` having to plumb
+    /// the closure through its already-long parameter list.
+    ///
+    /// Stored as `Weak` rather than `Rc` to avoid a retain
+    /// cycle: the closure itself captures `Rc<AppState>` (and
+    /// other widget `Rc`s that hold `AppState` transitively), so
+    /// a strong handle here would keep the window tree alive
+    /// past close. The strong owner of the closure is the
+    /// recorder tick's `glib::timeout_add_local`, which drops
+    /// when the timeout returns Break (or the main loop quits).
+    /// Replay sites upgrade to `Rc` per call and skip silently
+    /// when the upgrade fails (closure already dropped). Issue
+    /// #589 / CR round 1 on PR #591.
+    pub recorder_action_interpreter: RefCell<Option<RecorderActionInterpreterWeak>>,
 }
 
-/// Boxed dyn `Fn` over `RecorderAction` — the deferred-AOS gate
-/// stashes a clone of the satellites-panel `interpret_action`
-/// closure and replays it from the
-/// `AcarsEnabledChanged(Ok(false))` handler.
-pub type RecorderActionInterpreter = Rc<dyn Fn(sdr_ui_recorder_action::RecorderAction)>;
+/// `Weak` handle to a `RecorderAction` interpreter closure.
+/// Boxed dyn `Fn`; replay sites call `Weak::upgrade` to get an
+/// `Rc<dyn Fn>` and skip if `None`.
+pub type RecorderActionInterpreterWeak = Weak<dyn Fn(sdr_ui_recorder_action::RecorderAction)>;
 
 /// Re-export wrapper so the `AppState` struct can name the
 /// `RecorderAction` type without pulling the entire
@@ -415,7 +427,7 @@ impl AppState {
             acars_pending: Cell::new(false),
             acars_saved_volume: Cell::new(None),
             suppress_volume_notify: Cell::new(false),
-            pending_aos_action: RefCell::new(None),
+            pending_aos_actions: RefCell::new(None),
             recorder_action_interpreter: RefCell::new(None),
         })
     }
@@ -542,8 +554,8 @@ mod tests {
             "volume notify suppression off at construction"
         );
         assert!(
-            state.pending_aos_action.borrow().is_none(),
-            "no pending AOS action stashed at construction"
+            state.pending_aos_actions.borrow().is_none(),
+            "no pending AOS action batch stashed at construction"
         );
         assert!(
             state.recorder_action_interpreter.borrow().is_none(),

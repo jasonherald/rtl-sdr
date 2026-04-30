@@ -2170,22 +2170,30 @@ fn handle_dsp_message(
                             );
                         }
                     }
-                    // Drain a deferred AOS pass (issue #589). When
-                    // a satellite auto-record AOS arrived during
-                    // an engaged session, the StartAutoRecord arm
-                    // stashed the action and dispatched
-                    // SetAcarsEnabled(false) — now that the
-                    // controller has acked the disengage we can
-                    // safely replay the action through the same
-                    // recorder interpreter. Defer to the next
-                    // idle so we're outside the dispatch borrow.
-                    let pending = state.pending_aos_action.borrow_mut().take();
-                    if let Some(action) = pending
-                        && let Some(interp) = state.recorder_action_interpreter.borrow().clone()
+                    // Drain a deferred AOS batch (issue #589). When
+                    // a satellite auto-record tick fired during an
+                    // engaged session, the recorder tick site
+                    // stashed the entire `Vec<RecorderAction>`
+                    // and dispatched SetAcarsEnabled(false) — now
+                    // that the controller has acked the disengage
+                    // we replay every action through the same
+                    // recorder interpreter, in the original order.
+                    // Defer to next idle so we're outside the
+                    // dispatch borrow.
+                    let pending = state.pending_aos_actions.borrow_mut().take();
+                    if let Some(actions) = pending
+                        && let Some(interp_weak) =
+                            state.recorder_action_interpreter.borrow().clone()
+                        && let Some(interp) = interp_weak.upgrade()
                     {
-                        tracing::info!("AOS replay: ACARS disengaged, executing deferred action");
+                        tracing::info!(
+                            "AOS replay: ACARS disengaged, executing {} deferred action(s)",
+                            actions.len()
+                        );
                         glib::idle_add_local_once(move || {
-                            interp(action);
+                            for action in actions {
+                                interp(action);
+                            }
                         });
                     }
                     tracing::info!("ACARS disengaged");
@@ -2212,30 +2220,36 @@ fn handle_dsp_message(
                     // disengage can restore them; a failed engage
                     // simply never set them.
                     //
-                    // Abort any deferred AOS pass (issue #589).
+                    // Abort any deferred AOS batch (issue #589).
                     // The disengage couldn't complete, so the
                     // satellite tune would still be rejected by
-                    // the airband lock. Drop the stashed action
-                    // + clear the round-trip flag so LOS doesn't
+                    // the airband lock. Drop the stashed batch +
+                    // clear the round-trip flag so LOS doesn't
                     // try to re-engage onto an unstable state,
                     // and surface a dedicated toast naming the
-                    // affected satellite.
-                    let aborted = state.pending_aos_action.borrow_mut().take();
-                    if let Some(crate::sidebar::satellites_recorder::Action::StartAutoRecord {
-                        satellite,
-                        ..
-                    }) = aborted
-                    {
+                    // affected satellite (looked up from the
+                    // batch's `StartAutoRecord` entry).
+                    let aborted = state.pending_aos_actions.borrow_mut().take();
+                    if let Some(actions) = aborted {
+                        let satellite = actions.iter().find_map(|a| match a {
+                            crate::sidebar::satellites_recorder::Action::StartAutoRecord {
+                                satellite,
+                                ..
+                            } => Some(satellite.clone()),
+                            _ => None,
+                        });
                         state.acars_was_engaged_pre_pass.set(false);
-                        tracing::warn!(
-                            satellite = %satellite,
-                            error = %err,
-                            "AOS aborted: ACARS disengage failed",
-                        );
-                        if let Some(overlay) = toast_overlay_weak.upgrade() {
-                            overlay.add_toast(adw::Toast::new(&format!(
-                                "Pass {satellite} aborted: ACARS disengage failed"
-                            )));
+                        if let Some(satellite) = satellite {
+                            tracing::warn!(
+                                satellite = %satellite,
+                                error = %err,
+                                "AOS aborted: ACARS disengage failed",
+                            );
+                            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                                overlay.add_toast(adw::Toast::new(&format!(
+                                    "Pass {satellite} aborted: ACARS disengage failed"
+                                )));
+                            }
                         }
                     }
                     // Surface the original engage/disengage
@@ -10845,33 +10859,16 @@ fn connect_satellites_panel(
                 tracing::info!(
                     "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz, protocol {protocol:?}",
                 );
-                // If ACARS is engaged, gate the AOS sequence on
-                // a confirmed disengage. Stash the action +
-                // dispatch `SetAcarsEnabled(false)`, then return
-                // — the `AcarsEnabledChanged(Ok(false))` arm in
-                // `handle_dsp_message` will replay the action
-                // through this same interpreter when the
-                // controller acks. On `Err` the action is
-                // dropped + a toast surfaces (no half-engaged
-                // pass with the wrong source geometry). Issue
-                // #589.
-                if state_a.acars_enabled.get() {
-                    tracing::info!(
-                        "auto-record AOS: gating on ACARS disengage ack for {satellite}"
-                    );
-                    state_a.acars_was_engaged_pre_pass.set(true);
-                    *state_a.pending_aos_action.borrow_mut() =
-                        Some(RecorderAction::StartAutoRecord {
-                            satellite,
-                            norad_id,
-                            freq_hz,
-                            mode,
-                            bandwidth_hz,
-                            protocol,
-                        });
-                    state_a.send_dsp(UiToDsp::SetAcarsEnabled(false));
-                    return;
-                }
+                // ACARS-engaged gating happens at the recorder
+                // tick site (the for-loop calling
+                // `interpret_action`), not here — that's the
+                // only level that has visibility into the
+                // entire `Vec<RecorderAction>` batch and can
+                // defer it as a unit. CR round 1 on PR #591
+                // flagged the gap: stashing only this single
+                // `StartAutoRecord` while iterating the rest
+                // of the batch left `StartAutoAudioRecord` etc.
+                // running while ACARS was still engaged.
                 // Per-protocol viewer dispatch. Adding a new
                 // protocol means adding a match arm here +
                 // flipping `imaging_protocol` on the catalog
@@ -11660,15 +11657,20 @@ fn connect_satellites_panel(
         })
     };
 
-    // Stash a clone of the interpreter on AppState so the
-    // `AcarsEnabledChanged(Ok(false))` arm in
-    // `handle_dsp_message` can replay a deferred AOS action
+    // Stash a `Weak` handle to the interpreter on AppState so
+    // the `AcarsEnabledChanged(Ok(false))` arm in
+    // `handle_dsp_message` can replay deferred AOS actions
     // without needing the closure plumbed through its parameter
-    // list. Issue #589.
-    *state.recorder_action_interpreter.borrow_mut() = Some(Rc::clone(&interpret_action));
+    // list. Stored weakly to avoid an `AppState` ↔ closure
+    // retain cycle (the closure captures `Rc<AppState>`
+    // transitively); the strong owner is the recorder tick
+    // `glib::timeout_add_local`. Issue #589 / CR round 1 on
+    // PR #591.
+    *state.recorder_action_interpreter.borrow_mut() = Some(Rc::downgrade(&interpret_action));
 
     if cache.is_some() {
         let panel_weak_tick = panel_weak.clone();
+        let state_for_recorder = Rc::clone(state);
         let displayed_tick = Rc::clone(&displayed);
         let recompute_tick = Rc::clone(&recompute);
         let recorder_tick = Rc::clone(&recorder);
@@ -11780,8 +11782,39 @@ fn connect_satellites_panel(
                 min_elev_deg,
                 now_tune,
             );
-            for action in actions {
-                interpret_tick(action);
+            // ACARS-disengage gate (issue #589): if any action
+            // in this tick is `StartAutoRecord` AND ACARS is
+            // currently engaged, stash the **whole batch** and
+            // dispatch `SetAcarsEnabled(false)`. The
+            // `AcarsEnabledChanged(Ok(false))` arm in
+            // `handle_dsp_message` will drain the batch and
+            // replay every action through `interpret_tick` once
+            // the controller acks the disengage.
+            //
+            // Stashing the whole batch (not just
+            // `StartAutoRecord`) makes the disengage ack a real
+            // gate: same-tick siblings like
+            // `StartAutoAudioRecord` and `ResetImagingDecoders`
+            // would otherwise execute while the source was
+            // still on airband geometry, capturing audio from
+            // the wrong frequency until the disengage lands.
+            // CR round 1 on PR #591.
+            let needs_acars_gate = state_for_recorder.acars_enabled.get()
+                && actions
+                    .iter()
+                    .any(|a| matches!(a, RecorderAction::StartAutoRecord { .. }));
+            if needs_acars_gate {
+                tracing::info!(
+                    "auto-record AOS: gating {} action(s) on ACARS disengage ack",
+                    actions.len()
+                );
+                state_for_recorder.acars_was_engaged_pre_pass.set(true);
+                *state_for_recorder.pending_aos_actions.borrow_mut() = Some(actions);
+                state_for_recorder.send_dsp(UiToDsp::SetAcarsEnabled(false));
+            } else {
+                for action in actions {
+                    interpret_tick(action);
+                }
             }
 
             // #510 — pre-pass desktop alerts. Walk the displayed
@@ -11979,11 +12012,15 @@ fn try_collapse_into_existing(
         let Some(obj) = item.downcast_ref::<crate::acars_viewer::AcarsMessageObject>() else {
             continue;
         };
-        // Stop scanning once we've passed the recency window —
-        // rows are in insertion order, so any earlier row is
-        // even older.
+        // Skip rows older than the recency window. We can't
+        // early-exit here even though insertion order would
+        // suggest later rows have even older `last_seen`:
+        // `record_duplicate` updates an existing row's
+        // `last_seen` IN PLACE (no store reorder), so the
+        // "monotonic by index" invariant doesn't hold once any
+        // collapse has fired. CR round 1 on PR #591.
         if obj.last_seen() < cutoff {
-            return None;
+            continue;
         }
         let inner = obj.imp().inner.borrow();
         let Some(existing) = inner.as_ref() else {
