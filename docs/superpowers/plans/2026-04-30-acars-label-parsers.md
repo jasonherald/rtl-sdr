@@ -386,7 +386,7 @@ pub fn decode_label(label: [u8; 2], text: &str) -> Option<Oooi> {
 }
 ```
 
-- [ ] **Step 2.3: Add 10 unit tests**
+- [ ] **Step 2.3: Add 11 unit tests**
 
 In the `tests` module (after the existing tests):
 
@@ -662,7 +662,7 @@ Extend the `b'Q'` match arm to include the new parsers (full block now):
         },
 ```
 
-- [ ] **Step 3.3: Add 9 unit tests**
+- [ ] **Step 3.3: Add 10 unit tests**
 
 ```rust
     #[test]
@@ -906,7 +906,7 @@ Add to the top-level match in `decode_label` (before the `b'Q'` arm):
         },
 ```
 
-- [ ] **Step 4.3: Add 6 + 1 unit tests**
+- [ ] **Step 4.3: Add 9 unit tests**
 
 ```rust
     #[test]
@@ -1138,7 +1138,7 @@ Add (alphabetically, after the `b'1'` arm):
         },
 ```
 
-- [ ] **Step 5.3: Add 7 unit tests**
+- [ ] **Step 5.3: Add 8 unit tests**
 
 ```rust
     #[test]
@@ -1219,7 +1219,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 44 tests pass (37 prior + 7 new).
+Expected: 45 tests pass (37 prior + 8 new).
 
 - [ ] **Step 5.5: Commit**
 
@@ -1359,7 +1359,7 @@ fn label_45(text: &str) -> Option<Oooi> {
         },
 ```
 
-- [ ] **Step 6.3: Add 6 unit tests**
+- [ ] **Step 6.3: Add 7 unit tests**
 
 ```rust
     #[test]
@@ -1442,7 +1442,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 51 tests pass (44 prior + 7 new).
+Expected: 52 tests pass (45 prior + 7 new).
 
 - [ ] **Step 6.5: Commit**
 
@@ -1560,7 +1560,7 @@ fn label_8s(text: &str) -> Option<Oooi> {
         },
 ```
 
-- [ ] **Step 7.3: Add 6 unit tests**
+- [ ] **Step 7.3: Add 7 unit tests**
 
 ```rust
     #[test]
@@ -1628,7 +1628,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 57 tests pass (51 prior + 6 new).
+Expected: 59 tests pass (52 prior + 7 new).
 
 - [ ] **Step 7.5: Commit**
 
@@ -1687,7 +1687,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 58 tests pass (57 prior + 1 new). Dispatch is now complete — every C parser path has a Rust counterpart.
+Expected: 60 tests pass (59 prior + 1 new). Dispatch is now complete — every C parser path has a Rust counterpart.
 
 - [ ] **Step 8.4: Commit**
 
@@ -1838,6 +1838,7 @@ grep -n "for emitted in ch.assembler.observe" /data/source/rtl-sdr/crates/sdr-ac
 ```
 
 Expected output (line number may shift slightly):
+
 ```text
 269:            for emitted in ch.assembler.observe(msg, now) {
 ```
@@ -1886,6 +1887,7 @@ grep -n "for emitted in ch.assembler.drain_timeouts" /data/source/rtl-sdr/crates
 ```
 
 Expected:
+
 ```text
 292:            for emitted in ch.assembler.drain_timeouts(std::time::SystemTime::now()) {
 ```
@@ -1968,7 +1970,7 @@ cargo test --workspace --features sdr-transcription/whisper-cpu
 cargo fmt --all -- --check
 ```
 
-Expected: all green. Test count: `label_parsers` should have ~58 tests; full sdr-acars suite ~85+.
+Expected: all green. Test count: `label_parsers` should have ~60 tests; full sdr-acars suite ~96+.
 
 - [ ] **Step 11.4: Re-confirm no regressions in reassembly tests**
 

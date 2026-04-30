@@ -149,6 +149,7 @@ ASCII, so non-boundary failures are unreachable in practice but
 returning `None` is correct.
 
 Each parser is then a sequence of `?` chains:
+
 ```rust
 fn label_q1(text: &str) -> Option<Oooi> {
     Some(Oooi {
@@ -272,6 +273,7 @@ One test per parser fn (39 total). Each test:
    with the expected values.
 
 Example:
+
 ```rust
 #[test]
 fn label_q1_extracts_all_six_fields() {
