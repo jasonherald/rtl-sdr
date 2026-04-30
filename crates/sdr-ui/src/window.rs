@@ -11900,7 +11900,24 @@ fn connect_aviation_panel(
         let state = Rc::clone(state);
         let config = std::sync::Arc::clone(config);
         panel.region_row.connect_selected_notify(move |row| {
-            let region = region_from_combo_index(row.selected());
+            // Guard against transient ComboRow indices. The model
+            // briefly emits selection notifications during
+            // teardown / repopulate that don't correspond to a
+            // real `REGION_OPTIONS` slot. If the round-trip
+            // through `region_from_combo_index` lands on a
+            // different index than the selector reported, the
+            // value is transient — skip persistence + dispatch
+            // so a UI quirk doesn't churn config or fire a
+            // needless DSP command. CR round 1 on PR #593.
+            let selected = row.selected();
+            let region = region_from_combo_index(selected);
+            if region_combo_index(region) != selected {
+                tracing::debug!(
+                    selected,
+                    "acars region combo emitted transient index; ignoring"
+                );
+                return;
+            }
             crate::acars_config::save_acars_channel_set(&config, region.config_id());
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
         });

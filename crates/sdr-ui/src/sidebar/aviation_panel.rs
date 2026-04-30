@@ -144,8 +144,14 @@ pub fn build_aviation_panel() -> AviationPanel {
     page.add(&acars_group);
 
     // ─── Group 2: per-channel status rows ───
+    // Title kept region-neutral — the same group hosts both US-6
+    // and Europe channels, just relabeled per-row from the active
+    // region's `channels()` array. Embedding the region name in
+    // the group title would go stale on every region swap (the
+    // builder doesn't return the group widget, so there's no
+    // later hook to retitle it). CR round 1 on PR #593.
     let channels_group = adw::PreferencesGroup::builder()
-        .title("Channels (US-6)")
+        .title("Channels")
         .description(format!(
             "{GLYPH_LOCKED} Locked   {GLYPH_IDLE} Idle   {GLYPH_SIGNAL} Signal-no-decode"
         ))

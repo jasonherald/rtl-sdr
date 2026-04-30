@@ -174,7 +174,14 @@ impl MessageAssembler {
             self.pending.insert(
                 key,
                 PendingMessage {
-                    first_seen: msg.timestamp,
+                    // Stamp with the caller-provided clock, not
+                    // `msg.timestamp`. Replay paths can drift the
+                    // two clocks (e.g. an offline test passing a
+                    // synthetic `now` while the message carries a
+                    // wall-clock stamp). Pinning to `now` keeps
+                    // the timeout contract consistent with the
+                    // sweep clock — CR round 1 on PR #593.
+                    first_seen: now,
                     blocks: vec![msg],
                 },
             );
@@ -192,6 +199,23 @@ impl MessageAssembler {
             .drain()
             .map(|(_, pending)| combine_partial(pending.blocks))
             .collect()
+    }
+
+    /// Drain pending buckets older than [`REASSEMBLY_TIMEOUT`]
+    /// at `now`. Returns the expired entries as partial
+    /// reassemblies, sorted by their `first_seen` so test +
+    /// log output is deterministic.
+    ///
+    /// Public so callers (e.g. [`crate::ChannelBank::process`])
+    /// can drive timeout emission on a regular tick — without
+    /// it, a channel that decodes one ETB and then goes silent
+    /// would never get an `observe()` call to internally sweep,
+    /// and the partial reassembly would never surface (the
+    /// `flush` path emits everything regardless of age, which
+    /// is too aggressive for a still-engaged session). CR
+    /// round 1 on PR #593.
+    pub fn drain_timeouts(&mut self, now: SystemTime) -> Vec<AcarsMessage> {
+        self.sweep_timeouts(now)
     }
 
     /// Drain pending buckets older than [`REASSEMBLY_TIMEOUT`]
@@ -504,16 +528,19 @@ mod tests {
     fn cap_evicts_oldest_pending() {
         let mut a = MessageAssembler::new();
         let base = SystemTime::UNIX_EPOCH;
-        // Insert MAX + 1 distinct ETBs. Oldest (the first)
-        // should get evicted when we cross the cap.
+        // Insert MAX + 1 distinct ETBs at distinct `now` clocks.
+        // `first_seen` is stamped from the caller-provided
+        // `now` (CR round 1 on PR #593), so the test must vary
+        // `now` for the LRU evict-by-first-seen logic to be
+        // deterministic — varying `msg.timestamp` is now
+        // irrelevant.
         for i in 0..=MAX_PENDING_MESSAGES {
             let aircraft = format!(".N{i:05}");
             let msg_no = format!("M{i:03}");
-            let mut m = make_msg(&aircraft, &msg_no, 1, false, "X");
-            // Distinct timestamps so eviction order is well-defined.
-            m.timestamp =
+            let m = make_msg(&aircraft, &msg_no, 1, false, "X");
+            let now =
                 base + Duration::from_millis(u64::try_from(i).expect("loop bound fits u64"));
-            let _ = a.observe(m, base);
+            let _ = a.observe(m, now);
         }
         assert_eq!(a.pending_count(), MAX_PENDING_MESSAGES);
         // The very first key (.N00000) should have been evicted.
@@ -523,6 +550,56 @@ mod tests {
         let out = a.observe(etx, base);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].text, "_etx", "evicted ETB body did NOT come through");
+    }
+
+    #[test]
+    fn drain_timeouts_emits_only_stale_buckets() {
+        // Public counterpart of the internal sweep — must drain
+        // expired buckets WITHOUT touching fresh ones, so a
+        // silent channel can periodically call this from its
+        // housekeeping path and still get partials surfaced
+        // after REASSEMBLY_TIMEOUT. CR round 1 on PR #593.
+        let mut a = MessageAssembler::new();
+        let t0 = SystemTime::UNIX_EPOCH;
+        let _ = a.observe(make_msg(".A", "M1", 1, false, "AAA"), t0);
+        let _ = a.observe(
+            make_msg(".B", "M2", 1, false, "BBB"),
+            t0 + REASSEMBLY_TIMEOUT,
+        );
+        // At t0 + 2*timeout, only the .A bucket is stale.
+        let later = t0 + REASSEMBLY_TIMEOUT + REASSEMBLY_TIMEOUT;
+        let drained = a.drain_timeouts(later);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].aircraft.as_str(), ".A");
+        assert_eq!(drained[0].text, "AAA");
+        assert!(!drained[0].end_of_message, "partial keeps ETB flag");
+        assert_eq!(a.pending_count(), 1, "fresh .B bucket survives");
+    }
+
+    #[test]
+    fn first_seen_uses_observation_clock_not_msg_timestamp() {
+        // Replay safety: the bucket's `first_seen` must be the
+        // caller's `now`, so a stale `msg.timestamp` from an
+        // offline replay can't fool the timeout logic into
+        // emitting (or holding) the wrong way. CR round 1 on
+        // PR #593.
+        const ONE_HOUR_SECS: u64 = 60 * 60;
+        let mut a = MessageAssembler::new();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(ONE_HOUR_SECS);
+        // Construct an ETB whose own timestamp is way in the
+        // past. If the bucket used `msg.timestamp`, a sweep at
+        // `now` would immediately consider it timed out
+        // (3600 s > 30 s). We expect the bucket to survive.
+        let mut etb = make_msg(".A", "M1", 1, false, "X");
+        etb.timestamp = SystemTime::UNIX_EPOCH;
+        let _ = a.observe(etb, now);
+        assert_eq!(a.pending_count(), 1);
+        // Sweep at `now + half-timeout` — bucket should still be
+        // alive (would NOT be alive if `first_seen` had been
+        // pinned to `msg.timestamp`).
+        let drained = a.drain_timeouts(now + REASSEMBLY_TIMEOUT / 2);
+        assert_eq!(drained.len(), 0);
+        assert_eq!(a.pending_count(), 1);
     }
 
     #[test]

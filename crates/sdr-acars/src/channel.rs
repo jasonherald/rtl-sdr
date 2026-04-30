@@ -280,6 +280,22 @@ impl ChannelBank {
                     on_message(emitted);
                 }
             });
+            // Drive timeout emission on every IQ-block tick, not
+            // just when the parser produces a frame. A channel
+            // that observed one ETB and then went silent would
+            // never get an `observe()` call to internally sweep
+            // — the partial reassembly would stay parked
+            // indefinitely. The check is cheap (HashMap
+            // iteration capped at MAX_PENDING_MESSAGES) and
+            // runs at IQ-block cadence, well above the 30 s
+            // recency window. Issue #580 / CR round 1 on PR #593.
+            for emitted in ch.assembler.drain_timeouts(std::time::SystemTime::now()) {
+                stats.msg_count = stats.msg_count.saturating_add(1);
+                stats.last_msg_at = Some(emitted.timestamp);
+                stats.level_db = emitted.level_db;
+                stats.lock_state = ChannelLockState::Locked;
+                on_message(emitted);
+            }
             // Apply pending polarity flip if the parser
             // detected an inverted-SYN at frame start
             // (`acars.c:259,274`).

@@ -1111,6 +1111,19 @@ mod tests {
     }
 
     #[test]
+    fn acars_set_region_constructs() {
+        // Wire-contract pin for the variant added by issue #581.
+        // CR round 1 on PR #593 flagged the absence of a
+        // shape-regression test alongside the other UiToDsp
+        // checks; this is the matching `matches!` assertion.
+        let cmd = UiToDsp::SetAcarsRegion(crate::acars_airband_lock::AcarsRegion::Europe);
+        assert!(matches!(
+            cmd,
+            UiToDsp::SetAcarsRegion(crate::acars_airband_lock::AcarsRegion::Europe)
+        ));
+    }
+
+    #[test]
     fn acars_enabled_changed_carries_error() {
         use crate::acars_airband_lock::AcarsEnableError;
         let msg = DspToUi::AcarsEnabledChanged(Err(AcarsEnableError::UnsupportedSourceType(

@@ -962,10 +962,17 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     // lazy-rebuild at the now-coherent live rate.
                     // Per CR rounds 4+8 on PR #584.
                     if state.acars_pre_lock.is_some() {
+                        // Use the active region's center, not
+                        // the US-6 default — for non-US regions
+                        // the post-Start reassert would otherwise
+                        // retune to the wrong source center and
+                        // desynchronize channel geometry. Issue
+                        // #581 / CR round 1 on PR #593.
+                        let acars_center = state.acars_region.center_hz();
                         match apply_acars_geometry(
                             state,
                             crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
-                            crate::acars_airband_lock::ACARS_CENTER_HZ,
+                            acars_center,
                             crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
                         ) {
                             Ok(()) => {
@@ -4343,10 +4350,15 @@ fn handle_set_acars_enabled(
             // caller via TeardownNeeded; helper no longer owns
             // the cleanup() call to avoid recursion when invoked
             // from inside cleanup() itself. CR rounds 14 + 18.
+            // Use the active region's center, not the US-6
+            // default — best-effort re-lock for a non-US session
+            // would otherwise pull the source back to the wrong
+            // band. Issue #581 / CR round 1 on PR #593.
+            let acars_center = state.acars_region.center_hz();
             let relock = apply_acars_geometry(
                 state,
                 crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
-                crate::acars_airband_lock::ACARS_CENTER_HZ,
+                acars_center,
                 crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
             );
             if let Err(relock_err) = &relock {

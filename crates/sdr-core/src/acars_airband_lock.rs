@@ -65,10 +65,16 @@ pub const EUROPE_SIX_CHANNELS_HZ: [f64; ACARS_CHANNEL_COUNT] = [
 /// (`sdr_acars::ChannelBank`) is region-agnostic — all this
 /// type does is pick which fixed array to feed it and where
 /// to center the source. Custom (user-defined) channel sets
-/// are a deferred follow-up; the enum is intentionally sealed
-/// so a future refactor to runtime-sized arrays is non-
-/// breaking for current consumers.
+/// are a deferred follow-up (#592).
+///
+/// `#[non_exhaustive]` so a future region addition (e.g. AU,
+/// or the deferred `Custom` variant) is a non-breaking change
+/// for downstream crates: external consumers can no longer
+/// rely on exhaustive matching, which is exactly the contract
+/// this enum needs given its forward-compat plan. CR round 1
+/// on PR #593.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum AcarsRegion {
     /// North America (default). Six channels in 129.125–
     /// 131.550 MHz. Center 130.3375 MHz.
