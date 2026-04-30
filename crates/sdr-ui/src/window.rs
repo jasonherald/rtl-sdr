@@ -1110,6 +1110,8 @@ pub fn build_window(
     let scanner_panel_for_dsp = panels.scanner.clone();
     let freq_selector_for_dsp = freq_selector.clone();
     let demod_dropdown_for_dsp = demod_dropdown.clone();
+    let sample_rate_row_for_dsp = panels.source.sample_rate_row.clone();
+    let decimation_row_for_dsp = panels.source.decimation_row.clone();
     // Just the three widgets the rtl_tcp status renderer touches —
     // cloning the whole SourcePanel would be a lot of refcount
     // traffic for one signal handler. Weak refs, upgraded per
@@ -1196,6 +1198,8 @@ pub fn build_window(
                         &scanner_panel_for_dsp,
                         &freq_selector_for_dsp,
                         &demod_dropdown_for_dsp,
+                        &sample_rate_row_for_dsp,
+                        &decimation_row_for_dsp,
                         &rtl_tcp_status_row_weak,
                         &rtl_tcp_disconnect_button_weak,
                         &rtl_tcp_retry_button_weak,
@@ -1422,6 +1426,8 @@ fn handle_dsp_message(
     scanner_panel: &sidebar::scanner_panel::ScannerPanel,
     freq_selector: &header::frequency_selector::FrequencySelector,
     demod_dropdown: &gtk4::DropDown,
+    sample_rate_row: &adw::ComboRow,
+    decimation_row: &adw::ComboRow,
     rtl_tcp_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     rtl_tcp_disconnect_button_weak: &glib::WeakRef<gtk4::Button>,
     rtl_tcp_retry_button_weak: &glib::WeakRef<gtk4::Button>,
@@ -2011,6 +2017,13 @@ fn handle_dsp_message(
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                     freq_selector.set_frequency(center_hz as u64);
                     freq_selector.widget.set_sensitive(false);
+                    // Mirror the DSP's airband lock on the other
+                    // geometry-mutating widgets (rounds 14-15 on
+                    // PR #584): SetDemodMode, SetSampleRate, and
+                    // SetDecimation are all rejected while engaged.
+                    demod_dropdown.set_sensitive(false);
+                    sample_rate_row.set_sensitive(false);
+                    decimation_row.set_sensitive(false);
                     status_bar.update_frequency(center_hz);
                     tracing::info!("ACARS engaged");
                 }
@@ -2030,6 +2043,9 @@ fn handle_dsp_message(
                         status_bar.update_frequency(prev as f64);
                     }
                     freq_selector.widget.set_sensitive(true);
+                    demod_dropdown.set_sensitive(true);
+                    sample_rate_row.set_sensitive(true);
+                    decimation_row.set_sensitive(true);
                     tracing::info!("ACARS disengaged");
                 }
                 Err(err) => {
