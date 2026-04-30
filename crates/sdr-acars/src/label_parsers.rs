@@ -945,6 +945,16 @@ mod tests {
     }
 
     #[test]
+    fn label_26_second_line_not_eta_returns_none() {
+        // Per C source (label.c:194-200): if a second \n is
+        // present but the line doesn't start with "ETA/", the
+        // parser returns 0. Pin that behavior so future edits
+        // don't silently relax it to "succeed with sa/da only".
+        let txt = "VER/077\nSCH/X/KORD KSFO\nXXX/0830";
+        assert!(decode_label([b'2', b'6'], txt).is_none());
+    }
+
+    #[test]
     fn label_2n_extracts_sa_da_after_tko01() {
         // Offsets: "TKO01" 0..5, skip 5..11, '/' at 11, skip
         // 12..20, sa(20..24), da(24..28).
