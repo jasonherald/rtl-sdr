@@ -311,7 +311,7 @@ unit tests only.
 
 ## File layout
 
-```
+```text
 crates/sdr-acars/src/
 ├── label_parsers.rs   ← NEW (~430 LOC)
 ├── lib.rs             ← +1 mod, +1 re-export

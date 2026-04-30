@@ -18,7 +18,7 @@
 
 ## File Structure
 
-```
+```text
 crates/sdr-acars/src/
 ├── label_parsers.rs   ← NEW (~430 LOC)
 ├── lib.rs             ← +1 mod, +1 re-export
@@ -1838,7 +1838,7 @@ grep -n "for emitted in ch.assembler.observe" /data/source/rtl-sdr/crates/sdr-ac
 ```
 
 Expected output (line number may shift slightly):
-```
+```text
 269:            for emitted in ch.assembler.observe(msg, now) {
 ```
 
@@ -1886,7 +1886,7 @@ grep -n "for emitted in ch.assembler.drain_timeouts" /data/source/rtl-sdr/crates
 ```
 
 Expected:
-```
+```text
 292:            for emitted in ch.assembler.drain_timeouts(std::time::SystemTime::now()) {
 ```
 
