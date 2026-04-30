@@ -330,6 +330,39 @@ pub struct AppState {
     /// auto-restore doesn't write 0.0 back to config or
     /// re-enter `send_dsp` from the value-changed handler.
     pub suppress_volume_notify: Cell<bool>,
+    /// Stash for a satellite auto-record `StartAutoRecord`
+    /// action that arrived while ACARS was engaged. The arm in
+    /// `connect_satellites_panel`'s `interpret_action` parks
+    /// the action here, dispatches `SetAcarsEnabled(false)`, and
+    /// returns. The `AcarsEnabledChanged(Ok(false))` handler
+    /// then drains it and replays it through the stashed
+    /// `recorder_action_interpreter` (see below). On `Err` the
+    /// stash is dropped and the pass aborted with a toast.
+    /// Issue #589.
+    pub pending_aos_action: RefCell<Option<sdr_ui_recorder_action::RecorderAction>>,
+    /// Late-bound clone of `connect_satellites_panel`'s
+    /// `interpret_action` closure so the
+    /// `AcarsEnabledChanged(Ok(false))` arm can replay a stashed
+    /// `pending_aos_action` without `handle_dsp_message` having
+    /// to plumb the closure through its already-long parameter
+    /// list. Set once during sidebar wiring; cleared on window
+    /// close (the closure captures widgets that drop with the
+    /// window). Issue #589.
+    pub recorder_action_interpreter: RefCell<Option<RecorderActionInterpreter>>,
+}
+
+/// Boxed dyn `Fn` over `RecorderAction` — the deferred-AOS gate
+/// stashes a clone of the satellites-panel `interpret_action`
+/// closure and replays it from the
+/// `AcarsEnabledChanged(Ok(false))` handler.
+pub type RecorderActionInterpreter = Rc<dyn Fn(sdr_ui_recorder_action::RecorderAction)>;
+
+/// Re-export wrapper so the `AppState` struct can name the
+/// `RecorderAction` type without pulling the entire
+/// `sidebar::satellites_recorder` module path into every
+/// `AppState` consumer's import graph.
+pub mod sdr_ui_recorder_action {
+    pub use crate::sidebar::satellites_recorder::Action as RecorderAction;
 }
 
 impl AppState {
@@ -382,6 +415,8 @@ impl AppState {
             acars_pending: Cell::new(false),
             acars_saved_volume: Cell::new(None),
             suppress_volume_notify: Cell::new(false),
+            pending_aos_action: RefCell::new(None),
+            recorder_action_interpreter: RefCell::new(None),
         })
     }
 
@@ -505,6 +540,14 @@ mod tests {
         assert!(
             !state.suppress_volume_notify.get(),
             "volume notify suppression off at construction"
+        );
+        assert!(
+            state.pending_aos_action.borrow().is_none(),
+            "no pending AOS action stashed at construction"
+        );
+        assert!(
+            state.recorder_action_interpreter.borrow().is_none(),
+            "no recorder action interpreter wired until satellites panel connects"
         );
         assert!(
             state.acars_viewer_handles.borrow().is_none(),

@@ -29,7 +29,37 @@ pub struct ViewerHandles {
     pub status_label: gtk4::Label,
     pub pause_button: gtk4::ToggleButton,
     pub filter_entry: gtk4::SearchEntry,
+    /// Collapse-duplicates toggle (issue #586). When active,
+    /// the message-append site walks the most recent rows for
+    /// a `(aircraft, mode, label, text)` key match within the
+    /// recency window and bumps the existing row's count + last
+    /// seen instead of appending a new one.
+    pub collapse_button: gtk4::ToggleButton,
+    /// `ScrolledWindow` for the auto-scroll-to-top behavior on
+    /// new arrivals. The append site checks whether the user is
+    /// at the top via `vadjustment().value()` and resets the
+    /// adjustment back to its lower bound — if they've manually
+    /// scrolled down to read older rows, auto-follow freezes
+    /// until they scroll back. Bypasses `ColumnView::scroll_to`
+    /// which needs gtk4 `v4_12` (workspace is on `v4_10`).
+    pub scrolled_window: gtk4::ScrolledWindow,
 }
+
+/// Recency window length in seconds (10 minutes). Split into a
+/// named intermediate so the `60 * 10` factor reads as
+/// "ten minutes" without tripping the duration-unit lint that
+/// would otherwise fire on `from_secs(600)`.
+const ACARS_COLLAPSE_WINDOW_SECS: u64 = 60 * 10;
+
+/// Window of "recent" rows the collapse-duplicates path scans
+/// for a key match (issue #586). 10 minutes per the spec; rows
+/// older than this stay as their own entry even if the same
+/// `(aircraft, mode, label, text)` reappears later. Walking
+/// the store from the most recent row backwards typically hits
+/// this cutoff before exhausting many rows in a busy session,
+/// so the linear scan is fine in practice.
+pub const ACARS_COLLAPSE_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(ACARS_COLLAPSE_WINDOW_SECS);
 
 /// Default window dimensions (per spec `acars_viewer.rs` budget).
 const ACARS_VIEWER_WINDOW_WIDTH: i32 = 1100;
@@ -38,14 +68,37 @@ const ACARS_VIEWER_WINDOW_HEIGHT: i32 = 600;
 // ── glib::Object wrapper around an AcarsMessage ────────────────
 
 mod imp {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::time::SystemTime;
 
     use gtk4::glib;
     use gtk4::glib::subclass::prelude::{ObjectImpl, ObjectSubclass};
 
-    #[derive(Default)]
     pub struct AcarsMessageObject {
         pub inner: RefCell<Option<sdr_acars::AcarsMessage>>,
+        /// Number of times this `(aircraft, mode, label, text)`
+        /// has been seen since the row was inserted. `1` for a
+        /// fresh row; bumped by the duplicate-collapse path
+        /// (issue #586) when the toggle is active.
+        pub count: Cell<u32>,
+        /// Last-seen timestamp. Equal to `inner.timestamp` for a
+        /// fresh row; updated on each duplicate hit so the Time
+        /// column displays the most recent occurrence rather
+        /// than the first. `SystemTime::UNIX_EPOCH` as a
+        /// safe-default sentinel before a real value is set
+        /// (callers populate it via `AcarsMessageObject::new`
+        /// from the wrapped message's own timestamp).
+        pub last_seen: Cell<SystemTime>,
+    }
+
+    impl Default for AcarsMessageObject {
+        fn default() -> Self {
+            Self {
+                inner: RefCell::new(None),
+                count: Cell::new(1),
+                last_seen: Cell::new(SystemTime::UNIX_EPOCH),
+            }
+        }
     }
 
     #[glib::object_subclass]
@@ -68,10 +121,16 @@ glib::wrapper! {
 
 impl AcarsMessageObject {
     /// Wrap an `AcarsMessage` for insertion into a `GListStore`.
+    /// `count` is initialised to 1 and `last_seen` to the
+    /// message's own timestamp; the duplicate-collapse path
+    /// (issue #586) bumps both via [`Self::record_duplicate`]
+    /// when the viewer toggle is active.
     #[must_use]
     pub fn new(msg: sdr_acars::AcarsMessage) -> Self {
         let obj: Self = glib::Object::new();
+        let timestamp = msg.timestamp;
         *obj.imp().inner.borrow_mut() = Some(msg);
+        obj.imp().last_seen.set(timestamp);
         obj
     }
 
@@ -81,6 +140,30 @@ impl AcarsMessageObject {
     #[must_use]
     pub fn message(&self) -> Option<sdr_acars::AcarsMessage> {
         self.imp().inner.borrow().clone()
+    }
+
+    /// Current duplicate count (1 for a fresh row).
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        self.imp().count.get()
+    }
+
+    /// Last-seen timestamp.
+    #[must_use]
+    pub fn last_seen(&self) -> std::time::SystemTime {
+        self.imp().last_seen.get()
+    }
+
+    /// Bump the duplicate count and update `last_seen` to the
+    /// new timestamp. Called by the append site in `window.rs`
+    /// when the collapse toggle is active and an incoming
+    /// message matches an existing row's `(aircraft, mode,
+    /// label, text)` key within the recency window.
+    pub fn record_duplicate(&self, ts: std::time::SystemTime) {
+        self.imp()
+            .count
+            .set(self.imp().count.get().saturating_add(1));
+        self.imp().last_seen.set(ts);
     }
 }
 
@@ -107,7 +190,11 @@ pub fn open_acars_viewer_if_needed(state: &Rc<AppState>) {
 }
 
 /// Column descriptor: (title, render function, expand).
-type ColumnSpec = (&'static str, fn(&sdr_acars::AcarsMessage) -> String, bool);
+/// Render fn takes `&AcarsMessageObject` so the Time column can
+/// read `count` + `last_seen` from the wrapper for the
+/// duplicate-collapse `(×N)` prefix; non-time columns borrow
+/// `obj.imp().inner` themselves.
+type ColumnSpec = (&'static str, fn(&AcarsMessageObject) -> String, bool);
 
 #[allow(clippy::too_many_lines)]
 fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
@@ -146,6 +233,17 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     clear_button.update_property(&[gtk4::accessible::Property::Label(
         "Clear ACARS message list",
     )]);
+    let collapse_button = gtk4::ToggleButton::builder()
+        .icon_name("view-list-bullet-symbolic")
+        .tooltip_text(
+            "Collapse adjacent duplicates within a 10-minute window. \
+             Repeated messages from the same aircraft (e.g. Q0 link tests) \
+             stack into a single row with a (×N) prefix.",
+        )
+        .build();
+    collapse_button.update_property(&[gtk4::accessible::Property::Label(
+        "Collapse duplicate ACARS messages",
+    )]);
     let filter_entry = gtk4::SearchEntry::builder()
         .placeholder_text("Filter aircraft / label / text…")
         .build();
@@ -172,6 +270,7 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
 
     header.pack_start(&pause_button);
     header.pack_start(&clear_button);
+    header.pack_start(&collapse_button);
     header.set_title_widget(Some(&filter_entry));
     header.pack_end(&status_label);
 
@@ -253,16 +352,7 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
             else {
                 return;
             };
-            // Borrow rather than clone the inner message —
-            // factory.connect_bind fires on every visible row
-            // every store change; cloning the full
-            // `AcarsMessage` (with String + ArrayString fields)
-            // here would be wasted work when the render fns
-            // only need a borrow.
-            let inner = obj.imp().inner.borrow();
-            if let Some(msg) = inner.as_ref() {
-                label.set_text(&render(msg));
-            }
+            label.set_text(&render(&obj));
         });
         let column = gtk4::ColumnViewColumn::builder()
             .title(title)
@@ -302,6 +392,8 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         status_label: status_label.clone(),
         pause_button: pause_button.clone(),
         filter_entry: filter_entry.clone(),
+        collapse_button: collapse_button.clone(),
+        scrolled_window: scroll.clone(),
     });
     *state.acars_viewer_handles.borrow_mut() = Some(Rc::clone(&handles));
 
@@ -427,29 +519,56 @@ where
     })
 }
 
-fn render_time(msg: &sdr_acars::AcarsMessage) -> String {
-    let dt: chrono::DateTime<chrono::Local> = msg.timestamp.into();
-    dt.format("%H:%M:%S").to_string()
-}
-fn render_freq(msg: &sdr_acars::AcarsMessage) -> String {
-    format!("{:.3}", msg.freq_hz / 1_000_000.0)
-}
-fn render_aircraft(msg: &sdr_acars::AcarsMessage) -> String {
-    msg.aircraft.to_string()
-}
-fn render_mode(msg: &sdr_acars::AcarsMessage) -> String {
-    char::from(msg.mode).to_string()
-}
-fn render_label(msg: &sdr_acars::AcarsMessage) -> String {
-    let raw = std::str::from_utf8(&msg.label).unwrap_or("??").to_string();
-    match sdr_acars::label::lookup(msg.label) {
-        Some(name) => format!("{raw} ({name})"),
-        None => raw,
+/// Render the Time column. Uses the wrapper's `last_seen` (so
+/// duplicate-collapsed rows show the most recent occurrence,
+/// not the first), and prepends `(×N)` when `count > 1`.
+fn render_time(obj: &AcarsMessageObject) -> String {
+    let dt: chrono::DateTime<chrono::Local> = obj.last_seen().into();
+    let formatted = dt.format("%H:%M:%S").to_string();
+    let count = obj.count();
+    if count > 1 {
+        format!("(×{count}) {formatted}")
+    } else {
+        formatted
     }
 }
-fn render_block(msg: &sdr_acars::AcarsMessage) -> String {
-    char::from(msg.block_id).to_string()
+
+/// Borrow the inner `AcarsMessage` and run `f`, falling back to
+/// an empty string if the slot is unset (model churn / partial
+/// teardown). All non-time columns flow through this helper so
+/// the borrow + None-fallback pattern stays in one place.
+fn render_inner<F: FnOnce(&sdr_acars::AcarsMessage) -> String>(
+    obj: &AcarsMessageObject,
+    f: F,
+) -> String {
+    obj.imp()
+        .inner
+        .borrow()
+        .as_ref()
+        .map_or_else(String::new, f)
 }
-fn render_text(msg: &sdr_acars::AcarsMessage) -> String {
-    msg.text.clone()
+
+fn render_freq(obj: &AcarsMessageObject) -> String {
+    render_inner(obj, |m| format!("{:.3}", m.freq_hz / 1_000_000.0))
+}
+fn render_aircraft(obj: &AcarsMessageObject) -> String {
+    render_inner(obj, |m| m.aircraft.to_string())
+}
+fn render_mode(obj: &AcarsMessageObject) -> String {
+    render_inner(obj, |m| char::from(m.mode).to_string())
+}
+fn render_label(obj: &AcarsMessageObject) -> String {
+    render_inner(obj, |m| {
+        let raw = std::str::from_utf8(&m.label).unwrap_or("??").to_string();
+        match sdr_acars::label::lookup(m.label) {
+            Some(name) => format!("{raw} ({name})"),
+            None => raw,
+        }
+    })
+}
+fn render_block(obj: &AcarsMessageObject) -> String {
+    render_inner(obj, |m| char::from(m.block_id).to_string())
+}
+fn render_text(obj: &AcarsMessageObject) -> String {
+    render_inner(obj, |m| m.text.clone())
 }
