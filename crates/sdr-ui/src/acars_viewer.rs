@@ -177,12 +177,19 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
 
     let filter = gtk4::CustomFilter::new(|_obj| true);
     let filter_model = gtk4::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
-    let selection = gtk4::NoSelection::new(Some(filter_model.clone()));
+    // SortListModel in the chain so column-header clicks reorder
+    // the visible rows. Issue #585. Sorter starts as `None`; it's
+    // bound to `column_view.sorter()` after the column-view exists
+    // so the user's header-click state drives sort order.
+    let sort_model =
+        gtk4::SortListModel::new(Some(filter_model.clone()), Option::<gtk4::Sorter>::None);
+    let selection = gtk4::NoSelection::new(Some(sort_model.clone()));
     let column_view = gtk4::ColumnView::builder()
         .model(&selection)
         .show_column_separators(true)
         .show_row_separators(true)
         .build();
+    sort_model.set_sorter(column_view.sorter().as_ref());
 
     // Seven columns per spec section "Content":
     //   Time | Freq | Aircraft | Mode | Label | Block | Text
@@ -196,7 +203,28 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         ("Text", render_text, true),
     ];
 
-    for (title, render, expand) in columns {
+    // Per-column sorters. Each is a `CustomSorter` reading the
+    // inner `AcarsMessage` via `obj.imp().inner.borrow()` (no
+    // clone on the comparator hot path) and falling back to
+    // `Ordering::Equal` when the slot is empty (model churn).
+    // Issue #585.
+    let sorters: [gtk4::CustomSorter; 7] = [
+        make_message_sorter(|a, b| a.timestamp.cmp(&b.timestamp)),
+        make_message_sorter(|a, b| {
+            a.freq_hz
+                .partial_cmp(&b.freq_hz)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        make_message_sorter(|a, b| cmp_case_insensitive(&a.aircraft, &b.aircraft)),
+        make_message_sorter(|a, b| a.mode.cmp(&b.mode)),
+        make_message_sorter(|a, b| a.label.cmp(&b.label)),
+        make_message_sorter(|a, b| a.block_id.cmp(&b.block_id)),
+        make_message_sorter(|a, b| cmp_case_insensitive(&a.text, &b.text)),
+    ];
+
+    let mut time_column: Option<gtk4::ColumnViewColumn> = None;
+
+    for (idx, (title, render, expand)) in columns.into_iter().enumerate() {
         let factory = gtk4::SignalListItemFactory::new();
         factory.connect_setup(move |_factory, item| {
             // Fail closed on unexpected item type rather than
@@ -242,7 +270,17 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
             .resizable(true)
             .expand(expand)
             .build();
+        column.set_sorter(Some(&sorters[idx]));
+        if idx == 0 {
+            time_column = Some(column.clone());
+        }
         column_view.append_column(&column);
+    }
+    // Default sort: Time descending so newest stays at top
+    // (matches the append-at-bottom behaviour pre-#585; just
+    // expressed as a sort instead of insertion order).
+    if let Some(col) = time_column {
+        column_view.sort_by_column(Some(&col), gtk4::SortType::Descending);
     }
 
     let scroll = gtk4::ScrolledWindow::builder()
@@ -348,6 +386,45 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     }
 
     window
+}
+
+/// Allocation-free, Unicode-aware case-insensitive comparison.
+/// Used by the Aircraft + Text column sorters where comparator
+/// fires once per row pair per sort. The naive
+/// `a.to_lowercase().cmp(&b.to_lowercase())` allocates two
+/// `String`s per call; this version threads `char::to_lowercase`
+/// through the iterator pair and stops at the first non-equal
+/// codepoint without ever materialising a folded string.
+/// CR round 1 on PR #590.
+fn cmp_case_insensitive(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
+}
+
+/// Build a `CustomSorter` over `AcarsMessageObject` rows. The
+/// inner `AcarsMessage` is borrowed (no clone on the comparator
+/// hot path) and `Ordering::Equal` is returned on any unexpected
+/// row state (model churn / wrong wrapper type / empty slot).
+/// Issue #585.
+fn make_message_sorter<F>(cmp: F) -> gtk4::CustomSorter
+where
+    F: Fn(&sdr_acars::AcarsMessage, &sdr_acars::AcarsMessage) -> std::cmp::Ordering + 'static,
+{
+    gtk4::CustomSorter::new(move |a, b| {
+        let Some(a_obj) = a.downcast_ref::<AcarsMessageObject>() else {
+            return gtk4::Ordering::Equal;
+        };
+        let Some(b_obj) = b.downcast_ref::<AcarsMessageObject>() else {
+            return gtk4::Ordering::Equal;
+        };
+        let a_inner = a_obj.imp().inner.borrow();
+        let b_inner = b_obj.imp().inner.borrow();
+        match (a_inner.as_ref(), b_inner.as_ref()) {
+            (Some(a_msg), Some(b_msg)) => cmp(a_msg, b_msg).into(),
+            _ => gtk4::Ordering::Equal,
+        }
+    })
 }
 
 fn render_time(msg: &sdr_acars::AcarsMessage) -> String {
