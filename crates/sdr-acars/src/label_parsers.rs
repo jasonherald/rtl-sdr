@@ -686,6 +686,10 @@ pub fn decode_label(label: [u8; 2], text: &str) -> Option<Oooi> {
             b'S' => label_8s(text),
             _ => None,
         },
+        b'R' => match label[1] {
+            b'B' => label_26(text),
+            _ => None,
+        },
         b'Q' => match label[1] {
             b'1' => label_q1(text),
             b'2' => label_q2(text),
@@ -1136,6 +1140,16 @@ mod tests {
         // don't silently relax it to "succeed with sa/da only".
         let txt = "VER/077\nSCH/X/KORD KSFO\nXXX/0830";
         assert!(decode_label([b'2', b'6'], txt).is_none());
+    }
+
+    #[test]
+    fn label_rb_aliases_label_26() {
+        // Same fixture as label_26's "all three lines" test.
+        let txt = "VER/077\nSCH/X/KORD KSFO\nETA/0830";
+        let o = decode_label([b'R', b'B'], txt).unwrap();
+        assert_eq!(o.sa.as_deref(), Some("KORD"));
+        assert_eq!(o.da.as_deref(), Some("KSFO"));
+        assert_eq!(o.eta.as_deref(), Some("0830"));
     }
 
     #[test]
