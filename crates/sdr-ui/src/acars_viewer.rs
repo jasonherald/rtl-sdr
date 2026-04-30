@@ -154,16 +154,19 @@ impl AcarsMessageObject {
         self.imp().last_seen.get()
     }
 
-    /// Bump the duplicate count and update `last_seen` to the
-    /// new timestamp. Called by the append site in `window.rs`
-    /// when the collapse toggle is active and an incoming
-    /// message matches an existing row's `(aircraft, mode,
-    /// label, text)` key within the recency window.
+    /// Bump the duplicate count and advance `last_seen` to the
+    /// later of the current value and `ts`. Called by the
+    /// append site in `window.rs` when the collapse toggle is
+    /// active and an incoming message matches an existing
+    /// row's `(aircraft, mode, label, text)` key within the
+    /// recency window. The `max` keeps the field monotonic
+    /// even if duplicate frames arrive slightly out of order
+    /// (CR round 2 on PR #591) — without it, the displayed
+    /// time and the time-column sort key could regress.
     pub fn record_duplicate(&self, ts: std::time::SystemTime) {
-        self.imp()
-            .count
-            .set(self.imp().count.get().saturating_add(1));
-        self.imp().last_seen.set(ts);
+        let imp = self.imp();
+        imp.count.set(imp.count.get().saturating_add(1));
+        imp.last_seen.set(std::cmp::max(imp.last_seen.get(), ts));
     }
 }
 
