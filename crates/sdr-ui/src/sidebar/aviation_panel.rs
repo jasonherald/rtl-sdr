@@ -55,6 +55,19 @@ pub struct AviationPanel {
     /// Wired up in `crate::window::connect_aviation_panel` to
     /// dispatch `UiToDsp::SetAcarsRegion` + persist the choice.
     pub region_row: adw::ComboRow,
+    /// Operator station ID — embedded in JSON's
+    /// `station_id` field. Issue #578.
+    pub station_id_row: adw::EntryRow,
+    /// Toggle for the JSONL log writer. Issue #578.
+    pub jsonl_enable_row: adw::SwitchRow,
+    /// Path entry for the JSONL log. Visible only when
+    /// `jsonl_enable_row` is on. Issue #578.
+    pub jsonl_path_row: adw::EntryRow,
+    /// Toggle for the UDP JSON feeder. Issue #578.
+    pub network_enable_row: adw::SwitchRow,
+    /// host:port entry for the feeder. Visible only when
+    /// `network_enable_row` is on. Issue #578.
+    pub network_addr_row: adw::EntryRow,
 }
 
 /// Region combo-row index → `AcarsRegion`. The ordering here is
@@ -90,6 +103,7 @@ pub fn region_combo_index(region: AcarsRegion) -> u32 {
 
 /// Build the Aviation activity panel. Pure widget assembly.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_aviation_panel() -> AviationPanel {
     let page = adw::PreferencesPage::new();
 
@@ -165,6 +179,49 @@ pub fn build_aviation_panel() -> AviationPanel {
 
     page.add(&channels_group);
 
+    // Output preferences group — JSONL log + UDP feeder +
+    // station ID. Issue #578.
+    let output_group = adw::PreferencesGroup::builder()
+        .title("Output")
+        .description("Log decoded messages to disk and forward them to external feeders (e.g. airframes.io).")
+        .build();
+
+    let station_id_row = adw::EntryRow::builder().title("Station ID").build();
+    output_group.add(&station_id_row);
+
+    let jsonl_enable_row = adw::SwitchRow::builder()
+        .title("Write JSON log")
+        .subtitle("Off")
+        .build();
+    output_group.add(&jsonl_enable_row);
+
+    let jsonl_path_row = adw::EntryRow::builder().title("Log file path").build();
+    jsonl_path_row.set_visible(false);
+    output_group.add(&jsonl_path_row);
+
+    let network_enable_row = adw::SwitchRow::builder()
+        .title("Forward to network feeder")
+        .subtitle("Off")
+        .build();
+    output_group.add(&network_enable_row);
+
+    let network_addr_row = adw::EntryRow::builder().title("Feeder address").build();
+    network_addr_row.set_visible(false);
+    output_group.add(&network_addr_row);
+
+    // Visibility binding: path/addr rows visible only when
+    // their toggle is on.
+    jsonl_enable_row
+        .bind_property("active", &jsonl_path_row, "visible")
+        .sync_create()
+        .build();
+    network_enable_row
+        .bind_property("active", &network_addr_row, "visible")
+        .sync_create()
+        .build();
+
+    page.add(&output_group);
+
     AviationPanel {
         widget: page,
         enable_switch,
@@ -172,5 +229,10 @@ pub fn build_aviation_panel() -> AviationPanel {
         open_viewer_button,
         channel_rows,
         region_row,
+        station_id_row,
+        jsonl_enable_row,
+        jsonl_path_row,
+        network_enable_row,
+        network_addr_row,
     }
 }
