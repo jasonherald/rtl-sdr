@@ -513,6 +513,12 @@ fn label_44(text: &str) -> Option<Oooi> {
     // txt[23..29..33..38..43..]: separator commas; eta is
     // overwritten — first at offset 29, then again at 44 (the
     // C source assigns oooi->eta twice; last write wins).
+    //
+    // The C source's `if(txt[0]=='0' && txt[1]!='0') return 0`
+    // guard is implicitly handled here: a "0X..." text (X≠0)
+    // fails `strip_prefix("00")` (returning the unmodified
+    // text), then fails both `starts_with("POS0")` and
+    // `starts_with("ETA0")` checks, returning `None`.
     let base = text.strip_prefix("00").unwrap_or(text);
     if !base.starts_with("POS0") && !base.starts_with("ETA0") {
         return None;
@@ -906,7 +912,10 @@ mod tests {
     fn q_family_short_text_returns_none() {
         // All Q-family parsers should bail when text is too short
         // for even the first slice4.
-        for second in [b'1', b'2', b'A', b'B', b'C', b'D', b'E', b'F', b'G', b'H'] {
+        for second in [
+            b'1', b'2', b'A', b'B', b'C', b'D', b'E', b'F', b'G', b'H', b'K', b'L', b'M', b'N',
+            b'P', b'Q', b'R', b'S', b'T',
+        ] {
             assert!(
                 decode_label([b'Q', second], "AB").is_none(),
                 "Q{} should be None for short text",
