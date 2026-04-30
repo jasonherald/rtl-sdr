@@ -49,6 +49,30 @@ pub fn serialize_message(msg: &AcarsMessage, station_id: Option<&str>) -> String
     obj.insert("label".to_string(), Value::from(label_to_string(msg.label)));
     obj.insert("tail".to_string(), Value::from(msg.aircraft.as_str()));
 
+    // block_id — omit when 0 (no-bid uplinks). When present,
+    // emit ack as `false` if `'!'`, else as 1-char string.
+    if msg.block_id != 0 {
+        obj.insert(
+            "block_id".to_string(),
+            Value::from(byte_to_string(msg.block_id)),
+        );
+        if msg.ack == b'!' {
+            obj.insert("ack".to_string(), Value::from(false));
+        } else {
+            obj.insert("ack".to_string(), Value::from(byte_to_string(msg.ack)));
+        }
+    }
+
+    // Downlink-only fields. Our parser populates these only
+    // for downlink blocks, so the Some-check is the natural
+    // gate.
+    if let Some(f) = &msg.flight_id {
+        obj.insert("flight".to_string(), Value::from(f.as_str()));
+    }
+    if let Some(n) = &msg.message_no {
+        obj.insert("msgno".to_string(), Value::from(n.as_str()));
+    }
+
     // App identity — `acarsdec` emits "acarsdec"; we emit our
     // own crate name + version so downstream consumers can
     // distinguish.
@@ -153,5 +177,55 @@ mod tests {
         let out = serialize_message(&msg, Some("ABCD"));
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["station_id"].as_str().unwrap(), "ABCD");
+    }
+
+    fn make_downlink_msg() -> AcarsMessage {
+        let mut m = make_uplink_msg();
+        m.block_id = b'1';
+        m.ack = b'\x15';
+        m.flight_id = Some(ArrayString::from("UA1234").unwrap());
+        m.message_no = Some(ArrayString::from("M01A").unwrap());
+        m.text = "REPORT".to_string();
+        m
+    }
+
+    #[test]
+    fn serializes_full_downlink_message() {
+        let msg = make_downlink_msg();
+        let out = serialize_message(&msg, Some("STN1"));
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["block_id"].as_str().unwrap(), "1");
+        assert_eq!(v["ack"].as_str().unwrap(), "\x15");
+        assert_eq!(v["flight"].as_str().unwrap(), "UA1234");
+        assert_eq!(v["msgno"].as_str().unwrap(), "M01A");
+        assert_eq!(v["station_id"].as_str().unwrap(), "STN1");
+    }
+
+    #[test]
+    fn omits_block_id_and_ack_when_block_id_zero() {
+        let mut msg = make_downlink_msg();
+        msg.block_id = 0;
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("block_id").is_none());
+        assert!(v.get("ack").is_none());
+    }
+
+    #[test]
+    fn ack_serializes_as_false_when_bang() {
+        let mut msg = make_downlink_msg();
+        msg.ack = b'!';
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ack"], Value::from(false));
+    }
+
+    #[test]
+    fn omits_flight_and_msgno_for_uplink() {
+        let msg = make_uplink_msg(); // flight_id, message_no = None
+        let out = serialize_message(&msg, None);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("flight").is_none());
+        assert!(v.get("msgno").is_none());
     }
 }
