@@ -1734,7 +1734,7 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 - Modify: `crates/sdr-acars/src/reassembly.rs:413` (test helper construction — explicit, needs `parsed: None`)
 - Modify: `crates/sdr-ffi/src/event.rs:1256` (`dummy_acars_message()` test fixture — explicit, needs `parsed: None`)
 
-The other `AcarsMessage` constructor in the codebase is `crates/sdr-acars/src/reassembly.rs:319` — `combine`'s defensive fallback. It uses struct-update syntax `..etx`, so it inherits the new `parsed` field automatically and needs no change. Verify with `grep -n "AcarsMessage {" crates/` after the edits — the result should match the four sites above plus the spread-syntax site.
+The other `AcarsMessage` constructor in the codebase is `crates/sdr-acars/src/reassembly.rs:319` — `combine`'s defensive fallback. It uses struct-update syntax `..etx`, so it inherits the new `parsed` field automatically and needs no change. Verify with `grep -rn "AcarsMessage {" crates/` after the edits — the result should match the four sites above plus the spread-syntax site.
 
 - [ ] **Step 9.1: Add field to struct**
 
