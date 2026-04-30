@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
+use gtk4::subclass::prelude::ObjectSubclassIsExt;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_core::Engine;
@@ -1987,22 +1988,65 @@ fn handle_dsp_message(
             // don't grow UI memory + filter cost without bound.
             // Splice from the front (oldest first) before append
             // so the new row lands at the bottom.
+            //
+            // Collapse-duplicates (#586): when the viewer's
+            // collapse toggle is active, walk the most recent
+            // rows for a `(aircraft, mode, label, text)` key
+            // match within `ACARS_COLLAPSE_WINDOW`. On hit, bump
+            // the existing wrapper's count + last_seen and emit
+            // an `items_changed` so the row re-binds with the
+            // new `(×N)` prefix instead of appending a duplicate.
+            //
+            // Auto-scroll-to-top: if the viewer is scrolled to
+            // the top, scroll back to position 0 after the
+            // append/mutate so new rows flow into view. If the
+            // user has scrolled down to read older rows, freeze
+            // until they scroll back up.
             if let Some(handles) = state.acars_viewer_handles.borrow().as_ref()
                 && !handles.pause_button.is_active()
             {
-                let cap = crate::acars_config::default_recent_keep();
-                let n = handles.store.n_items();
-                if n >= cap {
-                    let excess = n - cap + 1;
+                let collapse_active = handles.collapse_button.is_active();
+                let mut collapsed_into: Option<u32> = None;
+                if collapse_active {
+                    collapsed_into = try_collapse_into_existing(&handles.store, &msg);
+                }
+
+                if let Some(idx) = collapsed_into {
+                    handles.store.items_changed(idx, 1, 1);
+                } else {
+                    let cap = crate::acars_config::default_recent_keep();
+                    let n = handles.store.n_items();
+                    if n >= cap {
+                        let excess = n - cap + 1;
+                        handles
+                            .store
+                            .splice(0, excess, &[] as &[gtk4::glib::Object]);
+                    }
                     handles
                         .store
-                        .splice(0, excess, &[] as &[gtk4::glib::Object]);
+                        .append(&crate::acars_viewer::AcarsMessageObject::new(
+                            (*msg).clone(),
+                        ));
                 }
-                handles
-                    .store
-                    .append(&crate::acars_viewer::AcarsMessageObject::new(
-                        (*msg).clone(),
-                    ));
+
+                // Auto-scroll-to-top if the user is currently
+                // viewing the top of the list. `vadjustment.value`
+                // is the offset from `lower`; ≈ 0 means the user
+                // is at the top, in which case we hold them
+                // pinned to the top so new rows under the active
+                // sort flow into view (newest with the default
+                // time-desc sort). When the user has scrolled
+                // down to read older rows, we leave the adjustment
+                // alone so reading isn't interrupted — they
+                // resume auto-follow by scrolling back up.
+                //
+                // Direct adjustment manipulation rather than
+                // `ColumnView::scroll_to`: that API is gated
+                // behind gtk4 v4_12 and the workspace pins v4_10.
+                let adj = handles.scrolled_window.vadjustment();
+                if (adj.value() - adj.lower()).abs() < 1.0 {
+                    adj.set_value(adj.lower());
+                }
             }
 
             tracing::trace!(
@@ -2126,6 +2170,32 @@ fn handle_dsp_message(
                             );
                         }
                     }
+                    // Drain a deferred AOS batch (issue #589). When
+                    // a satellite auto-record tick fired during an
+                    // engaged session, the recorder tick site
+                    // stashed the entire `Vec<RecorderAction>`
+                    // and dispatched SetAcarsEnabled(false) — now
+                    // that the controller has acked the disengage
+                    // we replay every action through the same
+                    // recorder interpreter, in the original order.
+                    // Defer to next idle so we're outside the
+                    // dispatch borrow.
+                    let pending = state.pending_aos_actions.borrow_mut().take();
+                    if let Some(actions) = pending
+                        && let Some(interp_weak) =
+                            state.recorder_action_interpreter.borrow().clone()
+                        && let Some(interp) = interp_weak.upgrade()
+                    {
+                        tracing::info!(
+                            "AOS replay: ACARS disengaged, executing {} deferred action(s)",
+                            actions.len()
+                        );
+                        glib::idle_add_local_once(move || {
+                            for action in actions {
+                                interp(action);
+                            }
+                        });
+                    }
                     tracing::info!("ACARS disengaged");
                 }
                 Err(err) => {
@@ -2149,8 +2219,42 @@ fn handle_dsp_message(
                     // preserved so the eventual successful
                     // disengage can restore them; a failed engage
                     // simply never set them.
-                    // Surface the failure as a toast so the user
-                    // sees the actionable error (e.g. "scanner is
+                    //
+                    // Abort any deferred AOS batch (issue #589).
+                    // The disengage couldn't complete, so the
+                    // satellite tune would still be rejected by
+                    // the airband lock. Drop the stashed batch +
+                    // clear the round-trip flag so LOS doesn't
+                    // try to re-engage onto an unstable state,
+                    // and surface a dedicated toast naming the
+                    // affected satellite (looked up from the
+                    // batch's `StartAutoRecord` entry).
+                    let aborted = state.pending_aos_actions.borrow_mut().take();
+                    if let Some(actions) = aborted {
+                        let satellite = actions.iter().find_map(|a| match a {
+                            crate::sidebar::satellites_recorder::Action::StartAutoRecord {
+                                satellite,
+                                ..
+                            } => Some(satellite.clone()),
+                            _ => None,
+                        });
+                        state.acars_was_engaged_pre_pass.set(false);
+                        if let Some(satellite) = satellite {
+                            tracing::warn!(
+                                satellite = %satellite,
+                                error = %err,
+                                "AOS aborted: ACARS disengage failed",
+                            );
+                            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                                overlay.add_toast(adw::Toast::new(&format!(
+                                    "Pass {satellite} aborted: ACARS disengage failed"
+                                )));
+                            }
+                        }
+                    }
+                    // Surface the original engage/disengage
+                    // failure as a toast too so the user sees
+                    // the actionable error (e.g. "scanner is
                     // running" or "RTL-SDR required").
                     if let Some(overlay) = toast_overlay_weak.upgrade() {
                         overlay.add_toast(adw::Toast::new(&format!("ACARS: {err}")));
@@ -10755,17 +10859,16 @@ fn connect_satellites_panel(
                 tracing::info!(
                     "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz, protocol {protocol:?}",
                 );
-                // If ACARS is engaged, auto-disengage it so the
-                // satellite tune isn't rejected by the airband
-                // lock (rounds 14-15 on PR #584). Stash the
-                // pre-pass engaged state so the LOS RestoreTune
-                // arm can re-engage. Mirrors how SavedTune
-                // captures other pre-AOS state for round-trip.
-                if state_a.acars_enabled.get() {
-                    tracing::info!("auto-record AOS: auto-disabling ACARS for the pass");
-                    state_a.acars_was_engaged_pre_pass.set(true);
-                    state_a.send_dsp(UiToDsp::SetAcarsEnabled(false));
-                }
+                // ACARS-engaged gating happens at the recorder
+                // tick site (the for-loop calling
+                // `interpret_action`), not here — that's the
+                // only level that has visibility into the
+                // entire `Vec<RecorderAction>` batch and can
+                // defer it as a unit. CR round 1 on PR #591
+                // flagged the gap: stashing only this single
+                // `StartAutoRecord` while iterating the rest
+                // of the batch left `StartAutoAudioRecord` etc.
+                // running while ACARS was still engaged.
                 // Per-protocol viewer dispatch. Adding a new
                 // protocol means adding a match arm here +
                 // flipping `imaging_protocol` on the catalog
@@ -11554,8 +11657,20 @@ fn connect_satellites_panel(
         })
     };
 
+    // Stash a `Weak` handle to the interpreter on AppState so
+    // the `AcarsEnabledChanged(Ok(false))` arm in
+    // `handle_dsp_message` can replay deferred AOS actions
+    // without needing the closure plumbed through its parameter
+    // list. Stored weakly to avoid an `AppState` ↔ closure
+    // retain cycle (the closure captures `Rc<AppState>`
+    // transitively); the strong owner is the recorder tick
+    // `glib::timeout_add_local`. Issue #589 / CR round 1 on
+    // PR #591.
+    *state.recorder_action_interpreter.borrow_mut() = Some(Rc::downgrade(&interpret_action));
+
     if cache.is_some() {
         let panel_weak_tick = panel_weak.clone();
+        let state_for_recorder = Rc::clone(state);
         let displayed_tick = Rc::clone(&displayed);
         let recompute_tick = Rc::clone(&recompute);
         let recorder_tick = Rc::clone(&recorder);
@@ -11667,8 +11782,39 @@ fn connect_satellites_panel(
                 min_elev_deg,
                 now_tune,
             );
-            for action in actions {
-                interpret_tick(action);
+            // ACARS-disengage gate (issue #589): if any action
+            // in this tick is `StartAutoRecord` AND ACARS is
+            // currently engaged, stash the **whole batch** and
+            // dispatch `SetAcarsEnabled(false)`. The
+            // `AcarsEnabledChanged(Ok(false))` arm in
+            // `handle_dsp_message` will drain the batch and
+            // replay every action through `interpret_tick` once
+            // the controller acks the disengage.
+            //
+            // Stashing the whole batch (not just
+            // `StartAutoRecord`) makes the disengage ack a real
+            // gate: same-tick siblings like
+            // `StartAutoAudioRecord` and `ResetImagingDecoders`
+            // would otherwise execute while the source was
+            // still on airband geometry, capturing audio from
+            // the wrong frequency until the disengage lands.
+            // CR round 1 on PR #591.
+            let needs_acars_gate = state_for_recorder.acars_enabled.get()
+                && actions
+                    .iter()
+                    .any(|a| matches!(a, RecorderAction::StartAutoRecord { .. }));
+            if needs_acars_gate {
+                tracing::info!(
+                    "auto-record AOS: gating {} action(s) on ACARS disengage ack",
+                    actions.len()
+                );
+                state_for_recorder.acars_was_engaged_pre_pass.set(true);
+                *state_for_recorder.pending_aos_actions.borrow_mut() = Some(actions);
+                state_for_recorder.send_dsp(UiToDsp::SetAcarsEnabled(false));
+            } else {
+                for action in actions {
+                    interpret_tick(action);
+                }
             }
 
             // #510 — pre-pass desktop alerts. Walk the displayed
@@ -11837,6 +11983,65 @@ fn connect_aviation_panel(panel: &sidebar::aviation_panel::AviationPanel, state:
 /// Format a `SystemTime` as a relative age string ("5s ago",
 /// "2m ago", "1h ago"). Returns "—" if the timestamp is in the
 /// future or unrepresentable.
+/// Walk the most recent rows of the viewer store backwards from
+/// the end and check for a `(aircraft, mode, label, text)` key
+/// match within `ACARS_COLLAPSE_WINDOW`. Returns the matched
+/// row's index after bumping its count + `last_seen` in place,
+/// or `None` if no in-window match — in which case the caller
+/// appends a fresh row. Stops walking as soon as it sees a row
+/// older than the recency window (rows are insertion-ordered
+/// in the underlying store, oldest at index 0). Issue #586.
+fn try_collapse_into_existing(
+    store: &gtk4::gio::ListStore,
+    msg: &sdr_acars::AcarsMessage,
+) -> Option<u32> {
+    use gtk4::prelude::ListModelExt;
+    let n = store.n_items();
+    if n == 0 {
+        return None;
+    }
+    let cutoff = msg
+        .timestamp
+        .checked_sub(crate::acars_viewer::ACARS_COLLAPSE_WINDOW)?;
+    let mut idx = n;
+    while idx > 0 {
+        idx -= 1;
+        let Some(item) = store.item(idx) else {
+            continue;
+        };
+        let Some(obj) = item.downcast_ref::<crate::acars_viewer::AcarsMessageObject>() else {
+            continue;
+        };
+        // Skip rows older than the recency window. We can't
+        // early-exit here even though insertion order would
+        // suggest later rows have even older `last_seen`:
+        // `record_duplicate` updates an existing row's
+        // `last_seen` IN PLACE (no store reorder), so the
+        // "monotonic by index" invariant doesn't hold once any
+        // collapse has fired. CR round 1 on PR #591.
+        if obj.last_seen() < cutoff {
+            continue;
+        }
+        let inner = obj.imp().inner.borrow();
+        let Some(existing) = inner.as_ref() else {
+            continue;
+        };
+        if existing.aircraft == msg.aircraft
+            && existing.mode == msg.mode
+            && existing.label == msg.label
+            && existing.text == msg.text
+        {
+            // Drop the borrow before mutating via the public
+            // API (which doesn't actually need the borrow held,
+            // but keeping the scope tight is cleaner).
+            drop(inner);
+            obj.record_duplicate(msg.timestamp);
+            return Some(idx);
+        }
+    }
+    None
+}
+
 fn format_relative_age(ts: std::time::SystemTime) -> String {
     let Ok(elapsed) = ts.elapsed() else {
         return "—".to_string();
