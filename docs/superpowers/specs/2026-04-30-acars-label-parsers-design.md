@@ -145,8 +145,10 @@ fn slice4(text: &str, start: usize) -> Option<ArrayString<4>> {
 `text.get(start..end)` returns `None` if either bound is past the
 end OR if the bound isn't on a UTF-8 char boundary — both are
 safe failure modes for the parser. ACARS payloads are 7-bit
-ASCII, so non-boundary failures are unreachable in practice but
-returning `None` is correct.
+ASCII, so non-boundary failures should not happen for normal
+payloads, but the parser is generic over `&str` and uses byte
+indices, so returning `None` is the correct fallback if upstream
+framing ever changes or non-ASCII payloads appear.
 
 Each parser is then a sequence of `?` chains:
 
@@ -165,10 +167,13 @@ fn label_q1(text: &str) -> Option<Oooi> {
 }
 ```
 
-Where `has_any` returns `true` if at least one field is `Some`.
-The `.filter(...)` mirrors C's "return 1 only if something
-populated" semantics — without it, a too-short text would return
-`Some(empty_oooi)` which is meaningless.
+Where `Oooi::has_any` returns `true` if at least one of the seven
+fields (`sa`, `da`, `gout`, `woff`, `won`, `gin`, `eta`) is
+`Some`. The `.filter(...)` mirrors C's "return 1 only if
+something populated" semantics — without it, a too-short text
+would return `Some(empty_oooi)` (an `Oooi` with all seven fields
+`None`), which is meaningless. The exact field set is the
+single source of truth in `Oooi::has_any`'s implementation.
 
 ### Validation arms
 

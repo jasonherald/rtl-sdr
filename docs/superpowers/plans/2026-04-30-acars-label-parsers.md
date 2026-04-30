@@ -175,6 +175,17 @@ mod tests {
     }
 
     #[test]
+    fn slice4_none_when_slice_starts_inside_multibyte_codepoint() {
+        // U+00E9 (é) is 2 bytes in UTF-8: [0xC3, 0xA9]. A slice
+        // starting at byte 1 lands inside the codepoint — text.get
+        // returns None, which slice4 propagates. ACARS payloads are
+        // 7-bit ASCII so this is unreachable for normal payloads,
+        // but the doc promises bounds-safety either way.
+        let s = "\u{00E9}XYZW"; // bytes: 0xC3 0xA9 'X' 'Y' 'Z' 'W'
+        assert!(slice4(s, 1).is_none());
+    }
+
+    #[test]
     fn byte_at_returns_none_on_short_text() {
         assert_eq!(byte_at("AB", 5), None);
     }
@@ -222,7 +233,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: all tests pass (7 in `label_parsers::tests`), clippy clean, fmt clean.
+Expected: all tests pass (8 in `label_parsers::tests`), clippy clean, fmt clean.
 
 - [ ] **Step 1.4: Commit**
 
@@ -503,7 +514,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 18 tests pass (7 from Task 1 + 11 new).
+Expected: 19 tests pass (8 from Task 1 + 11 new).
 
 - [ ] **Step 2.5: Commit**
 
@@ -766,7 +777,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 28 tests pass (18 prior + 10 new).
+Expected: 29 tests pass (19 prior + 10 new).
 
 - [ ] **Step 3.5: Commit**
 
@@ -992,7 +1003,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 37 tests pass (28 prior + 9 new).
+Expected: 38 tests pass (29 prior + 9 new).
 
 - [ ] **Step 4.5: Commit**
 
@@ -1219,7 +1230,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 45 tests pass (37 prior + 8 new).
+Expected: 46 tests pass (38 prior + 8 new).
 
 - [ ] **Step 5.5: Commit**
 
@@ -1442,7 +1453,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 52 tests pass (45 prior + 7 new).
+Expected: 53 tests pass (46 prior + 7 new).
 
 - [ ] **Step 6.5: Commit**
 
@@ -1628,7 +1639,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 59 tests pass (52 prior + 7 new).
+Expected: 60 tests pass (53 prior + 7 new).
 
 - [ ] **Step 7.5: Commit**
 
@@ -1687,7 +1698,7 @@ cargo clippy -p sdr-acars --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Expected: 60 tests pass (59 prior + 1 new). Dispatch is now complete — every C parser path has a Rust counterpart.
+Expected: 61 tests pass (60 prior + 1 new). Dispatch is now complete — every C parser path has a Rust counterpart.
 
 - [ ] **Step 8.4: Commit**
 
@@ -1970,7 +1981,7 @@ cargo test --workspace --features sdr-transcription/whisper-cpu
 cargo fmt --all -- --check
 ```
 
-Expected: all green. Test count: `label_parsers` should have ~60 tests; full sdr-acars suite ~96+.
+Expected: all green. Test count: `label_parsers` should have ~61 tests; full sdr-acars suite ~97+.
 
 - [ ] **Step 11.4: Re-confirm no regressions in reassembly tests**
 
