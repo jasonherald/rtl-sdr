@@ -2262,6 +2262,18 @@ fn handle_dsp_message(
                 }
             }
         }
+        // Output-writer errors (issue #578). Handler wired in Task 8;
+        // stub here keeps the match exhaustive. Surfaces the kind-scoped
+        // message as a toast so the user sees misconfigured paths / DNS
+        // failures without having to consult the log.
+        DspToUi::AcarsOutputError { kind, message } => {
+            tracing::warn!(kind, message, "ACARS output error");
+            if let Some(overlay) = toast_overlay_weak.upgrade() {
+                overlay.add_toast(adw::Toast::new(&format!(
+                    "ACARS {kind} output error: {message}"
+                )));
+            }
+        }
     }
 }
 
@@ -11872,7 +11884,9 @@ const DOPPLER_TRIGGER_TICK: Duration = Duration::from_secs(1);
 const DOPPLER_RECOMPUTE_TICK: Duration = Duration::from_millis(250);
 
 /// Wire the Aviation sidebar panel: toggle switch → DSP, 4 Hz tick
-/// for status/channel-row refresh, and the open-viewer button stub.
+/// for status/channel-row refresh, the open-viewer button, and the
+/// output-formatter controls (station ID, JSONL log, network feeder).
+#[allow(clippy::too_many_lines)]
 fn connect_aviation_panel(
     panel: &sidebar::aviation_panel::AviationPanel,
     state: &Rc<AppState>,
@@ -12022,6 +12036,243 @@ fn connect_aviation_panel(
             crate::acars_viewer::open_acars_viewer_if_needed(&state);
         });
     }
+
+    // ─── Output-formatter widget seed + wiring (issue #578) ───
+    // Seed text fields and toggles BEFORE wiring signal handlers so
+    // the initial set_text / set_active calls do NOT fire save or
+    // dispatch. The explicit send_dsp block at the end delivers the
+    // persisted state to the controller unconditionally.
+
+    // Seed text fields first. Station ID is normalized to
+    // the same 8-char cap the DSP enforces (see
+    // `controller.rs::handle_set_acars_station_id`), and
+    // healed back to config when the persisted value is over
+    // the cap — otherwise the field, the config, and the
+    // DSP would briefly hold three different values until
+    // the user touches the row. CR round 5 on PR #595.
+    let raw_station_id = crate::acars_config::read_acars_station_id(config);
+    let normalized_station_id: String = raw_station_id.chars().take(8).collect();
+    if normalized_station_id != raw_station_id {
+        crate::acars_config::save_acars_station_id(config, &normalized_station_id);
+    }
+    panel.station_id_row.set_text(&normalized_station_id);
+    panel
+        .jsonl_path_row
+        .set_text(&crate::acars_config::read_acars_jsonl_path(config));
+    panel
+        .network_addr_row
+        .set_text(&crate::acars_config::read_acars_network_addr(config));
+
+    // Seed toggles (bind_property in the panel builder already handles
+    // path/addr row visibility, so these calls also show/hide them).
+    panel
+        .jsonl_enable_row
+        .set_active(crate::acars_config::read_acars_jsonl_enabled(config));
+    panel
+        .network_enable_row
+        .set_active(crate::acars_config::read_acars_network_enabled(config));
+
+    // Set subtitle to match current toggle state — signal
+    // handlers only fire on user-initiated changes, so we
+    // need to seed the subtitle explicitly. CR round 1 on
+    // PR #595.
+    {
+        let path = panel.jsonl_path_row.text();
+        let active = panel.jsonl_enable_row.is_active();
+        let subtitle = if active {
+            if path.is_empty() {
+                "~/sdr-recordings/acars.jsonl".to_string()
+            } else {
+                path.to_string()
+            }
+        } else {
+            "Off".to_string()
+        };
+        panel.jsonl_enable_row.set_subtitle(&subtitle);
+    }
+    {
+        let addr = panel.network_addr_row.text();
+        let active = panel.network_enable_row.is_active();
+        let subtitle = if active {
+            if addr.is_empty() {
+                "feed.airframes.io:5550".to_string()
+            } else {
+                addr.to_string()
+            }
+        } else {
+            "Off".to_string()
+        };
+        panel.network_enable_row.set_subtitle(&subtitle);
+    }
+
+    // Wire station_id_row — per-keystroke save + dispatch.
+    // Station ID changes are cheap on the DSP side (just
+    // updates a string field, no reopen), so live updates
+    // are fine and match the codebase's existing pattern for
+    // text-row config (server_panel.rs nickname,
+    // source_panel.rs file path). CR round 4 on PR #595 —
+    // `connect_apply` only fires on Enter, so it would lose
+    // edits committed via focus-out or app close.
+    {
+        let state = Rc::clone(state);
+        let config = std::sync::Arc::clone(config);
+        panel.station_id_row.connect_changed(move |row| {
+            let value = row.text().to_string();
+            crate::acars_config::save_acars_station_id(&config, &value);
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsStationId(value));
+        });
+    }
+
+    // Wire jsonl_enable_row toggle.
+    {
+        let state = Rc::clone(state);
+        let config = std::sync::Arc::clone(config);
+        let path_row = panel.jsonl_path_row.clone();
+        panel.jsonl_enable_row.connect_active_notify(move |row| {
+            let active = row.is_active();
+            let path = path_row.text().to_string();
+            // Persist + dispatch the latest path on EVERY
+            // toggle edge so an edit-then-toggle-off sequence
+            // doesn't leave config / DSP holding the old
+            // value. The user's typed text is always the
+            // source of truth. CR round 3 on PR #595.
+            crate::acars_config::save_acars_jsonl_path(&config, &path);
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(path.clone()));
+            crate::acars_config::save_acars_jsonl_enabled(&config, active);
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlEnabled(active));
+            // Subtitle reflects current path or "Off".
+            let subtitle = if active {
+                if path.is_empty() {
+                    "~/sdr-recordings/acars.jsonl".to_string()
+                } else {
+                    path
+                }
+            } else {
+                "Off".to_string()
+            };
+            row.set_subtitle(&subtitle);
+        });
+    }
+
+    // Wire jsonl_path_row — per-keystroke save to config so
+    // edits never get lost on focus-out / app close, plus
+    // explicit-commit DSP dispatch on Enter (apply) so we
+    // don't reopen the writer 17 times while the user types
+    // a path. Toggle handlers read the live row text
+    // separately, so toggling on after typing without Enter
+    // dispatches the latest value too. CR round 4 on PR #595.
+    {
+        let config = std::sync::Arc::clone(config);
+        panel.jsonl_path_row.connect_changed(move |row| {
+            crate::acars_config::save_acars_jsonl_path(&config, &row.text());
+        });
+    }
+    {
+        let state = Rc::clone(state);
+        let enable_row = panel.jsonl_enable_row.clone();
+        panel.jsonl_path_row.connect_apply(move |row| {
+            let value = row.text().to_string();
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(
+                value.clone(),
+            ));
+            // Keep the enable-row subtitle in sync — when the
+            // toggle is on, the subtitle shows the current
+            // path. CR round 2 on PR #595.
+            if enable_row.is_active() {
+                let subtitle = if value.is_empty() {
+                    "~/sdr-recordings/acars.jsonl".to_string()
+                } else {
+                    value
+                };
+                enable_row.set_subtitle(&subtitle);
+            }
+        });
+    }
+
+    // Wire network_enable_row toggle.
+    {
+        let state = Rc::clone(state);
+        let config = std::sync::Arc::clone(config);
+        let addr_row = panel.network_addr_row.clone();
+        panel.network_enable_row.connect_active_notify(move |row| {
+            let active = row.is_active();
+            let addr = addr_row.text().to_string();
+            // Persist + dispatch the latest addr on EVERY
+            // toggle edge — same pattern as jsonl above.
+            // CR round 3 on PR #595.
+            crate::acars_config::save_acars_network_addr(&config, &addr);
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkAddr(
+                addr.clone(),
+            ));
+            crate::acars_config::save_acars_network_enabled(&config, active);
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkEnabled(active));
+            // Subtitle reflects current addr or "Off".
+            let subtitle = if active {
+                if addr.is_empty() {
+                    "feed.airframes.io:5550".to_string()
+                } else {
+                    addr
+                }
+            } else {
+                "Off".to_string()
+            };
+            row.set_subtitle(&subtitle);
+        });
+    }
+
+    // Wire network_addr_row — same split as jsonl_path_row:
+    // per-keystroke save to config (no DNS/dial spam), DSP
+    // dispatch on apply. CR round 4 on PR #595.
+    {
+        let config = std::sync::Arc::clone(config);
+        panel.network_addr_row.connect_changed(move |row| {
+            crate::acars_config::save_acars_network_addr(&config, &row.text());
+        });
+    }
+    {
+        let state = Rc::clone(state);
+        let enable_row = panel.network_enable_row.clone();
+        panel.network_addr_row.connect_apply(move |row| {
+            let value = row.text().to_string();
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkAddr(
+                value.clone(),
+            ));
+            // Keep the enable-row subtitle in sync — when the
+            // toggle is on, the subtitle shows the current
+            // addr. CR round 2 on PR #595.
+            if enable_row.is_active() {
+                let subtitle = if value.is_empty() {
+                    "feed.airframes.io:5550".to_string()
+                } else {
+                    value
+                };
+                enable_row.set_subtitle(&subtitle);
+            }
+        });
+    }
+
+    // Initial dispatch — deliver persisted values to the controller so
+    // writers reopen on launch if previously enabled. Path/addr/station_id
+    // are dispatched BEFORE enabled so the controller's handler finds the
+    // pending paths already set when it processes the enabled flags.
+    // Use the (already-normalized) row text rather than the
+    // raw config value so the initial DSP-side state matches
+    // exactly what the user sees. CR round 5 on PR #595.
+    state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsStationId(
+        panel.station_id_row.text().to_string(),
+    ));
+    state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlPath(
+        crate::acars_config::read_acars_jsonl_path(config),
+    ));
+    state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkAddr(
+        crate::acars_config::read_acars_network_addr(config),
+    ));
+    state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsJsonlEnabled(
+        crate::acars_config::read_acars_jsonl_enabled(config),
+    ));
+    state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkEnabled(
+        crate::acars_config::read_acars_network_enabled(config),
+    ));
 }
 
 /// Format a `SystemTime` as a relative age string ("5s ago",

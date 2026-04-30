@@ -45,6 +45,7 @@ thiserror.workspace = true
 tracing.workspace = true
 bytemuck.workspace = true
 num-complex.workspace = true
+dirs-next.workspace = true
 
 # Audio sink. The base dep is unconditional so `controller.rs`'s
 # `use sdr_sink_audio::AudioSink;` resolves on every target — including
@@ -63,6 +64,11 @@ sdr-sink-audio = { workspace = true, features = ["pipewire"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sdr-sink-audio = { workspace = true, features = ["coreaudio"] }
+
+[dev-dependencies]
+arrayvec = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

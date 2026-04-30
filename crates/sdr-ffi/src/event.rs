@@ -769,7 +769,10 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         // its own ticket. Drop here for the same reason as AptLine.
         | DspToUi::AcarsMessage(_)
         | DspToUi::AcarsChannelStats(_)
-        | DspToUi::AcarsEnabledChanged(_) => return None,
+        | DspToUi::AcarsEnabledChanged(_)
+        // Output-error toast (issue #578) — Linux-only writer path;
+        // macOS ticket will handle when FFI layer gets ACARS output.
+        | DspToUi::AcarsOutputError { .. } => return None,
     };
 
     Some((event, owned_cstring, owned_vec))
@@ -1313,6 +1316,18 @@ mod tests {
         assert!(
             translate_event(&msg).is_none(),
             "AcarsEnabledChanged(Err) must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
+    fn translate_acars_output_error_is_dropped_at_ffi_boundary() {
+        let msg = DspToUi::AcarsOutputError {
+            kind: "udp",
+            message: "could not resolve host".to_string(),
+        };
+        assert!(
+            translate_event(&msg).is_none(),
+            "AcarsOutputError must not translate to a wire event yet",
         );
     }
 

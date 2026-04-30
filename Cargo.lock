@@ -3100,6 +3100,7 @@ dependencies = [
  "clap",
  "hound",
  "num-complex",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
@@ -3121,7 +3122,9 @@ dependencies = [
 name = "sdr-core"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "bytemuck",
+ "dirs-next",
  "num-complex",
  "sdr-acars",
  "sdr-config",
@@ -3138,6 +3141,8 @@ dependencies = [
  "sdr-source-rtlsdr",
  "sdr-transcription",
  "sdr-types",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
