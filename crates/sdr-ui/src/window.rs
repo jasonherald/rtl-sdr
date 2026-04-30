@@ -1112,6 +1112,7 @@ pub fn build_window(
     let demod_dropdown_for_dsp = demod_dropdown.clone();
     let sample_rate_row_for_dsp = panels.source.sample_rate_row.clone();
     let decimation_row_for_dsp = panels.source.decimation_row.clone();
+    let volume_button_for_dsp = volume_button.clone();
     // Just the three widgets the rtl_tcp status renderer touches —
     // cloning the whole SourcePanel would be a lot of refcount
     // traffic for one signal handler. Weak refs, upgraded per
@@ -1200,6 +1201,7 @@ pub fn build_window(
                         &demod_dropdown_for_dsp,
                         &sample_rate_row_for_dsp,
                         &decimation_row_for_dsp,
+                        &volume_button_for_dsp,
                         &rtl_tcp_status_row_weak,
                         &rtl_tcp_disconnect_button_weak,
                         &rtl_tcp_retry_button_weak,
@@ -1428,6 +1430,7 @@ fn handle_dsp_message(
     demod_dropdown: &gtk4::DropDown,
     sample_rate_row: &adw::ComboRow,
     decimation_row: &adw::ComboRow,
+    volume_button: &gtk4::ScaleButton,
     rtl_tcp_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     rtl_tcp_disconnect_button_weak: &glib::WeakRef<gtk4::Button>,
     rtl_tcp_retry_button_weak: &glib::WeakRef<gtk4::Button>,
@@ -2048,6 +2051,25 @@ fn handle_dsp_message(
                     sample_rate_row.set_sensitive(false);
                     decimation_row.set_sensitive(false);
                     status_bar.update_frequency(center_hz);
+                    // Auto-mute the speaker (issue #588). With ACARS
+                    // engaged the demod is parked on the user's
+                    // single pre-engage VFO position, which is
+                    // unrelated to the 6 ACARS channels being
+                    // decoded silently in parallel — so whatever
+                    // comes out of the speaker is at best an
+                    // unrelated airband channel and at worst static.
+                    // Capture pre-engage volume + flip to 0; the
+                    // suppress flag prevents the value-changed
+                    // handler from persisting 0.0 to config or
+                    // double-dispatching SetVolume. We send
+                    // SetVolume(0.0) explicitly here.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let pre_engage_volume = volume_button.value() as f32;
+                    state.acars_saved_volume.set(Some(pre_engage_volume));
+                    state.suppress_volume_notify.set(true);
+                    volume_button.set_value(0.0);
+                    state.suppress_volume_notify.set(false);
+                    state.send_dsp(UiToDsp::SetVolume(0.0));
                     tracing::info!("ACARS engaged");
                 }
                 Ok(false) => {
@@ -2080,6 +2102,30 @@ fn handle_dsp_message(
                     demod_dropdown.set_sensitive(true);
                     sample_rate_row.set_sensitive(true);
                     decimation_row.set_sensitive(true);
+                    // Auto-restore volume (issue #588) — but only
+                    // if the user didn't manually move it during
+                    // the session. We muted to 0.0 on engage; if
+                    // current value is still ≈ 0, no override
+                    // happened, restore the saved value. If the
+                    // user moved it (current > tolerance), respect
+                    // their explicit choice and skip restore.
+                    // Tolerance 0.01 (1%) is well above ScaleButton
+                    // popover step granularity. Don't suppress on
+                    // restore: the value-changed handler's
+                    // dispatch + persist of the restored value is
+                    // exactly what we want.
+                    if let Some(saved) = state.acars_saved_volume.take() {
+                        const VOLUME_OVERRIDE_TOLERANCE: f64 = 0.01;
+                        let current = volume_button.value();
+                        if current.abs() < VOLUME_OVERRIDE_TOLERANCE {
+                            volume_button.set_value(f64::from(saved));
+                        } else {
+                            tracing::debug!(
+                                current,
+                                "ACARS disengage: keeping user-overridden volume"
+                            );
+                        }
+                    }
                     tracing::info!("ACARS disengaged");
                 }
                 Err(err) => {
@@ -2095,6 +2141,14 @@ fn handle_dsp_message(
                     // `state.acars_enabled` value, undoing the
                     // user's failed toggle.
                     state.acars_pending.set(false);
+                    // `acars_saved_volume` (and `acars_saved_tune`)
+                    // are intentionally NOT cleared here. Err
+                    // doesn't disambiguate engage-vs-disengage
+                    // failure: a failed disengage on an already-
+                    // engaged session needs the saved snapshots
+                    // preserved so the eventual successful
+                    // disengage can restore them; a failed engage
+                    // simply never set them.
                     // Surface the failure as a toast so the user
                     // sees the actionable error (e.g. "scanner is
                     // running" or "RTL-SDR required").
@@ -9409,6 +9463,16 @@ fn connect_volume_persistence(
     let config_vol = std::sync::Arc::clone(config);
     let volume_row_weak = panels.audio.volume_row.downgrade();
     volume_button.connect_value_changed(move |_btn, value| {
+        // Suppress fires when the ACARS engage path programmatically
+        // sets the value to 0 (or restores it on disengage); without
+        // this guard the auto-mute would persist 0.0 to config and
+        // double-dispatch SetVolume. The engage / disengage arms in
+        // `handle_dsp_message` take responsibility for the explicit
+        // SetVolume dispatch. Mirrors `suppress_bandwidth_notify` /
+        // `suppress_demod_notify`.
+        if state_vol.suppress_volume_notify.get() {
+            return;
+        }
         #[allow(clippy::cast_possible_truncation)]
         state_vol.send_dsp(UiToDsp::SetVolume(value as f32));
         config_vol.write(|v| {

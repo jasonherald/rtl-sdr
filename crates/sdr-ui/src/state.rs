@@ -314,6 +314,22 @@ pub struct AppState {
     /// `AcarsEnabledChanged` arm (`Ok(true)` / `Ok(false)` /
     /// `Err`).
     pub acars_pending: Cell<bool>,
+    /// Pre-engage audio volume captured by the
+    /// `AcarsEnabledChanged(Ok(true))` arm so the disengage path
+    /// can restore it. While ACARS is engaged the speaker output
+    /// is meaningless (the demod is parked on whatever single
+    /// VFO position the user had pre-engage; the 6 ACARS channels
+    /// are decoded silently in parallel), so we auto-mute on
+    /// engage (issue #588) and restore on disengage. Per-session
+    /// override: if the user manually re-raises volume mid-session,
+    /// the disengage arm respects that and skips restore.
+    pub acars_saved_volume: Cell<Option<f32>>,
+    /// Mirror of `suppress_bandwidth_notify` for the volume
+    /// `ScaleButton`. Set around programmatic `set_value` calls
+    /// from the `AcarsEnabledChanged` arm so the auto-mute /
+    /// auto-restore doesn't write 0.0 back to config or
+    /// re-enter `send_dsp` from the value-changed handler.
+    pub suppress_volume_notify: Cell<bool>,
 }
 
 impl AppState {
@@ -364,6 +380,8 @@ impl AppState {
             acars_saved_tune: Cell::new(None),
             acars_was_engaged_pre_pass: Cell::new(false),
             acars_pending: Cell::new(false),
+            acars_saved_volume: Cell::new(None),
+            suppress_volume_notify: Cell::new(false),
         })
     }
 
@@ -479,6 +497,14 @@ mod tests {
         assert!(
             !state.acars_pending.get(),
             "no SetAcarsEnabled command in flight at construction"
+        );
+        assert!(
+            state.acars_saved_volume.get().is_none(),
+            "no saved pre-engage volume until first engage"
+        );
+        assert!(
+            !state.suppress_volume_notify.get(),
+            "volume notify suppression off at construction"
         );
         assert!(
             state.acars_viewer_handles.borrow().is_none(),
