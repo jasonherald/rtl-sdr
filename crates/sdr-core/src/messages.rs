@@ -446,6 +446,13 @@ pub enum UiToDsp {
     /// the prior source config and forces (2.5 `MSps`, 130.3375 MHz,
     /// frontend decim=1); `false` restores the snapshot.
     SetAcarsEnabled(bool),
+    /// Switch the ACARS channel set / region (issue #581). The
+    /// DSP records this on `DspState::acars_region`; the next
+    /// `SetAcarsEnabled(true)` consults it to pick channels and
+    /// the source center frequency. No-op while engaged (the
+    /// airband lock rejects geometry mutations); the user
+    /// disengages, switches region, then re-engages.
+    SetAcarsRegion(crate::acars_airband_lock::AcarsRegion),
 }
 
 #[cfg(test)]
@@ -1101,6 +1108,19 @@ mod tests {
         let s = format!("{cmd:?}");
         assert!(s.contains("SetAcarsEnabled"), "got {s}");
         assert!(s.contains("true"), "got {s}");
+    }
+
+    #[test]
+    fn acars_set_region_constructs() {
+        // Wire-contract pin for the variant added by issue #581.
+        // CR round 1 on PR #593 flagged the absence of a
+        // shape-regression test alongside the other UiToDsp
+        // checks; this is the matching `matches!` assertion.
+        let cmd = UiToDsp::SetAcarsRegion(crate::acars_airband_lock::AcarsRegion::Europe);
+        assert!(matches!(
+            cmd,
+            UiToDsp::SetAcarsRegion(crate::acars_airband_lock::AcarsRegion::Europe)
+        ));
     }
 
     #[test]
