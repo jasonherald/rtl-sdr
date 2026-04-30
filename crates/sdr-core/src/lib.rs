@@ -37,6 +37,7 @@
 mod controller;
 
 pub mod acars_airband_lock;
+pub mod acars_output;
 pub mod engine;
 pub mod fft_buffer;
 pub mod messages;

@@ -64,5 +64,10 @@ sdr-sink-audio = { workspace = true, features = ["pipewire"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 sdr-sink-audio = { workspace = true, features = ["coreaudio"] }
 
+[dev-dependencies]
+arrayvec = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
