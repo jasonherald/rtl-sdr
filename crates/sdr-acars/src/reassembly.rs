@@ -235,17 +235,26 @@ impl MessageAssembler {
             .map(|(k, _)| k.clone())
             .collect();
         let mut out = Vec::with_capacity(stale_keys.len());
-        // Sort by first_seen for stable test output.
-        let mut entries: Vec<(SystemTime, AcarsMessage)> = stale_keys
+        // Sort by (first_seen, aircraft, message_no) for fully
+        // deterministic output. `stale_keys` was filtered out of a
+        // HashMap, so without the key tiebreak two buckets that
+        // share a `first_seen` would surface in HashMap iteration
+        // order — non-deterministic across runs. CR round 3 on
+        // PR #593.
+        let mut entries: Vec<(SystemTime, ReassemblyKey, AcarsMessage)> = stale_keys
             .into_iter()
             .filter_map(|key| {
                 self.pending
                     .remove(&key)
-                    .and_then(|p| combine_partial(p.blocks).map(|m| (p.first_seen, m)))
+                    .and_then(|p| combine_partial(p.blocks).map(|m| (p.first_seen, key, m)))
             })
             .collect();
-        entries.sort_by_key(|(t, _)| *t);
-        out.extend(entries.into_iter().map(|(_, m)| m));
+        entries.sort_by(|(ta, ka, _), (tb, kb, _)| {
+            ta.cmp(tb)
+                .then_with(|| ka.aircraft.cmp(&kb.aircraft))
+                .then_with(|| ka.message_no.cmp(&kb.message_no))
+        });
+        out.extend(entries.into_iter().map(|(_, _, m)| m));
         out
     }
 
