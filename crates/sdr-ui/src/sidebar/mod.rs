@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 pub mod activity_bar;
 pub mod audio_panel;
+pub mod aviation_panel;
 pub mod bookmarks_panel;
 pub mod display_panel;
 pub mod general_panel;
@@ -24,6 +25,7 @@ pub use activity_bar::{
     build_activity_bar,
 };
 pub use audio_panel::{AudioPanel, build_audio_panel};
+pub use aviation_panel::{AviationPanel, build_aviation_panel};
 pub use bookmarks_panel::{BookmarksPanel, build_bookmarks_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
 pub use general_panel::{GeneralPanel, build_general_panel};
@@ -74,6 +76,10 @@ pub struct SidebarPanels {
     /// "Satellites" left activity (#481), with the auto-record
     /// switch driving #482's APT-on-pass wiring.
     pub satellites: SatellitesPanel,
+    /// Aviation activity panel — ACARS toggle, status, per-channel
+    /// stats, and a button that opens the floating viewer. Drives
+    /// the "Aviation" left activity (epic #474, sub-project 3).
+    pub aviation: AviationPanel,
 }
 
 /// Build every sidebar panel. Activity-bar migration: each panel
@@ -91,6 +97,7 @@ pub fn build_panels() -> SidebarPanels {
     let navigation = build_navigation_panel();
     let scanner = build_scanner_panel();
     let satellites = build_satellites_panel();
+    let aviation = build_aviation_panel();
     // Flyout is built after navigation because it borrows the
     // left-sidebar `name_entry` — its row actions (recall,
     // delete-of-active) sync the entry field.
@@ -115,5 +122,6 @@ pub fn build_panels() -> SidebarPanels {
         server,
         scanner,
         satellites,
+        aviation,
     }
 }

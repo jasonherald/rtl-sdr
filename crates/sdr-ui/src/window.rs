@@ -1110,6 +1110,8 @@ pub fn build_window(
     let scanner_panel_for_dsp = panels.scanner.clone();
     let freq_selector_for_dsp = freq_selector.clone();
     let demod_dropdown_for_dsp = demod_dropdown.clone();
+    let sample_rate_row_for_dsp = panels.source.sample_rate_row.clone();
+    let decimation_row_for_dsp = panels.source.decimation_row.clone();
     // Just the three widgets the rtl_tcp status renderer touches —
     // cloning the whole SourcePanel would be a lot of refcount
     // traffic for one signal handler. Weak refs, upgraded per
@@ -1196,6 +1198,8 @@ pub fn build_window(
                         &scanner_panel_for_dsp,
                         &freq_selector_for_dsp,
                         &demod_dropdown_for_dsp,
+                        &sample_rate_row_for_dsp,
+                        &decimation_row_for_dsp,
                         &rtl_tcp_status_row_weak,
                         &rtl_tcp_disconnect_button_weak,
                         &rtl_tcp_retry_button_weak,
@@ -1422,6 +1426,8 @@ fn handle_dsp_message(
     scanner_panel: &sidebar::scanner_panel::ScannerPanel,
     freq_selector: &header::frequency_selector::FrequencySelector,
     demod_dropdown: &gtk4::DropDown,
+    sample_rate_row: &adw::ComboRow,
+    decimation_row: &adw::ComboRow,
     rtl_tcp_status_row_weak: &glib::WeakRef<adw::ActionRow>,
     rtl_tcp_disconnect_button_weak: &glib::WeakRef<gtk4::Button>,
     rtl_tcp_retry_button_weak: &glib::WeakRef<gtk4::Button>,
@@ -1966,8 +1972,36 @@ fn handle_dsp_message(
             state
                 .acars_total_count
                 .set(state.acars_total_count.get().saturating_add(1));
-            // No UI rendering yet — sub-project 3 wires the
-            // viewer + panel summary off these fields.
+
+            // Mirror to the viewer store if a viewer is open and
+            // not paused. Pause semantic per
+            // `acars_viewer.rs::build_acars_viewer_window`:
+            // toggle active = skip append; the bounded ring keeps
+            // growing regardless.
+            //
+            // Bounded retention: cap the visible store at the same
+            // ceiling as `acars_recent` so multi-hour sessions
+            // don't grow UI memory + filter cost without bound.
+            // Splice from the front (oldest first) before append
+            // so the new row lands at the bottom.
+            if let Some(handles) = state.acars_viewer_handles.borrow().as_ref()
+                && !handles.pause_button.is_active()
+            {
+                let cap = crate::acars_config::default_recent_keep();
+                let n = handles.store.n_items();
+                if n >= cap {
+                    let excess = n - cap + 1;
+                    handles
+                        .store
+                        .splice(0, excess, &[] as &[gtk4::glib::Object]);
+                }
+                handles
+                    .store
+                    .append(&crate::acars_viewer::AcarsMessageObject::new(
+                        (*msg).clone(),
+                    ));
+            }
+
             tracing::trace!(
                 "ACARS msg {} ({}, label {:?})",
                 state.acars_total_count.get(),
@@ -1982,29 +2016,91 @@ fn handle_dsp_message(
             match result {
                 Ok(true) => {
                     state.acars_enabled.set(true);
+                    state.acars_pending.set(false);
                     state.acars_total_count.set(0);
                     state.acars_recent.borrow_mut().clear();
+                    // Mirror the DSP's silent retune to airband
+                    // center on the header freq selector + status
+                    // bar + spectrum, and disable user input
+                    // since DSP rejects geometry commands while
+                    // engaged (round 14 on PR #584). Stash the
+                    // pre-engage `(center, vfo_offset)` tuple
+                    // so disengage can restore both — the
+                    // controller's restore path reapplies the
+                    // snapshot offset (CR round 13 on PR #584)
+                    // and `state.center_frequency` would
+                    // otherwise drift from the DSP snapshot.
+                    state.acars_saved_tune.set(Some((
+                        state.center_frequency.get(),
+                        spectrum_handle.vfo_offset_hz(),
+                    )));
+                    let center_hz = sdr_core::acars_airband_lock::ACARS_CENTER_HZ;
+                    state.center_frequency.set(center_hz);
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    freq_selector.set_frequency(center_hz as u64);
+                    spectrum_handle.set_center_frequency(center_hz);
+                    freq_selector.widget.set_sensitive(false);
+                    // Mirror the DSP's airband lock on the other
+                    // geometry-mutating widgets (rounds 14-15 on
+                    // PR #584): SetDemodMode, SetSampleRate, and
+                    // SetDecimation are all rejected while engaged.
+                    demod_dropdown.set_sensitive(false);
+                    sample_rate_row.set_sensitive(false);
+                    decimation_row.set_sensitive(false);
+                    status_bar.update_frequency(center_hz);
                     tracing::info!("ACARS engaged");
                 }
                 Ok(false) => {
                     state.acars_enabled.set(false);
+                    state.acars_pending.set(false);
                     state.acars_recent.borrow_mut().clear();
                     state.acars_total_count.set(0);
                     *state.acars_channel_stats.borrow_mut() = [sdr_acars::ChannelStats::default();
                         sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT];
+                    // Restore the pre-engage tune snapshot. DSP
+                    // retunes silently and reapplies its own
+                    // snapshot offset, but doesn't emit Tune /
+                    // VfoOffsetChanged echoes — so restore the
+                    // UI mirrors here. Order matches what a
+                    // user-driven `Tune` would do:
+                    // `state.center_frequency`, spectrum center,
+                    // then offset (which the freq selector +
+                    // status bar derive from `center + offset`).
+                    if let Some((center_hz, offset_hz)) = state.acars_saved_tune.take() {
+                        state.center_frequency.set(center_hz);
+                        spectrum_handle.set_center_frequency(center_hz);
+                        spectrum_handle.set_vfo_offset(offset_hz);
+                        let tuned_hz = center_hz + offset_hz;
+                        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                        let tuned_u64 = tuned_hz.max(0.0) as u64;
+                        freq_selector.set_frequency(tuned_u64);
+                        status_bar.update_frequency(tuned_hz);
+                    }
+                    freq_selector.widget.set_sensitive(true);
+                    demod_dropdown.set_sensitive(true);
+                    sample_rate_row.set_sensitive(true);
+                    decimation_row.set_sensitive(true);
                     tracing::info!("ACARS disengaged");
                 }
                 Err(err) => {
                     tracing::warn!("ACARS enable failed: {err}");
-                    // Preserve the last-known `acars_enabled`
-                    // state — `Err` doesn't tell us whether the
-                    // transition was an engage attempt (so off
-                    // is correct) or a disengage attempt (where
-                    // the DSP may still be locked, so off would
-                    // mis-state the UI). Sub-project 3 wires a
-                    // toast off this and the panel toggle handler
-                    // can clear the state explicitly when it
-                    // knows which transition the user requested.
+                    // Clear the in-flight flag so the panel
+                    // refresh tick stops suppressing the
+                    // switch-state mirror. State.acars_enabled
+                    // is intentionally NOT mutated here per CR
+                    // round 1 on PR #584 — Err doesn't
+                    // disambiguate engage-vs-disengage failure.
+                    // The next refresh tick will resync the
+                    // switch to the unchanged
+                    // `state.acars_enabled` value, undoing the
+                    // user's failed toggle.
+                    state.acars_pending.set(false);
+                    // Surface the failure as a toast so the user
+                    // sees the actionable error (e.g. "scanner is
+                    // running" or "RTL-SDR required").
+                    if let Some(overlay) = toast_overlay_weak.upgrade() {
+                        overlay.add_toast(adw::Toast::new(&format!("ACARS: {err}")));
+                    }
                 }
             }
         }
@@ -2662,6 +2758,7 @@ fn build_layout(
     left_stack.add_named(&panels.scanner.widget, Some("scanner"));
     left_stack.add_named(&page_from_group(&panels.server.widget), Some("share"));
     left_stack.add_named(&panels.satellites.widget, Some("satellites"));
+    left_stack.add_named(&panels.aviation.widget, Some("aviation"));
 
     // Right panel stack — single child today, hosts the real
     // transcript widget (not a placeholder) so transcription keeps
@@ -3551,6 +3648,7 @@ fn connect_sidebar_panels(
         set_playing,
         status_bar,
     );
+    connect_aviation_panel(&panels.aviation, state);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -10584,6 +10682,17 @@ fn connect_satellites_panel(
                 tracing::info!(
                     "auto-record AOS: tuning to {satellite} @ {freq_hz} Hz, BW {bandwidth_hz} Hz, protocol {protocol:?}",
                 );
+                // If ACARS is engaged, auto-disengage it so the
+                // satellite tune isn't rejected by the airband
+                // lock (rounds 14-15 on PR #584). Stash the
+                // pre-pass engaged state so the LOS RestoreTune
+                // arm can re-engage. Mirrors how SavedTune
+                // captures other pre-AOS state for round-trip.
+                if state_a.acars_enabled.get() {
+                    tracing::info!("auto-record AOS: auto-disabling ACARS for the pass");
+                    state_a.acars_was_engaged_pre_pass.set(true);
+                    state_a.send_dsp(UiToDsp::SetAcarsEnabled(false));
+                }
                 // Per-protocol viewer dispatch. Adding a new
                 // protocol means adding a match arm here +
                 // flipping `imaging_protocol` on the catalog
@@ -11285,6 +11394,14 @@ fn connect_satellites_panel(
                 // bar when the DSP echoes the change, so we
                 // don't have to mirror those widgets manually.
                 state_a.dispatch_vfo_offset(saved.vfo_offset_hz);
+                // Re-engage ACARS if it was on before the pass.
+                // Goes after the tune so the airband lock retunes
+                // from the user's just-restored freq rather than
+                // racing against it. Symmetric with the AOS arm.
+                if state_a.acars_was_engaged_pre_pass.replace(false) {
+                    tracing::info!("auto-record LOS: re-engaging ACARS (was on pre-pass)");
+                    state_a.send_dsp(UiToDsp::SetAcarsEnabled(true));
+                }
                 // If the user had playback off pre-AOS, we
                 // started the radio at AOS to make audio flow —
                 // honour that round trip and stop it now. A user
@@ -11534,6 +11651,132 @@ const DOPPLER_TRIGGER_TICK: Duration = Duration::from_secs(1);
 /// filter, slow enough that the bus + status-bar updates
 /// don't hammer GTK.
 const DOPPLER_RECOMPUTE_TICK: Duration = Duration::from_millis(250);
+
+/// Wire the Aviation sidebar panel: toggle switch → DSP, 4 Hz tick
+/// for status/channel-row refresh, and the open-viewer button stub.
+fn connect_aviation_panel(panel: &sidebar::aviation_panel::AviationPanel, state: &Rc<AppState>) {
+    use crate::sidebar::aviation_panel::{
+        GLYPH_IDLE, GLYPH_LOCKED, GLYPH_SIGNAL, SIDEBAR_STATUS_REFRESH_MS,
+    };
+    use sdr_acars::ChannelLockState;
+
+    // ─── Toggle: switch-row → SetAcarsEnabled ───
+    // Set `acars_pending` BEFORE dispatching so the 4 Hz mirror
+    // tick (below) skips the switch-state mirror until the
+    // AcarsEnabledChanged ack lands. Without this, the tick can
+    // see the not-yet-updated `acars_enabled` cell, flip the
+    // switch back to its old state, and re-enter this same
+    // notify handler with the inverse SetAcarsEnabled —
+    // racing the original request.
+    {
+        let state = Rc::clone(state);
+        panel.enable_switch.connect_active_notify(move |row| {
+            state.acars_pending.set(true);
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsEnabled(
+                row.is_active(),
+            ));
+        });
+    }
+
+    // ─── 4 Hz tick: AppState → switch row + status subtitle + per-channel rows ───
+    // Hold weak refs only so closing the window drops the panel
+    // widgets and the timer self-cancels via Break on the next
+    // fire. Strong refs would keep the panel + AppState alive
+    // for the rest of the process.
+    let switch_weak = panel.enable_switch.downgrade();
+    let status_weak = panel.status_row.downgrade();
+    let row_weaks: Vec<gtk4::glib::WeakRef<adw::ActionRow>> = panel
+        .channel_rows
+        .iter()
+        .map(gtk4::prelude::ObjectExt::downgrade)
+        .collect();
+    let state_for_tick = Rc::clone(state);
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(SIDEBAR_STATUS_REFRESH_MS),
+        move || {
+            let (Some(switch), Some(status)) = (switch_weak.upgrade(), status_weak.upgrade())
+            else {
+                return glib::ControlFlow::Break;
+            };
+
+            let enabled = state_for_tick.acars_enabled.get();
+
+            // Mirror Cell→switch one direction only — but only
+            // when no SetAcarsEnabled is in flight. While
+            // pending, the user's just-typed switch value is
+            // authoritative; mirroring back from the still-old
+            // `enabled` Cell would race the in-flight command.
+            // Cleared by every AcarsEnabledChanged arm.
+            if !state_for_tick.acars_pending.get() && switch.is_active() != enabled {
+                switch.set_active(enabled);
+            }
+
+            // Status subtitle.
+            let total = state_for_tick.acars_total_count.get();
+            let last_label = state_for_tick
+                .acars_recent
+                .borrow()
+                .back()
+                .map(|m| format!("Last: {}", format_relative_age(m.timestamp)));
+            let subtitle = if enabled {
+                match last_label {
+                    Some(s) => format!("Decoded {total} · {s}"),
+                    None => format!("Decoded {total} · Awaiting first message"),
+                }
+            } else {
+                "Disabled".to_string()
+            };
+            status.set_subtitle(&subtitle);
+
+            // Per-channel rows.
+            let channel_stats = state_for_tick.acars_channel_stats.borrow();
+            for (idx, ch) in channel_stats.iter().enumerate() {
+                let Some(row) = row_weaks[idx].upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let glyph = match ch.lock_state {
+                    ChannelLockState::Locked => GLYPH_LOCKED,
+                    ChannelLockState::Idle => GLYPH_IDLE,
+                    ChannelLockState::Signal => GLYPH_SIGNAL,
+                };
+                row.set_title(&format!("{glyph}  {:.3} MHz", ch.freq_hz / 1_000_000.0));
+                row.set_subtitle(&format!(
+                    "{} msgs · {:.1} dB · {}",
+                    ch.msg_count,
+                    ch.level_db,
+                    ch.last_msg_at
+                        .map_or_else(|| "—".to_string(), format_relative_age)
+                ));
+            }
+            glib::ControlFlow::Continue
+        },
+    );
+
+    // ─── Open ACARS window button ───
+    {
+        let state = Rc::clone(state);
+        panel.open_viewer_button.connect_clicked(move |_| {
+            crate::acars_viewer::open_acars_viewer_if_needed(&state);
+        });
+    }
+}
+
+/// Format a `SystemTime` as a relative age string ("5s ago",
+/// "2m ago", "1h ago"). Returns "—" if the timestamp is in the
+/// future or unrepresentable.
+fn format_relative_age(ts: std::time::SystemTime) -> String {
+    let Ok(elapsed) = ts.elapsed() else {
+        return "—".to_string();
+    };
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
 
 /// Minimum |Δoffset| (Hz) before re-dispatching `SetVfoOffset`
 /// from the 4 Hz recompute tick. Sub-5-Hz changes are below

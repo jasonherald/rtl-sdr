@@ -269,6 +269,51 @@ pub struct AppState {
     /// engage ack arrives. Lets the UI display "restoring
     /// to `{prior_freq}`" hints on disengage.
     pub acars_pre_lock_state: RefCell<Option<PreLockSnapshot>>,
+    /// Currently-open ACARS viewer window, or `None` when no
+    /// viewer is open. `glib::WeakRef` so the `AppState` slot
+    /// doesn't keep the window alive past its natural
+    /// lifetime. Set by [`crate::acars_viewer::open_acars_viewer_if_needed`];
+    /// cleared by the window's `close-request` handler.
+    pub acars_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
+    /// Per-viewer mutable handles (column-view store, filter,
+    /// status label, etc). `Some` only while a viewer window
+    /// is open. Set by `acars_viewer::build_acars_viewer_window`;
+    /// cleared by the window's close-request handler alongside
+    /// `acars_viewer_window`. Held in `Rc` so the close-request
+    /// closure and the message-append site in `window.rs` can
+    /// both reach it without lifetime juggling.
+    pub acars_viewer_handles: RefCell<Option<Rc<crate::acars_viewer::ViewerHandles>>>,
+    /// Pre-engage tune snapshot (`(center_freq_hz, vfo_offset_hz)`),
+    /// captured by the `AcarsEnabledChanged(Ok(true))` arm so the
+    /// disengage path can restore the header frequency selector,
+    /// spectrum center, and VFO marker together. The DSP retunes
+    /// silently on engage/disengage (no `Tune` / `VfoOffsetChanged`
+    /// ack), and the controller's restore path explicitly reapplies
+    /// the snapshot offset (CR round 13 on PR #584), so the UI
+    /// snapshot needs both fields — collapsing into a single
+    /// displayed-frequency value would leave `state.center_frequency`
+    /// stale after disengage when a non-zero VFO offset was active
+    /// pre-engage. `None` when ACARS is disengaged.
+    pub acars_saved_tune: Cell<Option<(f64, f64)>>,
+    /// `true` if ACARS was engaged when a satellite auto-record
+    /// pass started, captured in the `StartAutoRecord` action
+    /// arm so the LOS `RestoreTune` arm can re-engage. Mirrors
+    /// the way the recorder saves the user's pre-AOS tune in
+    /// `SavedTune` and replays it at LOS — ACARS is just
+    /// another piece of pre-AOS state that needs to round-trip.
+    pub acars_was_engaged_pre_pass: Cell<bool>,
+    /// `true` while a `UiToDsp::SetAcarsEnabled(_)` is in flight
+    /// (sent by the Aviation panel toggle, awaiting an
+    /// `AcarsEnabledChanged` ack). The 4 Hz panel refresh tick
+    /// reads this to skip the switch-state mirror while a
+    /// transition is pending — without it, the tick would see
+    /// the not-yet-updated `acars_enabled` cell, flip the
+    /// switch back to the old value, and re-enter
+    /// `connect_active_notify` with the inverse command (race
+    /// against controller latency). Cleared in every
+    /// `AcarsEnabledChanged` arm (`Ok(true)` / `Ok(false)` /
+    /// `Err`).
+    pub acars_pending: Cell<bool>,
 }
 
 impl AppState {
@@ -314,6 +359,11 @@ impl AppState {
             acars_total_count: Cell::new(0),
             acars_channel_stats: RefCell::new([ChannelStats::default(); US_SIX_CHANNEL_COUNT]),
             acars_pre_lock_state: RefCell::new(None),
+            acars_viewer_window: RefCell::new(None),
+            acars_viewer_handles: RefCell::new(None),
+            acars_saved_tune: Cell::new(None),
+            acars_was_engaged_pre_pass: Cell::new(false),
+            acars_pending: Cell::new(false),
         })
     }
 
@@ -413,6 +463,26 @@ mod tests {
         assert!(
             state.acars_pre_lock_state.borrow().is_none(),
             "no snapshot until first engage"
+        );
+        assert!(
+            state.acars_viewer_window.borrow().is_none(),
+            "no viewer window until first open"
+        );
+        assert!(
+            state.acars_saved_tune.get().is_none(),
+            "no saved pre-engage tune (center, offset) until first engage"
+        );
+        assert!(
+            !state.acars_was_engaged_pre_pass.get(),
+            "auto-record pre-pass ACARS flag defaults false"
+        );
+        assert!(
+            !state.acars_pending.get(),
+            "no SetAcarsEnabled command in flight at construction"
+        );
+        assert!(
+            state.acars_viewer_handles.borrow().is_none(),
+            "no viewer handles until first open"
         );
     }
 
