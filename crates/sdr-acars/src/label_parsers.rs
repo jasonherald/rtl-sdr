@@ -58,7 +58,7 @@ impl Oooi {
 // that land in subsequent tasks. Remove when the first parser
 // lands (it will call this from non-test code).
 #[allow(dead_code)]
-pub(crate) fn byte_at(text: &str, idx: usize) -> Option<u8> {
+fn byte_at(text: &str, idx: usize) -> Option<u8> {
     text.as_bytes().get(idx).copied()
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn byte_at(text: &str, idx: usize) -> Option<u8> {
 //
 // Dead-code allowed: same rationale as `byte_at` above.
 #[allow(dead_code)]
-pub(crate) fn slice4(text: &str, start: usize) -> Option<ArrayString<4>> {
+fn slice4(text: &str, start: usize) -> Option<ArrayString<4>> {
     text.get(start..start + 4)
         .and_then(|s| ArrayString::from(s).ok())
 }
@@ -114,11 +114,50 @@ mod tests {
 
     #[test]
     fn oooi_has_any_true_when_any_field_set() {
-        let o = Oooi {
-            sa: Some(ArrayString::from("KORD").unwrap()),
-            ..Default::default()
-        };
-        assert!(o.has_any());
+        let cases = [
+            Oooi {
+                sa: Some(ArrayString::from("KORD").unwrap()),
+                ..Default::default()
+            },
+            Oooi {
+                da: Some(ArrayString::from("KSFO").unwrap()),
+                ..Default::default()
+            },
+            Oooi {
+                gout: Some(ArrayString::from("0830").unwrap()),
+                ..Default::default()
+            },
+            Oooi {
+                woff: Some(ArrayString::from("0945").unwrap()),
+                ..Default::default()
+            },
+            Oooi {
+                won: Some(ArrayString::from("1020").unwrap()),
+                ..Default::default()
+            },
+            Oooi {
+                gin: Some(ArrayString::from("1245").unwrap()),
+                ..Default::default()
+            },
+            Oooi {
+                eta: Some(ArrayString::from("0830").unwrap()),
+                ..Default::default()
+            },
+        ];
+        for o in &cases {
+            assert!(o.has_any(), "has_any should be true for {o:?}");
+        }
+    }
+
+    #[test]
+    fn slice4_none_when_slice_starts_inside_multibyte_codepoint() {
+        // U+00E9 (é) is 2 bytes in UTF-8: [0xC3, 0xA9]. A slice
+        // starting at byte 1 lands inside the codepoint — text.get
+        // returns None, which slice4 propagates. ACARS payloads are
+        // 7-bit ASCII so this is unreachable in practice, but the
+        // doc promises bounds-safety either way.
+        let s = "\u{00E9}XYZW"; // bytes: 0xC3 0xA9 'X' 'Y' 'Z' 'W'
+        assert!(slice4(s, 1).is_none());
     }
 
     #[test]
