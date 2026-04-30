@@ -58,6 +58,15 @@ struct Channel {
     if_buffer: Vec<f32>,
     msk: MskDemod,
     parser: FrameParser,
+    /// Per-channel multi-block reassembler (issue #580).
+    /// Frames emerging from `parser.drain` flow through here
+    /// before reaching `process`'s `on_message` callback —
+    /// ETB blocks park; ETX blocks emit reassembled (or
+    /// pass-through if no pending). Per-channel rather than
+    /// shared because aircraft don't normally hop channels
+    /// mid-message and channel-isolated state machines are
+    /// simpler to reason about.
+    assembler: crate::reassembly::MessageAssembler,
 }
 
 /// No-signal floor (dBFS) used as the idle baseline for a
@@ -198,6 +207,7 @@ impl ChannelBank {
                 if_buffer: Vec::with_capacity(4096),
                 msk: MskDemod::new(),
                 parser: FrameParser::new(idx_u8, freq_hz),
+                assembler: crate::reassembly::MessageAssembler::new(),
             });
             stats.push(ChannelStats {
                 freq_hz,
@@ -245,19 +255,30 @@ impl ChannelBank {
             // `channels()` reflects real state, not the
             // construction placeholders. Per CR round 1 on
             // PR #583.
+            //
+            // Each parser-emitted frame flows through the
+            // per-channel `MessageAssembler` (issue #580). ETBs
+            // park silently (the assembler returns 0 messages);
+            // ETXs emit the reassembled message + any timed-out
+            // partial sweeps. Stats are stamped once per
+            // assembler-emitted message so a multi-block
+            // reassembly counts as one in `msg_count`.
             let stats = &mut self.stats[idx];
             ch.parser.drain(|msg| {
-                stats.msg_count = stats.msg_count.saturating_add(1);
-                stats.last_msg_at = Some(msg.timestamp);
-                // level_db on the message is currently 0.0
-                // (filled in by future sub-projects from MSK
-                // matched-filter output); keep stats.level_db
-                // pinned to the latest emitted value so the
-                // contract stays "stats reflect the latest
-                // decoded message" once levels start landing.
-                stats.level_db = msg.level_db;
-                stats.lock_state = ChannelLockState::Locked;
-                on_message(msg);
+                let now = msg.timestamp;
+                for emitted in ch.assembler.observe(msg, now) {
+                    stats.msg_count = stats.msg_count.saturating_add(1);
+                    stats.last_msg_at = Some(emitted.timestamp);
+                    // level_db on the message is currently 0.0
+                    // (filled in by future sub-projects from MSK
+                    // matched-filter output); keep stats.level_db
+                    // pinned to the latest emitted value so the
+                    // contract stays "stats reflect the latest
+                    // decoded message" once levels start landing.
+                    stats.level_db = emitted.level_db;
+                    stats.lock_state = ChannelLockState::Locked;
+                    on_message(emitted);
+                }
             });
             // Apply pending polarity flip if the parser
             // detected an inverted-SYN at frame start

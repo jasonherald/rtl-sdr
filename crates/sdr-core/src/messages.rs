@@ -446,6 +446,13 @@ pub enum UiToDsp {
     /// the prior source config and forces (2.5 `MSps`, 130.3375 MHz,
     /// frontend decim=1); `false` restores the snapshot.
     SetAcarsEnabled(bool),
+    /// Switch the ACARS channel set / region (issue #581). The
+    /// DSP records this on `DspState::acars_region`; the next
+    /// `SetAcarsEnabled(true)` consults it to pick channels and
+    /// the source center frequency. No-op while engaged (the
+    /// airband lock rejects geometry mutations); the user
+    /// disengages, switches region, then re-engages.
+    SetAcarsRegion(crate::acars_airband_lock::AcarsRegion),
 }
 
 #[cfg(test)]

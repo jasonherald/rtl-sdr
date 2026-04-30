@@ -31,9 +31,15 @@ pub const ACARS_FRONTEND_DECIM: u32 = 1;
 /// ring. Spec config key `acars_recent_keep_count`.
 pub const ACARS_RECENT_DEFAULT_KEEP: u32 = 500;
 
-/// US-6 channel set (Hz). The only `acars_channel_set` value
-/// supported in v1.
-pub const US_SIX_CHANNELS_HZ: [f64; 6] = [
+/// Cardinality of every named ACARS channel set. All
+/// predefined regions ship with exactly this many channels so
+/// the per-channel UI widgets and `[ChannelStats; N]` arrays
+/// stay const-sized. Custom channel sets (issue follow-up to
+/// #581) will pad / mask to this width too.
+pub const ACARS_CHANNEL_COUNT: usize = 6;
+
+/// US-6 channel set (Hz). Default for North-American operation.
+pub const US_SIX_CHANNELS_HZ: [f64; ACARS_CHANNEL_COUNT] = [
     131_550_000.0,
     131_525_000.0,
     130_025_000.0,
@@ -42,11 +48,103 @@ pub const US_SIX_CHANNELS_HZ: [f64; 6] = [
     129_125_000.0,
 ];
 
-/// Cardinality of the v1 ACARS channel set. Single source of
-/// truth for the array width — call sites that resize/reset
-/// `[ChannelStats; N]` reference this rather than hardcoding
-/// `6` so a future channel-set rev only edits one place.
-pub const US_SIX_CHANNEL_COUNT: usize = US_SIX_CHANNELS_HZ.len();
+/// Europe-6 channel set (Hz). Primary 131.725 MHz; the rest
+/// are the next-most-common European ACARS frequencies. Issue
+/// #581. Per the ARINC 618 / EUROCAE ED-89 spec European
+/// allocations cluster between 131.4 and 131.9 MHz.
+pub const EUROPE_SIX_CHANNELS_HZ: [f64; ACARS_CHANNEL_COUNT] = [
+    131_725_000.0, // Primary
+    131_525_000.0, // Shared with US-6
+    131_550_000.0, // Shared with US-6
+    131_825_000.0,
+    131_450_000.0,
+    131_875_000.0,
+];
+
+/// Predefined ACARS channel set. Issue #581. The DSP layer
+/// (`sdr_acars::ChannelBank`) is region-agnostic — all this
+/// type does is pick which fixed array to feed it and where
+/// to center the source. Custom (user-defined) channel sets
+/// are a deferred follow-up; the enum is intentionally sealed
+/// so a future refactor to runtime-sized arrays is non-
+/// breaking for current consumers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AcarsRegion {
+    /// North America (default). Six channels in 129.125–
+    /// 131.550 MHz. Center 130.3375 MHz.
+    #[default]
+    Us6,
+    /// Europe. Six channels clustered in 131.450–131.875 MHz.
+    /// Center derived from the cluster midpoint.
+    Europe,
+}
+
+impl AcarsRegion {
+    /// Channels for this region (Hz).
+    #[must_use]
+    pub const fn channels(self) -> [f64; ACARS_CHANNEL_COUNT] {
+        match self {
+            Self::Us6 => US_SIX_CHANNELS_HZ,
+            Self::Europe => EUROPE_SIX_CHANNELS_HZ,
+        }
+    }
+
+    /// Source center frequency for this region (Hz). Computed
+    /// as the midpoint of `min(channels)` and `max(channels)`
+    /// so the cluster fits symmetrically inside the 2.5 MHz
+    /// Nyquist window. The channel order in `channels()` is
+    /// not assumed to be sorted.
+    #[must_use]
+    pub fn center_hz(self) -> f64 {
+        let chans = self.channels();
+        let mut min = chans[0];
+        let mut max = chans[0];
+        for &c in &chans[1..] {
+            if c < min {
+                min = c;
+            }
+            if c > max {
+                max = c;
+            }
+        }
+        f64::midpoint(min, max)
+    }
+
+    /// Stable string id used as the `acars_region` config key
+    /// value. Round-trips with `from_config_id`.
+    #[must_use]
+    pub const fn config_id(self) -> &'static str {
+        match self {
+            Self::Us6 => "us-6",
+            Self::Europe => "europe",
+        }
+    }
+
+    /// Inverse of `config_id`. Falls back to the default on
+    /// unrecognised strings (forward-compat with future
+    /// regions).
+    #[must_use]
+    pub fn from_config_id(id: &str) -> Self {
+        match id {
+            "europe" => Self::Europe,
+            // "us-6" + anything else → default. We don't error
+            // on unknown values because that would lock users
+            // out of the panel after a downgrade or stale
+            // config; falling back is the more forgiving
+            // behaviour.
+            _ => Self::Us6,
+        }
+    }
+
+    /// Display label for the Aviation panel combo row.
+    #[must_use]
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Us6 => "United States (US-6)",
+            Self::Europe => "Europe",
+        }
+    }
+}
 
 /// Minimum interval between `DspToUi::AcarsChannelStats`
 /// emissions. Spec calls out ~1 Hz cadence.
@@ -164,13 +262,21 @@ pub struct DisengagePlan {
 /// Returns [`AcarsEnableError::UnsupportedSourceType`] if the
 /// active source isn't `SourceType::RtlSdr`. Source-type gate
 /// in v1 — `rtl_tcp` / network / file sources are not supported.
-pub fn engage(current: &CurrentSourceState) -> Result<EngagePlan, AcarsEnableError> {
+///
+/// `region` selects which channel set the resulting plan tunes
+/// to (issue #581). The default is `AcarsRegion::Us6` —
+/// callers that don't care can pass `Default::default()` and
+/// preserve the pre-#581 behaviour.
+pub fn engage(
+    current: &CurrentSourceState,
+    region: AcarsRegion,
+) -> Result<EngagePlan, AcarsEnableError> {
     if current.source_type != SourceType::RtlSdr {
         return Err(AcarsEnableError::UnsupportedSourceType(current.source_type));
     }
     Ok(EngagePlan {
         target_source_rate_hz: ACARS_SOURCE_RATE_HZ,
-        target_center_hz: ACARS_CENTER_HZ,
+        target_center_hz: region.center_hz(),
         target_frontend_decim: ACARS_FRONTEND_DECIM,
         snapshot: PreLockSnapshot {
             source_rate_hz: current.source_rate_hz,
@@ -211,7 +317,8 @@ mod tests {
 
     #[test]
     fn engage_snapshots_and_emits_target_geometry() {
-        let plan = engage(&rtl_state()).expect("RTL-SDR engage should succeed");
+        let plan =
+            engage(&rtl_state(), AcarsRegion::default()).expect("RTL-SDR engage should succeed");
         assert_eq!(plan.target_source_rate_hz, ACARS_SOURCE_RATE_HZ);
         assert_eq!(plan.target_center_hz, ACARS_CENTER_HZ);
         assert_eq!(plan.target_frontend_decim, ACARS_FRONTEND_DECIM);
@@ -227,7 +334,7 @@ mod tests {
         for bad in [SourceType::Network, SourceType::File, SourceType::RtlTcp] {
             let mut state = rtl_state();
             state.source_type = bad;
-            match engage(&state) {
+            match engage(&state, AcarsRegion::default()) {
                 Err(AcarsEnableError::UnsupportedSourceType(t)) => assert_eq!(t, bad),
                 other => panic!("source={bad:?} expected UnsupportedSourceType, got {other:?}"),
             }
@@ -235,8 +342,33 @@ mod tests {
     }
 
     #[test]
+    fn engage_with_europe_region_targets_europe_center() {
+        let plan = engage(&rtl_state(), AcarsRegion::Europe)
+            .expect("RTL-SDR + Europe engage should succeed");
+        assert_eq!(plan.target_center_hz, AcarsRegion::Europe.center_hz());
+        // Sanity: Europe's center is well above US-6's. Pin a
+        // ballpark range so a future channel-list edit that
+        // accidentally collapses the cluster still trips here.
+        assert!(plan.target_center_hz > 131_000_000.0);
+        assert!(plan.target_center_hz < 132_000_000.0);
+    }
+
+    #[test]
+    fn region_config_id_round_trips() {
+        for region in [AcarsRegion::Us6, AcarsRegion::Europe] {
+            let id = region.config_id();
+            assert_eq!(AcarsRegion::from_config_id(id), region);
+        }
+        // Unknown id falls back to default.
+        assert_eq!(
+            AcarsRegion::from_config_id("does-not-exist"),
+            AcarsRegion::Us6
+        );
+    }
+
+    #[test]
     fn disengage_returns_snapshotted_geometry_verbatim() {
-        let plan = engage(&rtl_state()).unwrap();
+        let plan = engage(&rtl_state(), AcarsRegion::default()).unwrap();
         let restore = disengage(&plan.snapshot);
         assert_eq!(restore.target_source_rate_hz, 1_024_000.0);
         assert_eq!(restore.target_center_hz, 162_550_000.0);
@@ -247,7 +379,7 @@ mod tests {
     #[test]
     fn engage_then_disengage_is_a_round_trip() {
         let original = rtl_state();
-        let plan = engage(&original).unwrap();
+        let plan = engage(&original, AcarsRegion::default()).unwrap();
         let restore = disengage(&plan.snapshot);
         assert_eq!(restore.target_source_rate_hz, original.source_rate_hz);
         assert_eq!(restore.target_center_hz, original.center_freq_hz);

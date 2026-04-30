@@ -2122,7 +2122,7 @@ fn handle_dsp_message(
                     state.acars_recent.borrow_mut().clear();
                     state.acars_total_count.set(0);
                     *state.acars_channel_stats.borrow_mut() = [sdr_acars::ChannelStats::default();
-                        sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT];
+                        sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT];
                     // Restore the pre-engage tune snapshot. DSP
                     // retunes silently and reapplies its own
                     // snapshot offset, but doesn't emit Tune /
@@ -3806,7 +3806,7 @@ fn connect_sidebar_panels(
         set_playing,
         status_bar,
     );
-    connect_aviation_panel(&panels.aviation, state);
+    connect_aviation_panel(&panels.aviation, state, config);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -11873,11 +11873,38 @@ const DOPPLER_RECOMPUTE_TICK: Duration = Duration::from_millis(250);
 
 /// Wire the Aviation sidebar panel: toggle switch → DSP, 4 Hz tick
 /// for status/channel-row refresh, and the open-viewer button stub.
-fn connect_aviation_panel(panel: &sidebar::aviation_panel::AviationPanel, state: &Rc<AppState>) {
+fn connect_aviation_panel(
+    panel: &sidebar::aviation_panel::AviationPanel,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     use crate::sidebar::aviation_panel::{
-        GLYPH_IDLE, GLYPH_LOCKED, GLYPH_SIGNAL, SIDEBAR_STATUS_REFRESH_MS,
+        GLYPH_IDLE, GLYPH_LOCKED, GLYPH_SIGNAL, SIDEBAR_STATUS_REFRESH_MS, region_combo_index,
+        region_from_combo_index,
     };
     use sdr_acars::ChannelLockState;
+    use sdr_core::acars_airband_lock::AcarsRegion;
+
+    // ─── Region selector seed + signal (issue #581) ───
+    // Read the persisted region, dispatch it to DSP at startup,
+    // and seed the combo index BEFORE wiring the change handler
+    // — otherwise the seed itself would fire a redundant
+    // dispatch + persist round-trip.
+    let initial_region =
+        AcarsRegion::from_config_id(crate::acars_config::read_acars_channel_set(config).as_str());
+    state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(initial_region));
+    panel
+        .region_row
+        .set_selected(region_combo_index(initial_region));
+    {
+        let state = Rc::clone(state);
+        let config = std::sync::Arc::clone(config);
+        panel.region_row.connect_selected_notify(move |row| {
+            let region = region_from_combo_index(row.selected());
+            crate::acars_config::save_acars_channel_set(&config, region.config_id());
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
+        });
+    }
 
     // ─── Toggle: switch-row → SetAcarsEnabled ───
     // Set `acars_pending` BEFORE dispatching so the 4 Hz mirror

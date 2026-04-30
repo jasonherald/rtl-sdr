@@ -9,7 +9,7 @@
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT;
+use sdr_core::acars_airband_lock::{ACARS_CHANNEL_COUNT, AcarsRegion};
 
 /// Per-channel row glyphs for the lock-state column. Per spec
 /// section "Group 2 — Channels":
@@ -43,13 +43,49 @@ pub struct AviationPanel {
     /// "Open ACARS Window" button — drives
     /// `crate::acars_viewer::open_acars_viewer_if_needed`.
     pub open_viewer_button: gtk4::Button,
-    /// Per-channel rows (one per US-6 channel). Width sourced
-    /// from `sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT`
+    /// Per-channel rows (one per region channel). Width sourced
+    /// from `sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT`
     /// so it stays in lock-step with the DSP-side channel array.
     /// Subtitles are live-updated from
     /// `DspToUi::AcarsChannelStats` arrivals (~1 Hz cadence per
     /// the DSP-side throttle).
-    pub channel_rows: [adw::ActionRow; US_SIX_CHANNEL_COUNT],
+    pub channel_rows: [adw::ActionRow; ACARS_CHANNEL_COUNT],
+    /// Region selector (issue #581). Switches the channel set
+    /// and source center frequency between US-6 and Europe.
+    /// Wired up in `crate::window::connect_aviation_panel` to
+    /// dispatch `UiToDsp::SetAcarsRegion` + persist the choice.
+    pub region_row: adw::ComboRow,
+}
+
+/// Region combo-row index → `AcarsRegion`. The ordering here is
+/// the source of truth for both the model + the persistence
+/// round-trip; bumping a new region means appending here, the
+/// `AcarsRegion` enum, and the `from_config_id`/`config_id`
+/// match arms.
+pub const REGION_OPTIONS: &[AcarsRegion] = &[AcarsRegion::Us6, AcarsRegion::Europe];
+
+/// Map a `0..REGION_OPTIONS.len()` combo-row index back to the
+/// matching region. Falls back to the default when the model
+/// changes shape under us (e.g. transient null state during
+/// rebuilds).
+#[must_use]
+pub fn region_from_combo_index(idx: u32) -> AcarsRegion {
+    REGION_OPTIONS
+        .get(idx as usize)
+        .copied()
+        .unwrap_or(AcarsRegion::Us6)
+}
+
+/// Inverse of `region_from_combo_index`: locate the region's
+/// index in the combo's model. Falls back to `0` (default
+/// region) on misses, which mirrors the seeding behaviour at
+/// startup when a stale config string can't be matched.
+#[must_use]
+pub fn region_combo_index(region: AcarsRegion) -> u32 {
+    REGION_OPTIONS
+        .iter()
+        .position(|&r| r == region)
+        .map_or(0, |i| u32::try_from(i).unwrap_or(0))
 }
 
 /// Build the Aviation activity panel. Pure widget assembly.
@@ -71,6 +107,21 @@ pub fn build_aviation_panel() -> AviationPanel {
         .subtitle("Locks airband geometry and starts the 6-channel decoder")
         .build();
     acars_group.add(&enable_switch);
+
+    // Region selector (issue #581). Two predefined channel sets
+    // shipped today; "Custom" support is a deferred follow-up.
+    let region_model = gtk4::StringList::new(
+        &REGION_OPTIONS
+            .iter()
+            .map(|r| r.display_label())
+            .collect::<Vec<_>>(),
+    );
+    let region_row = adw::ComboRow::builder()
+        .title("Region")
+        .subtitle("ACARS channel set + source center frequency")
+        .model(&region_model)
+        .build();
+    acars_group.add(&region_row);
 
     let status_row = adw::ActionRow::builder()
         .title("Status")
@@ -100,7 +151,7 @@ pub fn build_aviation_panel() -> AviationPanel {
         ))
         .build();
 
-    let channel_rows: [adw::ActionRow; US_SIX_CHANNEL_COUNT] = std::array::from_fn(|_| {
+    let channel_rows: [adw::ActionRow; ACARS_CHANNEL_COUNT] = std::array::from_fn(|_| {
         let row = adw::ActionRow::builder().title("—").subtitle("—").build();
         channels_group.add(&row);
         row
@@ -114,5 +165,6 @@ pub fn build_aviation_panel() -> AviationPanel {
         status_row,
         open_viewer_button,
         channel_rows,
+        region_row,
     }
 }

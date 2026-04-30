@@ -588,5 +588,19 @@ fn render_block(obj: &AcarsMessageObject) -> String {
     render_inner(obj, |m| char::from(m.block_id).to_string())
 }
 fn render_text(obj: &AcarsMessageObject) -> String {
-    render_inner(obj, |m| m.text.clone())
+    render_inner(obj, |m| {
+        // Multi-block reassembly indicator (#580). Surfaces both
+        // happy-path "[N blocks]" and the ETB-without-ETX
+        // "[N blocks, partial]" cases via `end_of_message`.
+        if m.reassembled_block_count > 1 {
+            let count = m.reassembled_block_count;
+            if m.end_of_message {
+                format!("[{count} blocks] {}", m.text)
+            } else {
+                format!("[{count} blocks, partial] {}", m.text)
+            }
+        } else {
+            m.text.clone()
+        }
+    })
 }

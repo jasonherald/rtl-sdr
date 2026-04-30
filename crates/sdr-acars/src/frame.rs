@@ -72,6 +72,13 @@ pub struct AcarsMessage {
     /// `true` if the closing byte was `ETX` (final block);
     /// `false` if `ETB` (multi-block, more to come — see #580).
     pub end_of_message: bool,
+    /// Number of frames that were reassembled into this
+    /// message by [`crate::reassembly::MessageAssembler`]. `1`
+    /// for a single-block message (the parser's default — no
+    /// reassembly took place); `≥ 2` when an ETB chain was
+    /// merged into a single logical message. Surfaced for the
+    /// viewer's "[N blocks]" indicator. Issue #580.
+    pub reassembled_block_count: u8,
 }
 
 /// Internal state of the byte-level state machine. Mirrors
@@ -447,6 +454,11 @@ impl FrameParser {
             message_no,
             text,
             end_of_message,
+            // The parser produces single-block messages by
+            // construction; reassembly into multi-block
+            // logical messages happens later, in
+            // `crate::reassembly::MessageAssembler`. Issue #580.
+            reassembled_block_count: 1,
         };
         self.pending_messages.push_back(msg);
         self.reset_to_idle();

@@ -55,6 +55,15 @@ pub fn read_acars_channel_set(config: &ConfigManager) -> String {
     })
 }
 
+/// Persist the channel-set selector. Uses
+/// `AcarsRegion::config_id` as the value so the round-trip
+/// stays under the enum's control. Issue #581.
+pub fn save_acars_channel_set(config: &ConfigManager, value: &str) {
+    config.write(|v| {
+        v[KEY_ACARS_CHANNEL_SET] = serde_json::json!(value);
+    });
+}
+
 /// Default ring-buffer cap. Returns the spec default
 /// (`ACARS_RECENT_DEFAULT_KEEP = 500`); sub-project 3 may
 /// extend this to consult `ConfigManager` for an override.
@@ -89,5 +98,14 @@ mod tests {
         assert!(read_acars_enabled(&cfg));
         save_acars_enabled(&cfg, false);
         assert!(!read_acars_enabled(&cfg));
+    }
+
+    #[test]
+    fn round_trip_channel_set() {
+        let cfg = fresh_config();
+        save_acars_channel_set(&cfg, "europe");
+        assert_eq!(read_acars_channel_set(&cfg), "europe");
+        save_acars_channel_set(&cfg, "us-6");
+        assert_eq!(read_acars_channel_set(&cfg), "us-6");
     }
 }

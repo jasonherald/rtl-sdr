@@ -6,7 +6,7 @@ use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 
 use sdr_acars::{AcarsMessage, ChannelStats};
-use sdr_core::acars_airband_lock::{PreLockSnapshot, US_SIX_CHANNEL_COUNT};
+use sdr_core::acars_airband_lock::{ACARS_CHANNEL_COUNT, PreLockSnapshot};
 use sdr_types::DemodMode;
 
 use crate::messages::UiToDsp;
@@ -264,7 +264,7 @@ pub struct AppState {
     pub acars_total_count: Cell<u64>,
     /// Latest per-channel stats, populated by the
     /// `DspToUi::AcarsChannelStats` arm. Defaulted on init.
-    pub acars_channel_stats: RefCell<[ChannelStats; US_SIX_CHANNEL_COUNT]>,
+    pub acars_channel_stats: RefCell<[ChannelStats; ACARS_CHANNEL_COUNT]>,
     /// Mirror of the DSP-side snapshot, populated when the
     /// engage ack arrives. Lets the UI display "restoring
     /// to `{prior_freq}`" hints on disengage.
@@ -418,7 +418,7 @@ impl AppState {
                 crate::acars_config::default_recent_keep() as usize,
             )),
             acars_total_count: Cell::new(0),
-            acars_channel_stats: RefCell::new([ChannelStats::default(); US_SIX_CHANNEL_COUNT]),
+            acars_channel_stats: RefCell::new([ChannelStats::default(); ACARS_CHANNEL_COUNT]),
             acars_pre_lock_state: RefCell::new(None),
             acars_viewer_window: RefCell::new(None),
             acars_viewer_handles: RefCell::new(None),
@@ -522,8 +522,8 @@ mod tests {
         drop(recent);
         assert_eq!(
             state.acars_channel_stats.borrow().len(),
-            sdr_core::acars_airband_lock::US_SIX_CHANNEL_COUNT,
-            "stats array width sourced from US_SIX_CHANNEL_COUNT"
+            sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT,
+            "stats array width sourced from ACARS_CHANNEL_COUNT"
         );
         assert!(
             state.acars_pre_lock_state.borrow().is_none(),

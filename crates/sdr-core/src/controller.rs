@@ -557,6 +557,12 @@ struct DspState {
     /// Throttles stats emission to ~1 Hz per spec.
     /// (Consumer lands in T8 stats-throttle in `process_iq_block`.)
     acars_stats_emitted_at: std::time::Instant,
+    /// Region selecting which ACARS channel set the airband
+    /// lock tunes to (issue #581). Defaults to US-6 — the
+    /// only region available pre-#581. Set by the UI via
+    /// `UiToDsp::SetAcarsRegion` before engage; read at
+    /// engage time to pick channels + center.
+    acars_region: crate::acars_airband_lock::AcarsRegion,
 }
 
 impl DspState {
@@ -651,6 +657,7 @@ impl DspState {
             acars_pre_lock: None,
             acars_init_failed: false,
             acars_stats_emitted_at: std::time::Instant::now(),
+            acars_region: crate::acars_airband_lock::AcarsRegion::default(),
         })
     }
 }
@@ -2447,6 +2454,31 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 let _ = dsp_tx.send(DspToUi::SourceStopped);
             }
         }
+        UiToDsp::SetAcarsRegion(region) => {
+            // Issue #581. Region is consulted at engage time;
+            // mutating it while engaged would create a state
+            // mismatch (live channels still tuned to the old
+            // region's freqs but `state.acars_region` says
+            // otherwise). Reject mid-engage and let the UI
+            // surface the constraint — the existing airband-
+            // lock invariant says geometry-affecting commands
+            // are user-disabled while engaged anyway, but the
+            // engaged-rejection path here is the belt to that
+            // suspenders.
+            if state.acars_pre_lock.is_some() {
+                tracing::warn!(
+                    requested = ?region,
+                    "ignoring SetAcarsRegion while ACARS engaged; disengage first",
+                );
+            } else {
+                tracing::info!(
+                    from = ?state.acars_region,
+                    to = ?region,
+                    "ACARS region changed",
+                );
+                state.acars_region = region;
+            }
+        }
     }
 }
 
@@ -3494,7 +3526,7 @@ fn process_iq_block(
                         &mut state.acars_init_failed,
                         state.sample_rate,
                         state.center_freq,
-                        &crate::acars_airband_lock::US_SIX_CHANNELS_HZ,
+                        &state.acars_region.channels(),
                         &state.processed_buf[..processed_count],
                         dsp_tx,
                     );
@@ -3517,7 +3549,7 @@ fn process_iq_block(
                         // visibly via missing stats updates rather than
                         // crashing the DSP thread.
                         if let Ok(arr) = <[sdr_acars::ChannelStats;
-                            crate::acars_airband_lock::US_SIX_CHANNEL_COUNT]>::try_from(
+                            crate::acars_airband_lock::ACARS_CHANNEL_COUNT]>::try_from(
                             ch_stats
                         ) {
                             let _ = dsp_tx
@@ -4171,9 +4203,7 @@ fn handle_set_acars_enabled(
     enable: bool,
     dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
 ) -> AcarsHandlerOutcome {
-    use crate::acars_airband_lock::{
-        AcarsEnableError, CurrentSourceState, US_SIX_CHANNELS_HZ, disengage, engage,
-    };
+    use crate::acars_airband_lock::{AcarsEnableError, CurrentSourceState, disengage, engage};
     use crate::messages::DspToUi;
 
     if enable {
@@ -4221,7 +4251,7 @@ fn handle_set_acars_enabled(
             source_type: state.source_type,
             frontend_decim: state.frontend.decim_ratio(),
         };
-        let plan = match engage(&current) {
+        let plan = match engage(&current, state.acars_region) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("ACARS engage rejected: {e}");
@@ -4260,8 +4290,11 @@ fn handle_set_acars_enabled(
         // online for the enable-while-stopped/startup-replay
         // path; the lazy-init in `acars_decode_tap` rebuilds it
         // at the actual streaming rate.
-        match sdr_acars::ChannelBank::new(state.sample_rate, state.center_freq, &US_SIX_CHANNELS_HZ)
-        {
+        match sdr_acars::ChannelBank::new(
+            state.sample_rate,
+            state.center_freq,
+            &state.acars_region.channels(),
+        ) {
             Ok(bank) => {
                 state.acars_bank = Some(bank);
                 state.acars_init_failed = false;

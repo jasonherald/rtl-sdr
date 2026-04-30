@@ -41,6 +41,7 @@ pub mod error;
 pub mod frame;
 pub mod label;
 pub mod msk;
+pub mod reassembly;
 pub mod syndrom;
 
 pub use channel::{ChannelBank, ChannelLockState, ChannelStats};
@@ -48,3 +49,4 @@ pub use error::AcarsError;
 pub use frame::{AcarsMessage, FrameParser};
 pub use label::lookup as lookup_label;
 pub use msk::{IF_RATE_HZ, MskDemod};
+pub use reassembly::{MessageAssembler, REASSEMBLY_TIMEOUT};
