@@ -215,11 +215,11 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
                 .partial_cmp(&b.freq_hz)
                 .unwrap_or(std::cmp::Ordering::Equal)
         }),
-        make_message_sorter(|a, b| a.aircraft.to_lowercase().cmp(&b.aircraft.to_lowercase())),
+        make_message_sorter(|a, b| cmp_case_insensitive(&a.aircraft, &b.aircraft)),
         make_message_sorter(|a, b| a.mode.cmp(&b.mode)),
         make_message_sorter(|a, b| a.label.cmp(&b.label)),
         make_message_sorter(|a, b| a.block_id.cmp(&b.block_id)),
-        make_message_sorter(|a, b| a.text.to_lowercase().cmp(&b.text.to_lowercase())),
+        make_message_sorter(|a, b| cmp_case_insensitive(&a.text, &b.text)),
     ];
 
     let mut time_column: Option<gtk4::ColumnViewColumn> = None;
@@ -386,6 +386,20 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     }
 
     window
+}
+
+/// Allocation-free, Unicode-aware case-insensitive comparison.
+/// Used by the Aircraft + Text column sorters where comparator
+/// fires once per row pair per sort. The naive
+/// `a.to_lowercase().cmp(&b.to_lowercase())` allocates two
+/// `String`s per call; this version threads `char::to_lowercase`
+/// through the iterator pair and stops at the first non-equal
+/// codepoint without ever materialising a folded string.
+/// CR round 1 on PR #590.
+fn cmp_case_insensitive(a: &str, b: &str) -> std::cmp::Ordering {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(b.chars().flat_map(char::to_lowercase))
 }
 
 /// Build a `CustomSorter` over `AcarsMessageObject` rows. The

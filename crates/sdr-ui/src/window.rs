@@ -9463,6 +9463,23 @@ fn connect_volume_persistence(
     let config_vol = std::sync::Arc::clone(config);
     let volume_row_weak = panels.audio.volume_row.downgrade();
     volume_button.connect_value_changed(move |_btn, value| {
+        // Audio-panel slider mirror runs unconditionally so the
+        // header `ScaleButton` stays the single source of truth
+        // for the audio panel's percent slider — including
+        // during the ACARS programmatic mute/restore where
+        // dispatch + persist are suppressed below. Without
+        // mirroring here, the panel slider would still show the
+        // pre-mute percent while the header sits at 0.0, and a
+        // user touching the panel slider could fight ACARS by
+        // dispatching the stale value. CR round 1 on PR #590.
+        if let Some(row) = volume_row_weak.upgrade() {
+            let target_pct = value * sidebar::audio_panel::VOLUME_PERCENT_MAX;
+            if (row.value() - target_pct).abs()
+                > VOLUME_SYNC_EPSILON * sidebar::audio_panel::VOLUME_PERCENT_MAX
+            {
+                row.set_value(target_pct);
+            }
+        }
         // Suppress fires when the ACARS engage path programmatically
         // sets the value to 0 (or restores it on disengage); without
         // this guard the auto-mute would persist 0.0 to config and
@@ -9478,14 +9495,6 @@ fn connect_volume_persistence(
         config_vol.write(|v| {
             v[sidebar::audio_panel::KEY_AUDIO_VOLUME] = serde_json::json!(value);
         });
-        if let Some(row) = volume_row_weak.upgrade() {
-            let target_pct = value * sidebar::audio_panel::VOLUME_PERCENT_MAX;
-            if (row.value() - target_pct).abs()
-                > VOLUME_SYNC_EPSILON * sidebar::audio_panel::VOLUME_PERCENT_MAX
-            {
-                row.set_value(target_pct);
-            }
-        }
     });
 
     // Audio panel row is mirror-only. Drives the button, which
