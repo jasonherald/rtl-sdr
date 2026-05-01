@@ -13,7 +13,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::thread::JoinHandle;
 
 use sdr_acars::AcarsMessage;
 
@@ -150,37 +152,136 @@ impl UdpFeeder {
     }
 }
 
-/// Output-writer bundle owned by `DspState`. Keeps the JSONL
-/// writer, UDP feeder, station ID, and per-writer warn-rate-
-/// limit timestamps together so the `acars_decode_tap`
-/// signature stays narrow. Issue #578. Async refactor in
-/// progress per #596 — fields will migrate to a worker
-/// thread + shared config lock in subsequent tasks.
+/// Capacity of the bounded `mpsc::sync_channel` between the
+/// DSP thread and the writer thread. 256 is ~4-5 minutes of
+/// worst-case ACARS bursts (~1 msg/sec sustained, 10 msg/sec
+/// burst peak); covers any realistic disk stall short of total
+/// filesystem hang. Issue #596.
+pub const ACARS_OUTPUT_CHANNEL_CAPACITY: usize = 256;
+
+/// Output-writer bundle owned by `DspState`. Holds the sender
+/// half of the bounded channel + the shared writer config +
+/// the worker thread's join handle. The DSP thread calls
+/// `try_send` per decoded message; the writer thread (spawned
+/// from `new`) does the actual JSONL/UDP I/O. Issue #596.
 pub struct AcarsOutputs {
-    pub jsonl: Option<JsonlWriter>,
-    pub udp: Option<UdpFeeder>,
-    pub jsonl_enabled: bool,
-    pub network_enabled: bool,
-    pub station_id: Option<String>,
-    pub jsonl_warn_at: Option<std::time::Instant>,
-    pub udp_warn_at: Option<std::time::Instant>,
-    pub pending_jsonl_path: Option<String>,
-    pub pending_network_addr: Option<String>,
+    /// Sender half of the writer channel. `try_send` drops on
+    /// full; the worker owns the receiver.
+    tx: mpsc::SyncSender<AcarsOutputMessage>,
+    /// Shared, runtime-mutable writer config. Written by the
+    /// UI side on toggle/edit; read by the writer thread on
+    /// each message.
+    pub config: Arc<RwLock<AcarsWriterConfig>>,
+    /// Cumulative count of messages dropped because the
+    /// channel was full. Surfaced via `drop_count` for
+    /// rate-limited warn at the call site (and the smoke
+    /// checklist).
+    drop_count: Arc<AtomicU64>,
+    /// Last warn timestamp for channel-full drops. Wrapped in
+    /// `Arc<Mutex>` because the warn fires from the DSP thread
+    /// (caller of `try_send`); the writer thread doesn't touch
+    /// it.
+    last_drop_warn_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Join handle for the writer thread. `Drop` for
+    /// `AcarsOutputs` drops `tx`, which signals shutdown via
+    /// recv() returning Err(Disconnected); we then `join()`.
+    writer_thread: Option<JoinHandle<()>>,
 }
 
 impl AcarsOutputs {
+    /// Construct an async-output bundle and spawn the writer
+    /// thread. The thread runs until `Drop` for `AcarsOutputs`
+    /// drops the `tx`, at which point the writer's `recv()`
+    /// returns `Err(Disconnected)` and the loop exits.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_capacity(ACARS_OUTPUT_CHANNEL_CAPACITY)
+    }
+
+    /// Same as `new` but with a caller-chosen channel
+    /// capacity. Production calls go through `new`; tests use
+    /// this directly via `with_capacity_for_test` to exercise
+    /// the drop-on-full path with a cap they can saturate.
+    fn with_capacity(capacity: usize) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(capacity);
+        let config = Arc::new(RwLock::new(AcarsWriterConfig::default()));
+
+        let writer_config = Arc::clone(&config);
+        let writer_thread = std::thread::Builder::new()
+            .name("sdr-acars-writer".into())
+            .spawn(move || run_writer_loop(rx, writer_config))
+            .expect("failed to spawn ACARS writer thread");
+
         Self {
-            jsonl: None,
-            udp: None,
-            jsonl_enabled: false,
-            network_enabled: false,
-            station_id: None,
-            jsonl_warn_at: None,
-            udp_warn_at: None,
-            pending_jsonl_path: None,
-            pending_network_addr: None,
+            tx,
+            config,
+            drop_count: Arc::new(AtomicU64::new(0)),
+            last_drop_warn_at: Arc::new(Mutex::new(None)),
+            writer_thread: Some(writer_thread),
+        }
+    }
+
+    /// Test-only constructor that builds the channel + config
+    /// but skips spawning the worker, leaving the receiver
+    /// dangling so tests can fill the channel without races.
+    #[cfg(test)]
+    fn with_capacity_for_test(capacity: usize) -> Self {
+        let (tx, _rx) = mpsc::sync_channel::<AcarsOutputMessage>(capacity);
+        // Leak the receiver as a thread-local so the channel
+        // doesn't disconnect (which would route try_send into
+        // the Disconnected arm instead of Full). std::mem::forget
+        // is the cheapest way to do this in test context.
+        #[allow(clippy::mem_forget)]
+        std::mem::forget(_rx);
+        let config = Arc::new(RwLock::new(AcarsWriterConfig::default()));
+        Self {
+            tx,
+            config,
+            drop_count: Arc::new(AtomicU64::new(0)),
+            last_drop_warn_at: Arc::new(Mutex::new(None)),
+            writer_thread: None,
+        }
+    }
+
+    /// Try to hand off `msg` to the writer thread. Returns
+    /// `true` on success, `false` if the channel was full
+    /// (drop counter incremented; warn fires at most once per
+    /// 30 s).
+    pub fn try_send(&self, msg: sdr_acars::AcarsMessage) -> bool {
+        match self.tx.try_send(AcarsOutputMessage::Decoded(msg)) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.drop_count.fetch_add(1, Ordering::Relaxed);
+                self.maybe_warn_full();
+                false
+            }
+            // Disconnected only happens on shutdown (writer
+            // thread is gone). Silent — caller shouldn't
+            // surface noise during teardown.
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// Cumulative drop count since startup.
+    #[must_use]
+    pub fn drop_count(&self) -> u64 {
+        self.drop_count.load(Ordering::Relaxed)
+    }
+
+    /// 30 s-rate-limited warn for channel-full drops. Reads
+    /// the current drop count so the message names how many
+    /// were lost in this window.
+    fn maybe_warn_full(&self) {
+        let mut last = self.last_drop_warn_at.lock().expect("warn lock poisoned");
+        let now = std::time::Instant::now();
+        let elapsed = last.map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
+        if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
+            let n = self.drop_count.load(Ordering::Relaxed);
+            tracing::warn!(
+                "ACARS output channel full ({n} drops since startup); \
+                 writer thread falling behind (rate-limited 30s)"
+            );
+            *last = Some(now);
         }
     }
 }
@@ -191,11 +292,32 @@ impl Default for AcarsOutputs {
     }
 }
 
+impl Drop for AcarsOutputs {
+    fn drop(&mut self) {
+        // Closing tx triggers Disconnected → the writer loop
+        // exits. We still need to join the thread to make
+        // sure its Drop impls (BufWriter flush) finish before
+        // the process exits.
+        if let Some(handle) = self.writer_thread.take() {
+            // Drop the tx clone held by `self.tx` first by
+            // overwriting it with a drained channel.
+            // (mpsc::SyncSender doesn't have an explicit
+            // close — Drop is the signal.)
+            let (dummy_tx, _) = mpsc::sync_channel::<AcarsOutputMessage>(0);
+            self.tx = dummy_tx;
+            // Now the original tx is gone (replaced + dropped).
+            // Wait for the worker to exit.
+            if let Err(e) = handle.join() {
+                tracing::warn!("ACARS writer thread join failed: {e:?}");
+            }
+        }
+    }
+}
+
 /// Writer-thread main loop. Owns the per-thread `JsonlWriter`
 /// and `UdpFeeder` instances, reads `config` on each message
 /// to detect path/addr changes, and exits cleanly when the
 /// sender side disconnects (app shutdown). Issue #596.
-#[allow(dead_code)] // used from tests; caller site lands in Task 5
 #[allow(clippy::needless_pass_by_value)] // rx must be owned to observe disconnect
 fn run_writer_loop(rx: mpsc::Receiver<AcarsOutputMessage>, config: Arc<RwLock<AcarsWriterConfig>>) {
     let mut jsonl: Option<(PathBuf, JsonlWriter)> = None;
@@ -430,6 +552,27 @@ mod tests {
             "writer thread did not exit within 500ms of tx drop"
         );
         handle.join().expect("writer thread panicked");
+    }
+
+    #[test]
+    fn try_send_drops_when_channel_full() {
+        // Build an AcarsOutputs against a tiny channel cap (8)
+        // by spawning *no* worker — leave the receiver dangling
+        // so the channel fills from the first send. The 9th
+        // try_send should drop.
+        //
+        // `AcarsOutputs::with_capacity` is a test-visible
+        // constructor that lets tests use a smaller cap than
+        // the production 256.
+        let outputs = AcarsOutputs::with_capacity_for_test(8);
+
+        for _ in 0..8 {
+            assert!(outputs.try_send(make_msg(0)));
+        }
+        // 9th send: channel full, drop returns false, counter
+        // increments.
+        assert!(!outputs.try_send(make_msg(0)));
+        assert_eq!(outputs.drop_count(), 1);
     }
 
     #[test]
