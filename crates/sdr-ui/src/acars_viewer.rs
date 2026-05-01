@@ -613,6 +613,8 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         let handles = Rc::clone(&handles);
         clear_button.connect_clicked(move |_| {
             handles.store.remove_all();
+            handles.aircraft_store.remove_all();
+            handles.aircraft_index.borrow_mut().clear();
             state.acars_recent.borrow_mut().clear();
             // Don't reset acars_total_count — that's the
             // running total since toggle-on, distinct from the
