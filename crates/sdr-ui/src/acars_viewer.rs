@@ -246,11 +246,10 @@ pub struct AircraftEntry {
 
 impl AircraftEntryObject {
     /// Wrap an `AircraftEntry` for insertion into the aircraft
-    /// `gio::ListStore`. Caller should typically seed `msg_count`
-    /// to 0 and immediately invoke [`Self::record_message`] for
-    /// the message that triggered the insert; that gives the new
-    /// row a `msg_count` of 1 with `last_seen` and `last_label`
-    /// taken from the message.
+    /// `gio::ListStore`. Callers should set `msg_count` to 1 in
+    /// the seed entry (already counting the inserting message)
+    /// so the column view's first bind reads the correct value.
+    /// Subsequent messages are recorded via [`Self::record_message`].
     #[must_use]
     pub fn new(entry: AircraftEntry) -> Self {
         let obj: Self = glib::Object::new();
@@ -384,23 +383,28 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         for msg in recent.iter() {
             store.append(&AcarsMessageObject::new(msg.clone()));
 
-            // Mirror into aircraft_index + aircraft_store. New
-            // tail → seed an entry with msg_count=0 and let
-            // record_message bring it to 1; existing tail →
-            // record_message bumps in place.
+            // Mirror into aircraft_index + aircraft_store.
+            // New tail → initialize with msg_count=1 (already
+            // counting this message) so the column view's first
+            // bind reads the correct value, not zero. Existing
+            // tail → record_message bumps in place. No
+            // items_changed needed in the hydration loop; the
+            // column view binds once after all hydration is done,
+            // reading the final state.
             let mut idx = aircraft_index_initial.borrow_mut();
-            let obj = idx.entry(msg.aircraft).or_insert_with(|| {
+            if let Some(obj) = idx.get(&msg.aircraft) {
+                obj.record_message(msg);
+            } else {
                 let entry = AircraftEntry {
                     tail: msg.aircraft,
                     last_seen: msg.timestamp,
-                    msg_count: 0,
+                    msg_count: 1,
                     last_label: msg.label,
                 };
                 let obj = AircraftEntryObject::new(entry);
                 aircraft_store.append(&obj);
-                obj
-            });
-            obj.record_message(msg);
+                idx.insert(msg.aircraft, obj);
+            }
         }
     }
     let initial_count = store.n_items();
@@ -861,7 +865,12 @@ fn build_aircraft_column_view(
     // view's sorter once it exists.
     let sort_model =
         gtk4::SortListModel::new(Some(filter_model.clone()), Option::<gtk4::Sorter>::None);
-    let selection = gtk4::NoSelection::new(Some(sort_model.clone()));
+    // SingleSelection (vs NoSelection on the Stream tab) so the
+    // column view's `activate` signal fires on double-click / Enter.
+    // Click-to-filter wiring depends on `connect_activate`, which
+    // NoSelection does not propagate.
+    let selection = gtk4::SingleSelection::new(Some(sort_model.clone()));
+    selection.set_can_unselect(true);
     let column_view = gtk4::ColumnView::builder()
         .model(&selection)
         .show_column_separators(true)

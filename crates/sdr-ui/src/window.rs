@@ -2005,6 +2005,15 @@ fn handle_dsp_message(
             if let Some(handles) = state.acars_viewer_handles.borrow().as_ref()
                 && !handles.pause_button.is_active()
             {
+                // Capture scroll state BEFORE the append. With the
+                // GtkStack wrap (issue #579), GTK shifts the visible
+                // area to preserve content when a new row lands at
+                // position 0 under the descending-time sort. Checking
+                // adj.value() AFTER the append would see the shifted
+                // value and skip the snap-to-top.
+                let adj = handles.scrolled_window.vadjustment();
+                let was_at_top = (adj.value() - adj.lower()).abs() < 1.0;
+
                 let collapse_active = handles.collapse_button.is_active();
                 let mut collapsed_into: Option<u32> = None;
                 if collapse_active {
@@ -2029,58 +2038,45 @@ fn handle_dsp_message(
                         ));
                 }
 
-                // Auto-scroll-to-top if the user is currently
-                // viewing the top of the list. `vadjustment.value`
-                // is the offset from `lower`; ≈ 0 means the user
-                // is at the top, in which case we hold them
-                // pinned to the top so new rows under the active
-                // sort flow into view (newest with the default
-                // time-desc sort). When the user has scrolled
-                // down to read older rows, we leave the adjustment
-                // alone so reading isn't interrupted — they
-                // resume auto-follow by scrolling back up.
-                //
-                // Direct adjustment manipulation rather than
-                // `ColumnView::scroll_to`: that API is gated
-                // behind gtk4 v4_12 and the workspace pins v4_10.
-                let adj = handles.scrolled_window.vadjustment();
-                if (adj.value() - adj.lower()).abs() < 1.0 {
+                // Auto-scroll-to-top: snap back if the user was at
+                // the top before the append. Direct adjustment
+                // manipulation rather than `ColumnView::scroll_to`:
+                // that API is gated behind gtk4 `v4_12` and the
+                // workspace pins `v4_10`.
+                if was_at_top {
                     adj.set_value(adj.lower());
                 }
 
                 // Aircraft-index update (issue #579). Find or
-                // insert the AircraftEntryObject for this tail,
-                // then call record_message to bump count +
-                // monotonic last_seen + last_label. On an
-                // existing-entry hit, manually nudge the
-                // filter/sort models via items_changed since
-                // GListStore doesn't fire that signal on field
-                // mutation of an already-stored object.
+                // insert the AircraftEntryObject for this tail.
+                // New tails initialize with msg_count=1 (already
+                // counting this message) so the column view's bind
+                // reads the correct value on first paint. Existing
+                // tails bump in place via record_message, then we
+                // nudge the filter/sort models via items_changed
+                // since GListStore doesn't fire that signal on
+                // field mutation of an already-stored object.
                 {
                     let mut idx = handles.aircraft_index.borrow_mut();
-                    let inserted = !idx.contains_key(&msg.aircraft);
-                    let obj = idx.entry(msg.aircraft).or_insert_with(|| {
+                    if let Some(obj) = idx.get(&msg.aircraft) {
+                        obj.record_message(&msg);
+                        // O(n) over ~50 aircraft is fine; Clear
+                        // invalidates positions otherwise so we
+                        // re-find each time rather than tracking
+                        // a position field on the object.
+                        if let Some(pos) = handles.aircraft_store.find(obj) {
+                            handles.aircraft_store.items_changed(pos, 1, 1);
+                        }
+                    } else {
                         let entry = crate::acars_viewer::AircraftEntry {
                             tail: msg.aircraft,
                             last_seen: msg.timestamp,
-                            msg_count: 0,
+                            msg_count: 1,
                             last_label: msg.label,
                         };
                         let obj = crate::acars_viewer::AircraftEntryObject::new(entry);
                         handles.aircraft_store.append(&obj);
-                        obj
-                    });
-                    obj.record_message(&msg);
-                    if !inserted {
-                        // O(n) over ~50 aircraft is fine; Clear
-                        // invalidates positions otherwise so we
-                        // re-find each time rather than tracking
-                        // a position field on the object. Spec
-                        // edge-case "Aircraft store doesn't
-                        // auto-redraw on field change".
-                        if let Some(pos) = handles.aircraft_store.find(obj) {
-                            handles.aircraft_store.items_changed(pos, 1, 1);
-                        }
+                        idx.insert(msg.aircraft, obj);
                     }
                 }
             }
