@@ -817,15 +817,25 @@ cargo fmt --all -- --check
 
 Expected: clean. If clippy flags `doc_markdown` on identifiers (`JsonlWriter`, `UdpFeeder`, `mpsc::sync_channel`, `Arc<RwLock>`, `JoinHandle`, etc.) wrap in backticks.
 
-The build will FAIL at `controller.rs` because the old `AcarsOutputs` interface (jsonl, udp, jsonl_enabled, station_id, etc. fields) is gone. Don't try to fix that here — it's Task 6's job.
+The whole-crate build WILL FAIL at this commit because `controller.rs` still references the old `AcarsOutputs` interface (jsonl, udp, jsonl_enabled, station_id, etc. fields). That's the intentional pivot point — Task 6 finishes the migration in the next commit.
 
-To get the per-crate gates green WITHOUT building all of `controller.rs` consumers, run only:
+Cargo doesn't have a way to compile one submodule in isolation when its sibling is broken (private modules all build together for any test target inside the crate). So the standalone "did `acars_output.rs` come out right" verification is by inspection, not by `cargo test`:
 
 ```bash
-cargo test -p sdr-core --lib acars_output  # tests the new module in isolation
+# Confirm errors are localized to controller.rs (the consumer
+# that Task 6 fixes) — there should be no error[E0...] lines
+# pointing at acars_output.rs.
+cargo check -p sdr-core --features sdr-transcription/whisper-cpu 2>&1 \
+    | grep -oE "src/[^.]*\.rs" | sort -u
+# Expected output: only `src/controller.rs` (and possibly its
+# test file). If anything else shows up, fix it before
+# committing — it likely means the new types or signatures
+# in acars_output.rs are wrong.
 ```
 
-This passes if `acars_output.rs` compiles standalone. The full `cargo build -p sdr-core` will fail until Task 6.
+Once that check is clean, commit and proceed to Task 6. The full test suite (`cargo test -p sdr-core`) runs at the end of Task 6 once `controller.rs` is back in shape.
+
+Why not merge Tasks 5 + 6 into one commit? Task 5 is a type pivot (~270 LOC of new struct shape + tests) and Task 6 is the consumer-side migration (~75 LOC across many handlers). Splitting keeps each diff focused for code review and `git bisect`. The intentional intermediate red is the trade-off; this verification step makes it explicit so the implementer knows what to expect.
 
 - [ ] **Step 6: Commit (anticipating Task 6 to fix the build)**
 
@@ -1475,7 +1485,14 @@ Expected: FAIL — `Custom` is not a variant of `AcarsRegion`.
 Replace the `AcarsRegion` enum + impl block in `crates/sdr-core/src/acars_airband_lock.rs` (lines 76-153) with:
 
 ```rust
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+// Note: no `Eq` derive — `f64` only implements `PartialEq` (NaN
+// breaks the reflexivity contract Eq requires), so `Custom(Box<[f64]>)`
+// blocks `Eq`. The pre-#592 enum had `Eq` because all variants
+// were unit; dropping it is forced by the new payload. Existing
+// consumers should be using `==` / `!=` / `assert_eq!` which all
+// route through `PartialEq` and continue to work. CR round 5 on
+// PR #598.
+#[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub enum AcarsRegion {
     /// North America (default). Six channels in 129.125–
