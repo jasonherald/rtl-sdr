@@ -1058,9 +1058,16 @@ Add right after the `*state.acars_viewer_handles.borrow_mut() = Some(Rc::clone(&
     // single click both select AND emit `activate`.
     {
         let handles = Rc::clone(&handles);
-        aircraft_column_view.connect_activate(move |_view, position| {
-            let Some(obj) = handles
-                .aircraft_filter_model
+        aircraft_column_view.connect_activate(move |view, position| {
+            // `position` is the column view's row index, which
+            // maps to the immediate model (SingleSelection) wrapping
+            // sort + filter. Look up via `view.model()` so the
+            // resolved row matches the visible ordering regardless
+            // of current sort + filter; resolving through
+            // `aircraft_filter_model` directly would diverge once
+            // a non-default sort is active.
+            let Some(model) = view.model() else { return };
+            let Some(obj) = model
                 .item(position)
                 .and_then(|o| o.downcast::<AircraftEntryObject>().ok())
             else {
