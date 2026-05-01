@@ -11938,10 +11938,10 @@ fn connect_aviation_panel(
     // dispatch + persist round-trip.
     let initial_region =
         AcarsRegion::from_config_id(crate::acars_config::read_acars_channel_set(config).as_str());
-    state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(initial_region));
     panel
         .region_row
-        .set_selected(region_combo_index(initial_region));
+        .set_selected(region_combo_index(&initial_region));
+    state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(initial_region));
     {
         let state = Rc::clone(state);
         let config = std::sync::Arc::clone(config);
@@ -11957,7 +11957,7 @@ fn connect_aviation_panel(
             // needless DSP command. CR round 1 on PR #593.
             let selected = row.selected();
             let region = region_from_combo_index(selected);
-            if region_combo_index(region) != selected {
+            if region_combo_index(&region) != selected {
                 tracing::debug!(
                     selected,
                     "acars region combo emitted transient index; ignoring"

@@ -3573,7 +3573,7 @@ fn process_iq_block(
                         &mut state.acars_init_failed,
                         state.sample_rate,
                         state.center_freq,
-                        &state.acars_region.channels(),
+                        state.acars_region.channels(),
                         &state.processed_buf[..processed_count],
                         dsp_tx,
                         &state.acars_outputs,
@@ -4420,7 +4420,7 @@ fn handle_set_acars_enabled(
             source_type: state.source_type,
             frontend_decim: state.frontend.decim_ratio(),
         };
-        let plan = match engage(&current, state.acars_region) {
+        let plan = match engage(&current, &state.acars_region) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("ACARS engage rejected: {e}");
@@ -4462,7 +4462,7 @@ fn handle_set_acars_enabled(
         match sdr_acars::ChannelBank::new(
             state.sample_rate,
             state.center_freq,
-            &state.acars_region.channels(),
+            state.acars_region.channels(),
         ) {
             Ok(bank) => {
                 state.acars_bank = Some(bank);

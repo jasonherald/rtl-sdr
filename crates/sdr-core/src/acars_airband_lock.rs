@@ -172,36 +172,46 @@ pub fn validate_custom_channels(chans: &[f64]) -> Result<(), CustomChannelError>
 /// rely on exhaustive matching, which is exactly the contract
 /// this enum needs given its forward-compat plan. CR round 1
 /// on PR #593.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub enum AcarsRegion {
     /// North America (default). Six channels in 129.125–
-    /// 131.550 MHz. Center 130.3375 MHz.
+    /// 131.550 MHz.
     #[default]
     Us6,
     /// Europe. Six channels clustered in 131.450–131.875 MHz.
-    /// Center derived from the cluster midpoint.
     Europe,
+    /// User-defined channel set. Frequencies in Hz; validated
+    /// via `validate_custom_channels` at construction time.
+    /// Issue #592.
+    Custom(Box<[f64]>),
 }
 
 impl AcarsRegion {
-    /// Channels for this region (Hz).
+    /// Channels for this region (Hz). Returns a borrowed slice
+    /// so all variants — including `Custom` — share one
+    /// accessor. Issue #592.
     #[must_use]
-    pub const fn channels(self) -> [f64; ACARS_CHANNEL_COUNT] {
+    pub fn channels(&self) -> &[f64] {
         match self {
-            Self::Us6 => US_SIX_CHANNELS_HZ,
-            Self::Europe => EUROPE_SIX_CHANNELS_HZ,
+            Self::Us6 => &US_SIX_CHANNELS_HZ,
+            Self::Europe => &EUROPE_SIX_CHANNELS_HZ,
+            Self::Custom(c) => c,
         }
     }
 
     /// Source center frequency for this region (Hz). Computed
     /// as the midpoint of `min(channels)` and `max(channels)`
     /// so the cluster fits symmetrically inside the 2.5 MHz
-    /// Nyquist window. The channel order in `channels()` is
-    /// not assumed to be sorted.
+    /// Nyquist window.
     #[must_use]
-    pub fn center_hz(self) -> f64 {
+    pub fn center_hz(&self) -> f64 {
         let chans = self.channels();
+        if chans.is_empty() {
+            // `Custom([])` placeholder shouldn't reach engage,
+            // but keep this defensive — return 0.0.
+            return 0.0;
+        }
         let mut min = chans[0];
         let mut max = chans[0];
         for &c in &chans[1..] {
@@ -216,37 +226,40 @@ impl AcarsRegion {
     }
 
     /// Stable string id used as the `acars_region` config key
-    /// value. Round-trips with `from_config_id`.
+    /// value. Round-trips with `from_config_id`. The `Custom`
+    /// arm always returns `"custom"`; the actual channel list
+    /// is persisted under a separate `acars_custom_channels`
+    /// config key.
     #[must_use]
-    pub const fn config_id(self) -> &'static str {
+    pub fn config_id(&self) -> &'static str {
         match self {
             Self::Us6 => "us-6",
             Self::Europe => "europe",
+            Self::Custom(_) => "custom",
         }
     }
 
-    /// Inverse of `config_id`. Falls back to the default on
-    /// unrecognised strings (forward-compat with future
-    /// regions).
+    /// Inverse of `config_id`. Falls back to default on
+    /// unrecognised strings. Returns `Custom(Box::new([]))`
+    /// for `"custom"` — the load-side caller in
+    /// `window.rs::startup_replay` populates the actual
+    /// frequencies from `acars_custom_channels`.
     #[must_use]
     pub fn from_config_id(id: &str) -> Self {
         match id {
             "europe" => Self::Europe,
-            // "us-6" + anything else → default. We don't error
-            // on unknown values because that would lock users
-            // out of the panel after a downgrade or stale
-            // config; falling back is the more forgiving
-            // behaviour.
+            "custom" => Self::Custom(Box::new([])),
             _ => Self::Us6,
         }
     }
 
     /// Display label for the Aviation panel combo row.
     #[must_use]
-    pub const fn display_label(self) -> &'static str {
+    pub fn display_label(&self) -> &'static str {
         match self {
             Self::Us6 => "United States (US-6)",
             Self::Europe => "Europe",
+            Self::Custom(_) => "Custom",
         }
     }
 }
@@ -374,7 +387,7 @@ pub struct DisengagePlan {
 /// preserve the pre-#581 behaviour.
 pub fn engage(
     current: &CurrentSourceState,
-    region: AcarsRegion,
+    region: &AcarsRegion,
 ) -> Result<EngagePlan, AcarsEnableError> {
     if current.source_type != SourceType::RtlSdr {
         return Err(AcarsEnableError::UnsupportedSourceType(current.source_type));
@@ -423,7 +436,7 @@ mod tests {
     #[test]
     fn engage_snapshots_and_emits_target_geometry() {
         let plan =
-            engage(&rtl_state(), AcarsRegion::default()).expect("RTL-SDR engage should succeed");
+            engage(&rtl_state(), &AcarsRegion::default()).expect("RTL-SDR engage should succeed");
         assert_eq!(plan.target_source_rate_hz, ACARS_SOURCE_RATE_HZ);
         assert_eq!(plan.target_center_hz, ACARS_CENTER_HZ);
         assert_eq!(plan.target_frontend_decim, ACARS_FRONTEND_DECIM);
@@ -439,7 +452,7 @@ mod tests {
         for bad in [SourceType::Network, SourceType::File, SourceType::RtlTcp] {
             let mut state = rtl_state();
             state.source_type = bad;
-            match engage(&state, AcarsRegion::default()) {
+            match engage(&state, &AcarsRegion::default()) {
                 Err(AcarsEnableError::UnsupportedSourceType(t)) => assert_eq!(t, bad),
                 other => panic!("source={bad:?} expected UnsupportedSourceType, got {other:?}"),
             }
@@ -448,7 +461,7 @@ mod tests {
 
     #[test]
     fn engage_with_europe_region_targets_europe_center() {
-        let plan = engage(&rtl_state(), AcarsRegion::Europe)
+        let plan = engage(&rtl_state(), &AcarsRegion::Europe)
             .expect("RTL-SDR + Europe engage should succeed");
         assert_eq!(plan.target_center_hz, AcarsRegion::Europe.center_hz());
         // Sanity: Europe's center is well above US-6's. Pin a
@@ -473,7 +486,7 @@ mod tests {
 
     #[test]
     fn disengage_returns_snapshotted_geometry_verbatim() {
-        let plan = engage(&rtl_state(), AcarsRegion::default()).unwrap();
+        let plan = engage(&rtl_state(), &AcarsRegion::default()).unwrap();
         let restore = disengage(&plan.snapshot);
         assert_eq!(restore.target_source_rate_hz, 1_024_000.0);
         assert_eq!(restore.target_center_hz, 162_550_000.0);
@@ -484,7 +497,7 @@ mod tests {
     #[test]
     fn engage_then_disengage_is_a_round_trip() {
         let original = rtl_state();
-        let plan = engage(&original, AcarsRegion::default()).unwrap();
+        let plan = engage(&original, &AcarsRegion::default()).unwrap();
         let restore = disengage(&plan.snapshot);
         assert_eq!(restore.target_source_rate_hz, original.source_rate_hz);
         assert_eq!(restore.target_center_hz, original.center_freq_hz);
@@ -594,5 +607,35 @@ mod tests {
         assert!(s.contains("2.5"), "span value present: {s}");
         assert!(s.contains("129"), "low freq present: {s}");
         assert!(s.contains("131"), "high freq present: {s}");
+    }
+
+    #[test]
+    fn from_config_id_round_trips_custom() {
+        // Custom is a placeholder — channels live in a separate
+        // config key, loaded by window.rs::startup-replay.
+        let r = AcarsRegion::from_config_id("custom");
+        assert_eq!(r.config_id(), "custom");
+        // Empty placeholder: from_config_id returns Custom([])
+        // unconditionally; the actual frequencies are populated
+        // by the load-side caller.
+        assert_eq!(r.channels(), &[] as &[f64]);
+    }
+
+    #[test]
+    fn channels_accessor_returns_borrowed_slice() {
+        let us = AcarsRegion::Us6;
+        let eu = AcarsRegion::Europe;
+        assert_eq!(us.channels().len(), ACARS_CHANNEL_COUNT);
+        assert_eq!(eu.channels().len(), ACARS_CHANNEL_COUNT);
+
+        let custom = AcarsRegion::Custom(Box::from([131_550_000.0, 131_525_000.0].as_slice()));
+        assert_eq!(custom.channels().len(), 2);
+        assert!((custom.channels()[0] - 131_550_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn display_label_custom() {
+        let custom = AcarsRegion::Custom(Box::from([131_550_000.0].as_slice()));
+        assert_eq!(custom.display_label(), "Custom");
     }
 }

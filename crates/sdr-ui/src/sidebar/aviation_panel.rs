@@ -85,7 +85,7 @@ pub const REGION_OPTIONS: &[AcarsRegion] = &[AcarsRegion::Us6, AcarsRegion::Euro
 pub fn region_from_combo_index(idx: u32) -> AcarsRegion {
     REGION_OPTIONS
         .get(idx as usize)
-        .copied()
+        .cloned()
         .unwrap_or(AcarsRegion::Us6)
 }
 
@@ -94,10 +94,10 @@ pub fn region_from_combo_index(idx: u32) -> AcarsRegion {
 /// region) on misses, which mirrors the seeding behaviour at
 /// startup when a stale config string can't be matched.
 #[must_use]
-pub fn region_combo_index(region: AcarsRegion) -> u32 {
+pub fn region_combo_index(region: &AcarsRegion) -> u32 {
     REGION_OPTIONS
         .iter()
-        .position(|&r| r == region)
+        .position(|r| r == region)
         .map_or(0, |i| u32::try_from(i).unwrap_or(0))
 }
 
@@ -127,7 +127,7 @@ pub fn build_aviation_panel() -> AviationPanel {
     let region_model = gtk4::StringList::new(
         &REGION_OPTIONS
             .iter()
-            .map(|r| r.display_label())
+            .map(AcarsRegion::display_label)
             .collect::<Vec<_>>(),
     );
     let region_row = adw::ComboRow::builder()
