@@ -1092,13 +1092,6 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 state.acars_bank = None;
                                 state.acars_init_failed = false;
                                 state.acars_pre_lock = None;
-                                // Forced-off path: clear the writer
-                                // config so the writer thread closes
-                                // its current handles on the next
-                                // message. Intent (path / addr) is
-                                // re-stamped by the next engage.
-                                // Issue #596.
-                                clear_acars_writer_config(&state.acars_outputs);
                                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
                                 // Also send a definitive Ok(false)
                                 // so the UI (which preserves state
@@ -3298,10 +3291,6 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     state.acars_init_failed = false;
     state.acars_pre_lock = None;
     if acars_forced_off {
-        // Forced-off: clear the writer config so the writer
-        // thread closes on the next message. The next engage
-        // re-stamps path/addr per user intent. Issue #596.
-        clear_acars_writer_config(&state.acars_outputs);
         let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
     }
 
@@ -4233,11 +4222,6 @@ fn handle_acars_engage_failure(
     state.acars_init_failed = false;
     state.acars_pre_lock = None;
 
-    // Forced-off: clear the writer config so the writer thread
-    // closes its handles on the next message. The next engage
-    // re-stamps path/addr per user intent. Issue #596.
-    clear_acars_writer_config(&state.acars_outputs);
-
     let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(orig_err)));
 
     // Signal teardown to caller if the live rollback failed AND
@@ -4281,27 +4265,6 @@ fn resolve_jsonl_path(path: &str) -> std::path::PathBuf {
 /// feed. Used when the network output is enabled without an
 /// explicit address.
 const ACARS_NETWORK_DEFAULT_ADDR: &str = "feed.airframes.io:5550";
-
-/// Clear `jsonl_path` + `network_addr` in the writer-thread
-/// config. The writer thread observes the change on its next
-/// message and closes its `JsonlWriter` / `UdpFeeder`. Used by
-/// every "forced-off" path (successful disengage, post-Start
-/// reassert failure, disengage double-failure, `cleanup()`
-/// forced-off branch). `station_id` is left intact — it's a
-/// stable user attribute, not output state. Issue #596.
-///
-/// NOTE: this is "clear", not "preserve" — a subsequent engage
-/// will not auto-reopen writers. Preserving user intent across
-/// disengage is a phase-2 follow-up; for now the user re-
-/// enables outputs after re-engage.
-fn clear_acars_writer_config(outputs: &AcarsOutputs) {
-    let mut cfg = outputs
-        .config
-        .write()
-        .expect("acars writer config poisoned");
-    cfg.jsonl_path = None;
-    cfg.network_addr = None;
-}
 
 fn handle_set_acars_jsonl_enabled(
     state: &mut DspState,
@@ -4580,10 +4543,6 @@ fn handle_set_acars_enabled(
                 state.acars_bank = None;
                 state.acars_init_failed = false;
                 state.acars_pre_lock = None;
-                // Forced-off: clear the writer config so the
-                // writer thread closes on the next message.
-                // Issue #596.
-                clear_acars_writer_config(&state.acars_outputs);
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
                 return if state.source.is_some() {
@@ -4607,12 +4566,6 @@ fn handle_set_acars_enabled(
         // see None and short-circuit.
         state.acars_bank = None;
         state.acars_init_failed = false;
-
-        // Disengage: clear the writer config so the writer
-        // thread closes its current handles on the next
-        // message. The next engage re-stamps path/addr per
-        // user intent. Issue #596.
-        clear_acars_writer_config(&state.acars_outputs);
 
         // VFO offset restore. The controller stores it on
         // `state.vfo_offset` (read by `rebuild_vfo` and the
