@@ -572,6 +572,16 @@ struct DspState {
     /// station ID; the DSP thread calls `try_send` per
     /// decoded message. Issues #578 + #596.
     acars_outputs: AcarsOutputs,
+    /// Most-recent user-set JSONL destination, preserved across
+    /// disable/enable toggles so re-enabling restores the user's
+    /// previously-chosen path rather than the default. Mirrors
+    /// what would otherwise live in `AcarsWriterConfig.jsonl_path`
+    /// but separated so the writer's `Some/None` "is enabled"
+    /// semantics stay clean. CR round 2 on PR #598.
+    acars_last_user_jsonl_path: Option<std::path::PathBuf>,
+    /// Same pattern as `acars_last_user_jsonl_path` for the
+    /// UDP feeder. CR round 2 on PR #598.
+    acars_last_user_network_addr: Option<String>,
 }
 
 impl DspState {
@@ -668,6 +678,8 @@ impl DspState {
             acars_stats_emitted_at: std::time::Instant::now(),
             acars_region: crate::acars_airband_lock::AcarsRegion::default(),
             acars_outputs: AcarsOutputs::new(dsp_tx),
+            acars_last_user_jsonl_path: None,
+            acars_last_user_network_addr: None,
         })
     }
 }
@@ -4284,12 +4296,21 @@ fn handle_set_acars_jsonl_enabled(
     {
         let mut cfg = acars_config_write(&state.acars_outputs.config);
         if enabled {
-            // Preserve the user's previously-set path across
-            // disable/enable toggles. `get_or_insert_with` only
-            // stamps the default if the slot is currently None.
-            // CR round 1 on PR #598.
-            cfg.jsonl_path.get_or_insert_with(|| resolve_jsonl_path(""));
+            // Restore the user's last-chosen path (preserved
+            // across disable/enable cycles via
+            // `acars_last_user_jsonl_path`). Falls back to the
+            // default if the user hasn't picked a path yet.
+            // CR round 2 on PR #598.
+            cfg.jsonl_path = Some(
+                state
+                    .acars_last_user_jsonl_path
+                    .clone()
+                    .unwrap_or_else(|| resolve_jsonl_path("")),
+            );
         } else {
+            // Disable: clear `cfg.jsonl_path` so the writer
+            // stops, but keep `acars_last_user_jsonl_path` so
+            // re-enable restores. CR round 2 on PR #598.
             cfg.jsonl_path = None;
         }
     }
@@ -4299,13 +4320,34 @@ fn handle_set_acars_jsonl_enabled(
 }
 
 fn handle_set_acars_jsonl_path(state: &mut DspState, _dsp_tx: &mpsc::Sender<DspToUi>, path: &str) {
-    let path = path.trim();
-    let resolved: Option<std::path::PathBuf> = if path.is_empty() {
-        None
+    let trimmed = path.trim();
+    let new_value = if trimmed.is_empty() {
+        // Empty apply: don't implicitly disable. If the sink
+        // is currently enabled, normalize to the default path
+        // (matching the user-intent "use the default"). If
+        // the sink is currently disabled, just clear the
+        // remembered path and stay disabled. CR round 2 on
+        // PR #598.
+        let currently_enabled = acars_config_write(&state.acars_outputs.config)
+            .jsonl_path
+            .is_some();
+        if currently_enabled {
+            Some(resolve_jsonl_path(""))
+        } else {
+            None
+        }
     } else {
-        Some(resolve_jsonl_path(path))
+        Some(resolve_jsonl_path(trimmed))
     };
-    acars_config_write(&state.acars_outputs.config).jsonl_path = resolved;
+    state.acars_last_user_jsonl_path.clone_from(&new_value);
+    // Only push to the writer's config if the sink is currently
+    // enabled (Some) — otherwise we'd accidentally turn it on.
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if cfg.jsonl_path.is_some() {
+            cfg.jsonl_path = new_value;
+        }
+    }
     state.acars_outputs.notify_config_changed();
 }
 
@@ -4317,11 +4359,15 @@ fn handle_set_acars_network_enabled(
     {
         let mut cfg = acars_config_write(&state.acars_outputs.config);
         if enabled {
-            // Preserve the user's previously-set address; only
-            // stamp the airframes.io default if no addr is set.
-            // CR round 1 on PR #598.
-            cfg.network_addr
-                .get_or_insert_with(|| ACARS_NETWORK_DEFAULT_ADDR.to_string());
+            // Same pattern as JSONL: restore the user's last-
+            // chosen address, fall back to the airframes.io
+            // default. CR round 2 on PR #598.
+            cfg.network_addr = Some(
+                state
+                    .acars_last_user_network_addr
+                    .clone()
+                    .unwrap_or_else(|| ACARS_NETWORK_DEFAULT_ADDR.to_string()),
+            );
         } else {
             cfg.network_addr = None;
         }
@@ -4335,12 +4381,28 @@ fn handle_set_acars_network_addr(
     addr: &str,
 ) {
     let trimmed = addr.trim();
-    let resolved = if trimmed.is_empty() {
-        None
+    let new_value = if trimmed.is_empty() {
+        // Same empty-apply semantics as JSONL: only normalize
+        // to default if currently enabled; else stay
+        // disabled. CR round 2 on PR #598.
+        let currently_enabled = acars_config_write(&state.acars_outputs.config)
+            .network_addr
+            .is_some();
+        if currently_enabled {
+            Some(ACARS_NETWORK_DEFAULT_ADDR.to_string())
+        } else {
+            None
+        }
     } else {
         Some(trimmed.to_string())
     };
-    acars_config_write(&state.acars_outputs.config).network_addr = resolved;
+    state.acars_last_user_network_addr.clone_from(&new_value);
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if cfg.network_addr.is_some() {
+            cfg.network_addr = new_value;
+        }
+    }
     state.acars_outputs.notify_config_changed();
 }
 
