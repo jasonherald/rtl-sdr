@@ -16,6 +16,33 @@ use std::path::{Path, PathBuf};
 
 use sdr_acars::AcarsMessage;
 
+/// Runtime-mutable writer config. Read-heavy access pattern:
+/// the writer thread reads on every message, the UI side writes
+/// only on user toggle / address edit / station-id change.
+/// Issue #596.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub struct AcarsWriterConfig {
+    /// Where to write the JSONL log. `None` means JSONL output
+    /// is disabled. Path changes trigger a reopen on the next
+    /// message; the worker closes the previous file.
+    pub jsonl_path: Option<PathBuf>,
+    /// UDP feeder destination (`"host:port"`). `None` means
+    /// network output is disabled.
+    pub network_addr: Option<String>,
+    /// Station ID injected into each emitted JSON record.
+    pub station_id: Option<String>,
+}
+
+/// Messages handed from the DSP thread to the writer thread.
+/// Bounded `mpsc::sync_channel` decouples the DSP-thread
+/// `acars_decode_tap` closure from disk / network I/O latency.
+#[allow(dead_code)]
+pub enum AcarsOutputMessage {
+    /// One decoded ACARS message, ready to write + feed.
+    Decoded(sdr_acars::AcarsMessage),
+}
+
 /// Append-only JSONL writer. One JSON object per line (`\n`-
 /// terminated). Wraps the file in a `BufWriter` so bursty
 /// per-message writes don't syscall on each one; flushed on
