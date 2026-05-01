@@ -591,15 +591,24 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     });
     *state.acars_viewer_handles.borrow_mut() = Some(Rc::clone(&handles));
 
-    // Click-to-filter (issue #579): double-click / Enter / Space on
-    // an aircraft row sets the filter entry to the tail and switches
-    // to the Stream tab. `GtkColumnView::connect_activate` fires on
-    // double-click / Enter / Space; single click stays as selection.
+    // Click-to-filter (issue #579): single-click on an aircraft row
+    // sets the filter entry to the tail and switches to the Stream
+    // tab. `single_click_activate(true)` on the ColumnView means a
+    // single click both selects AND emits `activate`. Using
+    // `view.model().item(position)` rather than
+    // `handles.aircraft_filter_model.item(position)` so the lookup
+    // matches the visible row regardless of current sort order
+    // (`position` is the column view / sort-model index, not the
+    // pre-sort FilterListModel index).
     {
         let handles = Rc::clone(&handles);
-        aircraft_column_view.connect_activate(move |_view, position| {
-            let Some(obj) = handles
-                .aircraft_filter_model
+        aircraft_column_view.connect_activate(move |view, position| {
+            // `position` is the column view's row index, which maps
+            // to the selection/sort model's order. Use `view.model()`
+            // so the lookup matches the visible row regardless of
+            // current sort + filter.
+            let Some(model) = view.model() else { return };
+            let Some(obj) = model
                 .item(position)
                 .and_then(|o| o.downcast::<AircraftEntryObject>().ok())
             else {
@@ -866,15 +875,16 @@ fn build_aircraft_column_view(
     let sort_model =
         gtk4::SortListModel::new(Some(filter_model.clone()), Option::<gtk4::Sorter>::None);
     // SingleSelection (vs NoSelection on the Stream tab) so the
-    // column view's `activate` signal fires on double-click / Enter.
-    // Click-to-filter wiring depends on `connect_activate`, which
-    // NoSelection does not propagate.
+    // column view's `activate` signal fires. Click-to-filter wiring
+    // depends on `connect_activate`; `single_click_activate(true)`
+    // on the ColumnView makes a single click both select and emit
+    // `activate`, matching the "click an aircraft to drill in" UX.
     let selection = gtk4::SingleSelection::new(Some(sort_model.clone()));
-    selection.set_can_unselect(true);
     let column_view = gtk4::ColumnView::builder()
         .model(&selection)
         .show_column_separators(true)
         .show_row_separators(true)
+        .single_click_activate(true)
         .build();
     sort_model.set_sorter(column_view.sorter().as_ref());
 
