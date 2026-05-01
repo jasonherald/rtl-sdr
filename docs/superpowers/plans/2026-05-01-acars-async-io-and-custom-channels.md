@@ -675,17 +675,27 @@ impl AcarsOutputs {
         let config = Arc::new(RwLock::new(AcarsWriterConfig::default()));
 
         let writer_config = Arc::clone(&config);
-        let writer_thread = std::thread::Builder::new()
+        // Thread spawn can fail (rlimit, OOM). Log + return a
+        // None handle rather than panic — the controller still
+        // boots and the user sees an error toast on the next
+        // ACARS message attempt. CR round 2 on PR #598.
+        let writer_thread = match std::thread::Builder::new()
             .name("sdr-acars-writer".into())
             .spawn(move || run_writer_loop(rx, writer_config))
-            .expect("failed to spawn ACARS writer thread");
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::error!("ACARS writer thread spawn failed: {e}");
+                None
+            }
+        };
 
         Self {
             tx,
             config,
             drop_count: Arc::new(AtomicU64::new(0)),
             last_drop_warn_at: Arc::new(Mutex::new(None)),
-            writer_thread: Some(writer_thread),
+            writer_thread,
             #[cfg(test)]
             _test_rx: Arc::new(Mutex::new(None)),
         }
@@ -738,7 +748,14 @@ impl AcarsOutputs {
     /// the current drop count so the message names how many
     /// were lost in this window.
     fn maybe_warn_full(&self) {
-        let mut last = self.last_drop_warn_at.lock().expect("warn lock poisoned");
+        // Recover from poisoning rather than panicking — a
+        // panic in maybe_warn_full would otherwise propagate
+        // to every later DSP-thread try_send. CR round 2 on
+        // PR #598.
+        let mut last = self
+            .last_drop_warn_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let now = std::time::Instant::now();
         let elapsed = last.map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
         if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
@@ -1015,9 +1032,27 @@ Also delete the local `ACARS_OUTPUT_WARN_MIN_INTERVAL` if it's still in `control
 
 In the engage path (`SetAcarsEnabled(true)` handler), the existing code reads `pending_jsonl_path` etc. to open writers. With the new shape, the writer thread is always running — engage just needs to make sure the config has the right values. The `pending_*` setter handlers (Step 3) already update the config, so the engage path can be simplified: just set `jsonl_enabled` / `network_enabled` flags ... but wait — the spec replaces those flags with `jsonl_path: Option` (Some = enabled). Re-read the spec.
 
-The spec says `AcarsWriterConfig { jsonl_path, network_addr, station_id }` — no separate enable flag. The semantics are: if `jsonl_path` is `Some`, write; if `None`, don't. The UI's "enable JSONL" toggle is implemented as: setting `jsonl_path` to the resolved default-or-user path on enable, and to `None` on disable.
+The writer config models the runtime state: `jsonl_path: Option<PathBuf>` is the writer's current behaviour (`Some` = write to this path, `None` = don't write). Per CR round 2 on PR #598, the user's *intent* (their last-chosen path) lives separately on `DspState` so a disable→enable cycle can restore it without conflating the writer's runtime state with persistence.
 
-So the existing `handle_set_acars_jsonl_enabled` (and same for network) handler needs to translate the boolean toggle into a path-or-None config write:
+Add two fields to `DspState`:
+
+```rust
+struct DspState {
+    /* … existing fields … */
+    /// Most-recent user-set JSONL destination, preserved
+    /// across disable/enable toggles so re-enabling restores
+    /// the user's previously-chosen path rather than the
+    /// default.
+    acars_last_user_jsonl_path: Option<std::path::PathBuf>,
+    /// Same pattern as `acars_last_user_jsonl_path` for the
+    /// UDP feeder.
+    acars_last_user_network_addr: Option<String>,
+}
+```
+
+Initialize both to `None` in `DspState::new`.
+
+Then the enable-toggle handlers look like this — restore the user's last-chosen value, fall back to the protocol default when the user hasn't picked one yet:
 
 ```rust
 fn handle_set_acars_jsonl_enabled(
@@ -1028,16 +1063,21 @@ fn handle_set_acars_jsonl_enabled(
     {
         let mut cfg = acars_config_write(&state.acars_outputs.config);
         if enabled {
-            // Preserve the user's previously-set path (e.g. set
-            // via SetAcarsJsonlPath or persisted from prior session)
-            // across disable/enable toggles. `get_or_insert_with`
-            // only stamps the default if the slot is currently None.
-            // CR round 1 on PR #598.
-            cfg.jsonl_path
-                .get_or_insert_with(|| resolve_jsonl_path(""));
+            // Restore the user's last-chosen path (preserved
+            // across disable/enable cycles via
+            // `acars_last_user_jsonl_path`). Falls back to the
+            // default if the user hasn't picked a path yet.
+            // CR round 2 on PR #598.
+            cfg.jsonl_path = Some(
+                state
+                    .acars_last_user_jsonl_path
+                    .clone()
+                    .unwrap_or_else(|| resolve_jsonl_path("")),
+            );
         } else {
-            // Disabling: clear the path. Worker wakes on
-            // ConfigChanged below and closes the writer.
+            // Disable: clear `cfg.jsonl_path` so the writer
+            // stops, but keep `acars_last_user_jsonl_path` so
+            // re-enable restores. CR round 2 on PR #598.
             cfg.jsonl_path = None;
         }
     }
@@ -1052,11 +1092,12 @@ fn handle_set_acars_network_enabled(
     {
         let mut cfg = acars_config_write(&state.acars_outputs.config);
         if enabled {
-            // Preserve the user's previously-set address; only
-            // stamp the airframes.io default if no addr is set.
-            // CR round 1 on PR #598.
-            cfg.network_addr
-                .get_or_insert_with(|| ACARS_NETWORK_DEFAULT_ADDR.to_string());
+            cfg.network_addr = Some(
+                state
+                    .acars_last_user_network_addr
+                    .clone()
+                    .unwrap_or_else(|| ACARS_NETWORK_DEFAULT_ADDR.to_string()),
+            );
         } else {
             cfg.network_addr = None;
         }
@@ -1064,6 +1105,40 @@ fn handle_set_acars_network_enabled(
     state.acars_outputs.notify_config_changed();
 }
 ```
+
+The corresponding `handle_set_acars_jsonl_path` / `handle_set_acars_network_addr` handlers update `acars_last_user_jsonl_path` / `acars_last_user_network_addr` always (so the user's intent survives a future disable). They only push to the writer's config if the sink is currently enabled — otherwise the path edit shouldn't accidentally turn the sink on. They also normalize an empty apply correctly: when the sink is currently enabled, an empty apply means "use the default"; when it's currently disabled, an empty apply means "clear my saved path":
+
+```rust
+fn handle_set_acars_jsonl_path(
+    state: &mut DspState,
+    _dsp_tx: &mpsc::Sender<DspToUi>,
+    path: &str,
+) {
+    let trimmed = path.trim();
+    let new_value = if trimmed.is_empty() {
+        let currently_enabled = acars_config_write(&state.acars_outputs.config)
+            .jsonl_path
+            .is_some();
+        if currently_enabled {
+            Some(resolve_jsonl_path(""))
+        } else {
+            None
+        }
+    } else {
+        Some(resolve_jsonl_path(trimmed))
+    };
+    state.acars_last_user_jsonl_path.clone_from(&new_value);
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if cfg.jsonl_path.is_some() {
+            cfg.jsonl_path = new_value;
+        }
+    }
+    state.acars_outputs.notify_config_changed();
+}
+```
+
+(The corresponding `handle_set_acars_network_addr` follows the same shape with `network_addr` and `ACARS_NETWORK_DEFAULT_ADDR`.)
 
 If the existing `handle_set_acars_jsonl_enabled` already exists, replace its body with the above. If it doesn't (i.e., the legacy code packed enable + path into one call), reconcile by checking the `UiToDsp` message variants.
 
@@ -1265,40 +1340,28 @@ pub const MAX_CUSTOM_CHANNELS: usize = 8;
 pub const MAX_CHANNEL_SPAN_HZ: f64 = 2_400_000.0;
 
 /// Error variants returned by [`validate_custom_channels`].
-/// `Display` impl produces user-facing toast text. Issue #592.
-#[derive(Clone, Debug, PartialEq)]
+/// `Display` derive produces user-facing toast text via
+/// `thiserror::Error`. Issue #592 / CR round 2 on PR #598
+/// (matches the project convention of using thiserror for
+/// library error types rather than hand-rolling Display +
+/// Error impls).
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum CustomChannelError {
+    #[error("Custom channel list is empty")]
     Empty,
+    #[error("Too many custom channels ({count}); maximum is {max}")]
     TooMany { count: usize, max: usize },
+    #[error("Invalid custom-channel frequency: {value}")]
     InvalidFrequency { value: f64 },
+    #[error(
+        "Span {:.3} MHz exceeds {:.3} MHz limit ({:.3} to {:.3} MHz)",
+        *span_hz / 1_000_000.0,
+        MAX_CHANNEL_SPAN_HZ / 1_000_000.0,
+        *low_hz / 1_000_000.0,
+        *high_hz / 1_000_000.0
+    )]
     SpanExceeded { low_hz: f64, high_hz: f64, span_hz: f64 },
 }
-
-impl std::fmt::Display for CustomChannelError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "Custom channel list is empty"),
-            Self::TooMany { count, max } => {
-                write!(f, "Too many custom channels ({count}); maximum is {max}")
-            }
-            Self::InvalidFrequency { value } => {
-                write!(f, "Invalid custom-channel frequency: {value}")
-            }
-            Self::SpanExceeded { low_hz, high_hz, span_hz } => {
-                let span_mhz = span_hz / 1_000_000.0;
-                let low_mhz = low_hz / 1_000_000.0;
-                let high_mhz = high_hz / 1_000_000.0;
-                write!(
-                    f,
-                    "Span {span_mhz:.3} MHz exceeds {} MHz limit ({low_mhz:.3} to {high_mhz:.3} MHz)",
-                    MAX_CHANNEL_SPAN_HZ / 1_000_000.0
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for CustomChannelError {}
 
 /// Validate a slice of custom-channel frequencies (Hz). Returns
 /// `Ok(())` if the list is non-empty, ≤ `MAX_CUSTOM_CHANNELS`,
@@ -1951,11 +2014,23 @@ pub const REGION_OPTIONS: &[(&str, &str)] = &[
     ("custom", "Custom"),
 ];
 
-/// Index of the `"custom"` slot in `REGION_OPTIONS`. Exposed
-/// so the visibility binding for the Custom channels entry-row
-/// (and any other index-keyed UI logic) doesn't hardcode `2`.
-/// CR round 1 on PR #598.
-pub const CUSTOM_REGION_COMBO_INDEX: u32 = 2;
+/// Resolve a region id (e.g. `"custom"`) to its slot index in
+/// `REGION_OPTIONS`. Returns `None` for unknown ids — callers
+/// fall through to the predefined default.
+///
+/// Index-keyed UI logic (the visibility-binding for the Custom
+/// channels entry-row, the rebuild handler) routes through
+/// this rather than hardcoding the slot number, so reordering
+/// `REGION_OPTIONS` only requires editing one slice. CR round
+/// 2 on PR #598 (round 1 introduced a `CUSTOM_REGION_COMBO_INDEX`
+/// constant; round 2 generalised to the lookup helper).
+#[must_use]
+pub fn region_index_for_id(id: &str) -> Option<u32> {
+    REGION_OPTIONS
+        .iter()
+        .position(|(opt_id, _)| *opt_id == id)
+        .and_then(|p| u32::try_from(p).ok())
+}
 ```
 
 Adjust the field shape to match the existing tuple layout (string id + display label).
@@ -1971,12 +2046,13 @@ let custom_channels_row = adw::EntryRow::builder()
 custom_channels_row.set_visible(false);
 acars_group.add(&custom_channels_row);
 
-// Bind visibility to "selected slot is Custom" via the named
-// constant rather than a raw index. CR round 1 on PR #598.
+// Bind visibility to "selected slot resolves to Custom" via
+// the lookup helper rather than a raw index. CR round 2 on
+// PR #598.
 {
     let custom_row = custom_channels_row.clone();
     region_row.connect_selected_notify(move |row| {
-        custom_row.set_visible(row.selected() == CUSTOM_REGION_COMBO_INDEX);
+        custom_row.set_visible(Some(row.selected()) == region_index_for_id("custom"));
     });
 }
 ```
@@ -2058,14 +2134,18 @@ The cleanest approach: have `window.rs` rebuild on every region change since it 
 // Resolve the AcarsRegion from the selected slot (so we don't
 // depend on raw indices) and use its channels().len(). CR
 // round 1 on PR #598.
-let region = if selected_idx == CUSTOM_REGION_COMBO_INDEX {
+// Resolve the AcarsRegion from the selected slot via a domain
+// lookup so we don't depend on raw indices. CR round 2 on
+// PR #598 (round 1 used a CUSTOM_REGION_COMBO_INDEX constant;
+// round 2 generalised to slice lookup).
+let id = REGION_OPTIONS
+    .get(selected_idx as usize)
+    .map(|(id, _)| *id)
+    .unwrap_or("us-6");
+let region = if id == "custom" {
     let saved = read_acars_custom_channels(&state.config);
     AcarsRegion::Custom(saved.into_boxed_slice())
 } else {
-    let id = REGION_OPTIONS
-        .get(selected_idx as usize)
-        .map(|(id, _)| *id)
-        .unwrap_or("us-6");
     AcarsRegion::from_config_id(id)
 };
 let new_count = region.channels().len();
