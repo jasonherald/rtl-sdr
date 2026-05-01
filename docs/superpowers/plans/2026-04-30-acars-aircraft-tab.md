@@ -869,11 +869,18 @@ fn build_aircraft_column_view(
     // view's sorter once it exists.
     let sort_model =
         gtk4::SortListModel::new(Some(filter_model.clone()), Option::<gtk4::Sorter>::None);
-    let selection = gtk4::NoSelection::new(Some(sort_model.clone()));
+    // SingleSelection (vs NoSelection on the Stream tab) so the
+    // column view's `activate` signal fires. Click-to-filter
+    // wiring depends on `connect_activate`; `single_click_activate
+    // (true)` on the ColumnView makes a single click both select
+    // and emit `activate`, matching the "click an aircraft to drill
+    // in" UX. NoSelection suppresses the activate signal entirely.
+    let selection = gtk4::SingleSelection::new(Some(sort_model.clone()));
     let column_view = gtk4::ColumnView::builder()
         .model(&selection)
         .show_column_separators(true)
         .show_row_separators(true)
+        .single_click_activate(true)
         .build();
     sort_model.set_sorter(column_view.sorter().as_ref());
 
