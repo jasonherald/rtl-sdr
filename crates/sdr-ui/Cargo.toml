@@ -74,6 +74,7 @@ sdr-rtltcp-discovery.workspace = true
 sdr-server-rtltcp = { path = "../sdr-server-rtltcp", default-features = false }
 sdr-acars.workspace = true
 sdr-tray.workspace = true
+arrayvec.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true

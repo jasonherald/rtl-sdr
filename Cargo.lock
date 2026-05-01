@@ -3419,6 +3419,7 @@ dependencies = [
 name = "sdr-ui"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "bytemuck",
  "cairo-rs",
  "chrono",
