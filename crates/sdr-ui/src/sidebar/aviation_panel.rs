@@ -49,13 +49,28 @@ pub struct AviationPanel {
     /// list (US-6 / Europe = 6; Custom is variable up to
     /// `MAX_CUSTOM_CHANNELS`). Subtitles are live-updated from
     /// `DspToUi::AcarsChannelStats` arrivals (~1 Hz cadence per
-    /// the DSP-side throttle).
-    pub channel_rows: Vec<adw::ActionRow>,
+    /// the DSP-side throttle). Wrapped in `Rc<RefCell<…>>` so the
+    /// region-change rebuild in
+    /// `crate::window::connect_aviation_panel` can swap the row
+    /// list while the 4 Hz tick still reads a live view (issue
+    /// #592).
+    pub channel_rows: std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>>,
+    /// Per-channel rows' container group. Exposed so the
+    /// region-change rebuild can `add` / `remove` rows when the
+    /// active region's channel count changes (issue #592).
+    pub channels_group: adw::PreferencesGroup,
     /// Region selector (issue #581). Switches the channel set
-    /// and source center frequency between US-6 and Europe.
-    /// Wired up in `crate::window::connect_aviation_panel` to
-    /// dispatch `UiToDsp::SetAcarsRegion` + persist the choice.
+    /// and source center frequency between US-6, Europe, and
+    /// user-defined Custom (#592). Wired up in
+    /// `crate::window::connect_aviation_panel` to dispatch
+    /// `UiToDsp::SetAcarsRegion` + persist the choice.
     pub region_row: adw::ComboRow,
+    /// User-defined channel CSV editor. Visible only when the
+    /// region combo's selected slot is the Custom slot. Wired
+    /// in `crate::window::connect_aviation_panel`'s
+    /// `connect_apply` handler to parse + validate + persist
+    /// + dispatch. Issue #592.
+    pub custom_channels_row: adw::EntryRow,
     /// Operator station ID — embedded in JSON's
     /// `station_id` field. Issue #578.
     pub station_id_row: adw::EntryRow,
@@ -71,23 +86,37 @@ pub struct AviationPanel {
     pub network_addr_row: adw::EntryRow,
 }
 
-/// Region combo-row index → `AcarsRegion`. The ordering here is
-/// the source of truth for both the model + the persistence
-/// round-trip; bumping a new region means appending here, the
-/// `AcarsRegion` enum, and the `from_config_id`/`config_id`
-/// match arms.
-pub const REGION_OPTIONS: &[AcarsRegion] = &[AcarsRegion::Us6, AcarsRegion::Europe];
+/// Region combo-row entries. Index → `(config_id, display_label)`.
+/// The ordering here is the source of truth for both the model
+/// and the persistence round-trip; bumping a new region means
+/// appending here, plus the matching `AcarsRegion` variant and
+/// `from_config_id`/`config_id` arms. Issue #592 added the
+/// `"custom"` slot at index 2.
+pub const REGION_OPTIONS: &[(&str, &str)] = &[
+    ("us-6", "United States (US-6)"),
+    ("europe", "Europe"),
+    ("custom", "Custom"),
+];
+
+/// Combo-row slot index for the user-defined `Custom` region.
+/// Used by the visibility binding for the custom-channels
+/// `EntryRow`.
+pub const CUSTOM_REGION_COMBO_INDEX: u32 = 2;
 
 /// Map a `0..REGION_OPTIONS.len()` combo-row index back to the
 /// matching region. Falls back to the default when the model
 /// changes shape under us (e.g. transient null state during
-/// rebuilds).
+/// rebuilds). The `Custom` arm returns
+/// `AcarsRegion::Custom(Box::new([]))` as a placeholder; the
+/// caller is responsible for populating the actual frequencies
+/// from `acars_custom_channels` before dispatching.
 #[must_use]
 pub fn region_from_combo_index(idx: u32) -> AcarsRegion {
     REGION_OPTIONS
         .get(idx as usize)
-        .cloned()
-        .unwrap_or(AcarsRegion::Us6)
+        .map_or_else(AcarsRegion::default, |(id, _)| {
+            AcarsRegion::from_config_id(id)
+        })
 }
 
 /// Inverse of `region_from_combo_index`: locate the region's
@@ -96,9 +125,10 @@ pub fn region_from_combo_index(idx: u32) -> AcarsRegion {
 /// startup when a stale config string can't be matched.
 #[must_use]
 pub fn region_combo_index(region: &AcarsRegion) -> u32 {
+    let id = region.config_id();
     REGION_OPTIONS
         .iter()
-        .position(|r| r == region)
+        .position(|(slot_id, _)| *slot_id == id)
         .map_or(0, |i| u32::try_from(i).unwrap_or(0))
 }
 
@@ -128,12 +158,12 @@ pub fn build_aviation_panel(channel_count: usize) -> AviationPanel {
         .build();
     acars_group.add(&enable_switch);
 
-    // Region selector (issue #581). Two predefined channel sets
-    // shipped today; "Custom" support is a deferred follow-up.
+    // Region selector (issue #581). Predefined channel sets
+    // (US-6 / Europe) plus user-defined Custom (issue #592).
     let region_model = gtk4::StringList::new(
         &REGION_OPTIONS
             .iter()
-            .map(AcarsRegion::display_label)
+            .map(|(_, label)| *label)
             .collect::<Vec<_>>(),
     );
     let region_row = adw::ComboRow::builder()
@@ -142,6 +172,27 @@ pub fn build_aviation_panel(channel_count: usize) -> AviationPanel {
         .model(&region_model)
         .build();
     acars_group.add(&region_row);
+
+    // Custom-channels editor (issue #592). Visible only when the
+    // region combo's selected slot is `CUSTOM_REGION_COMBO_INDEX`.
+    // CSV of MHz values, parsed + validated by the apply handler
+    // wired in `crate::window::connect_aviation_panel`.
+    let custom_channels_row = adw::EntryRow::builder()
+        .title("Custom channels (MHz, comma-separated)")
+        .build();
+    custom_channels_row.set_visible(false);
+    acars_group.add(&custom_channels_row);
+
+    // Bind visibility: visible only when the region combo's
+    // selected slot is the Custom slot. Wired here in the
+    // pure-widget builder because it's a self-contained
+    // visibility mirror — no AppState / config touching.
+    {
+        let custom_row = custom_channels_row.clone();
+        region_row.connect_selected_notify(move |row| {
+            custom_row.set_visible(row.selected() == CUSTOM_REGION_COMBO_INDEX);
+        });
+    }
 
     let status_row = adw::ActionRow::builder()
         .title("Status")
@@ -243,12 +294,35 @@ pub fn build_aviation_panel(channel_count: usize) -> AviationPanel {
         enable_switch,
         status_row,
         open_viewer_button,
-        channel_rows,
+        channel_rows: std::rc::Rc::new(std::cell::RefCell::new(channel_rows)),
+        channels_group,
         region_row,
+        custom_channels_row,
         station_id_row,
         jsonl_enable_row,
         jsonl_path_row,
         network_enable_row,
         network_addr_row,
+    }
+}
+
+/// Rebuild the per-channel rows in `panel.channels_group` to
+/// match `channel_count`. Removes any existing rows first, then
+/// appends `channel_count` fresh placeholder rows. Used by
+/// `crate::window::connect_aviation_panel` on region change so
+/// the row list stays in lock-step with
+/// `region.channels().len()` (predefined regions are 6; Custom
+/// is variable, including 0 when the user hasn't entered a CSV
+/// yet). Issue #592.
+pub fn rebuild_channel_rows(panel: &AviationPanel, channel_count: usize) {
+    let mut rows = panel.channel_rows.borrow_mut();
+    for row in rows.iter() {
+        panel.channels_group.remove(row);
+    }
+    rows.clear();
+    for _ in 0..channel_count {
+        let row = adw::ActionRow::builder().title("—").subtitle("—").build();
+        panel.channels_group.add(&row);
+        rows.push(row);
     }
 }

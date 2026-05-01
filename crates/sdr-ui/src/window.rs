@@ -3849,7 +3849,7 @@ fn connect_sidebar_panels(
         set_playing,
         status_bar,
     );
-    connect_aviation_panel(&panels.aviation, state, config);
+    connect_aviation_panel(&panels.aviation, state, config, toast_overlay);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(
         panels,
@@ -11922,28 +11922,67 @@ fn connect_aviation_panel(
     panel: &sidebar::aviation_panel::AviationPanel,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
+    toast_overlay: &adw::ToastOverlay,
 ) {
     use crate::sidebar::aviation_panel::{
-        GLYPH_IDLE, GLYPH_LOCKED, GLYPH_SIGNAL, SIDEBAR_STATUS_REFRESH_MS, region_combo_index,
-        region_from_combo_index,
+        GLYPH_IDLE, GLYPH_LOCKED, GLYPH_SIGNAL, SIDEBAR_STATUS_REFRESH_MS, rebuild_channel_rows,
+        region_combo_index, region_from_combo_index,
     };
     use sdr_acars::ChannelLockState;
-    use sdr_core::acars_airband_lock::AcarsRegion;
+    use sdr_core::acars_airband_lock::{AcarsRegion, validate_custom_channels};
 
-    // ─── Region selector seed + signal (issue #581) ───
+    // ─── Region selector seed + signal (issue #581 / #592) ───
     // Read the persisted region, dispatch it to DSP at startup,
     // and seed the combo index BEFORE wiring the change handler
     // — otherwise the seed itself would fire a redundant
     // dispatch + persist round-trip.
-    let initial_region =
-        AcarsRegion::from_config_id(crate::acars_config::read_acars_channel_set(config).as_str());
+    let saved_region_id = crate::acars_config::read_acars_channel_set(config);
+    let initial_region = if saved_region_id == "custom" {
+        // Hydrate the Custom variant with the saved channel
+        // list so the initial DSP dispatch carries real
+        // frequencies. An empty list means the user picked
+        // Custom but never entered channels — keep the
+        // placeholder so engage logic still sees a Custom
+        // variant; the apply handler dispatches a real one
+        // once the user types valid input.
+        let saved_chans = crate::acars_config::read_acars_custom_channels(config);
+        AcarsRegion::Custom(saved_chans.into_boxed_slice())
+    } else {
+        AcarsRegion::from_config_id(saved_region_id.as_str())
+    };
     panel
         .region_row
         .set_selected(region_combo_index(&initial_region));
+    // Rebuild channel rows to match the seeded region's channel
+    // count (predefined = 6; Custom = saved list len, possibly 0).
+    rebuild_channel_rows(panel, initial_region.channels().len());
+    // Hydrate the Custom EntryRow text from saved config so the
+    // user sees their last entry next to the (now-visible) row.
+    {
+        let saved_chans = crate::acars_config::read_acars_custom_channels(config);
+        if !saved_chans.is_empty() {
+            let csv = saved_chans
+                .iter()
+                .map(|hz| format!("{:.3}", hz / 1_000_000.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            panel.custom_channels_row.set_text(&csv);
+        }
+    }
     state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(initial_region));
     {
         let state = Rc::clone(state);
         let config = std::sync::Arc::clone(config);
+        // Capture the panel widgets needed by the rebuild path.
+        // Each widget already holds a strong ref into the GTK
+        // tree, so cloning here is the same cheap GObject ref
+        // bump the rest of `connect_aviation_panel` uses. The
+        // `channel_rows` Rc is the SAME inner cell the 4 Hz
+        // tick reads — this is what keeps that tick from
+        // operating on a stale row snapshot.
+        let channels_group = panel.channels_group.clone();
+        let channel_rows_cell = std::rc::Rc::clone(&panel.channel_rows);
+        let custom_row_for_dispatch = panel.custom_channels_row.clone();
         panel.region_row.connect_selected_notify(move |row| {
             // Guard against transient ComboRow indices. The model
             // briefly emits selection notifications during
@@ -11955,7 +11994,7 @@ fn connect_aviation_panel(
             // so a UI quirk doesn't churn config or fire a
             // needless DSP command. CR round 1 on PR #593.
             let selected = row.selected();
-            let region = region_from_combo_index(selected);
+            let mut region = region_from_combo_index(selected);
             if region_combo_index(&region) != selected {
                 tracing::debug!(
                     selected,
@@ -11963,7 +12002,120 @@ fn connect_aviation_panel(
                 );
                 return;
             }
+            // Custom slot: hydrate from saved config (or the
+            // current EntryRow text if the user just typed
+            // something but hasn't pressed Enter yet). Empty
+            // list is fine — the variant is dispatched as
+            // `Custom([])` and the apply handler later
+            // replaces it with a real list.
+            if matches!(region, AcarsRegion::Custom(_)) {
+                let saved = crate::acars_config::read_acars_custom_channels(&config);
+                region = AcarsRegion::Custom(saved.into_boxed_slice());
+                // Make the EntryRow visible immediately on
+                // selection — the visibility-binding closure in
+                // the panel builder also fires on this same
+                // notify, but invoking the binding side-effect
+                // here would require ordering guarantees we
+                // don't have. Cheap idempotent set is fine.
+                custom_row_for_dispatch.set_visible(true);
+            }
             crate::acars_config::save_acars_channel_set(&config, region.config_id());
+            // Rebuild channel rows to match the new region's
+            // channel count — borrow_mut + adw mutation must
+            // happen before send_dsp because the 4 Hz tick will
+            // start consulting the new row count almost
+            // immediately.
+            let new_count = region.channels().len();
+            // Inline the rebuild (the helper takes
+            // `&AviationPanel`, but we only have the
+            // individual fields here in the closure).
+            {
+                let mut rows = channel_rows_cell.borrow_mut();
+                for row in rows.iter() {
+                    channels_group.remove(row);
+                }
+                rows.clear();
+                for _ in 0..new_count {
+                    let row = adw::ActionRow::builder().title("—").subtitle("—").build();
+                    channels_group.add(&row);
+                    rows.push(row);
+                }
+            }
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
+        });
+    }
+
+    // ─── Custom-channels apply handler (issue #592) ───
+    // Fires on Enter or focus-out. Parses CSV → multiplies by
+    // 1e6 → validates via `validate_custom_channels`. On success
+    // persists + dispatches a `Custom` variant with real
+    // frequencies. On failure: toast naming the problem + add
+    // the `error` CSS class (cleared on success).
+    {
+        let state = Rc::clone(state);
+        let config = std::sync::Arc::clone(config);
+        let toast_overlay = toast_overlay.clone();
+        let channels_group = panel.channels_group.clone();
+        let channel_rows_cell = std::rc::Rc::clone(&panel.channel_rows);
+        panel.custom_channels_row.connect_apply(move |row| {
+            let text = row.text();
+            // Stage 1: parse CSV → Vec<f64> (Hz). Empty entries
+            // (e.g. trailing comma) are silently skipped; a
+            // truly empty list will be caught in stage 2 by
+            // `validate_custom_channels`.
+            let parsed: Result<Vec<f64>, String> = text
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.parse::<f64>()
+                        .map(|mhz| mhz * 1_000_000.0)
+                        .map_err(|e| format!("'{s}': {e}"))
+                })
+                .collect();
+            let chans = match parsed {
+                Ok(v) => v,
+                Err(e) => {
+                    row.add_css_class("error");
+                    let toast = adw::Toast::builder()
+                        .title(format!("Invalid custom channels: {e}"))
+                        .timeout(5)
+                        .build();
+                    toast_overlay.add_toast(toast);
+                    return;
+                }
+            };
+            // Stage 2: domain validation (size, finite, span).
+            if let Err(e) = validate_custom_channels(&chans) {
+                row.add_css_class("error");
+                let toast = adw::Toast::builder()
+                    .title(e.to_string())
+                    .timeout(5)
+                    .build();
+                toast_overlay.add_toast(toast);
+                return;
+            }
+            // Validated — clear any prior error styling and
+            // commit (persist + rebuild rows + dispatch).
+            row.remove_css_class("error");
+            crate::acars_config::save_acars_custom_channels(&config, &chans);
+            // Rebuild channel rows to match the new custom-
+            // channel count — same inline pattern as the
+            // region-change handler above.
+            let new_count = chans.len();
+            {
+                let mut rows = channel_rows_cell.borrow_mut();
+                for row in rows.iter() {
+                    channels_group.remove(row);
+                }
+                rows.clear();
+                for _ in 0..new_count {
+                    let r = adw::ActionRow::builder().title("—").subtitle("—").build();
+                    channels_group.add(&r);
+                    rows.push(r);
+                }
+            }
+            let region = AcarsRegion::Custom(chans.into_boxed_slice());
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
         });
     }
@@ -11990,14 +12142,17 @@ fn connect_aviation_panel(
     // Hold weak refs only so closing the window drops the panel
     // widgets and the timer self-cancels via Break on the next
     // fire. Strong refs would keep the panel + AppState alive
-    // for the rest of the process.
+    // for the rest of the process. The channel-rows view is an
+    // `Rc<RefCell<…>>` clone so the rebuild handler can swap the
+    // row list under us without the tick needing a re-snapshot.
+    // We hold a STRONG ref to the cell here — the cell itself
+    // is small (one `Vec<ActionRow>` plus a borrow flag) and
+    // the rows it owns are dropped in lock-step with the panel
+    // widgets when the window closes; the switch/status weak
+    // refs gate Break on the next fire either way.
     let switch_weak = panel.enable_switch.downgrade();
     let status_weak = panel.status_row.downgrade();
-    let row_weaks: Vec<gtk4::glib::WeakRef<adw::ActionRow>> = panel
-        .channel_rows
-        .iter()
-        .map(gtk4::prelude::ObjectExt::downgrade)
-        .collect();
+    let channel_rows_for_tick = std::rc::Rc::clone(&panel.channel_rows);
     let state_for_tick = Rc::clone(state);
     glib::timeout_add_local(
         std::time::Duration::from_millis(SIDEBAR_STATUS_REFRESH_MS),
@@ -12036,17 +12191,20 @@ fn connect_aviation_panel(
             };
             status.set_subtitle(&subtitle);
 
-            // Per-channel rows. Both `row_weaks` and `channel_stats`
-            // are now `Vec`s sized from the active region (Task 9
-            // migration); their lengths can transiently differ
-            // around a region swap (panel rebuild lags the next
-            // DSP-side stats emission). Zip over the shorter of
-            // the two so neither side panics during the window.
+            // Per-channel rows. Read the LIVE row list each tick
+            // so a region swap (which drops + recreates rows
+            // under `channel_rows_for_tick`) is reflected
+            // immediately — a snapshot taken at wire time would
+            // hold weak refs into the OLD generation of rows.
+            // `channel_stats` is a `Vec` sized from the active
+            // region (Task 9 migration); the two lengths can
+            // transiently differ around a region swap (panel
+            // rebuild lags the next DSP-side stats emission).
+            // Zip over the shorter of the two so neither side
+            // panics during the window. Issue #592.
             let channel_stats = state_for_tick.acars_channel_stats.borrow();
-            for (row_weak, ch) in row_weaks.iter().zip(channel_stats.iter()) {
-                let Some(row) = row_weak.upgrade() else {
-                    return glib::ControlFlow::Break;
-                };
+            let rows = channel_rows_for_tick.borrow();
+            for (row, ch) in rows.iter().zip(channel_stats.iter()) {
                 let glyph = match ch.lock_state {
                     ChannelLockState::Locked => GLYPH_LOCKED,
                     ChannelLockState::Idle => GLYPH_IDLE,
