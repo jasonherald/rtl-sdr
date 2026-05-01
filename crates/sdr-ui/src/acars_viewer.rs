@@ -623,33 +623,50 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         });
     }
 
-    // ── Filter: live substring match on aircraft + label + text ──
+    // ── Filter: live substring match across both tabs ────────────
+    // Stream tab: aircraft + label + text. Aircraft tab: tail only
+    // (label/text don't exist on aircraft rows).
     {
         let filter = handles.filter.clone();
+        let aircraft_filter = handles.aircraft_filter.clone();
         let entry = handles.filter_entry.clone();
         entry.connect_search_changed(move |entry| {
             let needle_str: String = entry.text().as_str().to_lowercase();
+
+            // Stream filter — existing logic unchanged.
+            let stream_needle = needle_str.clone();
             filter.set_filter_func(move |obj| {
                 let Some(obj) = obj.downcast_ref::<AcarsMessageObject>() else {
                     return false;
                 };
-                // Borrow the inner message — the filter predicate
-                // fires for every row on every keystroke + every
-                // append, so cloning the full message here would
-                // be a measurable hot-path cost on long-running
-                // sessions.
                 let inner = obj.imp().inner.borrow();
                 let Some(msg) = inner.as_ref() else {
                     return false;
                 };
-                if needle_str.is_empty() {
+                if stream_needle.is_empty() {
                     return true;
                 }
-                let needle = &needle_str;
+                let needle = &stream_needle;
                 msg.aircraft.to_lowercase().contains(needle)
                     || std::str::from_utf8(&msg.label)
                         .is_ok_and(|s| s.to_lowercase().contains(needle))
                     || msg.text.to_lowercase().contains(needle)
+            });
+
+            // Aircraft filter — tail substring only.
+            let aircraft_needle = needle_str;
+            aircraft_filter.set_filter_func(move |obj| {
+                let Some(obj) = obj.downcast_ref::<AircraftEntryObject>() else {
+                    return false;
+                };
+                let inner = obj.imp().inner.borrow();
+                let Some(entry) = inner.as_ref() else {
+                    return false;
+                };
+                if aircraft_needle.is_empty() {
+                    return true;
+                }
+                entry.tail.to_lowercase().contains(&aircraft_needle)
             });
         });
     }
