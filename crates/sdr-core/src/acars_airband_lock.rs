@@ -61,6 +61,105 @@ pub const EUROPE_SIX_CHANNELS_HZ: [f64; ACARS_CHANNEL_COUNT] = [
     131_875_000.0,
 ];
 
+/// Maximum number of channels in a user-defined custom region.
+/// Sized for any realistic ACARS cluster within
+/// `MAX_CHANNEL_SPAN_HZ`. Issue #592.
+pub const MAX_CUSTOM_CHANNELS: usize = 8;
+
+/// Maximum allowed span (max - min) of a custom channel set
+/// in Hz. Set to 2.4 MHz to leave a 100 kHz margin against
+/// the 2.5 `MSps` source rate (Nyquist bandwidth ≈ 2.5 MHz).
+/// Issue #592.
+pub const MAX_CHANNEL_SPAN_HZ: f64 = 2_400_000.0;
+
+/// Error variants returned by [`validate_custom_channels`].
+/// `Display` impl produces user-facing toast text. Issue #592.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CustomChannelError {
+    Empty,
+    TooMany {
+        count: usize,
+        max: usize,
+    },
+    InvalidFrequency {
+        value: f64,
+    },
+    SpanExceeded {
+        low_hz: f64,
+        high_hz: f64,
+        span_hz: f64,
+    },
+}
+
+impl std::fmt::Display for CustomChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "Custom channel list is empty"),
+            Self::TooMany { count, max } => {
+                write!(f, "Too many custom channels ({count}); maximum is {max}")
+            }
+            Self::InvalidFrequency { value } => {
+                write!(f, "Invalid custom-channel frequency: {value}")
+            }
+            Self::SpanExceeded {
+                low_hz,
+                high_hz,
+                span_hz,
+            } => {
+                let span_mhz = span_hz / 1_000_000.0;
+                let low_mhz = low_hz / 1_000_000.0;
+                let high_mhz = high_hz / 1_000_000.0;
+                write!(
+                    f,
+                    "Span {span_mhz:.3} MHz exceeds {} MHz limit ({low_mhz:.3} to {high_mhz:.3} MHz)",
+                    MAX_CHANNEL_SPAN_HZ / 1_000_000.0
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CustomChannelError {}
+
+/// Validate a slice of custom-channel frequencies (Hz). Returns
+/// `Ok(())` if the list is non-empty, ≤ `MAX_CUSTOM_CHANNELS`,
+/// all values are finite + positive, and `max - min ≤
+/// MAX_CHANNEL_SPAN_HZ`. Issue #592.
+pub fn validate_custom_channels(chans: &[f64]) -> Result<(), CustomChannelError> {
+    if chans.is_empty() {
+        return Err(CustomChannelError::Empty);
+    }
+    if chans.len() > MAX_CUSTOM_CHANNELS {
+        return Err(CustomChannelError::TooMany {
+            count: chans.len(),
+            max: MAX_CUSTOM_CHANNELS,
+        });
+    }
+    for &c in chans {
+        if !c.is_finite() || c <= 0.0 {
+            return Err(CustomChannelError::InvalidFrequency { value: c });
+        }
+    }
+    let (mut min, mut max) = (chans[0], chans[0]);
+    for &c in &chans[1..] {
+        if c < min {
+            min = c;
+        }
+        if c > max {
+            max = c;
+        }
+    }
+    let span = max - min;
+    if span > MAX_CHANNEL_SPAN_HZ {
+        return Err(CustomChannelError::SpanExceeded {
+            low_hz: min,
+            high_hz: max,
+            span_hz: span,
+        });
+    }
+    Ok(())
+}
+
 /// Predefined ACARS channel set. Issue #581. The DSP layer
 /// (`sdr_acars::ChannelBank`) is region-agnostic — all this
 /// type does is pick which fixed array to feed it and where
@@ -391,5 +490,109 @@ mod tests {
         assert_eq!(restore.target_center_hz, original.center_freq_hz);
         assert_eq!(restore.target_frontend_decim, original.frontend_decim);
         assert_eq!(restore.target_vfo_offset_hz, original.vfo_offset_hz);
+    }
+
+    #[test]
+    fn validate_rejects_empty() {
+        assert_eq!(
+            validate_custom_channels(&[]),
+            Err(CustomChannelError::Empty)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_single_channel() {
+        assert_eq!(validate_custom_channels(&[131_550_000.0]), Ok(()));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn validate_accepts_max_count() {
+        let chans: Vec<f64> = (0..MAX_CUSTOM_CHANNELS)
+            .map(|i| 131_000_000.0 + (i as f64) * 100_000.0)
+            .collect();
+        assert_eq!(validate_custom_channels(&chans), Ok(()));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn validate_rejects_too_many() {
+        let chans: Vec<f64> = (0..=MAX_CUSTOM_CHANNELS)
+            .map(|i| 131_000_000.0 + (i as f64) * 100_000.0)
+            .collect();
+        assert_eq!(
+            validate_custom_channels(&chans),
+            Err(CustomChannelError::TooMany {
+                count: MAX_CUSTOM_CHANNELS + 1,
+                max: MAX_CUSTOM_CHANNELS,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nan() {
+        match validate_custom_channels(&[131_550_000.0, f64::NAN]) {
+            Err(CustomChannelError::InvalidFrequency { .. }) => {}
+            other => panic!("expected InvalidFrequency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_inf() {
+        match validate_custom_channels(&[131_550_000.0, f64::INFINITY]) {
+            Err(CustomChannelError::InvalidFrequency { .. }) => {}
+            other => panic!("expected InvalidFrequency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_or_zero() {
+        match validate_custom_channels(&[131_550_000.0, 0.0]) {
+            Err(CustomChannelError::InvalidFrequency { value: 0.0 }) => {}
+            other => panic!("expected InvalidFrequency(0.0), got {other:?}"),
+        }
+        match validate_custom_channels(&[131_550_000.0, -1.0]) {
+            Err(CustomChannelError::InvalidFrequency { value: -1.0 }) => {}
+            other => panic!("expected InvalidFrequency(-1.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_span_just_under() {
+        // 2.4 MHz exact span — accepted (the constraint is ≤).
+        assert_eq!(
+            validate_custom_channels(&[129_125_000.0, 131_525_000.0]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_rejects_span_just_over() {
+        // 2.5 MHz — rejected.
+        match validate_custom_channels(&[129_000_000.0, 131_500_000.0]) {
+            Err(CustomChannelError::SpanExceeded {
+                low_hz,
+                high_hz,
+                span_hz,
+            }) => {
+                assert!((low_hz - 129_000_000.0).abs() < 1.0);
+                assert!((high_hz - 131_500_000.0).abs() < 1.0);
+                assert!((span_hz - 2_500_000.0).abs() < 1.0);
+            }
+            other => panic!("expected SpanExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_channel_error_display_span_exceeded() {
+        let err = CustomChannelError::SpanExceeded {
+            low_hz: 129_000_000.0,
+            high_hz: 131_500_000.0,
+            span_hz: 2_500_000.0,
+        };
+        let s = format!("{err}");
+        assert!(s.contains("2.5"), "span value present: {s}");
+        assert!(s.contains("129"), "low freq present: {s}");
+        assert!(s.contains("131"), "high freq present: {s}");
     }
 }
