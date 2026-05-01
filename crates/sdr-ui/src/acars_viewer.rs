@@ -170,6 +170,93 @@ impl AcarsMessageObject {
     }
 }
 
+// ── glib::Object wrapper around an AircraftEntry (issue #579) ──
+
+mod imp_aircraft {
+    use std::cell::RefCell;
+
+    use gtk4::glib;
+    use gtk4::glib::subclass::prelude::{ObjectImpl, ObjectSubclass};
+
+    pub struct AircraftEntryObject {
+        pub inner: RefCell<Option<super::AircraftEntry>>,
+    }
+
+    impl Default for AircraftEntryObject {
+        fn default() -> Self {
+            Self {
+                inner: RefCell::new(None),
+            }
+        }
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for AircraftEntryObject {
+        const NAME: &'static str = "AircraftEntryObject";
+        type Type = super::AircraftEntryObject;
+    }
+
+    impl ObjectImpl for AircraftEntryObject {}
+}
+
+glib::wrapper! {
+    /// Glib subclass wrapping an `AircraftEntry`. Used as the
+    /// row model for the "By Aircraft" tab in the ACARS viewer.
+    /// The aircraft column view's factories + sorters borrow
+    /// the inner `AircraftEntry` via `obj.imp().inner.borrow()`.
+    pub struct AircraftEntryObject(ObjectSubclass<imp_aircraft::AircraftEntryObject>);
+}
+
+/// Per-aircraft summary backing one row of the "By Aircraft"
+/// tab. Mutated in place via [`AircraftEntryObject::record_message`]
+/// — `last_seen` advances monotonically (`max(prev, msg.timestamp)`)
+/// to mirror the same out-of-order discipline as
+/// `AcarsMessageObject::record_duplicate` (CR round 2 on PR #591).
+#[derive(Clone, Debug)]
+pub struct AircraftEntry {
+    pub tail: arrayvec::ArrayString<8>,
+    pub last_seen: std::time::SystemTime,
+    pub msg_count: u32,
+    pub last_label: [u8; 2],
+}
+
+impl AircraftEntryObject {
+    /// Wrap an `AircraftEntry` for insertion into the aircraft
+    /// `gio::ListStore`. Caller should typically seed `msg_count`
+    /// to 0 and immediately invoke [`Self::record_message`] for
+    /// the message that triggered the insert; that gives the new
+    /// row a `msg_count` of 1 with `last_seen` and `last_label`
+    /// taken from the message.
+    #[must_use]
+    pub fn new(entry: AircraftEntry) -> Self {
+        let obj: Self = glib::Object::new();
+        *obj.imp().inner.borrow_mut() = Some(entry);
+        obj
+    }
+
+    /// Borrow-clone of the wrapped entry. Returns `None` only if
+    /// a caller called `take()` (we don't); column-view factories
+    /// can `expect` in their bind closures.
+    #[must_use]
+    pub fn entry(&self) -> Option<AircraftEntry> {
+        self.imp().inner.borrow().clone()
+    }
+
+    /// Record a new message for this aircraft: bumps `msg_count`,
+    /// advances `last_seen` monotonically to
+    /// `max(last_seen, msg.timestamp)`, and overwrites
+    /// `last_label`. Same out-of-order discipline as
+    /// `AcarsMessageObject::record_duplicate`.
+    pub fn record_message(&self, msg: &sdr_acars::AcarsMessage) {
+        let imp = self.imp();
+        let mut slot = imp.inner.borrow_mut();
+        let Some(entry) = slot.as_mut() else { return };
+        entry.msg_count = entry.msg_count.saturating_add(1);
+        entry.last_seen = std::cmp::max(entry.last_seen, msg.timestamp);
+        entry.last_label = msg.label;
+    }
+}
+
 // ── Public API: open / present-if-already-open ─────────────────
 
 /// Open the ACARS viewer window if not already open. If a
@@ -603,4 +690,102 @@ fn render_text(obj: &AcarsMessageObject) -> String {
             m.text.clone()
         }
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::*;
+    use arrayvec::ArrayString;
+    use sdr_acars::AcarsMessage;
+
+    fn fixture_message(tail: &str, label: [u8; 2], ts: SystemTime) -> AcarsMessage {
+        let mut aircraft = ArrayString::<8>::new();
+        aircraft.push_str(tail);
+        AcarsMessage {
+            timestamp: ts,
+            channel_idx: 0,
+            freq_hz: 131_550_000.0,
+            level_db: 0.0,
+            error_count: 0,
+            mode: b'2',
+            label,
+            block_id: b'5',
+            ack: b'!',
+            aircraft,
+            flight_id: None,
+            message_no: None,
+            text: String::new(),
+            end_of_message: true,
+            reassembled_block_count: 1,
+            parsed: None,
+        }
+    }
+
+    #[test]
+    fn aircraft_entry_object_record_message_bumps_count() {
+        // GTK glib::Object subclasses can be constructed without
+        // a running GTK Application — `glib::Object::new` works
+        // as long as the type was registered (which happens via
+        // the `#[glib::object_subclass]` macro at module load).
+        gtk4::glib::MainContext::default();
+        let ts = SystemTime::now();
+        let entry = AircraftEntry {
+            tail: {
+                let mut s = ArrayString::<8>::new();
+                s.push_str(".N12345");
+                s
+            },
+            last_seen: ts,
+            msg_count: 0,
+            last_label: *b"H1",
+        };
+        let obj = AircraftEntryObject::new(entry);
+        assert_eq!(obj.entry().unwrap().msg_count, 0);
+
+        let msg = fixture_message(".N12345", *b"M1", ts + Duration::from_secs(1));
+        obj.record_message(&msg);
+        assert_eq!(obj.entry().unwrap().msg_count, 1);
+
+        obj.record_message(&msg);
+        assert_eq!(obj.entry().unwrap().msg_count, 2);
+    }
+
+    #[test]
+    fn aircraft_entry_object_last_seen_monotonic() {
+        gtk4::glib::MainContext::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let entry = AircraftEntry {
+            tail: ArrayString::new(),
+            last_seen: t0,
+            msg_count: 0,
+            last_label: *b"  ",
+        };
+        let obj = AircraftEntryObject::new(entry);
+
+        // Out-of-order timestamps must not regress last_seen.
+        let later = fixture_message("X", *b"H1", t0 + Duration::from_mins(1));
+        let earlier = fixture_message("X", *b"H1", t0 + Duration::from_secs(30));
+        obj.record_message(&later);
+        obj.record_message(&earlier);
+        assert_eq!(obj.entry().unwrap().last_seen, t0 + Duration::from_mins(1));
+    }
+
+    #[test]
+    fn aircraft_entry_object_record_message_updates_label() {
+        gtk4::glib::MainContext::default();
+        let ts = SystemTime::now();
+        let entry = AircraftEntry {
+            tail: ArrayString::new(),
+            last_seen: ts,
+            msg_count: 0,
+            last_label: *b"H1",
+        };
+        let obj = AircraftEntryObject::new(entry);
+        let msg = fixture_message("X", *b"M1", ts);
+        obj.record_message(&msg);
+        assert_eq!(obj.entry().unwrap().last_label, *b"M1");
+    }
 }
