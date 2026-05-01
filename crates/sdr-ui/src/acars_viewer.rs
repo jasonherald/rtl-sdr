@@ -510,20 +510,38 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         .hexpand(true)
         .build();
 
-    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    content.append(&header);
-    content.append(&scroll);
-    window.set_content(Some(&content));
-
-    // Placeholder aircraft store + filter + stack for the
-    // "By Aircraft" tab. Wired to a real column view + click
-    // handlers in subsequent tasks; this stub keeps the
-    // struct buildable so the field additions land cleanly.
+    // Aircraft store + filter + filter model — needed before
+    // `build_aircraft_column_view` is called below.
     let aircraft_store = gtk4::gio::ListStore::new::<AircraftEntryObject>();
     let aircraft_filter = gtk4::CustomFilter::new(|_obj| true);
     let aircraft_filter_model =
         gtk4::FilterListModel::new(Some(aircraft_store.clone()), Some(aircraft_filter.clone()));
+
+    // Build the aircraft column view. Helper returns its own
+    // `ScrolledWindow` so each tab retains its own `GtkAdjustment`
+    // and scroll position independently.
+    let (aircraft_scroll, aircraft_column_view) =
+        build_aircraft_column_view(&aircraft_filter_model);
+
+    // Stack with two pages — Stream (existing) and By Aircraft
+    // (issue #579). Switcher in the header bar between the
+    // existing buttons and the filter entry.
     let stack = gtk4::Stack::new();
+    stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    stack.add_titled(&scroll, Some("stream"), "Stream");
+    stack.add_titled(&aircraft_scroll, Some("aircraft"), "By Aircraft");
+
+    let stack_switcher = gtk4::StackSwitcher::builder().stack(&stack).build();
+    // Pack switcher between the action buttons (already
+    // `pack_start`'d) and the filter entry (set as title widget).
+    // `pack_start` preserves declaration order so the switcher
+    // sits to the right of the collapse button.
+    header.pack_start(&stack_switcher);
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    content.append(&header);
+    content.append(&stack);
+    window.set_content(Some(&content));
 
     // Hoist handles so all signal handlers below can clone from it.
     let handles = Rc::new(ViewerHandles {
@@ -542,6 +560,26 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         stack,
     });
     *state.acars_viewer_handles.borrow_mut() = Some(Rc::clone(&handles));
+
+    // Click-to-filter (issue #579): double-click / Enter / Space on
+    // an aircraft row sets the filter entry to the tail and switches
+    // to the Stream tab. `GtkColumnView::connect_activate` fires on
+    // double-click / Enter / Space; single click stays as selection.
+    {
+        let handles = Rc::clone(&handles);
+        aircraft_column_view.connect_activate(move |_view, position| {
+            let Some(obj) = handles
+                .aircraft_filter_model
+                .item(position)
+                .and_then(|o| o.downcast::<AircraftEntryObject>().ok())
+            else {
+                return;
+            };
+            let Some(entry) = obj.entry() else { return };
+            handles.filter_entry.set_text(&entry.tail);
+            handles.stack.set_visible_child_name("stream");
+        });
+    }
 
     // ── Clear button ──────────────────────────────────────────────
     {
@@ -663,6 +701,189 @@ where
             _ => gtk4::Ordering::Equal,
         }
     })
+}
+
+/// Aircraft-tab column descriptor. Same shape as [`ColumnSpec`]
+/// but the render closure operates on [`AircraftEntryObject`].
+type AircraftColumnSpec = (&'static str, fn(&AircraftEntryObject) -> String, bool);
+
+/// Build the aircraft-tab column view + scrolled window. Returns
+/// the `ScrolledWindow` so the caller can pack it into the stack.
+/// The column view emits `connect_activate` for click-to-filter;
+/// the caller wires that handler so the activate closure can hold
+/// `Rc`s of the relevant viewer state.
+#[allow(clippy::too_many_lines)]
+fn build_aircraft_column_view(
+    filter_model: &gtk4::FilterListModel,
+) -> (gtk4::ScrolledWindow, gtk4::ColumnView) {
+    let columns: [AircraftColumnSpec; 4] = [
+        ("Aircraft", render_aircraft_tail, false),
+        ("Last Seen", render_aircraft_last_seen, false),
+        ("Count", render_aircraft_count, false),
+        ("Last Label", render_aircraft_last_label, true),
+    ];
+
+    let sorters: [gtk4::CustomSorter; 4] = [
+        // Aircraft tail — case-insensitive alphabetical
+        gtk4::CustomSorter::new(|a, b| {
+            let Some(a_obj) = a.downcast_ref::<AircraftEntryObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            let Some(b_obj) = b.downcast_ref::<AircraftEntryObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            let a_inner = a_obj.imp().inner.borrow();
+            let b_inner = b_obj.imp().inner.borrow();
+            match (a_inner.as_ref(), b_inner.as_ref()) {
+                (Some(a), Some(b)) => cmp_case_insensitive(&a.tail, &b.tail).into(),
+                _ => gtk4::Ordering::Equal,
+            }
+        }),
+        // Last Seen — newest first wins descending sort
+        gtk4::CustomSorter::new(|a, b| {
+            let Some(a_obj) = a.downcast_ref::<AircraftEntryObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            let Some(b_obj) = b.downcast_ref::<AircraftEntryObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            let a_inner = a_obj.imp().inner.borrow();
+            let b_inner = b_obj.imp().inner.borrow();
+            match (a_inner.as_ref(), b_inner.as_ref()) {
+                (Some(a), Some(b)) => a.last_seen.cmp(&b.last_seen).into(),
+                _ => gtk4::Ordering::Equal,
+            }
+        }),
+        // Count — numeric
+        gtk4::CustomSorter::new(|a, b| {
+            let Some(a_obj) = a.downcast_ref::<AircraftEntryObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            let Some(b_obj) = b.downcast_ref::<AircraftEntryObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            let a_inner = a_obj.imp().inner.borrow();
+            let b_inner = b_obj.imp().inner.borrow();
+            match (a_inner.as_ref(), b_inner.as_ref()) {
+                (Some(a), Some(b)) => a.msg_count.cmp(&b.msg_count).into(),
+                _ => gtk4::Ordering::Equal,
+            }
+        }),
+        // Last Label — byte ordering on the 2-char code
+        gtk4::CustomSorter::new(|a, b| {
+            let Some(a_obj) = a.downcast_ref::<AircraftEntryObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            let Some(b_obj) = b.downcast_ref::<AircraftEntryObject>() else {
+                return gtk4::Ordering::Equal;
+            };
+            let a_inner = a_obj.imp().inner.borrow();
+            let b_inner = b_obj.imp().inner.borrow();
+            match (a_inner.as_ref(), b_inner.as_ref()) {
+                (Some(a), Some(b)) => a.last_label.cmp(&b.last_label).into(),
+                _ => gtk4::Ordering::Equal,
+            }
+        }),
+    ];
+
+    // `SortListModel` in the chain so column-header clicks reorder
+    // visible rows. Sorter starts as `None`; bound to the column
+    // view's sorter once it exists.
+    let sort_model =
+        gtk4::SortListModel::new(Some(filter_model.clone()), Option::<gtk4::Sorter>::None);
+    let selection = gtk4::NoSelection::new(Some(sort_model.clone()));
+    let column_view = gtk4::ColumnView::builder()
+        .model(&selection)
+        .show_column_separators(true)
+        .show_row_separators(true)
+        .build();
+    sort_model.set_sorter(column_view.sorter().as_ref());
+
+    let mut last_seen_column: Option<gtk4::ColumnViewColumn> = None;
+
+    for (idx, (title, render, expand)) in columns.into_iter().enumerate() {
+        let factory = gtk4::SignalListItemFactory::new();
+        factory.connect_setup(move |_factory, item| {
+            let Some(item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let label = gtk4::Label::builder()
+                .xalign(0.0)
+                .ellipsize(gtk4::pango::EllipsizeMode::End)
+                .build();
+            item.set_child(Some(&label));
+        });
+        factory.connect_bind(move |_factory, item| {
+            let Some(item) = item.downcast_ref::<gtk4::ListItem>() else {
+                return;
+            };
+            let Some(label) = item.child().and_then(|w| w.downcast::<gtk4::Label>().ok()) else {
+                return;
+            };
+            let Some(obj) = item
+                .item()
+                .and_then(|o| o.downcast::<AircraftEntryObject>().ok())
+            else {
+                return;
+            };
+            label.set_text(&render(&obj));
+        });
+        let column = gtk4::ColumnViewColumn::builder()
+            .title(title)
+            .factory(&factory)
+            .resizable(true)
+            .expand(expand)
+            .build();
+        column.set_sorter(Some(&sorters[idx]));
+        if idx == 1 {
+            last_seen_column = Some(column.clone());
+        }
+        column_view.append_column(&column);
+    }
+    // Default sort: Last Seen descending — newest active aircraft
+    // at top, stale entries drift down.
+    if let Some(col) = last_seen_column {
+        column_view.sort_by_column(Some(&col), gtk4::SortType::Descending);
+    }
+
+    let scrolled = gtk4::ScrolledWindow::builder()
+        .child(&column_view)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+
+    (scrolled, column_view)
+}
+
+fn render_aircraft_tail(obj: &AircraftEntryObject) -> String {
+    obj.entry().map(|e| e.tail.to_string()).unwrap_or_default()
+}
+
+fn render_aircraft_last_seen(obj: &AircraftEntryObject) -> String {
+    let Some(entry) = obj.entry() else {
+        return String::new();
+    };
+    let dt: chrono::DateTime<chrono::Local> = entry.last_seen.into();
+    dt.format("%H:%M:%S").to_string()
+}
+
+fn render_aircraft_count(obj: &AircraftEntryObject) -> String {
+    obj.entry()
+        .map(|e| e.msg_count.to_string())
+        .unwrap_or_default()
+}
+
+fn render_aircraft_last_label(obj: &AircraftEntryObject) -> String {
+    let Some(entry) = obj.entry() else {
+        return String::new();
+    };
+    let raw = std::str::from_utf8(&entry.last_label)
+        .unwrap_or("??")
+        .to_string();
+    match sdr_acars::label::lookup(entry.last_label) {
+        Some(name) => format!("{raw} ({name})"),
+        None => raw,
+    }
 }
 
 /// Render the Time column. Uses the wrapper's `last_seen` (so
