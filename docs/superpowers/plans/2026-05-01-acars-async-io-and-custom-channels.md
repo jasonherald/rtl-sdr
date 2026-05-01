@@ -434,9 +434,12 @@ fn run_writer_loop(
         let AcarsOutputMessage::Decoded(msg) = msg;
 
         // Snapshot the config under a brief read lock so we
-        // don't hold it across blocking I/O.
+        // don't hold it across blocking I/O. Recover from
+        // poisoning rather than panicking — a panic in the
+        // writer path would otherwise propagate to all later
+        // settings edits. CR round 1 on PR #598.
         let (want_jsonl_path, want_udp_addr, station_id) = {
-            let cfg = config.read().expect("acars writer config poisoned");
+            let cfg = config.read().unwrap_or_else(|p| p.into_inner());
             (cfg.jsonl_path.clone(), cfg.network_addr.clone(), cfg.station_id.clone())
         };
 
@@ -946,51 +949,53 @@ fn handle_set_acars_jsonl_path(
     } else {
         Some(resolve_jsonl_path(path))
     };
-    state
-        .acars_outputs
-        .config
-        .write()
-        .expect("acars writer config poisoned")
-        .jsonl_path = resolved.clone();
-    // Echo the resolved path back to the UI for status display.
-    let display = resolved
-        .as_ref()
-        .map_or_else(String::new, |p| p.display().to_string());
-    let _ = dsp_tx.send(DspToUi::AcarsJsonlPathResolved(display));
+    acars_config_write(&state.acars_outputs.config).jsonl_path = resolved;
+    state.acars_outputs.notify_config_changed();
 }
 
 fn handle_set_acars_network_addr(
     state: &mut DspState,
-    dsp_tx: &mpsc::Sender<DspToUi>,
+    _dsp_tx: &mpsc::Sender<DspToUi>,
     addr: &str,
 ) {
-    let resolved = if addr.is_empty() {
-        None
-    } else {
-        Some(addr.to_string())
-    };
-    state
-        .acars_outputs
-        .config
-        .write()
-        .expect("acars writer config poisoned")
-        .network_addr = resolved.clone();
-    let display = resolved.unwrap_or_default();
-    let _ = dsp_tx.send(DspToUi::AcarsNetworkAddrResolved(display));
-}
-
-fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
-    let trimmed = station_id.trim();
-    state
-        .acars_outputs
-        .config
-        .write()
-        .expect("acars writer config poisoned")
-        .station_id = if trimmed.is_empty() {
+    let trimmed = addr.trim();
+    let resolved = if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
     };
+    acars_config_write(&state.acars_outputs.config).network_addr = resolved;
+    state.acars_outputs.notify_config_changed();
+}
+
+fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
+    // Trim, bound to 8 chars (matches acarsdec's `idstation`
+    // field width), and treat empty-after-trim as None so
+    // non-UI callers (config replay, future FFI) can't leak
+    // whitespace-only or oversized IDs into emitted JSON.
+    // CR round 3 on PR #595.
+    let trimmed = station_id.trim();
+    acars_config_write(&state.acars_outputs.config).station_id = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(8).collect())
+    };
+    state.acars_outputs.notify_config_changed();
+}
+```
+
+The `acars_config_write` helper recovers from `RwLock` poisoning rather than panicking; without it, a panic in the writer thread would propagate to every later settings edit.
+
+```rust
+/// Acquire the ACARS writer config write lock, recovering from
+/// poisoning rather than panicking. CR round 1 on PR #598.
+fn acars_config_write(
+    cfg: &std::sync::RwLock<crate::acars_output::AcarsWriterConfig>,
+) -> std::sync::RwLockWriteGuard<'_, crate::acars_output::AcarsWriterConfig> {
+    cfg.write().unwrap_or_else(|poisoned| {
+        tracing::warn!("acars writer config lock was poisoned; recovering");
+        poisoned.into_inner()
+    })
 }
 ```
 
@@ -1015,30 +1020,48 @@ The spec says `AcarsWriterConfig { jsonl_path, network_addr, station_id }` — n
 So the existing `handle_set_acars_jsonl_enabled` (and same for network) handler needs to translate the boolean toggle into a path-or-None config write:
 
 ```rust
-fn handle_set_acars_jsonl_enabled(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, enabled: bool) {
-    if enabled {
-        // Enabling: resolve the user's pending path (or default if unset)
-        // and stamp it into the config.
-        let path = resolve_jsonl_path(""); // empty → default
-        state.acars_outputs.config.write().expect("acars writer config poisoned").jsonl_path = Some(path.clone());
-        let _ = dsp_tx.send(DspToUi::AcarsJsonlPathResolved(path.display().to_string()));
-    } else {
-        // Disabling: clear the path. Worker's ensure_jsonl
-        // will close the writer on the next message.
-        state.acars_outputs.config.write().expect("acars writer config poisoned").jsonl_path = None;
-        let _ = dsp_tx.send(DspToUi::AcarsJsonlPathResolved(String::new()));
+fn handle_set_acars_jsonl_enabled(
+    state: &mut DspState,
+    _dsp_tx: &mpsc::Sender<DspToUi>,
+    enabled: bool,
+) {
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if enabled {
+            // Preserve the user's previously-set path (e.g. set
+            // via SetAcarsJsonlPath or persisted from prior session)
+            // across disable/enable toggles. `get_or_insert_with`
+            // only stamps the default if the slot is currently None.
+            // CR round 1 on PR #598.
+            cfg.jsonl_path
+                .get_or_insert_with(|| resolve_jsonl_path(""));
+        } else {
+            // Disabling: clear the path. Worker wakes on
+            // ConfigChanged below and closes the writer.
+            cfg.jsonl_path = None;
+        }
     }
+    state.acars_outputs.notify_config_changed();
 }
 
-fn handle_set_acars_network_enabled(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, enabled: bool) {
-    if enabled {
-        let addr = "feed.airframes.io:5550".to_string(); // default
-        state.acars_outputs.config.write().expect("acars writer config poisoned").network_addr = Some(addr.clone());
-        let _ = dsp_tx.send(DspToUi::AcarsNetworkAddrResolved(addr));
-    } else {
-        state.acars_outputs.config.write().expect("acars writer config poisoned").network_addr = None;
-        let _ = dsp_tx.send(DspToUi::AcarsNetworkAddrResolved(String::new()));
+fn handle_set_acars_network_enabled(
+    state: &mut DspState,
+    _dsp_tx: &mpsc::Sender<DspToUi>,
+    enabled: bool,
+) {
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if enabled {
+            // Preserve the user's previously-set address; only
+            // stamp the airframes.io default if no addr is set.
+            // CR round 1 on PR #598.
+            cfg.network_addr
+                .get_or_insert_with(|| ACARS_NETWORK_DEFAULT_ADDR.to_string());
+        } else {
+            cfg.network_addr = None;
+        }
     }
+    state.acars_outputs.notify_config_changed();
 }
 ```
 
@@ -1927,6 +1950,12 @@ pub const REGION_OPTIONS: &[(&str, &str)] = &[
     ("europe", "Europe"),
     ("custom", "Custom"),
 ];
+
+/// Index of the `"custom"` slot in `REGION_OPTIONS`. Exposed
+/// so the visibility binding for the Custom channels entry-row
+/// (and any other index-keyed UI logic) doesn't hardcode `2`.
+/// CR round 1 on PR #598.
+pub const CUSTOM_REGION_COMBO_INDEX: u32 = 2;
 ```
 
 Adjust the field shape to match the existing tuple layout (string id + display label).
@@ -1942,13 +1971,12 @@ let custom_channels_row = adw::EntryRow::builder()
 custom_channels_row.set_visible(false);
 acars_group.add(&custom_channels_row);
 
-// Bind visibility to "selected slot is Custom".
+// Bind visibility to "selected slot is Custom" via the named
+// constant rather than a raw index. CR round 1 on PR #598.
 {
     let custom_row = custom_channels_row.clone();
     region_row.connect_selected_notify(move |row| {
-        let selected = row.selected();
-        // REGION_OPTIONS Custom slot is index 2.
-        custom_row.set_visible(selected == 2);
+        custom_row.set_visible(row.selected() == CUSTOM_REGION_COMBO_INDEX);
     });
 }
 ```
@@ -2027,12 +2055,20 @@ The cleanest approach: have `window.rs` rebuild on every region change since it 
 
 ```rust
 // Rebuild channel_rows to match the new region's channel count.
-let new_count = match selected_idx {
-    0 => 6,           // US-6
-    1 => 6,           // Europe
-    2 => state.config.borrow().acars_custom_channels().len(),
-    _ => 6,
+// Resolve the AcarsRegion from the selected slot (so we don't
+// depend on raw indices) and use its channels().len(). CR
+// round 1 on PR #598.
+let region = if selected_idx == CUSTOM_REGION_COMBO_INDEX {
+    let saved = read_acars_custom_channels(&state.config);
+    AcarsRegion::Custom(saved.into_boxed_slice())
+} else {
+    let id = REGION_OPTIONS
+        .get(selected_idx as usize)
+        .map(|(id, _)| *id)
+        .unwrap_or("us-6");
+    AcarsRegion::from_config_id(id)
 };
+let new_count = region.channels().len();
 rebuild_aviation_channel_rows(&panels.aviation, new_count);
 ```
 
