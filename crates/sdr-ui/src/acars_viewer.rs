@@ -671,25 +671,50 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         });
     }
 
-    // ── Status label: <filtered> / <total> ───────────────────────
-    // Re-evaluated on every store change. `items-changed` fires on
-    // append AND on filter re-evaluation, so this catches both.
-    //
-    // Read the filter-model count off the signal's `model`
-    // argument rather than capturing a strong clone — the latter
-    // creates a self-reference (model owns the handler, handler
-    // owns the model) that would keep the viewer model + store
-    // alive past window close.
+    // ── Status label: <filtered> / <total> on the visible tab ────
+    // Switches wording between "messages" and "aircraft" based on
+    // stack.visible_child_name(). Re-evaluated on:
+    //   - either filter model's items-changed signal
+    //   - stack visible-child-notify
     {
+        let stack = handles.stack.clone();
         let status = handles.status_label.clone();
         let store = handles.store.clone();
-        handles
-            .filter_model
-            .connect_items_changed(move |model, _, _, _| {
-                let filtered = model.n_items();
+        let aircraft_store = handles.aircraft_store.clone();
+        let filter_model = handles.filter_model.clone();
+        let aircraft_filter_model = handles.aircraft_filter_model.clone();
+        let refresh = std::rc::Rc::new(move || {
+            let on_aircraft = stack.visible_child_name().as_deref() == Some("aircraft");
+            if on_aircraft {
+                let filtered = aircraft_filter_model.n_items();
+                let total = aircraft_store.n_items();
+                status.set_label(&format!("{filtered} / {total} aircraft"));
+            } else {
+                let filtered = filter_model.n_items();
                 let total = store.n_items();
                 status.set_label(&format!("{filtered} / {total} messages"));
-            });
+            }
+        });
+
+        // Wire the same refresh closure to all three signal
+        // sources. Each clone is its own move-into-closure so
+        // lifetimes work out.
+        {
+            let r = std::rc::Rc::clone(&refresh);
+            handles
+                .filter_model
+                .connect_items_changed(move |_, _, _, _| r());
+        }
+        {
+            let r = std::rc::Rc::clone(&refresh);
+            handles
+                .aircraft_filter_model
+                .connect_items_changed(move |_, _, _, _| r());
+        }
+        {
+            let r = std::rc::Rc::clone(&refresh);
+            handles.stack.connect_visible_child_notify(move |_| r());
+        }
     }
 
     // Wire close-request to clear the `AppState` weak-ref slot AND
