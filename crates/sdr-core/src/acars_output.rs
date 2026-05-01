@@ -13,6 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, mpsc};
 
 use sdr_acars::AcarsMessage;
 
@@ -20,7 +21,6 @@ use sdr_acars::AcarsMessage;
 /// the writer thread reads on every message, the UI side writes
 /// only on user toggle / address edit / station-id change.
 /// Issue #596.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct AcarsWriterConfig {
     /// Where to write the JSONL log. `None` means JSONL output
@@ -37,7 +37,6 @@ pub struct AcarsWriterConfig {
 /// Messages handed from the DSP thread to the writer thread.
 /// Bounded `mpsc::sync_channel` decouples the DSP-thread
 /// `acars_decode_tap` closure from disk / network I/O latency.
-#[allow(dead_code)]
 pub enum AcarsOutputMessage {
     /// One decoded ACARS message, ready to write + feed.
     Decoded(sdr_acars::AcarsMessage),
@@ -192,6 +191,25 @@ impl Default for AcarsOutputs {
     }
 }
 
+/// Writer-thread main loop. Owns the per-thread `JsonlWriter`
+/// and `UdpFeeder` instances, reads `config` on each message
+/// to detect path/addr changes, and exits cleanly when the
+/// sender side disconnects (app shutdown). Issue #596.
+#[allow(dead_code)] // used from tests; caller site lands in Task 5
+#[allow(clippy::needless_pass_by_value)] // rx must be owned to observe disconnect
+fn run_writer_loop(
+    rx: mpsc::Receiver<AcarsOutputMessage>,
+    _config: Arc<RwLock<AcarsWriterConfig>>,
+) {
+    // Real per-message handling lands in Task 4 (path/addr
+    // hot-reload) and Task 5 (writes + send). For now, just
+    // drain the channel so the shutdown-on-disconnect contract
+    // holds.
+    while let Ok(_msg) = rx.recv() {
+        // Drain only — Task 4 + 5 wire writes here.
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -204,6 +222,8 @@ mod tests {
     use sdr_acars::AcarsMessage;
     use serde_json::Value;
     use tempfile::tempdir;
+
+    use std::sync::{Arc, RwLock, mpsc};
 
     use super::*;
 
@@ -307,5 +327,29 @@ mod tests {
         // Unresolvable host.
         // Use .invalid TLD per RFC 6761 — guaranteed to never resolve.
         assert!(UdpFeeder::open("nonexistent.invalid:5550").is_err());
+    }
+
+    #[test]
+    fn writer_thread_exits_on_disconnect() {
+        // Spawn a writer thread, drop the sender, assert the
+        // thread joins within a short timeout. Exercises the
+        // recv() returning Err(Disconnected) → loop break path.
+        let config = Arc::new(RwLock::new(AcarsWriterConfig::default()));
+        let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(8);
+        let handle = std::thread::spawn(move || {
+            run_writer_loop(rx, Arc::clone(&config));
+        });
+        drop(tx);
+        // Loop should exit promptly. Allow up to 500 ms for
+        // schedulability under loaded test workers.
+        let start = std::time::Instant::now();
+        while !handle.is_finished() && start.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handle.is_finished(),
+            "writer thread did not exit within 500ms of tx drop"
+        );
+        handle.join().expect("writer thread panicked");
     }
 }
