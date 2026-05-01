@@ -73,53 +73,29 @@ pub const MAX_CUSTOM_CHANNELS: usize = 8;
 pub const MAX_CHANNEL_SPAN_HZ: f64 = 2_400_000.0;
 
 /// Error variants returned by [`validate_custom_channels`].
-/// `Display` impl produces user-facing toast text. Issue #592.
-#[derive(Clone, Debug, PartialEq)]
+/// `Display` derive produces user-facing toast text via
+/// `thiserror::Error`. Issue #592 / CR round 2 on PR #598.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum CustomChannelError {
+    #[error("Custom channel list is empty")]
     Empty,
-    TooMany {
-        count: usize,
-        max: usize,
-    },
-    InvalidFrequency {
-        value: f64,
-    },
+    #[error("Too many custom channels ({count}); maximum is {max}")]
+    TooMany { count: usize, max: usize },
+    #[error("Invalid custom-channel frequency: {value}")]
+    InvalidFrequency { value: f64 },
+    #[error(
+        "Span {:.3} MHz exceeds {:.3} MHz limit ({:.3} to {:.3} MHz)",
+        *span_hz / 1_000_000.0,
+        MAX_CHANNEL_SPAN_HZ / 1_000_000.0,
+        *low_hz / 1_000_000.0,
+        *high_hz / 1_000_000.0
+    )]
     SpanExceeded {
         low_hz: f64,
         high_hz: f64,
         span_hz: f64,
     },
 }
-
-impl std::fmt::Display for CustomChannelError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "Custom channel list is empty"),
-            Self::TooMany { count, max } => {
-                write!(f, "Too many custom channels ({count}); maximum is {max}")
-            }
-            Self::InvalidFrequency { value } => {
-                write!(f, "Invalid custom-channel frequency: {value}")
-            }
-            Self::SpanExceeded {
-                low_hz,
-                high_hz,
-                span_hz,
-            } => {
-                let span_mhz = span_hz / 1_000_000.0;
-                let low_mhz = low_hz / 1_000_000.0;
-                let high_mhz = high_hz / 1_000_000.0;
-                write!(
-                    f,
-                    "Span {span_mhz:.3} MHz exceeds {} MHz limit ({low_mhz:.3} to {high_mhz:.3} MHz)",
-                    MAX_CHANNEL_SPAN_HZ / 1_000_000.0
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for CustomChannelError {}
 
 /// Validate a slice of custom-channel frequencies (Hz). Returns
 /// `Ok(())` if the list is non-empty, ≤ `MAX_CUSTOM_CHANNELS`,
