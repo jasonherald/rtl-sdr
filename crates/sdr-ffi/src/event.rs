@@ -1292,17 +1292,27 @@ mod tests {
 
     #[test]
     fn translate_acars_channel_stats_is_dropped_at_ffi_boundary() {
-        let msg = DspToUi::AcarsChannelStats(
-            vec![
-                sdr_acars::ChannelStats::default();
-                sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT
-            ]
-            .into_boxed_slice(),
-        );
-        assert!(
-            translate_event(&msg).is_none(),
-            "AcarsChannelStats must not translate to a wire event yet",
-        );
+        // Cover three widths to exercise the variable-length
+        // payload (post-#592 the variant is `Box<[ChannelStats]>`,
+        // not the fixed-width `[ChannelStats; 6]`):
+        //   - 1 channel (Custom region with a single freq)
+        //   - ACARS_CHANNEL_COUNT (predefined US-6 / Europe)
+        //   - ACARS_CHANNEL_COUNT + 1 (Custom region wider than
+        //     the predefined count, up to MAX_CUSTOM_CHANNELS=8)
+        // CR round 1 on PR #598.
+        for n in [
+            1,
+            sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT,
+            sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT + 1,
+        ] {
+            let msg = DspToUi::AcarsChannelStats(
+                vec![sdr_acars::ChannelStats::default(); n].into_boxed_slice(),
+            );
+            assert!(
+                translate_event(&msg).is_none(),
+                "AcarsChannelStats(width={n}) must not translate to a wire event yet",
+            );
+        }
     }
 
     #[test]
