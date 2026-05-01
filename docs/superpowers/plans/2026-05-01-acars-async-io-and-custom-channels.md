@@ -209,6 +209,21 @@ pub struct AcarsWriterConfig {
 pub enum AcarsOutputMessage {
     /// One decoded ACARS message, ready to write + feed.
     Decoded(sdr_acars::AcarsMessage),
+    /// The shared `AcarsWriterConfig` was mutated by the UI
+    /// side. Wakes the writer to re-snapshot config and apply
+    /// `ensure_jsonl` / `ensure_udp` so config-only changes
+    /// (disable, path swap, addr swap) take effect immediately
+    /// instead of being buffered until the next decoded
+    /// message. Wired up in Task 4 (loop arm) and Task 5
+    /// (`notify_config_changed` sender). CR round 1 on PR #598.
+    ConfigChanged,
+    /// Explicit clean-shutdown signal. `Drop for AcarsOutputs`
+    /// emits this before dropping `tx`; the worker also exits
+    /// cleanly on `Err(Disconnected)` as a fallback. Having an
+    /// explicit variant makes shutdown deterministic for tests.
+    /// Wired up in Task 4 (loop arm) and Task 5 (`Drop` impl
+    /// sender). CR round 6 on PR #598.
+    Shutdown,
 }
 ```
 
@@ -430,30 +445,51 @@ fn run_writer_loop(
     let mut jsonl_warn_at: Option<std::time::Instant> = None;
     let mut udp_warn_at: Option<std::time::Instant> = None;
 
-    while let Ok(msg) = rx.recv() {
-        let AcarsOutputMessage::Decoded(msg) = msg;
-
-        // Snapshot the config under a brief read lock so we
-        // don't hold it across blocking I/O. Recover from
-        // poisoning rather than panicking — a panic in the
-        // writer path would otherwise propagate to all later
-        // settings edits. CR round 1 on PR #598.
-        let (want_jsonl_path, want_udp_addr, station_id) = {
-            let cfg = config.read().unwrap_or_else(|p| p.into_inner());
-            (cfg.jsonl_path.clone(), cfg.network_addr.clone(), cfg.station_id.clone())
-        };
-
-        ensure_jsonl(&mut jsonl, want_jsonl_path.as_deref());
-        ensure_udp(&mut udp, want_udp_addr.as_deref());
-
-        if let Some((_, w)) = jsonl.as_mut() {
-            if let Err(e) = w.write(&msg, station_id.as_deref()) {
-                rate_limited_warn("jsonl", &mut jsonl_warn_at, e);
+    // `while let Ok(_)` is the disconnect-fallback path; the
+    // inner `match` handles the explicit `Shutdown` sentinel
+    // (which `break`s out of the outer loop) and the
+    // `ConfigChanged` wake-up. Either path exits cleanly.
+    'recv: while let Ok(msg) = rx.recv() {
+        match msg {
+            AcarsOutputMessage::Shutdown => break 'recv,
+            AcarsOutputMessage::ConfigChanged => {
+                // No payload to write — just resnap config and
+                // close/open. `ensure_*` close on `None` and
+                // reopen on path/addr change, so disabling
+                // JSONL or swapping the destination applies
+                // immediately even with no decoded traffic.
+                // CR round 1 on PR #598.
+                let (want_jsonl_path, want_udp_addr, _station_id) = {
+                    let cfg = config.read().unwrap_or_else(|p| p.into_inner());
+                    (cfg.jsonl_path.clone(), cfg.network_addr.clone(), cfg.station_id.clone())
+                };
+                ensure_jsonl(&mut jsonl, want_jsonl_path.as_deref());
+                ensure_udp(&mut udp, want_udp_addr.as_deref());
             }
-        }
-        if let Some((_, f)) = udp.as_mut() {
-            if let Err(e) = f.send(&msg, station_id.as_deref()) {
-                rate_limited_warn("udp", &mut udp_warn_at, e);
+            AcarsOutputMessage::Decoded(msg) => {
+                // Snapshot the config under a brief read lock so we
+                // don't hold it across blocking I/O. Recover from
+                // poisoning rather than panicking — a panic in the
+                // writer path would otherwise propagate to all later
+                // settings edits. CR round 1 on PR #598.
+                let (want_jsonl_path, want_udp_addr, station_id) = {
+                    let cfg = config.read().unwrap_or_else(|p| p.into_inner());
+                    (cfg.jsonl_path.clone(), cfg.network_addr.clone(), cfg.station_id.clone())
+                };
+
+                ensure_jsonl(&mut jsonl, want_jsonl_path.as_deref());
+                ensure_udp(&mut udp, want_udp_addr.as_deref());
+
+                if let Some((_, w)) = jsonl.as_mut() {
+                    if let Err(e) = w.write(&msg, station_id.as_deref()) {
+                        rate_limited_warn("jsonl", &mut jsonl_warn_at, e);
+                    }
+                }
+                if let Some((_, f)) = udp.as_mut() {
+                    if let Err(e) = f.send(&msg, station_id.as_deref()) {
+                        rate_limited_warn("udp", &mut udp_warn_at, e);
+                    }
+                }
             }
         }
     }
@@ -744,6 +780,24 @@ impl AcarsOutputs {
         self.drop_count.load(Ordering::Relaxed)
     }
 
+    /// Wake the writer thread so it re-snapshots
+    /// `AcarsWriterConfig` and applies `ensure_jsonl` /
+    /// `ensure_udp` immediately. Called by the controller's
+    /// path/addr/enable/station handlers AFTER they mutate
+    /// `config` — without it, the worker only wakes on
+    /// `Decoded` and stale handles linger until the next
+    /// decoded frame (CR round 1 on PR #598).
+    ///
+    /// `try_send`, not `send`: if the channel is full the
+    /// worker is already saturated processing `Decoded` and
+    /// will re-snapshot config on the next iteration anyway —
+    /// a dropped `ConfigChanged` is harmless under that
+    /// pressure. Disconnected (worker gone during teardown)
+    /// is also fine to silently drop.
+    pub fn notify_config_changed(&self) {
+        let _ = self.tx.try_send(AcarsOutputMessage::ConfigChanged);
+    }
+
     /// 30 s-rate-limited warn for channel-full drops. Reads
     /// the current drop count so the message names how many
     /// were lost in this window.
@@ -777,10 +831,20 @@ impl Default for AcarsOutputs {
 
 impl Drop for AcarsOutputs {
     fn drop(&mut self) {
+        // Send the explicit `Shutdown` sentinel first so the
+        // worker exits via the deterministic `Shutdown` arm
+        // rather than the `Err(Disconnected)` fallback. Both
+        // paths drain cleanly, but `Shutdown` means tests can
+        // assert promptness without racing the OS scheduler.
+        // `try_send` is fine — if the channel is full the
+        // `Disconnected` fallback below still terminates.
+        // CR round 6 on PR #598.
+        let _ = self.tx.try_send(AcarsOutputMessage::Shutdown);
+
         // Closing tx triggers Disconnected → the writer loop
-        // exits. We still need to join the thread to make
-        // sure its Drop impls (BufWriter flush) finish before
-        // the process exits.
+        // exits as a fallback. We still need to join the
+        // thread to make sure its Drop impls (BufWriter flush)
+        // finish before the process exits.
         if let Some(handle) = self.writer_thread.take() {
             // Drop the tx clone held by `self.tx` first by
             // overwriting it with a drained channel. (mpsc::SyncSender
