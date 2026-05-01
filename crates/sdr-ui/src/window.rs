@@ -2047,6 +2047,42 @@ fn handle_dsp_message(
                 if (adj.value() - adj.lower()).abs() < 1.0 {
                     adj.set_value(adj.lower());
                 }
+
+                // Aircraft-index update (issue #579). Find or
+                // insert the AircraftEntryObject for this tail,
+                // then call record_message to bump count +
+                // monotonic last_seen + last_label. On an
+                // existing-entry hit, manually nudge the
+                // filter/sort models via items_changed since
+                // GListStore doesn't fire that signal on field
+                // mutation of an already-stored object.
+                {
+                    let mut idx = handles.aircraft_index.borrow_mut();
+                    let inserted = !idx.contains_key(&msg.aircraft);
+                    let obj = idx.entry(msg.aircraft).or_insert_with(|| {
+                        let entry = crate::acars_viewer::AircraftEntry {
+                            tail: msg.aircraft,
+                            last_seen: msg.timestamp,
+                            msg_count: 0,
+                            last_label: msg.label,
+                        };
+                        let obj = crate::acars_viewer::AircraftEntryObject::new(entry);
+                        handles.aircraft_store.append(&obj);
+                        obj
+                    });
+                    obj.record_message(&msg);
+                    if !inserted {
+                        // O(n) over ~50 aircraft is fine; Clear
+                        // invalidates positions otherwise so we
+                        // re-find each time rather than tracking
+                        // a position field on the object. Spec
+                        // edge-case "Aircraft store doesn't
+                        // auto-redraw on field change".
+                        if let Some(pos) = handles.aircraft_store.find(obj) {
+                            handles.aircraft_store.items_changed(pos, 1, 1);
+                        }
+                    }
+                }
             }
 
             tracing::trace!(
