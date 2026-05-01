@@ -184,7 +184,7 @@ pub struct AcarsOutputs {
     last_drop_warn_at: Arc<Mutex<Option<std::time::Instant>>>,
     /// Join handle for the writer thread. `Drop` for
     /// `AcarsOutputs` drops `tx`, which signals shutdown via
-    /// recv() returning Err(Disconnected); we then `join()`.
+    /// `recv()` returning `Err(Disconnected)`; we then `join()`.
     writer_thread: Option<JoinHandle<()>>,
 }
 
@@ -226,13 +226,13 @@ impl AcarsOutputs {
     /// dangling so tests can fill the channel without races.
     #[cfg(test)]
     fn with_capacity_for_test(capacity: usize) -> Self {
-        let (tx, _rx) = mpsc::sync_channel::<AcarsOutputMessage>(capacity);
-        // Leak the receiver as a thread-local so the channel
-        // doesn't disconnect (which would route try_send into
-        // the Disconnected arm instead of Full). std::mem::forget
-        // is the cheapest way to do this in test context.
+        let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(capacity);
+        // Leak the receiver so the channel doesn't disconnect
+        // (which would route try_send into the Disconnected arm
+        // instead of Full). std::mem::forget is the cheapest way
+        // to do this in test context.
         #[allow(clippy::mem_forget)]
-        std::mem::forget(_rx);
+        std::mem::forget(rx);
         let config = Arc::new(RwLock::new(AcarsWriterConfig::default()));
         Self {
             tx,
