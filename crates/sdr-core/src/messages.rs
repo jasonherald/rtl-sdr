@@ -167,7 +167,7 @@ pub enum DspToUi {
     AcarsMessage(Box<sdr_acars::AcarsMessage>),
     /// Per-channel ACARS stats. Emitted no more than once per
     /// `ACARS_STATS_EMIT_INTERVAL_MS` while ACARS is on.
-    AcarsChannelStats(Box<[sdr_acars::ChannelStats; 6]>),
+    AcarsChannelStats(Box<[sdr_acars::ChannelStats]>),
     /// Ack for `UiToDsp::SetAcarsEnabled`. `Ok(true)` after a
     /// successful engage; `Ok(false)` after disengage; `Err`
     /// on any failure (bank init, source retune, etc).

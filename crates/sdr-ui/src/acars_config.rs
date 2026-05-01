@@ -37,6 +37,11 @@ pub const KEY_ACARS_NETWORK_ADDR: &str = "acars_network_addr";
 /// `station_id` field. Empty ⇒ field omitted. Issue #578.
 pub const KEY_ACARS_STATION_ID: &str = "acars_station_id";
 
+/// Custom-channel frequencies (Hz) persisted when the active
+/// region is `Custom`. Empty array ⇒ no custom channels saved
+/// yet (or the active region isn't Custom). Issue #592.
+pub const KEY_ACARS_CUSTOM_CHANNELS: &str = "acars_custom_channels";
+
 /// Default value used when a key is missing from the config.
 const DEFAULT_ACARS_ENABLED: bool = false;
 const DEFAULT_ACARS_CHANNEL_SET: &str = "us-6";
@@ -163,6 +168,28 @@ pub fn save_acars_station_id(config: &ConfigManager, value: &str) {
     });
 }
 
+/// Read the persisted custom-channel frequency list (Hz).
+/// Returns an empty `Vec` if the key is absent or cannot be
+/// deserialized. Issue #592.
+#[must_use]
+pub fn read_acars_custom_channels(config: &ConfigManager) -> Vec<f64> {
+    config.read(|v| {
+        v.get(KEY_ACARS_CUSTOM_CHANNELS)
+            .and_then(|val| serde_json::from_value(val.clone()).ok())
+            .unwrap_or_default()
+    })
+}
+
+/// Persist a custom-channel frequency list (Hz). Caller is
+/// responsible for validating via
+/// `acars_airband_lock::validate_custom_channels` before
+/// calling. Issue #592.
+pub fn save_acars_custom_channels(config: &ConfigManager, chans: &[f64]) {
+    config.write(|v| {
+        v[KEY_ACARS_CUSTOM_CHANNELS] = serde_json::json!(chans);
+    });
+}
+
 /// Default ring-buffer cap. Returns the spec default
 /// (`ACARS_RECENT_DEFAULT_KEEP = 500`); sub-project 3 may
 /// extend this to consult `ConfigManager` for an override.
@@ -231,5 +258,19 @@ mod tests {
         assert!(read_acars_network_enabled(&cfg));
         assert_eq!(read_acars_network_addr(&cfg), "127.0.0.1:5550");
         assert_eq!(read_acars_station_id(&cfg), "TEST1");
+    }
+
+    #[test]
+    fn acars_custom_channels_round_trips() {
+        let cfg = fresh_config();
+        save_acars_custom_channels(&cfg, &[131_550_000.0, 131_525_000.0, 130_025_000.0]);
+        let chans = read_acars_custom_channels(&cfg);
+        assert_eq!(chans, vec![131_550_000.0_f64, 131_525_000.0, 130_025_000.0]);
+    }
+
+    #[test]
+    fn acars_custom_channels_empty_default() {
+        let cfg = fresh_config();
+        assert_eq!(read_acars_custom_channels(&cfg), Vec::<f64>::new());
     }
 }

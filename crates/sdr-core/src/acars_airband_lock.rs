@@ -61,6 +61,81 @@ pub const EUROPE_SIX_CHANNELS_HZ: [f64; ACARS_CHANNEL_COUNT] = [
     131_875_000.0,
 ];
 
+/// Maximum number of channels in a user-defined custom region.
+/// Sized for any realistic ACARS cluster within
+/// `MAX_CHANNEL_SPAN_HZ`. Issue #592.
+pub const MAX_CUSTOM_CHANNELS: usize = 8;
+
+/// Maximum allowed span (max - min) of a custom channel set
+/// in Hz. Set to 2.4 MHz to leave a 100 kHz margin against
+/// the 2.5 `MSps` source rate (Nyquist bandwidth ≈ 2.5 MHz).
+/// Issue #592.
+pub const MAX_CHANNEL_SPAN_HZ: f64 = 2_400_000.0;
+
+/// Error variants returned by [`validate_custom_channels`].
+/// `Display` derive produces user-facing toast text via
+/// `thiserror::Error`. Issue #592 / CR round 2 on PR #598.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum CustomChannelError {
+    #[error("Custom channel list is empty")]
+    Empty,
+    #[error("Too many custom channels ({count}); maximum is {max}")]
+    TooMany { count: usize, max: usize },
+    #[error("Invalid custom-channel frequency: {value}")]
+    InvalidFrequency { value: f64 },
+    #[error(
+        "Span {:.3} MHz exceeds {:.3} MHz limit ({:.3} to {:.3} MHz)",
+        *span_hz / 1_000_000.0,
+        MAX_CHANNEL_SPAN_HZ / 1_000_000.0,
+        *low_hz / 1_000_000.0,
+        *high_hz / 1_000_000.0
+    )]
+    SpanExceeded {
+        low_hz: f64,
+        high_hz: f64,
+        span_hz: f64,
+    },
+}
+
+/// Validate a slice of custom-channel frequencies (Hz). Returns
+/// `Ok(())` if the list is non-empty, ≤ `MAX_CUSTOM_CHANNELS`,
+/// all values are finite + positive, and `max - min ≤
+/// MAX_CHANNEL_SPAN_HZ`. Issue #592.
+pub fn validate_custom_channels(chans: &[f64]) -> Result<(), CustomChannelError> {
+    if chans.is_empty() {
+        return Err(CustomChannelError::Empty);
+    }
+    if chans.len() > MAX_CUSTOM_CHANNELS {
+        return Err(CustomChannelError::TooMany {
+            count: chans.len(),
+            max: MAX_CUSTOM_CHANNELS,
+        });
+    }
+    for &c in chans {
+        if !c.is_finite() || c <= 0.0 {
+            return Err(CustomChannelError::InvalidFrequency { value: c });
+        }
+    }
+    let (mut min, mut max) = (chans[0], chans[0]);
+    for &c in &chans[1..] {
+        if c < min {
+            min = c;
+        }
+        if c > max {
+            max = c;
+        }
+    }
+    let span = max - min;
+    if span > MAX_CHANNEL_SPAN_HZ {
+        return Err(CustomChannelError::SpanExceeded {
+            low_hz: min,
+            high_hz: max,
+            span_hz: span,
+        });
+    }
+    Ok(())
+}
+
 /// Predefined ACARS channel set. Issue #581. The DSP layer
 /// (`sdr_acars::ChannelBank`) is region-agnostic — all this
 /// type does is pick which fixed array to feed it and where
@@ -73,36 +148,46 @@ pub const EUROPE_SIX_CHANNELS_HZ: [f64; ACARS_CHANNEL_COUNT] = [
 /// rely on exhaustive matching, which is exactly the contract
 /// this enum needs given its forward-compat plan. CR round 1
 /// on PR #593.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub enum AcarsRegion {
     /// North America (default). Six channels in 129.125–
-    /// 131.550 MHz. Center 130.3375 MHz.
+    /// 131.550 MHz.
     #[default]
     Us6,
     /// Europe. Six channels clustered in 131.450–131.875 MHz.
-    /// Center derived from the cluster midpoint.
     Europe,
+    /// User-defined channel set. Frequencies in Hz; validated
+    /// via `validate_custom_channels` at construction time.
+    /// Issue #592.
+    Custom(Box<[f64]>),
 }
 
 impl AcarsRegion {
-    /// Channels for this region (Hz).
+    /// Channels for this region (Hz). Returns a borrowed slice
+    /// so all variants — including `Custom` — share one
+    /// accessor. Issue #592.
     #[must_use]
-    pub const fn channels(self) -> [f64; ACARS_CHANNEL_COUNT] {
+    pub fn channels(&self) -> &[f64] {
         match self {
-            Self::Us6 => US_SIX_CHANNELS_HZ,
-            Self::Europe => EUROPE_SIX_CHANNELS_HZ,
+            Self::Us6 => &US_SIX_CHANNELS_HZ,
+            Self::Europe => &EUROPE_SIX_CHANNELS_HZ,
+            Self::Custom(c) => c,
         }
     }
 
     /// Source center frequency for this region (Hz). Computed
     /// as the midpoint of `min(channels)` and `max(channels)`
     /// so the cluster fits symmetrically inside the 2.5 MHz
-    /// Nyquist window. The channel order in `channels()` is
-    /// not assumed to be sorted.
+    /// Nyquist window.
     #[must_use]
-    pub fn center_hz(self) -> f64 {
+    pub fn center_hz(&self) -> f64 {
         let chans = self.channels();
+        if chans.is_empty() {
+            // `Custom([])` placeholder shouldn't reach engage,
+            // but keep this defensive — return 0.0.
+            return 0.0;
+        }
         let mut min = chans[0];
         let mut max = chans[0];
         for &c in &chans[1..] {
@@ -117,37 +202,40 @@ impl AcarsRegion {
     }
 
     /// Stable string id used as the `acars_region` config key
-    /// value. Round-trips with `from_config_id`.
+    /// value. Round-trips with `from_config_id`. The `Custom`
+    /// arm always returns `"custom"`; the actual channel list
+    /// is persisted under a separate `acars_custom_channels`
+    /// config key.
     #[must_use]
-    pub const fn config_id(self) -> &'static str {
+    pub fn config_id(&self) -> &'static str {
         match self {
             Self::Us6 => "us-6",
             Self::Europe => "europe",
+            Self::Custom(_) => "custom",
         }
     }
 
-    /// Inverse of `config_id`. Falls back to the default on
-    /// unrecognised strings (forward-compat with future
-    /// regions).
+    /// Inverse of `config_id`. Falls back to default on
+    /// unrecognised strings. Returns `Custom(Box::new([]))`
+    /// for `"custom"` — the load-side caller in
+    /// `window.rs::startup_replay` populates the actual
+    /// frequencies from `acars_custom_channels`.
     #[must_use]
     pub fn from_config_id(id: &str) -> Self {
         match id {
             "europe" => Self::Europe,
-            // "us-6" + anything else → default. We don't error
-            // on unknown values because that would lock users
-            // out of the panel after a downgrade or stale
-            // config; falling back is the more forgiving
-            // behaviour.
+            "custom" => Self::Custom(Box::new([])),
             _ => Self::Us6,
         }
     }
 
     /// Display label for the Aviation panel combo row.
     #[must_use]
-    pub const fn display_label(self) -> &'static str {
+    pub fn display_label(&self) -> &'static str {
         match self {
             Self::Us6 => "United States (US-6)",
             Self::Europe => "Europe",
+            Self::Custom(_) => "Custom",
         }
     }
 }
@@ -275,10 +363,23 @@ pub struct DisengagePlan {
 /// preserve the pre-#581 behaviour.
 pub fn engage(
     current: &CurrentSourceState,
-    region: AcarsRegion,
+    region: &AcarsRegion,
 ) -> Result<EngagePlan, AcarsEnableError> {
     if current.source_type != SourceType::RtlSdr {
         return Err(AcarsEnableError::UnsupportedSourceType(current.source_type));
+    }
+    // Reject empty / invalid Custom regions before computing
+    // geometry. `from_config_id("custom")` builds a placeholder
+    // `Custom(Box::new([]))` that should never reach engage —
+    // window.rs::startup_replay validates and falls back to the
+    // default region on stale config, but defending here keeps
+    // an `target_center_hz = 0.0` from leaking through if any
+    // future path constructs an empty Custom and dispatches it.
+    // CR round 1 on PR #598.
+    if let AcarsRegion::Custom(chans) = region {
+        validate_custom_channels(chans).map_err(|e| {
+            AcarsEnableError::ChannelBankInit(format!("invalid custom-channel set: {e}"))
+        })?;
     }
     Ok(EngagePlan {
         target_source_rate_hz: ACARS_SOURCE_RATE_HZ,
@@ -324,7 +425,7 @@ mod tests {
     #[test]
     fn engage_snapshots_and_emits_target_geometry() {
         let plan =
-            engage(&rtl_state(), AcarsRegion::default()).expect("RTL-SDR engage should succeed");
+            engage(&rtl_state(), &AcarsRegion::default()).expect("RTL-SDR engage should succeed");
         assert_eq!(plan.target_source_rate_hz, ACARS_SOURCE_RATE_HZ);
         assert_eq!(plan.target_center_hz, ACARS_CENTER_HZ);
         assert_eq!(plan.target_frontend_decim, ACARS_FRONTEND_DECIM);
@@ -336,11 +437,52 @@ mod tests {
     }
 
     #[test]
+    fn engage_rejects_empty_custom_region() {
+        // CR round 1 on PR #598: an empty `Custom` region (the
+        // placeholder `from_config_id("custom")` returns when
+        // saved channels haven't been validated yet) must not
+        // reach engage. Without this guard, `center_hz()`
+        // returns 0.0 and the controller would retune to 0 Hz.
+        let region = AcarsRegion::Custom(Box::new([]));
+        match engage(&rtl_state(), &region) {
+            Err(AcarsEnableError::ChannelBankInit(msg)) => {
+                assert!(
+                    msg.contains("invalid custom-channel set"),
+                    "error wraps validate_custom_channels output: {msg}"
+                );
+            }
+            other => panic!("expected ChannelBankInit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engage_rejects_oversized_custom_region() {
+        #[allow(clippy::cast_precision_loss)]
+        let chans: Vec<f64> = (0..=MAX_CUSTOM_CHANNELS)
+            .map(|i| 131_000_000.0 + (i as f64) * 100_000.0)
+            .collect();
+        let region = AcarsRegion::Custom(chans.into_boxed_slice());
+        match engage(&rtl_state(), &region) {
+            Err(AcarsEnableError::ChannelBankInit(msg)) => {
+                assert!(msg.contains("Too many custom channels"), "msg={msg}");
+            }
+            other => panic!("expected ChannelBankInit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engage_accepts_valid_custom_region() {
+        let region = AcarsRegion::Custom(Box::new([131_550_000.0, 131_525_000.0]));
+        let plan = engage(&rtl_state(), &region).expect("valid Custom region engages");
+        assert_eq!(plan.target_center_hz, region.center_hz());
+    }
+
+    #[test]
     fn engage_rejects_non_rtl_sources() {
         for bad in [SourceType::Network, SourceType::File, SourceType::RtlTcp] {
             let mut state = rtl_state();
             state.source_type = bad;
-            match engage(&state, AcarsRegion::default()) {
+            match engage(&state, &AcarsRegion::default()) {
                 Err(AcarsEnableError::UnsupportedSourceType(t)) => assert_eq!(t, bad),
                 other => panic!("source={bad:?} expected UnsupportedSourceType, got {other:?}"),
             }
@@ -349,7 +491,7 @@ mod tests {
 
     #[test]
     fn engage_with_europe_region_targets_europe_center() {
-        let plan = engage(&rtl_state(), AcarsRegion::Europe)
+        let plan = engage(&rtl_state(), &AcarsRegion::Europe)
             .expect("RTL-SDR + Europe engage should succeed");
         assert_eq!(plan.target_center_hz, AcarsRegion::Europe.center_hz());
         // Sanity: Europe's center is well above US-6's. Pin a
@@ -374,7 +516,7 @@ mod tests {
 
     #[test]
     fn disengage_returns_snapshotted_geometry_verbatim() {
-        let plan = engage(&rtl_state(), AcarsRegion::default()).unwrap();
+        let plan = engage(&rtl_state(), &AcarsRegion::default()).unwrap();
         let restore = disengage(&plan.snapshot);
         assert_eq!(restore.target_source_rate_hz, 1_024_000.0);
         assert_eq!(restore.target_center_hz, 162_550_000.0);
@@ -385,11 +527,145 @@ mod tests {
     #[test]
     fn engage_then_disengage_is_a_round_trip() {
         let original = rtl_state();
-        let plan = engage(&original, AcarsRegion::default()).unwrap();
+        let plan = engage(&original, &AcarsRegion::default()).unwrap();
         let restore = disengage(&plan.snapshot);
         assert_eq!(restore.target_source_rate_hz, original.source_rate_hz);
         assert_eq!(restore.target_center_hz, original.center_freq_hz);
         assert_eq!(restore.target_frontend_decim, original.frontend_decim);
         assert_eq!(restore.target_vfo_offset_hz, original.vfo_offset_hz);
+    }
+
+    #[test]
+    fn validate_rejects_empty() {
+        assert_eq!(
+            validate_custom_channels(&[]),
+            Err(CustomChannelError::Empty)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_single_channel() {
+        assert_eq!(validate_custom_channels(&[131_550_000.0]), Ok(()));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn validate_accepts_max_count() {
+        let chans: Vec<f64> = (0..MAX_CUSTOM_CHANNELS)
+            .map(|i| 131_000_000.0 + (i as f64) * 100_000.0)
+            .collect();
+        assert_eq!(validate_custom_channels(&chans), Ok(()));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn validate_rejects_too_many() {
+        let chans: Vec<f64> = (0..=MAX_CUSTOM_CHANNELS)
+            .map(|i| 131_000_000.0 + (i as f64) * 100_000.0)
+            .collect();
+        assert_eq!(
+            validate_custom_channels(&chans),
+            Err(CustomChannelError::TooMany {
+                count: MAX_CUSTOM_CHANNELS + 1,
+                max: MAX_CUSTOM_CHANNELS,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nan() {
+        match validate_custom_channels(&[131_550_000.0, f64::NAN]) {
+            Err(CustomChannelError::InvalidFrequency { .. }) => {}
+            other => panic!("expected InvalidFrequency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_inf() {
+        match validate_custom_channels(&[131_550_000.0, f64::INFINITY]) {
+            Err(CustomChannelError::InvalidFrequency { .. }) => {}
+            other => panic!("expected InvalidFrequency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_or_zero() {
+        match validate_custom_channels(&[131_550_000.0, 0.0]) {
+            Err(CustomChannelError::InvalidFrequency { value: 0.0 }) => {}
+            other => panic!("expected InvalidFrequency(0.0), got {other:?}"),
+        }
+        match validate_custom_channels(&[131_550_000.0, -1.0]) {
+            Err(CustomChannelError::InvalidFrequency { value: -1.0 }) => {}
+            other => panic!("expected InvalidFrequency(-1.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_span_just_under() {
+        // 2.4 MHz exact span — accepted (the constraint is ≤).
+        assert_eq!(
+            validate_custom_channels(&[129_125_000.0, 131_525_000.0]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_rejects_span_just_over() {
+        // 2.5 MHz — rejected.
+        match validate_custom_channels(&[129_000_000.0, 131_500_000.0]) {
+            Err(CustomChannelError::SpanExceeded {
+                low_hz,
+                high_hz,
+                span_hz,
+            }) => {
+                assert!((low_hz - 129_000_000.0).abs() < 1.0);
+                assert!((high_hz - 131_500_000.0).abs() < 1.0);
+                assert!((span_hz - 2_500_000.0).abs() < 1.0);
+            }
+            other => panic!("expected SpanExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_channel_error_display_span_exceeded() {
+        let err = CustomChannelError::SpanExceeded {
+            low_hz: 129_000_000.0,
+            high_hz: 131_500_000.0,
+            span_hz: 2_500_000.0,
+        };
+        let s = format!("{err}");
+        assert!(s.contains("2.5"), "span value present: {s}");
+        assert!(s.contains("129"), "low freq present: {s}");
+        assert!(s.contains("131"), "high freq present: {s}");
+    }
+
+    #[test]
+    fn from_config_id_round_trips_custom() {
+        // Custom is a placeholder — channels live in a separate
+        // config key, loaded by window.rs::startup-replay.
+        let r = AcarsRegion::from_config_id("custom");
+        assert_eq!(r.config_id(), "custom");
+        // Empty placeholder: from_config_id returns Custom([])
+        // unconditionally; the actual frequencies are populated
+        // by the load-side caller.
+        assert_eq!(r.channels(), &[] as &[f64]);
+    }
+
+    #[test]
+    fn channels_accessor_returns_borrowed_slice() {
+        let us = AcarsRegion::Us6;
+        let eu = AcarsRegion::Europe;
+        assert_eq!(us.channels().len(), ACARS_CHANNEL_COUNT);
+        assert_eq!(eu.channels().len(), ACARS_CHANNEL_COUNT);
+
+        let custom = AcarsRegion::Custom(Box::from([131_550_000.0, 131_525_000.0].as_slice()));
+        assert_eq!(custom.channels().len(), 2);
+        assert!((custom.channels()[0] - 131_550_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn display_label_custom() {
+        let custom = AcarsRegion::Custom(Box::from([131_550_000.0].as_slice()));
+        assert_eq!(custom.display_label(), "Custom");
     }
 }

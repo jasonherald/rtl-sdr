@@ -142,7 +142,7 @@ fn dsp_thread_main(
 ) {
     tracing::info!("DSP controller thread started");
 
-    let mut state = match DspState::new() {
+    let mut state = match DspState::new(dsp_tx.clone()) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("failed to initialize DSP state: {e}");
@@ -226,55 +226,7 @@ fn poll_rtl_tcp_connection_state(state: &mut DspState, dsp_tx: &mpsc::Sender<Dsp
     }
 }
 
-/// Output-writer bundle owned by `DspState`. Keeps the
-/// JSONL writer, UDP feeder, station ID, and per-writer
-/// warn-rate-limit timestamps together so the
-/// `acars_decode_tap` signature stays narrow. Issue #578.
-struct AcarsOutputs {
-    jsonl: Option<crate::acars_output::JsonlWriter>,
-    udp: Option<crate::acars_output::UdpFeeder>,
-    /// User's enable intent for the JSONL writer. Persists
-    /// across disengage / open-failure so path changes can
-    /// trigger reopen, and ACARS re-engage can restore the
-    /// writer. Issue #578.
-    jsonl_enabled: bool,
-    /// User's enable intent for the UDP feeder. Same pattern
-    /// as `jsonl_enabled`.
-    network_enabled: bool,
-    station_id: Option<String>,
-    /// Last warn timestamp for JSONL write failures. 30 s
-    /// rate limit prevents log spam from a misconfigured
-    /// path. Issue #578.
-    jsonl_warn_at: Option<std::time::Instant>,
-    /// Last warn timestamp for UDP send failures.
-    udp_warn_at: Option<std::time::Instant>,
-    /// Latest user-set JSONL path (resolved when opening).
-    /// `None` ⇒ use default `~/sdr-recordings/acars.jsonl`.
-    pending_jsonl_path: Option<String>,
-    /// Latest user-set feeder addr. `None` ⇒ default
-    /// `feed.airframes.io:5550`.
-    pending_network_addr: Option<String>,
-}
-
-impl AcarsOutputs {
-    const fn new() -> Self {
-        Self {
-            jsonl: None,
-            udp: None,
-            jsonl_enabled: false,
-            network_enabled: false,
-            station_id: None,
-            jsonl_warn_at: None,
-            udp_warn_at: None,
-            pending_jsonl_path: None,
-            pending_network_addr: None,
-        }
-    }
-}
-
-/// Minimum interval between repeated warn-log emissions for
-/// the same writer. Issue #578.
-const ACARS_OUTPUT_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::acars_output::AcarsOutputs;
 
 /// Mutable state owned by the DSP thread.
 ///
@@ -613,15 +565,27 @@ struct DspState {
     /// `UiToDsp::SetAcarsRegion` before engage; read at
     /// engage time to pick channels + center.
     acars_region: crate::acars_airband_lock::AcarsRegion,
-    /// Output-writer bundle: JSONL log, UDP feeder, station
-    /// ID, and per-writer warn-rate-limit timestamps.
-    /// Tap wiring (`jsonl_warn_at` / `udp_warn_at`) lands in Task 9.
-    /// Issue #578.
+    /// Output-writer bundle: bounded `mpsc` channel to a
+    /// dedicated writer thread that owns the JSONL file +
+    /// UDP socket. Shared `Arc<RwLock<AcarsWriterConfig>>`
+    /// holds the runtime-mutable jsonl path / network addr /
+    /// station ID; the DSP thread calls `try_send` per
+    /// decoded message. Issues #578 + #596.
     acars_outputs: AcarsOutputs,
+    /// Most-recent user-set JSONL destination, preserved across
+    /// disable/enable toggles so re-enabling restores the user's
+    /// previously-chosen path rather than the default. Mirrors
+    /// what would otherwise live in `AcarsWriterConfig.jsonl_path`
+    /// but separated so the writer's `Some/None` "is enabled"
+    /// semantics stay clean. CR round 2 on PR #598.
+    acars_last_user_jsonl_path: Option<std::path::PathBuf>,
+    /// Same pattern as `acars_last_user_jsonl_path` for the
+    /// UDP feeder. CR round 2 on PR #598.
+    acars_last_user_network_addr: Option<String>,
 }
 
 impl DspState {
-    fn new() -> Result<Self, String> {
+    fn new(dsp_tx: mpsc::Sender<DspToUi>) -> Result<Self, String> {
         let frontend = IqFrontend::new(
             DEFAULT_SAMPLE_RATE,
             DEFAULT_DECIMATION,
@@ -713,7 +677,9 @@ impl DspState {
             acars_init_failed: false,
             acars_stats_emitted_at: std::time::Instant::now(),
             acars_region: crate::acars_airband_lock::AcarsRegion::default(),
-            acars_outputs: AcarsOutputs::new(),
+            acars_outputs: AcarsOutputs::new(dsp_tx),
+            acars_last_user_jsonl_path: None,
+            acars_last_user_network_addr: None,
         })
     }
 }
@@ -884,7 +850,7 @@ fn acars_decode_tap(
     channels: &[f64],
     iq: &[sdr_types::Complex],
     dsp_tx: &std::sync::mpsc::Sender<crate::messages::DspToUi>,
-    outputs: &mut AcarsOutputs,
+    outputs: &AcarsOutputs,
 ) {
     // Compile-time guard: `bytemuck::cast_slice::<Complex, Complex32>`
     // below is sound because both types are `repr(C) { re: f32, im: f32 }`
@@ -931,49 +897,14 @@ fn acars_decode_tap(
     // at compile time.
     let iq_c32: &[num_complex::Complex32] = bytemuck::cast_slice(iq);
     bank.process(iq_c32, |msg| {
-        // JSONL write — log warn + toast (both rate-limited)
-        // on failure. Without the toast, a disk-full or
-        // permission-loss after open would silently drop
-        // future messages from the user's perspective while
-        // ACARS decoding continues normally. CR round 7 on
-        // PR #595.
-        if let Some(w) = outputs.jsonl.as_mut()
-            && let Err(e) = w.write(&msg, outputs.station_id.as_deref())
-        {
-            let now = std::time::Instant::now();
-            let elapsed = outputs
-                .jsonl_warn_at
-                .map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
-            if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
-                let message = format!("acars jsonl write failed: {e}");
-                tracing::warn!("{message} (rate-limited 30s)");
-                outputs.jsonl_warn_at = Some(now);
-                let _ = dsp_tx.send(crate::messages::DspToUi::AcarsOutputError {
-                    kind: "jsonl",
-                    message,
-                });
-            }
-        }
-
-        // UDP send — same warn + toast pattern.
-        if let Some(f) = outputs.udp.as_ref()
-            && let Err(e) = f.send(&msg, outputs.station_id.as_deref())
-        {
-            let now = std::time::Instant::now();
-            let elapsed = outputs
-                .udp_warn_at
-                .map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
-            if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
-                let message = format!("acars udp send failed: {e}");
-                tracing::warn!("{message} (rate-limited 30s)");
-                outputs.udp_warn_at = Some(now);
-                let _ = dsp_tx.send(crate::messages::DspToUi::AcarsOutputError {
-                    kind: "udp",
-                    message,
-                });
-            }
-        }
-
+        // Hand off to the writer thread via the bounded
+        // channel. Drop-on-full is handled by `try_send`
+        // (rate-limited warn lives there). The writer thread
+        // owns JsonlWriter::write + UdpFeeder::send and reads
+        // station_id / paths from the shared config lock.
+        // Issue #596.
+        outputs.try_send(msg.clone());
+        // Forward to the UI viewer regardless of writer state.
         // Boxed because AcarsMessage is large enough that
         // unboxed would inflate the DspToUi enum's footprint.
         let _ = dsp_tx.send(crate::messages::DspToUi::AcarsMessage(Box::new(msg)));
@@ -1080,28 +1011,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 state.acars_bank = None;
                                 state.acars_init_failed = false;
                                 state.acars_stats_emitted_at = std::time::Instant::now();
-                                // Mirror the engage-path output reopen
-                                // hook for the enable-while-stopped /
-                                // startup-replay flow: if writers were
-                                // intended-on but failed to open during
-                                // the engage (or never got a chance),
-                                // retry now that the source is going
-                                // live. Without this the session would
-                                // silently run with no JSONL / UDP until
-                                // the user toggles or reapplies the
-                                // destination. CR round 6 on PR #595.
-                                if state.acars_outputs.jsonl_enabled
-                                    && state.acars_outputs.jsonl.is_none()
-                                {
-                                    let path = jsonl_path_for(&state.acars_outputs);
-                                    open_jsonl(state, dsp_tx, &path);
-                                }
-                                if state.acars_outputs.network_enabled
-                                    && state.acars_outputs.udp.is_none()
-                                {
-                                    let addr = network_addr_for(&state.acars_outputs);
-                                    open_udp(state, dsp_tx, &addr);
-                                }
+                                // Writer thread auto-opens JSONL / UDP
+                                // on the next message based on the
+                                // config lock; no per-Start reopen
+                                // needed. Issue #596.
                                 tracing::debug!(
                                     sample_rate = state.sample_rate,
                                     center_freq = state.center_freq,
@@ -1191,11 +1104,6 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 state.acars_bank = None;
                                 state.acars_init_failed = false;
                                 state.acars_pre_lock = None;
-                                // Forced-off path also closes
-                                // output writers — intent flags
-                                // persist for the next engage.
-                                // CR round 2 on PR #595.
-                                close_acars_outputs(&mut state.acars_outputs);
                                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
                                 // Also send a definitive Ok(false)
                                 // so the UI (which preserves state
@@ -3395,10 +3303,6 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     state.acars_init_failed = false;
     state.acars_pre_lock = None;
     if acars_forced_off {
-        // Close output writers on forced-off cleanup. Intent
-        // flags persist so a future engage reopens. CR round 2
-        // on PR #595.
-        close_acars_outputs(&mut state.acars_outputs);
         let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
     }
 
@@ -3681,10 +3585,10 @@ fn process_iq_block(
                         &mut state.acars_init_failed,
                         state.sample_rate,
                         state.center_freq,
-                        &state.acars_region.channels(),
+                        state.acars_region.channels(),
                         &state.processed_buf[..processed_count],
                         dsp_tx,
-                        &mut state.acars_outputs,
+                        &state.acars_outputs,
                     );
 
                     // ~1 Hz channel-stats emission throttle.
@@ -3697,21 +3601,16 @@ fn process_iq_block(
                         && let Some(bank) = state.acars_bank.as_ref()
                     {
                         let ch_stats = bank.channels();
-                        // `<[T; N]>::try_from(&[T])` requires `T: Copy`,
-                        // which `ChannelStats` derives. Returns `Err` if
-                        // the slice length doesn't equal N — silently
-                        // drops the emission rather than panicking, so
-                        // a future channel-set width mismatch fails
-                        // visibly via missing stats updates rather than
-                        // crashing the DSP thread.
-                        if let Ok(arr) = <[sdr_acars::ChannelStats;
-                            crate::acars_airband_lock::ACARS_CHANNEL_COUNT]>::try_from(
-                            ch_stats
-                        ) {
-                            let _ = dsp_tx
-                                .send(crate::messages::DspToUi::AcarsChannelStats(Box::new(arr)));
-                            state.acars_stats_emitted_at = now;
-                        }
+                        // Box the slice as `Box<[ChannelStats]>` so the
+                        // message variant is variable-width — the
+                        // active region's channel count can be 6 (US-6
+                        // / Europe) or up to `MAX_CUSTOM_CHANNELS` for
+                        // a Custom region. Per Task 9 of the bundled
+                        // ACARS PR plan.
+                        let _ = dsp_tx.send(crate::messages::DspToUi::AcarsChannelStats(
+                            ch_stats.to_vec().into_boxed_slice(),
+                        ));
+                        state.acars_stats_emitted_at = now;
                     }
                 }
 
@@ -4330,12 +4229,6 @@ fn handle_acars_engage_failure(
     state.acars_init_failed = false;
     state.acars_pre_lock = None;
 
-    // Output writers may have been opened by an earlier engage;
-    // close them on forced-off so file/socket handles don't
-    // leak. Intent flags persist for the next engage.
-    // CR round 2 on PR #595.
-    close_acars_outputs(&mut state.acars_outputs);
-
     let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(orig_err)));
 
     // Signal teardown to caller if the live rollback failed AND
@@ -4375,157 +4268,142 @@ fn resolve_jsonl_path(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-/// Default JSONL path for the current `AcarsOutputs`. Resolves
-/// the user's pending path when set; falls back to the home-
-/// derived default when unset.
-fn jsonl_path_for(outputs: &AcarsOutputs) -> std::path::PathBuf {
-    resolve_jsonl_path(outputs.pending_jsonl_path.as_deref().unwrap_or(""))
-}
+/// Default UDP feeder address for the airframes.io public
+/// feed. Used when the network output is enabled without an
+/// explicit address.
+const ACARS_NETWORK_DEFAULT_ADDR: &str = "feed.airframes.io:5550";
 
-/// Default UDP feeder address for the current `AcarsOutputs`.
-/// Returns the user's pending addr when set; falls back to
-/// airframes.io's default when unset.
-fn network_addr_for(outputs: &AcarsOutputs) -> String {
-    outputs
-        .pending_network_addr
-        .clone()
-        .unwrap_or_else(|| "feed.airframes.io:5550".to_string())
-}
-
-/// Open the JSONL writer; on failure log + emit
-/// `DspToUi::AcarsOutputError` toast.
-fn open_jsonl(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, path: &std::path::Path) {
-    match crate::acars_output::JsonlWriter::open(path) {
-        Ok(w) => {
-            tracing::info!("acars jsonl writer opened at {}", path.display());
-            state.acars_outputs.jsonl = Some(w);
-            // Reset the warn throttle so the first failure
-            // against this newly-opened destination logs
-            // immediately rather than getting silenced by the
-            // 30 s window from the previous destination.
-            // CR round 5 on PR #595.
-            state.acars_outputs.jsonl_warn_at = None;
-        }
-        Err(e) => {
-            let message = format!("Could not open {}: {e}", path.display());
-            tracing::warn!("acars jsonl open failed: {message}");
-            let _ = dsp_tx.send(DspToUi::AcarsOutputError {
-                kind: "jsonl",
-                message,
-            });
-        }
-    }
-}
-
-/// Open the UDP feeder; on failure log + emit
-/// `DspToUi::AcarsOutputError` toast.
-fn open_udp(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, addr: &str) {
-    match crate::acars_output::UdpFeeder::open(addr) {
-        Ok(f) => {
-            tracing::info!("acars udp feeder opened at {addr}");
-            state.acars_outputs.udp = Some(f);
-            // Reset the warn throttle — same reason as
-            // open_jsonl above. CR round 5 on PR #595.
-            state.acars_outputs.udp_warn_at = None;
-        }
-        Err(e) => {
-            let message = format!("Could not open feeder at {addr}: {e}");
-            tracing::warn!("acars udp open failed: {message}");
-            let _ = dsp_tx.send(DspToUi::AcarsOutputError {
-                kind: "udp",
-                message,
-            });
-        }
-    }
-}
-
-/// Flush + drop the JSONL writer and the UDP feeder. Used by
-/// every ACARS "forced-off" path (successful disengage, post-
-/// Start reassert failure, disengage double-failure, and the
-/// `cleanup()` forced-off branch). Intent flags
-/// (`jsonl_enabled` / `network_enabled`) stay untouched so a
-/// subsequent re-engage reopens the writers automatically.
-/// CR round 2 on PR #595.
-fn close_acars_outputs(outputs: &mut AcarsOutputs) {
-    if let Some(mut w) = outputs.jsonl.take()
-        && let Err(e) = w.flush()
-    {
-        tracing::warn!("acars jsonl flush on close failed: {e}");
-    }
-    outputs.udp = None;
+/// Acquire the ACARS writer config write lock, recovering from
+/// poisoning rather than panicking. A poisoned lock means the
+/// writer thread previously panicked while holding the write
+/// guard — recoverable from the controller's POV (we just take
+/// the inner guard and continue). Per the no-panic rule for
+/// library crates + CR round 1 on PR #598.
+fn acars_config_write(
+    cfg: &std::sync::RwLock<crate::acars_output::AcarsWriterConfig>,
+) -> std::sync::RwLockWriteGuard<'_, crate::acars_output::AcarsWriterConfig> {
+    cfg.write().unwrap_or_else(|poisoned| {
+        tracing::warn!("acars writer config lock was poisoned; recovering");
+        poisoned.into_inner()
+    })
 }
 
 fn handle_set_acars_jsonl_enabled(
     state: &mut DspState,
-    dsp_tx: &mpsc::Sender<DspToUi>,
+    _dsp_tx: &mpsc::Sender<DspToUi>,
     enabled: bool,
 ) {
-    state.acars_outputs.jsonl_enabled = enabled;
-    if !enabled {
-        if let Some(mut w) = state.acars_outputs.jsonl.take()
-            && let Err(e) = w.flush()
-        {
-            tracing::warn!("acars jsonl flush on disable failed: {e}");
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if enabled {
+            // Restore the user's last-chosen path (preserved
+            // across disable/enable cycles via
+            // `acars_last_user_jsonl_path`). Falls back to the
+            // default if the user hasn't picked a path yet.
+            // CR round 2 on PR #598.
+            cfg.jsonl_path = Some(
+                state
+                    .acars_last_user_jsonl_path
+                    .clone()
+                    .unwrap_or_else(|| resolve_jsonl_path("")),
+            );
+        } else {
+            // Disable: clear `cfg.jsonl_path` so the writer
+            // stops, but keep `acars_last_user_jsonl_path` so
+            // re-enable restores. CR round 2 on PR #598.
+            cfg.jsonl_path = None;
         }
-        return;
     }
-    // Already open? No-op.
-    if state.acars_outputs.jsonl.is_some() {
-        return;
-    }
-    let path = jsonl_path_for(&state.acars_outputs);
-    open_jsonl(state, dsp_tx, &path);
+    // Wake the writer so the disable/enable takes effect even
+    // if no decoded message follows. CR round 1 on PR #598.
+    state.acars_outputs.notify_config_changed();
 }
 
-fn handle_set_acars_jsonl_path(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, path: &str) {
-    let path = path.trim();
-    state.acars_outputs.pending_jsonl_path = if path.is_empty() {
-        None
+fn handle_set_acars_jsonl_path(state: &mut DspState, _dsp_tx: &mpsc::Sender<DspToUi>, path: &str) {
+    let trimmed = path.trim();
+    let new_value = if trimmed.is_empty() {
+        // Empty apply: don't implicitly disable. If the sink
+        // is currently enabled, normalize to the default path
+        // (matching the user-intent "use the default"). If
+        // the sink is currently disabled, just clear the
+        // remembered path and stay disabled. CR round 2 on
+        // PR #598.
+        let currently_enabled = acars_config_write(&state.acars_outputs.config)
+            .jsonl_path
+            .is_some();
+        if currently_enabled {
+            Some(resolve_jsonl_path(""))
+        } else {
+            None
+        }
     } else {
-        Some(path.to_string())
+        Some(resolve_jsonl_path(trimmed))
     };
-    let should_reopen = state.acars_outputs.jsonl_enabled;
-    if let Some(mut w) = state.acars_outputs.jsonl.take()
-        && let Err(e) = w.flush()
+    state.acars_last_user_jsonl_path.clone_from(&new_value);
+    // Only push to the writer's config if the sink is currently
+    // enabled (Some) — otherwise we'd accidentally turn it on.
     {
-        tracing::warn!("acars jsonl flush on path-change failed: {e}");
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if cfg.jsonl_path.is_some() {
+            cfg.jsonl_path = new_value;
+        }
     }
-    if should_reopen {
-        let resolved = jsonl_path_for(&state.acars_outputs);
-        open_jsonl(state, dsp_tx, &resolved);
-    }
+    state.acars_outputs.notify_config_changed();
 }
 
 fn handle_set_acars_network_enabled(
     state: &mut DspState,
-    dsp_tx: &mpsc::Sender<DspToUi>,
+    _dsp_tx: &mpsc::Sender<DspToUi>,
     enabled: bool,
 ) {
-    state.acars_outputs.network_enabled = enabled;
-    if !enabled {
-        state.acars_outputs.udp = None;
-        return;
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if enabled {
+            // Same pattern as JSONL: restore the user's last-
+            // chosen address, fall back to the airframes.io
+            // default. CR round 2 on PR #598.
+            cfg.network_addr = Some(
+                state
+                    .acars_last_user_network_addr
+                    .clone()
+                    .unwrap_or_else(|| ACARS_NETWORK_DEFAULT_ADDR.to_string()),
+            );
+        } else {
+            cfg.network_addr = None;
+        }
     }
-    if state.acars_outputs.udp.is_some() {
-        return;
-    }
-    let addr = network_addr_for(&state.acars_outputs);
-    open_udp(state, dsp_tx, &addr);
+    state.acars_outputs.notify_config_changed();
 }
 
-fn handle_set_acars_network_addr(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, addr: &str) {
-    let addr = addr.trim();
-    state.acars_outputs.pending_network_addr = if addr.is_empty() {
-        None
+fn handle_set_acars_network_addr(
+    state: &mut DspState,
+    _dsp_tx: &mpsc::Sender<DspToUi>,
+    addr: &str,
+) {
+    let trimmed = addr.trim();
+    let new_value = if trimmed.is_empty() {
+        // Same empty-apply semantics as JSONL: only normalize
+        // to default if currently enabled; else stay
+        // disabled. CR round 2 on PR #598.
+        let currently_enabled = acars_config_write(&state.acars_outputs.config)
+            .network_addr
+            .is_some();
+        if currently_enabled {
+            Some(ACARS_NETWORK_DEFAULT_ADDR.to_string())
+        } else {
+            None
+        }
     } else {
-        Some(addr.to_string())
+        Some(trimmed.to_string())
     };
-    let should_reopen = state.acars_outputs.network_enabled;
-    state.acars_outputs.udp = None;
-    if should_reopen {
-        let resolved = network_addr_for(&state.acars_outputs);
-        open_udp(state, dsp_tx, &resolved);
+    state.acars_last_user_network_addr.clone_from(&new_value);
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if cfg.network_addr.is_some() {
+            cfg.network_addr = new_value;
+        }
     }
+    state.acars_outputs.notify_config_changed();
 }
 
 fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
@@ -4535,11 +4413,12 @@ fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
     // 8-char cap matches acarsdec's `idstation` field width.
     // CR round 3 on PR #595.
     let trimmed = station_id.trim();
-    state.acars_outputs.station_id = if trimmed.is_empty() {
+    acars_config_write(&state.acars_outputs.config).station_id = if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.chars().take(8).collect())
     };
+    state.acars_outputs.notify_config_changed();
 }
 
 /// Handler for `UiToDsp::SetAcarsEnabled`. Engages or
@@ -4605,7 +4484,7 @@ fn handle_set_acars_enabled(
             source_type: state.source_type,
             frontend_decim: state.frontend.decim_ratio(),
         };
-        let plan = match engage(&current, state.acars_region) {
+        let plan = match engage(&current, &state.acars_region) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!("ACARS engage rejected: {e}");
@@ -4647,26 +4526,19 @@ fn handle_set_acars_enabled(
         match sdr_acars::ChannelBank::new(
             state.sample_rate,
             state.center_freq,
-            &state.acars_region.channels(),
+            state.acars_region.channels(),
         ) {
             Ok(bank) => {
                 state.acars_bank = Some(bank);
                 state.acars_init_failed = false;
                 state.acars_pre_lock = Some(plan.snapshot);
                 state.acars_stats_emitted_at = std::time::Instant::now();
-                // Reopen output writers if user previously
-                // toggled them on. CR round 1 on PR #595 —
-                // intent persists across disengage, so engage
-                // restores the writers without requiring the
-                // user to toggle off+on. Issue #578.
-                if state.acars_outputs.jsonl_enabled && state.acars_outputs.jsonl.is_none() {
-                    let path = jsonl_path_for(&state.acars_outputs);
-                    open_jsonl(state, dsp_tx, &path);
-                }
-                if state.acars_outputs.network_enabled && state.acars_outputs.udp.is_none() {
-                    let addr = network_addr_for(&state.acars_outputs);
-                    open_udp(state, dsp_tx, &addr);
-                }
+                // Writer thread auto-opens JSONL / UDP on the
+                // next message if path/addr are set in the
+                // config. Disengage clears the config, so a
+                // re-engage requires the user to re-enable
+                // outputs (phase-2 follow-up to preserve
+                // intent across disengage). Issue #596.
                 tracing::info!("ACARS engaged: airband lock active");
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(true)));
                 AcarsHandlerOutcome::Normal
@@ -4735,10 +4607,6 @@ fn handle_set_acars_enabled(
                 state.acars_bank = None;
                 state.acars_init_failed = false;
                 state.acars_pre_lock = None;
-                // Forced-off — close output writers (intent
-                // flags persist for next engage). CR round 2
-                // on PR #595.
-                close_acars_outputs(&mut state.acars_outputs);
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
                 let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
                 return if state.source.is_some() {
@@ -4762,12 +4630,6 @@ fn handle_set_acars_enabled(
         // see None and short-circuit.
         state.acars_bank = None;
         state.acars_init_failed = false;
-
-        // Flush + drop output writers. Intent flags
-        // (`jsonl_enabled` / `network_enabled`) stay set so a
-        // subsequent `SetAcarsEnabled(true)` re-engage reopens
-        // them automatically. Issue #578.
-        close_acars_outputs(&mut state.acars_outputs);
 
         // VFO offset restore. The controller stores it on
         // `state.vfo_offset` (read by `rebuild_vfo` and the
@@ -4799,7 +4661,8 @@ mod tests {
 
     #[test]
     fn dsp_state_creates_successfully() {
-        let state = DspState::new().unwrap();
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let state = DspState::new(dsp_tx).unwrap();
         assert!(!state.running);
         assert!(state.source.is_none());
         assert_eq!(state.iq_buf.len(), IQ_PAIRS_PER_READ);
@@ -4816,7 +4679,8 @@ mod tests {
         // freshly-opened RTL-SDR source; defaults must match the
         // dongle's power-on state so first launch (no persisted
         // dispatch yet) doesn't change hardware behavior.
-        let state = DspState::new().unwrap();
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let state = DspState::new(dsp_tx).unwrap();
         assert!(!state.bias_tee_enabled);
         assert_eq!(state.direct_sampling_mode, 0);
         assert!(!state.offset_tuning_enabled);
@@ -4829,7 +4693,8 @@ mod tests {
 
     #[test]
     fn rebuild_vfo_creates_vfo_and_sets_radio_rate() {
-        let mut state = DspState::new().unwrap();
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx).unwrap();
         // Simulate what open_source does: frontend is already built at default rate.
         rebuild_vfo(&mut state).unwrap();
         assert!(state.vfo.is_some());
@@ -4837,7 +4702,8 @@ mod tests {
 
     #[test]
     fn rebuild_vfo_after_mode_switch_changes_rates() {
-        let mut state = DspState::new().unwrap();
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx).unwrap();
         // Start with NFM (default) — IF rate 50 kHz
         rebuild_vfo(&mut state).unwrap();
 
@@ -4944,7 +4810,8 @@ mod tests {
         let mut init_failed = false;
         let (tx, rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
-        let mut outputs = super::AcarsOutputs::new();
+        let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
+        let outputs = super::AcarsOutputs::new(acars_dsp_tx);
 
         super::acars_decode_tap(
             &mut bank,
@@ -4954,7 +4821,7 @@ mod tests {
             &US_SIX_CHANNELS_HZ,
             &iq,
             &tx,
-            &mut outputs,
+            &outputs,
         );
         assert!(bank.is_some(), "first call should initialize the bank");
         assert!(!init_failed);
@@ -4968,7 +4835,8 @@ mod tests {
         let mut init_failed = true; // Simulate prior failure.
         let (tx, _rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
-        let mut outputs = super::AcarsOutputs::new();
+        let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
+        let outputs = super::AcarsOutputs::new(acars_dsp_tx);
 
         super::acars_decode_tap(
             &mut bank,
@@ -4978,7 +4846,7 @@ mod tests {
             &US_SIX_CHANNELS_HZ,
             &iq,
             &tx,
-            &mut outputs,
+            &outputs,
         );
         assert!(bank.is_none(), "init_failed=true must short-circuit");
         assert!(init_failed);
@@ -4991,7 +4859,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
         let bad_channels: [f64; 6] = [0.0; 6]; // outside source bandwidth
-        let mut outputs = super::AcarsOutputs::new();
+        let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
+        let outputs = super::AcarsOutputs::new(acars_dsp_tx);
 
         super::acars_decode_tap(
             &mut bank,
@@ -5001,7 +4870,7 @@ mod tests {
             &bad_channels,
             &iq,
             &tx,
-            &mut outputs,
+            &outputs,
         );
         assert!(bank.is_none());
         assert!(init_failed, "bad channels should set init_failed");
