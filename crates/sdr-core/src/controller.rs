@@ -4261,22 +4261,33 @@ fn resolve_jsonl_path(path: &str) -> std::path::PathBuf {
 /// explicit address.
 const ACARS_NETWORK_DEFAULT_ADDR: &str = "feed.airframes.io:5550";
 
+/// Acquire the ACARS writer config write lock, recovering from
+/// poisoning rather than panicking. A poisoned lock means the
+/// writer thread previously panicked while holding the write
+/// guard — recoverable from the controller's POV (we just take
+/// the inner guard and continue). Per the no-panic rule for
+/// library crates + CR round 1 on PR #598.
+fn acars_config_write(
+    cfg: &std::sync::RwLock<crate::acars_output::AcarsWriterConfig>,
+) -> std::sync::RwLockWriteGuard<'_, crate::acars_output::AcarsWriterConfig> {
+    cfg.write().unwrap_or_else(|poisoned| {
+        tracing::warn!("acars writer config lock was poisoned; recovering");
+        poisoned.into_inner()
+    })
+}
+
 fn handle_set_acars_jsonl_enabled(
     state: &mut DspState,
     _dsp_tx: &mpsc::Sender<DspToUi>,
     enabled: bool,
 ) {
-    let mut cfg = state
-        .acars_outputs
-        .config
-        .write()
-        .expect("acars writer config poisoned");
+    let mut cfg = acars_config_write(&state.acars_outputs.config);
     if enabled {
-        // Stamp the default path. The writer thread opens the
-        // file lazily on the next decoded message.
-        // (Phase-2: preserve a user's previously-set custom
-        // path across disable/enable toggles.)
-        cfg.jsonl_path = Some(resolve_jsonl_path(""));
+        // Preserve the user's previously-set path across
+        // disable/enable toggles. `get_or_insert_with` only
+        // stamps the default if the slot is currently None.
+        // CR round 1 on PR #598.
+        cfg.jsonl_path.get_or_insert_with(|| resolve_jsonl_path(""));
     } else {
         cfg.jsonl_path = None;
     }
@@ -4289,12 +4300,7 @@ fn handle_set_acars_jsonl_path(state: &mut DspState, _dsp_tx: &mpsc::Sender<DspT
     } else {
         Some(resolve_jsonl_path(path))
     };
-    state
-        .acars_outputs
-        .config
-        .write()
-        .expect("acars writer config poisoned")
-        .jsonl_path = resolved;
+    acars_config_write(&state.acars_outputs.config).jsonl_path = resolved;
 }
 
 fn handle_set_acars_network_enabled(
@@ -4302,13 +4308,13 @@ fn handle_set_acars_network_enabled(
     _dsp_tx: &mpsc::Sender<DspToUi>,
     enabled: bool,
 ) {
-    let mut cfg = state
-        .acars_outputs
-        .config
-        .write()
-        .expect("acars writer config poisoned");
+    let mut cfg = acars_config_write(&state.acars_outputs.config);
     if enabled {
-        cfg.network_addr = Some(ACARS_NETWORK_DEFAULT_ADDR.to_string());
+        // Preserve the user's previously-set address; only
+        // stamp the airframes.io default if no addr is set.
+        // CR round 1 on PR #598.
+        cfg.network_addr
+            .get_or_insert_with(|| ACARS_NETWORK_DEFAULT_ADDR.to_string());
     } else {
         cfg.network_addr = None;
     }
@@ -4325,12 +4331,7 @@ fn handle_set_acars_network_addr(
     } else {
         Some(trimmed.to_string())
     };
-    state
-        .acars_outputs
-        .config
-        .write()
-        .expect("acars writer config poisoned")
-        .network_addr = resolved;
+    acars_config_write(&state.acars_outputs.config).network_addr = resolved;
 }
 
 fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
@@ -4340,12 +4341,7 @@ fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
     // 8-char cap matches acarsdec's `idstation` field width.
     // CR round 3 on PR #595.
     let trimmed = station_id.trim();
-    state
-        .acars_outputs
-        .config
-        .write()
-        .expect("acars writer config poisoned")
-        .station_id = if trimmed.is_empty() {
+    acars_config_write(&state.acars_outputs.config).station_id = if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.chars().take(8).collect())
