@@ -667,7 +667,7 @@ The ACK byte is currently invisible in the viewer — `0x15` (NAK) renders as a 
 | Time | Freq | Aircraft | Mode | Label | Block | Ack | Text |
 ```
 
-`render_ack`: `0x15` → `"NAK"`, `b'!'` → `"!"`, printable ASCII → that char as a string, others → `0xNN` hex.
+`render_ack`: `0x15` → `"NAK"`, `b'!'` → `"!"`, printable ASCII (`0x20..=0x7E`, including space) → that char as a string, others → `0xNN` hex.
 
 - [ ] **Step 1: Add the `render_ack` function**
 
@@ -1042,10 +1042,10 @@ The final `let handles = Rc::new(ViewerHandles { … })` block should now refere
 Add right after the `*state.acars_viewer_handles.borrow_mut() = Some(Rc::clone(&handles));` line:
 
 ```rust
-    // Click-to-filter (issue #579): double-click an aircraft row
+    // Click-to-filter (issue #579): single-click an aircraft row
     // → set filter entry to the tail and switch to Stream tab.
-    // GtkColumnView::connect_activate fires on double-click /
-    // Enter / Space. Single click stays as just selection.
+    // `single_click_activate(true)` on the ColumnView makes a
+    // single click both select AND emit `activate`.
     {
         let handles = Rc::clone(&handles);
         aircraft_column_view.connect_activate(move |_view, position| {
@@ -1095,7 +1095,7 @@ descending; all 4 columns are resizable + sortable. Each tab
 wraps its own ScrolledWindow so per-tab scroll position is
 preserved automatically by GTK.
 
-Click-to-filter: double-click / Enter on an aircraft row sets
+Click-to-filter: single-click / Enter on an aircraft row sets
 the filter entry to the tail and switches to the Stream tab.
 
 Aircraft store/filter/index population happens in subsequent
@@ -1639,7 +1639,7 @@ Hand off to user with:
    - [ ] Open the app, engage ACARS, open the ACARS viewer.
    - [ ] Stream tab shows messages with the existing column layout PLUS a new `Ack` column between Block and Text.
    - [ ] Label column shows `H1 (Crew message)` for known labels and just `H1` (or whatever code) for unknowns.
-   - [ ] ACK column shows `NAK` for `0x15`, the printable char for graphic ASCII, `0xNN` for other bytes.
+   - [ ] ACK column shows `NAK` for `0x15`, the printable char for bytes `0x20..=0x7E` (including space), `0xNN` for other bytes.
 2. **By Aircraft tab populates**
    - [ ] Switch to By Aircraft tab via the GtkStackSwitcher in the header.
    - [ ] Status label changes wording from "messages" to "aircraft".
@@ -1648,7 +1648,7 @@ Hand off to user with:
    - [ ] Stay on aircraft tab. Confirm Count and Last Seen fields bump when new messages arrive from already-seen aircraft.
    - [ ] New aircraft → new row appears (with Count=1).
 4. **Click-to-filter**
-   - [ ] Double-click an aircraft row.
+   - [ ] Single-click an aircraft row.
    - [ ] Filter entry gets the tail. Stack switches to Stream tab. Stream tab shows only that aircraft's messages.
 5. **Filter applies to both tabs**
    - [ ] Type a substring in the filter (e.g. `UA` or `.N`).
