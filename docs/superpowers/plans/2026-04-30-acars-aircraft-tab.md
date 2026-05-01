@@ -1670,7 +1670,7 @@ Hand off to user with:
    - [ ] Resume. Both tabs resume from current state.
 7. **Clear works on both tabs**
    - [ ] Click Clear. Both tabs empty.
-   - [ ] Status label resets to `0 / 0`.
+   - [ ] Status label resets to `0 / 0 messages` on Stream or `0 / 0 aircraft` on By Aircraft (tab-aware).
 8. **Sort each aircraft column**
    - [ ] Click each header. Confirm: Aircraft column sorts case-insensitively alphabetical, Last Seen descending newest-first / ascending oldest-first, Count descending highest-first / ascending lowest-first, Last Label byte-ordered.
 9. **Reopen retains aircraft state**
