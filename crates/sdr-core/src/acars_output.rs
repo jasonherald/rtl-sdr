@@ -42,6 +42,18 @@ pub struct AcarsWriterConfig {
 pub enum AcarsOutputMessage {
     /// One decoded ACARS message, ready to write + feed.
     Decoded(sdr_acars::AcarsMessage),
+    /// The shared `AcarsWriterConfig` was mutated by the UI side.
+    /// Wakes the writer to re-snapshot config and apply
+    /// `ensure_jsonl` / `ensure_udp` so config-only changes
+    /// (disable, path swap, addr swap) take effect immediately
+    /// instead of being buffered until the next decoded message.
+    /// CR round 1 on PR #598.
+    ConfigChanged,
+    /// Explicit clean-shutdown signal. `Drop for AcarsOutputs`
+    /// emits this before dropping `tx`; the worker also exits
+    /// cleanly on `Disconnected` as a fallback. Having an
+    /// explicit variant makes shutdown deterministic for tests.
+    Shutdown,
 }
 
 /// Append-only JSONL writer. One JSON object per line (`\n`-
@@ -190,26 +202,33 @@ pub struct AcarsOutputs {
 
 impl AcarsOutputs {
     /// Construct an async-output bundle and spawn the writer
-    /// thread. The thread runs until `Drop` for `AcarsOutputs`
-    /// drops the `tx`, at which point the writer's `recv()`
-    /// returns `Err(Disconnected)` and the loop exits.
+    /// thread. `dsp_tx` is cloned into the worker so it can
+    /// surface open / write / send failures back to the UI as
+    /// `DspToUi::AcarsOutputError` toasts (CR round 1 on PR
+    /// #598; preserves the UI error contract that the original
+    /// synchronous code had in PR #595).
+    ///
+    /// The thread runs until `Drop for AcarsOutputs` sends an
+    /// explicit `Shutdown` message (or — as a fallback — drops
+    /// `tx`, at which point the writer's `recv()` returns
+    /// `Err(Disconnected)`). Either way the loop exits cleanly.
     #[must_use]
-    pub fn new() -> Self {
-        Self::with_capacity(ACARS_OUTPUT_CHANNEL_CAPACITY)
+    pub fn new(dsp_tx: mpsc::Sender<crate::messages::DspToUi>) -> Self {
+        Self::with_capacity(ACARS_OUTPUT_CHANNEL_CAPACITY, dsp_tx)
     }
 
     /// Same as `new` but with a caller-chosen channel
     /// capacity. Production calls go through `new`; tests use
     /// this directly via `with_capacity_for_test` to exercise
     /// the drop-on-full path with a cap they can saturate.
-    fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize, dsp_tx: mpsc::Sender<crate::messages::DspToUi>) -> Self {
         let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(capacity);
         let config = Arc::new(RwLock::new(AcarsWriterConfig::default()));
 
         let writer_config = Arc::clone(&config);
         let writer_thread = std::thread::Builder::new()
             .name("sdr-acars-writer".into())
-            .spawn(move || run_writer_loop(rx, writer_config))
+            .spawn(move || run_writer_loop(rx, writer_config, dsp_tx))
             .expect("failed to spawn ACARS writer thread");
 
         Self {
@@ -268,6 +287,24 @@ impl AcarsOutputs {
         self.drop_count.load(Ordering::Relaxed)
     }
 
+    /// Wake the writer thread so it re-snapshots the shared
+    /// `config` and applies `ensure_jsonl` / `ensure_udp`. The
+    /// controller's `handle_set_acars_*` handlers call this
+    /// after every config write so config-only changes
+    /// (disable, path swap, addr swap) take effect immediately
+    /// — without it, the worker only wakes on `Decoded` and
+    /// stale handles linger until the next decoded frame
+    /// (CR round 1 on PR #598).
+    ///
+    /// `try_send`, not `send`: if the channel is full the
+    /// worker is already saturated processing `Decoded` and
+    /// will re-snapshot config on the next iteration anyway
+    /// — a dropped `ConfigChanged` is harmless under that
+    /// pressure.
+    pub fn notify_config_changed(&self) {
+        let _ = self.tx.try_send(AcarsOutputMessage::ConfigChanged);
+    }
+
     /// 30 s-rate-limited warn for channel-full drops. Reads
     /// the current drop count so the message names how many
     /// were lost in this window.
@@ -286,18 +323,21 @@ impl AcarsOutputs {
     }
 }
 
-impl Default for AcarsOutputs {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Drop for AcarsOutputs {
     fn drop(&mut self) {
+        // Send the explicit Shutdown sentinel first so the
+        // worker exits via the deterministic `Shutdown` arm
+        // rather than the `Err(Disconnected)` fallback. Both
+        // paths drain cleanly, but Shutdown means tests can
+        // assert promptness without racing the OS scheduler.
+        // `try_send` is fine — if the channel is full the
+        // Disconnected fallback below still terminates.
+        let _ = self.tx.try_send(AcarsOutputMessage::Shutdown);
+
         // Closing tx triggers Disconnected → the writer loop
-        // exits. We still need to join the thread to make
-        // sure its Drop impls (BufWriter flush) finish before
-        // the process exits.
+        // exits as a fallback. We still need to join the thread
+        // to make sure its Drop impls (BufWriter flush) finish
+        // before the process exits.
         if let Some(handle) = self.writer_thread.take() {
             // Drop the tx clone held by `self.tx` first by
             // overwriting it with a drained channel.
@@ -316,48 +356,97 @@ impl Drop for AcarsOutputs {
 
 /// Writer-thread main loop. Owns the per-thread `JsonlWriter`
 /// and `UdpFeeder` instances, reads `config` on each message
-/// to detect path/addr changes, and exits cleanly when the
-/// sender side disconnects (app shutdown). Issue #596.
+/// (or on `ConfigChanged`) to detect path/addr changes, and
+/// exits cleanly on `Shutdown` or when the sender side
+/// disconnects (app shutdown). Issue #596 / CR round 1 on PR
+/// #598.
 #[allow(clippy::needless_pass_by_value)] // rx must be owned to observe disconnect
-fn run_writer_loop(rx: mpsc::Receiver<AcarsOutputMessage>, config: Arc<RwLock<AcarsWriterConfig>>) {
+fn run_writer_loop(
+    rx: mpsc::Receiver<AcarsOutputMessage>,
+    config: Arc<RwLock<AcarsWriterConfig>>,
+    dsp_tx: mpsc::Sender<crate::messages::DspToUi>,
+) {
     let mut jsonl: Option<(PathBuf, JsonlWriter)> = None;
     let mut udp: Option<(String, UdpFeeder)> = None;
     let mut jsonl_warn_at: Option<std::time::Instant> = None;
     let mut udp_warn_at: Option<std::time::Instant> = None;
 
-    while let Ok(msg) = rx.recv() {
-        let AcarsOutputMessage::Decoded(msg) = msg;
+    // `while let Ok(_)` is the disconnect-fallback path; the
+    // inner `match` handles the explicit Shutdown sentinel
+    // (which `break`s out of the outer loop). Either path
+    // exits cleanly. CR round 1 on PR #598.
+    'recv: while let Ok(msg) = rx.recv() {
+        match msg {
+            AcarsOutputMessage::Shutdown => break 'recv,
+            AcarsOutputMessage::ConfigChanged => {
+                // No payload to write — just resnap config and
+                // close/open. ensure_* close on None and reopen
+                // on path/addr change, so disabling JSONL or
+                // swapping the destination applies immediately
+                // even with no decoded traffic.
+                let (want_jsonl_path, want_udp_addr, _station_id) = {
+                    let cfg = config.read().expect("acars writer config poisoned");
+                    (
+                        cfg.jsonl_path.clone(),
+                        cfg.network_addr.clone(),
+                        cfg.station_id.clone(),
+                    )
+                };
+                ensure_jsonl(&mut jsonl, want_jsonl_path.as_deref(), &dsp_tx);
+                ensure_udp(&mut udp, want_udp_addr.as_deref(), &dsp_tx);
+            }
+            AcarsOutputMessage::Decoded(msg) => {
+                // Snapshot the config under a brief read lock so we
+                // don't hold it across blocking I/O.
+                let (want_jsonl_path, want_udp_addr, station_id) = {
+                    let cfg = config.read().expect("acars writer config poisoned");
+                    (
+                        cfg.jsonl_path.clone(),
+                        cfg.network_addr.clone(),
+                        cfg.station_id.clone(),
+                    )
+                };
 
-        // Snapshot the config under a brief read lock so we
-        // don't hold it across blocking I/O.
-        let (want_jsonl_path, want_udp_addr, station_id) = {
-            let cfg = config.read().expect("acars writer config poisoned");
-            (
-                cfg.jsonl_path.clone(),
-                cfg.network_addr.clone(),
-                cfg.station_id.clone(),
-            )
-        };
+                ensure_jsonl(&mut jsonl, want_jsonl_path.as_deref(), &dsp_tx);
+                ensure_udp(&mut udp, want_udp_addr.as_deref(), &dsp_tx);
 
-        ensure_jsonl(&mut jsonl, want_jsonl_path.as_deref());
-        ensure_udp(&mut udp, want_udp_addr.as_deref());
-
-        if let Some((_, w)) = jsonl.as_mut()
-            && let Err(e) = w.write(&msg, station_id.as_deref())
-        {
-            rate_limited_warn("jsonl", &mut jsonl_warn_at, &e);
-        }
-        if let Some((_, f)) = udp.as_mut()
-            && let Err(e) = f.send(&msg, station_id.as_deref())
-        {
-            rate_limited_warn("udp", &mut udp_warn_at, &e);
+                if let Some((_, w)) = jsonl.as_mut()
+                    && let Err(e) = w.write(&msg, station_id.as_deref())
+                {
+                    rate_limited_warn_and_emit("jsonl", &mut jsonl_warn_at, &e, &dsp_tx);
+                }
+                if let Some((_, f)) = udp.as_mut()
+                    && let Err(e) = f.send(&msg, station_id.as_deref())
+                {
+                    rate_limited_warn_and_emit("udp", &mut udp_warn_at, &e, &dsp_tx);
+                }
+            }
         }
     }
 }
 
+/// Emit `DspToUi::AcarsOutputError` for an open / write / send
+/// failure. The matching `tracing::warn!` is the caller's job
+/// (separated so the rate-limiter can decide whether to also
+/// warn-spam logs); this is the UI-toast surface.
+fn emit_output_error(
+    dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
+    kind: &'static str,
+    message: String,
+) {
+    let _ = dsp_tx.send(crate::messages::DspToUi::AcarsOutputError { kind, message });
+}
+
 /// Ensure `slot` holds an open `JsonlWriter` matching `want`.
 /// Reopens on path change; closes (drops) when `want` is `None`.
-fn ensure_jsonl(slot: &mut Option<(PathBuf, JsonlWriter)>, want: Option<&Path>) {
+/// Open failures are logged via `tracing::warn!` AND surfaced
+/// to the UI as `DspToUi::AcarsOutputError` for toast display
+/// (CR round 1 on PR #598).
+fn ensure_jsonl(
+    slot: &mut Option<(PathBuf, JsonlWriter)>,
+    want: Option<&Path>,
+    dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
+) {
     let needs_reopen = match (slot.as_ref(), want) {
         (None, None) => false,
         (Some((cur, _)), Some(want)) if cur == want => false,
@@ -370,7 +459,11 @@ fn ensure_jsonl(slot: &mut Option<(PathBuf, JsonlWriter)>, want: Option<&Path>) 
     if let Some(want) = want {
         match JsonlWriter::open(want) {
             Ok(w) => *slot = Some((want.to_path_buf(), w)),
-            Err(e) => tracing::warn!("acars jsonl open failed: {e}"),
+            Err(e) => {
+                let message = format!("acars jsonl open failed: {e}");
+                tracing::warn!("{message}");
+                emit_output_error(dsp_tx, "jsonl", message);
+            }
         }
     }
 }
@@ -378,7 +471,11 @@ fn ensure_jsonl(slot: &mut Option<(PathBuf, JsonlWriter)>, want: Option<&Path>) 
 /// Same shape as `ensure_jsonl` but for `UdpFeeder`. The `String`
 /// key compares the user-set addr verbatim; resolved peer
 /// addresses are not the source of truth.
-fn ensure_udp(slot: &mut Option<(String, UdpFeeder)>, want: Option<&str>) {
+fn ensure_udp(
+    slot: &mut Option<(String, UdpFeeder)>,
+    want: Option<&str>,
+    dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
+) {
     let needs_reopen = match (slot.as_ref(), want) {
         (None, None) => false,
         (Some((cur, _)), Some(want)) if cur == want => false,
@@ -391,22 +488,35 @@ fn ensure_udp(slot: &mut Option<(String, UdpFeeder)>, want: Option<&str>) {
     if let Some(want) = want {
         match UdpFeeder::open(want) {
             Ok(f) => *slot = Some((want.to_string(), f)),
-            Err(e) => tracing::warn!("acars udp open failed: {e}"),
+            Err(e) => {
+                let message = format!("acars udp open failed: {e}");
+                tracing::warn!("{message}");
+                emit_output_error(dsp_tx, "udp", message);
+            }
         }
     }
 }
 
 const ACARS_OUTPUT_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Emit a `tracing::warn!` at most once per
-/// `ACARS_OUTPUT_WARN_MIN_INTERVAL` for `kind`. Mirrors the
-/// per-writer 30 s rate-limit that previously lived in
-/// `controller.rs::acars_decode_tap`.
-fn rate_limited_warn(kind: &str, last: &mut Option<std::time::Instant>, err: &std::io::Error) {
+/// Emit a `tracing::warn!` AND a `DspToUi::AcarsOutputError`
+/// at most once per `ACARS_OUTPUT_WARN_MIN_INTERVAL` for
+/// `kind`. Mirrors the per-writer 30 s rate-limit that
+/// previously lived in `controller.rs::acars_decode_tap`,
+/// extended in CR round 1 on PR #598 to also surface the
+/// failure to the UI as a toast.
+fn rate_limited_warn_and_emit(
+    kind: &'static str,
+    last: &mut Option<std::time::Instant>,
+    err: &std::io::Error,
+    dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
+) {
     let now = std::time::Instant::now();
     let elapsed = last.map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
     if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
-        tracing::warn!("acars {kind} write/send failed: {err} (rate-limited 30s)");
+        let message = format!("acars {kind} write/send failed: {err}");
+        tracing::warn!("{message} (rate-limited 30s)");
+        emit_output_error(dsp_tx, kind, message);
         *last = Some(now);
     }
 }
@@ -537,8 +647,9 @@ mod tests {
         // recv() returning Err(Disconnected) → loop break path.
         let config = Arc::new(RwLock::new(AcarsWriterConfig::default()));
         let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(8);
+        let (dummy_dsp_tx, _dsp_rx) = mpsc::channel::<crate::messages::DspToUi>();
         let handle = std::thread::spawn(move || {
-            run_writer_loop(rx, Arc::clone(&config));
+            run_writer_loop(rx, Arc::clone(&config), dummy_dsp_tx);
         });
         drop(tx);
         // Loop should exit promptly. Allow up to 500 ms for
@@ -590,9 +701,10 @@ mod tests {
             station_id: None,
         }));
         let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(8);
+        let (dummy_dsp_tx, _dsp_rx) = mpsc::channel::<crate::messages::DspToUi>();
         let handle = {
             let config = Arc::clone(&config);
-            std::thread::spawn(move || run_writer_loop(rx, config))
+            std::thread::spawn(move || run_writer_loop(rx, config, dummy_dsp_tx))
         };
 
         tx.send(AcarsOutputMessage::Decoded(make_msg(0))).unwrap();
@@ -619,5 +731,50 @@ mod tests {
             1,
             "path B got the second message"
         );
+    }
+
+    #[test]
+    fn config_changed_signal_wakes_idle_writer() {
+        // Verifies the CR round 1 fix on PR #598: send
+        // ConfigChanged with no preceding Decoded; the worker
+        // re-snapshots config and calls ensure_jsonl, which
+        // opens the file in append mode and creates it. Without
+        // the fix the worker would only wake on Decoded and the
+        // file would never appear.
+        let dir = tempdir().unwrap();
+        let path_a = dir.path().join("idle_open.jsonl");
+
+        let config = Arc::new(RwLock::new(AcarsWriterConfig {
+            jsonl_path: Some(path_a.clone()),
+            network_addr: None,
+            station_id: None,
+        }));
+        let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(8);
+        let (dummy_dsp_tx, _dsp_rx) = mpsc::channel::<crate::messages::DspToUi>();
+        let handle = {
+            let config = Arc::clone(&config);
+            std::thread::spawn(move || run_writer_loop(rx, config, dummy_dsp_tx))
+        };
+
+        // No Decoded — only ConfigChanged. The worker must wake,
+        // resnap config, and open path_a. JsonlWriter::open in
+        // append-mode creates the file even with no writes.
+        tx.send(AcarsOutputMessage::ConfigChanged).unwrap();
+
+        // Spin briefly to let the worker process ConfigChanged.
+        let start = std::time::Instant::now();
+        while !path_a.exists() && start.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            path_a.exists(),
+            "ConfigChanged should have caused the writer to open path A even with no Decoded messages"
+        );
+
+        // Clean shutdown via Shutdown sentinel — exercises the
+        // explicit-shutdown arm.
+        tx.send(AcarsOutputMessage::Shutdown).unwrap();
+        drop(tx);
+        handle.join().expect("writer thread panicked");
     }
 }

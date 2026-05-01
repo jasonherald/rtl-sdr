@@ -142,7 +142,7 @@ fn dsp_thread_main(
 ) {
     tracing::info!("DSP controller thread started");
 
-    let mut state = match DspState::new() {
+    let mut state = match DspState::new(dsp_tx.clone()) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("failed to initialize DSP state: {e}");
@@ -575,7 +575,7 @@ struct DspState {
 }
 
 impl DspState {
-    fn new() -> Result<Self, String> {
+    fn new(dsp_tx: mpsc::Sender<DspToUi>) -> Result<Self, String> {
         let frontend = IqFrontend::new(
             DEFAULT_SAMPLE_RATE,
             DEFAULT_DECIMATION,
@@ -667,7 +667,7 @@ impl DspState {
             acars_init_failed: false,
             acars_stats_emitted_at: std::time::Instant::now(),
             acars_region: crate::acars_airband_lock::AcarsRegion::default(),
-            acars_outputs: AcarsOutputs::new(),
+            acars_outputs: AcarsOutputs::new(dsp_tx),
         })
     }
 }
@@ -4281,16 +4281,21 @@ fn handle_set_acars_jsonl_enabled(
     _dsp_tx: &mpsc::Sender<DspToUi>,
     enabled: bool,
 ) {
-    let mut cfg = acars_config_write(&state.acars_outputs.config);
-    if enabled {
-        // Preserve the user's previously-set path across
-        // disable/enable toggles. `get_or_insert_with` only
-        // stamps the default if the slot is currently None.
-        // CR round 1 on PR #598.
-        cfg.jsonl_path.get_or_insert_with(|| resolve_jsonl_path(""));
-    } else {
-        cfg.jsonl_path = None;
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if enabled {
+            // Preserve the user's previously-set path across
+            // disable/enable toggles. `get_or_insert_with` only
+            // stamps the default if the slot is currently None.
+            // CR round 1 on PR #598.
+            cfg.jsonl_path.get_or_insert_with(|| resolve_jsonl_path(""));
+        } else {
+            cfg.jsonl_path = None;
+        }
     }
+    // Wake the writer so the disable/enable takes effect even
+    // if no decoded message follows. CR round 1 on PR #598.
+    state.acars_outputs.notify_config_changed();
 }
 
 fn handle_set_acars_jsonl_path(state: &mut DspState, _dsp_tx: &mpsc::Sender<DspToUi>, path: &str) {
@@ -4301,6 +4306,7 @@ fn handle_set_acars_jsonl_path(state: &mut DspState, _dsp_tx: &mpsc::Sender<DspT
         Some(resolve_jsonl_path(path))
     };
     acars_config_write(&state.acars_outputs.config).jsonl_path = resolved;
+    state.acars_outputs.notify_config_changed();
 }
 
 fn handle_set_acars_network_enabled(
@@ -4308,16 +4314,19 @@ fn handle_set_acars_network_enabled(
     _dsp_tx: &mpsc::Sender<DspToUi>,
     enabled: bool,
 ) {
-    let mut cfg = acars_config_write(&state.acars_outputs.config);
-    if enabled {
-        // Preserve the user's previously-set address; only
-        // stamp the airframes.io default if no addr is set.
-        // CR round 1 on PR #598.
-        cfg.network_addr
-            .get_or_insert_with(|| ACARS_NETWORK_DEFAULT_ADDR.to_string());
-    } else {
-        cfg.network_addr = None;
+    {
+        let mut cfg = acars_config_write(&state.acars_outputs.config);
+        if enabled {
+            // Preserve the user's previously-set address; only
+            // stamp the airframes.io default if no addr is set.
+            // CR round 1 on PR #598.
+            cfg.network_addr
+                .get_or_insert_with(|| ACARS_NETWORK_DEFAULT_ADDR.to_string());
+        } else {
+            cfg.network_addr = None;
+        }
     }
+    state.acars_outputs.notify_config_changed();
 }
 
 fn handle_set_acars_network_addr(
@@ -4332,6 +4341,7 @@ fn handle_set_acars_network_addr(
         Some(trimmed.to_string())
     };
     acars_config_write(&state.acars_outputs.config).network_addr = resolved;
+    state.acars_outputs.notify_config_changed();
 }
 
 fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
@@ -4346,6 +4356,7 @@ fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
     } else {
         Some(trimmed.chars().take(8).collect())
     };
+    state.acars_outputs.notify_config_changed();
 }
 
 /// Handler for `UiToDsp::SetAcarsEnabled`. Engages or
@@ -4588,7 +4599,8 @@ mod tests {
 
     #[test]
     fn dsp_state_creates_successfully() {
-        let state = DspState::new().unwrap();
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let state = DspState::new(dsp_tx).unwrap();
         assert!(!state.running);
         assert!(state.source.is_none());
         assert_eq!(state.iq_buf.len(), IQ_PAIRS_PER_READ);
@@ -4605,7 +4617,8 @@ mod tests {
         // freshly-opened RTL-SDR source; defaults must match the
         // dongle's power-on state so first launch (no persisted
         // dispatch yet) doesn't change hardware behavior.
-        let state = DspState::new().unwrap();
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let state = DspState::new(dsp_tx).unwrap();
         assert!(!state.bias_tee_enabled);
         assert_eq!(state.direct_sampling_mode, 0);
         assert!(!state.offset_tuning_enabled);
@@ -4618,7 +4631,8 @@ mod tests {
 
     #[test]
     fn rebuild_vfo_creates_vfo_and_sets_radio_rate() {
-        let mut state = DspState::new().unwrap();
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx).unwrap();
         // Simulate what open_source does: frontend is already built at default rate.
         rebuild_vfo(&mut state).unwrap();
         assert!(state.vfo.is_some());
@@ -4626,7 +4640,8 @@ mod tests {
 
     #[test]
     fn rebuild_vfo_after_mode_switch_changes_rates() {
-        let mut state = DspState::new().unwrap();
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx).unwrap();
         // Start with NFM (default) — IF rate 50 kHz
         rebuild_vfo(&mut state).unwrap();
 
@@ -4733,7 +4748,8 @@ mod tests {
         let mut init_failed = false;
         let (tx, rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
-        let outputs = super::AcarsOutputs::new();
+        let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
+        let outputs = super::AcarsOutputs::new(acars_dsp_tx);
 
         super::acars_decode_tap(
             &mut bank,
@@ -4757,7 +4773,8 @@ mod tests {
         let mut init_failed = true; // Simulate prior failure.
         let (tx, _rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
-        let outputs = super::AcarsOutputs::new();
+        let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
+        let outputs = super::AcarsOutputs::new(acars_dsp_tx);
 
         super::acars_decode_tap(
             &mut bank,
@@ -4780,7 +4797,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
         let bad_channels: [f64; 6] = [0.0; 6]; // outside source bandwidth
-        let outputs = super::AcarsOutputs::new();
+        let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
+        let outputs = super::AcarsOutputs::new(acars_dsp_tx);
 
         super::acars_decode_tap(
             &mut bank,
