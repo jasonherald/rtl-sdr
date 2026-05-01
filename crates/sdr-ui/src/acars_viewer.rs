@@ -371,10 +371,36 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     // already bounded by `default_recent_keep`, which is the
     // same cap the append site enforces on `store` (CR round 1
     // on PR #587), so this can't push the store past its cap.
+    //
+    // A parallel pass seeds the aircraft_store + aircraft_index
+    // in the same walk so the By Aircraft tab also shows the
+    // retained backlog on reopen (issue #579).
+    let aircraft_store = gtk4::gio::ListStore::new::<AircraftEntryObject>();
+    let aircraft_index_initial: std::cell::RefCell<
+        std::collections::HashMap<arrayvec::ArrayString<8>, AircraftEntryObject>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
     {
         let recent = state.acars_recent.borrow();
-        for msg in recent.iter().cloned() {
-            store.append(&AcarsMessageObject::new(msg));
+        for msg in recent.iter() {
+            store.append(&AcarsMessageObject::new(msg.clone()));
+
+            // Mirror into aircraft_index + aircraft_store. New
+            // tail → seed an entry with msg_count=0 and let
+            // record_message bring it to 1; existing tail →
+            // record_message bumps in place.
+            let mut idx = aircraft_index_initial.borrow_mut();
+            let obj = idx.entry(msg.aircraft).or_insert_with(|| {
+                let entry = AircraftEntry {
+                    tail: msg.aircraft,
+                    last_seen: msg.timestamp,
+                    msg_count: 0,
+                    last_label: msg.label,
+                };
+                let obj = AircraftEntryObject::new(entry);
+                aircraft_store.append(&obj);
+                obj
+            });
+            obj.record_message(msg);
         }
     }
     let initial_count = store.n_items();
@@ -510,9 +536,9 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         .hexpand(true)
         .build();
 
-    // Aircraft store + filter + filter model — needed before
+    // Aircraft filter + filter model — needed before
     // `build_aircraft_column_view` is called below.
-    let aircraft_store = gtk4::gio::ListStore::new::<AircraftEntryObject>();
+    // `aircraft_store` was declared in the hydration block above.
     let aircraft_filter = gtk4::CustomFilter::new(|_obj| true);
     let aircraft_filter_model =
         gtk4::FilterListModel::new(Some(aircraft_store.clone()), Some(aircraft_filter.clone()));
@@ -556,7 +582,7 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         aircraft_store,
         aircraft_filter,
         aircraft_filter_model,
-        aircraft_index: std::cell::RefCell::new(std::collections::HashMap::new()),
+        aircraft_index: aircraft_index_initial,
         stack,
     });
     *state.acars_viewer_handles.borrow_mut() = Some(Rc::clone(&handles));
