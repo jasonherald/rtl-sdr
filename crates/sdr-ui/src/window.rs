@@ -2089,7 +2089,7 @@ fn handle_dsp_message(
             );
         }
         DspToUi::AcarsChannelStats(ch_stats) => {
-            *state.acars_channel_stats.borrow_mut() = *ch_stats;
+            *state.acars_channel_stats.borrow_mut() = ch_stats.into_vec();
         }
         DspToUi::AcarsEnabledChanged(result) => {
             match result {
@@ -2153,8 +2153,7 @@ fn handle_dsp_message(
                     state.acars_pending.set(false);
                     state.acars_recent.borrow_mut().clear();
                     state.acars_total_count.set(0);
-                    *state.acars_channel_stats.borrow_mut() = [sdr_acars::ChannelStats::default();
-                        sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT];
+                    state.acars_channel_stats.borrow_mut().clear();
                     // Restore the pre-engage tune snapshot. DSP
                     // retunes silently and reapplies its own
                     // snapshot offset, but doesn't emit Tune /
@@ -12037,10 +12036,15 @@ fn connect_aviation_panel(
             };
             status.set_subtitle(&subtitle);
 
-            // Per-channel rows.
+            // Per-channel rows. Both `row_weaks` and `channel_stats`
+            // are now `Vec`s sized from the active region (Task 9
+            // migration); their lengths can transiently differ
+            // around a region swap (panel rebuild lags the next
+            // DSP-side stats emission). Zip over the shorter of
+            // the two so neither side panics during the window.
             let channel_stats = state_for_tick.acars_channel_stats.borrow();
-            for (idx, ch) in channel_stats.iter().enumerate() {
-                let Some(row) = row_weaks[idx].upgrade() else {
+            for (row_weak, ch) in row_weaks.iter().zip(channel_stats.iter()) {
+                let Some(row) = row_weak.upgrade() else {
                     return glib::ControlFlow::Break;
                 };
                 let glyph = match ch.lock_state {

@@ -97,7 +97,11 @@ pub fn build_panels() -> SidebarPanels {
     let navigation = build_navigation_panel();
     let scanner = build_scanner_panel();
     let satellites = build_satellites_panel();
-    let aviation = build_aviation_panel();
+    // Predefined regions (US-6 / Europe) all have 6 channels;
+    // Custom regions are loaded post-startup via the config-replay
+    // path and rebuild the panel on the wiring side. Seed the
+    // initial widget at the predefined width.
+    let aviation = build_aviation_panel(sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT);
     // Flyout is built after navigation because it borrows the
     // left-sidebar `name_entry` — its row actions (recall,
     // delete-of-active) sync the entry field.

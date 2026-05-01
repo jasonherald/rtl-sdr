@@ -3589,21 +3589,16 @@ fn process_iq_block(
                         && let Some(bank) = state.acars_bank.as_ref()
                     {
                         let ch_stats = bank.channels();
-                        // `<[T; N]>::try_from(&[T])` requires `T: Copy`,
-                        // which `ChannelStats` derives. Returns `Err` if
-                        // the slice length doesn't equal N — silently
-                        // drops the emission rather than panicking, so
-                        // a future channel-set width mismatch fails
-                        // visibly via missing stats updates rather than
-                        // crashing the DSP thread.
-                        if let Ok(arr) = <[sdr_acars::ChannelStats;
-                            crate::acars_airband_lock::ACARS_CHANNEL_COUNT]>::try_from(
-                            ch_stats
-                        ) {
-                            let _ = dsp_tx
-                                .send(crate::messages::DspToUi::AcarsChannelStats(Box::new(arr)));
-                            state.acars_stats_emitted_at = now;
-                        }
+                        // Box the slice as `Box<[ChannelStats]>` so the
+                        // message variant is variable-width — the
+                        // active region's channel count can be 6 (US-6
+                        // / Europe) or up to `MAX_CUSTOM_CHANNELS` for
+                        // a Custom region. Per Task 9 of the bundled
+                        // ACARS PR plan.
+                        let _ = dsp_tx.send(crate::messages::DspToUi::AcarsChannelStats(
+                            ch_stats.to_vec().into_boxed_slice(),
+                        ));
+                        state.acars_stats_emitted_at = now;
                     }
                 }
 

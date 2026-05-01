@@ -1292,9 +1292,13 @@ mod tests {
 
     #[test]
     fn translate_acars_channel_stats_is_dropped_at_ffi_boundary() {
-        let msg = DspToUi::AcarsChannelStats(Box::new(
-            [sdr_acars::ChannelStats::default(); sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT],
-        ));
+        let msg = DspToUi::AcarsChannelStats(
+            vec![
+                sdr_acars::ChannelStats::default();
+                sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT
+            ]
+            .into_boxed_slice(),
+        );
         assert!(
             translate_event(&msg).is_none(),
             "AcarsChannelStats must not translate to a wire event yet",

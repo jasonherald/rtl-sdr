@@ -9,7 +9,7 @@
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use sdr_core::acars_airband_lock::{ACARS_CHANNEL_COUNT, AcarsRegion};
+use sdr_core::acars_airband_lock::AcarsRegion;
 
 /// Per-channel row glyphs for the lock-state column. Per spec
 /// section "Group 2 — Channels":
@@ -43,13 +43,14 @@ pub struct AviationPanel {
     /// "Open ACARS Window" button — drives
     /// `crate::acars_viewer::open_acars_viewer_if_needed`.
     pub open_viewer_button: gtk4::Button,
-    /// Per-channel rows (one per region channel). Width sourced
-    /// from `sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT`
-    /// so it stays in lock-step with the DSP-side channel array.
-    /// Subtitles are live-updated from
+    /// Per-channel rows (one per region channel). Width is the
+    /// `channel_count` argument passed to `build_aviation_panel`
+    /// so it stays in lock-step with the active region's channel
+    /// list (US-6 / Europe = 6; Custom is variable up to
+    /// `MAX_CUSTOM_CHANNELS`). Subtitles are live-updated from
     /// `DspToUi::AcarsChannelStats` arrivals (~1 Hz cadence per
     /// the DSP-side throttle).
-    pub channel_rows: [adw::ActionRow; ACARS_CHANNEL_COUNT],
+    pub channel_rows: Vec<adw::ActionRow>,
     /// Region selector (issue #581). Switches the channel set
     /// and source center frequency between US-6 and Europe.
     /// Wired up in `crate::window::connect_aviation_panel` to
@@ -102,9 +103,14 @@ pub fn region_combo_index(region: &AcarsRegion) -> u32 {
 }
 
 /// Build the Aviation activity panel. Pure widget assembly.
+///
+/// `channel_count` sizes the per-channel row list. Predefined
+/// regions (US-6 / Europe) are 6; the Custom variant is variable
+/// up to `MAX_CUSTOM_CHANNELS`. Callers source this from the
+/// active region's `channels().len()`.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn build_aviation_panel() -> AviationPanel {
+pub fn build_aviation_panel(channel_count: usize) -> AviationPanel {
     let page = adw::PreferencesPage::new();
 
     // ─── Group 1: ACARS toggle + status + open-window ───
@@ -171,11 +177,13 @@ pub fn build_aviation_panel() -> AviationPanel {
         ))
         .build();
 
-    let channel_rows: [adw::ActionRow; ACARS_CHANNEL_COUNT] = std::array::from_fn(|_| {
-        let row = adw::ActionRow::builder().title("—").subtitle("—").build();
-        channels_group.add(&row);
-        row
-    });
+    let channel_rows: Vec<adw::ActionRow> = (0..channel_count)
+        .map(|_| {
+            let row = adw::ActionRow::builder().title("—").subtitle("—").build();
+            channels_group.add(&row);
+            row
+        })
+        .collect();
 
     page.add(&channels_group);
 
