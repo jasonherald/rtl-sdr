@@ -1214,18 +1214,15 @@ Find the existing `mod tests` (likely at the bottom of `acars_airband_lock.rs`; 
 
     #[test]
     fn validate_rejects_nan() {
-        assert_eq!(
-            validate_custom_channels(&[131_550_000.0, f64::NAN]),
-            Err(CustomChannelError::InvalidFrequency { value: f64::NAN })
-        );
-        // f64::NAN != f64::NAN, so the assert_eq above compares
-        // via PartialEq on the wrapper struct; verify that
-        // CustomChannelError uses bitwise equality (which we'll
-        // arrange via #[derive(PartialEq)] on a NotNan-style
-        // wrapper) — actually, simpler: just check the variant.
-        // (Re-cast as a discriminant check.)
+        // Note: f64::NAN != f64::NAN, so `assert_eq!(..., Err(
+        // InvalidFrequency { value: f64::NAN }))` would fail
+        // even when the variant is correct. Pattern-match
+        // the variant and check `value.is_nan()` instead.
+        // CR round 4 on PR #598.
         match validate_custom_channels(&[131_550_000.0, f64::NAN]) {
-            Err(CustomChannelError::InvalidFrequency { .. }) => {}
+            Err(CustomChannelError::InvalidFrequency { value }) => {
+                assert!(value.is_nan());
+            }
             other => panic!("expected InvalidFrequency, got {other:?}"),
         }
     }
