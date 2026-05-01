@@ -197,16 +197,95 @@ impl Default for AcarsOutputs {
 /// sender side disconnects (app shutdown). Issue #596.
 #[allow(dead_code)] // used from tests; caller site lands in Task 5
 #[allow(clippy::needless_pass_by_value)] // rx must be owned to observe disconnect
-fn run_writer_loop(
-    rx: mpsc::Receiver<AcarsOutputMessage>,
-    _config: Arc<RwLock<AcarsWriterConfig>>,
-) {
-    // Real per-message handling lands in Task 4 (path/addr
-    // hot-reload) and Task 5 (writes + send). For now, just
-    // drain the channel so the shutdown-on-disconnect contract
-    // holds.
-    while let Ok(_msg) = rx.recv() {
-        // Drain only — Task 4 + 5 wire writes here.
+fn run_writer_loop(rx: mpsc::Receiver<AcarsOutputMessage>, config: Arc<RwLock<AcarsWriterConfig>>) {
+    let mut jsonl: Option<(PathBuf, JsonlWriter)> = None;
+    let mut udp: Option<(String, UdpFeeder)> = None;
+    let mut jsonl_warn_at: Option<std::time::Instant> = None;
+    let mut udp_warn_at: Option<std::time::Instant> = None;
+
+    while let Ok(msg) = rx.recv() {
+        let AcarsOutputMessage::Decoded(msg) = msg;
+
+        // Snapshot the config under a brief read lock so we
+        // don't hold it across blocking I/O.
+        let (want_jsonl_path, want_udp_addr, station_id) = {
+            let cfg = config.read().expect("acars writer config poisoned");
+            (
+                cfg.jsonl_path.clone(),
+                cfg.network_addr.clone(),
+                cfg.station_id.clone(),
+            )
+        };
+
+        ensure_jsonl(&mut jsonl, want_jsonl_path.as_deref());
+        ensure_udp(&mut udp, want_udp_addr.as_deref());
+
+        if let Some((_, w)) = jsonl.as_mut()
+            && let Err(e) = w.write(&msg, station_id.as_deref())
+        {
+            rate_limited_warn("jsonl", &mut jsonl_warn_at, &e);
+        }
+        if let Some((_, f)) = udp.as_mut()
+            && let Err(e) = f.send(&msg, station_id.as_deref())
+        {
+            rate_limited_warn("udp", &mut udp_warn_at, &e);
+        }
+    }
+}
+
+/// Ensure `slot` holds an open `JsonlWriter` matching `want`.
+/// Reopens on path change; closes (drops) when `want` is `None`.
+fn ensure_jsonl(slot: &mut Option<(PathBuf, JsonlWriter)>, want: Option<&Path>) {
+    let needs_reopen = match (slot.as_ref(), want) {
+        (None, None) => false,
+        (Some((cur, _)), Some(want)) if cur == want => false,
+        _ => true,
+    };
+    if !needs_reopen {
+        return;
+    }
+    *slot = None;
+    if let Some(want) = want {
+        match JsonlWriter::open(want) {
+            Ok(w) => *slot = Some((want.to_path_buf(), w)),
+            Err(e) => tracing::warn!("acars jsonl open failed: {e}"),
+        }
+    }
+}
+
+/// Same shape as `ensure_jsonl` but for `UdpFeeder`. The `String`
+/// key compares the user-set addr verbatim; resolved peer
+/// addresses are not the source of truth.
+fn ensure_udp(slot: &mut Option<(String, UdpFeeder)>, want: Option<&str>) {
+    let needs_reopen = match (slot.as_ref(), want) {
+        (None, None) => false,
+        (Some((cur, _)), Some(want)) if cur == want => false,
+        _ => true,
+    };
+    if !needs_reopen {
+        return;
+    }
+    *slot = None;
+    if let Some(want) = want {
+        match UdpFeeder::open(want) {
+            Ok(f) => *slot = Some((want.to_string(), f)),
+            Err(e) => tracing::warn!("acars udp open failed: {e}"),
+        }
+    }
+}
+
+const ACARS_OUTPUT_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Emit a `tracing::warn!` at most once per
+/// `ACARS_OUTPUT_WARN_MIN_INTERVAL` for `kind`. Mirrors the
+/// per-writer 30 s rate-limit that previously lived in
+/// `controller.rs::acars_decode_tap`.
+fn rate_limited_warn(kind: &str, last: &mut Option<std::time::Instant>, err: &std::io::Error) {
+    let now = std::time::Instant::now();
+    let elapsed = last.map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
+    if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
+        tracing::warn!("acars {kind} write/send failed: {err} (rate-limited 30s)");
+        *last = Some(now);
     }
 }
 
@@ -351,5 +430,51 @@ mod tests {
             "writer thread did not exit within 500ms of tx drop"
         );
         handle.join().expect("writer thread panicked");
+    }
+
+    #[test]
+    fn writer_reopens_on_path_change() {
+        // Pump message → path A; switch config to path B; pump
+        // message → path B. Assert both files exist with the
+        // expected line count.
+        let dir = tempdir().unwrap();
+        let path_a = dir.path().join("a.jsonl");
+        let path_b = dir.path().join("b.jsonl");
+
+        let config = Arc::new(RwLock::new(AcarsWriterConfig {
+            jsonl_path: Some(path_a.clone()),
+            network_addr: None,
+            station_id: None,
+        }));
+        let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(8);
+        let handle = {
+            let config = Arc::clone(&config);
+            std::thread::spawn(move || run_writer_loop(rx, config))
+        };
+
+        tx.send(AcarsOutputMessage::Decoded(make_msg(0))).unwrap();
+
+        // Spin briefly to let the writer process the first
+        // message before we mutate the path.
+        std::thread::sleep(Duration::from_millis(50));
+
+        config.write().unwrap().jsonl_path = Some(path_b.clone());
+        tx.send(AcarsOutputMessage::Decoded(make_msg(1))).unwrap();
+
+        // Drop tx → thread exits; flush on Drop ensures the
+        // BufWriter contents land on disk before we read.
+        drop(tx);
+        handle.join().expect("writer thread panicked");
+
+        let read_lines = |p: &Path| -> Vec<String> {
+            let f = File::open(p).unwrap();
+            BufReader::new(f).lines().collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(read_lines(&path_a).len(), 1, "path A got the first message");
+        assert_eq!(
+            read_lines(&path_b).len(),
+            1,
+            "path B got the second message"
+        );
     }
 }
