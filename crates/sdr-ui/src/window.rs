@@ -11938,15 +11938,22 @@ fn connect_aviation_panel(
     // dispatch + persist round-trip.
     let saved_region_id = crate::acars_config::read_acars_channel_set(config);
     let initial_region = if saved_region_id == "custom" {
-        // Hydrate the Custom variant with the saved channel
-        // list so the initial DSP dispatch carries real
-        // frequencies. An empty list means the user picked
-        // Custom but never entered channels — keep the
-        // placeholder so engage logic still sees a Custom
-        // variant; the apply handler dispatches a real one
-        // once the user types valid input.
+        // Two-key load: read channels, validate, then build
+        // Custom — or fall back to default on bad/stale config.
+        // `Custom([])` would reach the engage guard as invalid
+        // (validate_custom_channels rejects empty), so we must
+        // not dispatch it at startup.
         let saved_chans = crate::acars_config::read_acars_custom_channels(config);
-        AcarsRegion::Custom(saved_chans.into_boxed_slice())
+        match validate_custom_channels(&saved_chans) {
+            Ok(()) => AcarsRegion::Custom(saved_chans.into_boxed_slice()),
+            Err(e) => {
+                tracing::warn!(
+                    "saved custom ACARS channels invalid ({e}); \
+                     falling back to default region"
+                );
+                AcarsRegion::default()
+            }
+        }
     } else {
         AcarsRegion::from_config_id(saved_region_id.as_str())
     };
