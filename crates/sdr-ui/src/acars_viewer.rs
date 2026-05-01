@@ -404,15 +404,16 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         .build();
     sort_model.set_sorter(column_view.sorter().as_ref());
 
-    // Seven columns per spec section "Content":
-    //   Time | Freq | Aircraft | Mode | Label | Block | Text
-    let columns: [ColumnSpec; 7] = [
+    // Eight columns per spec section "Content" (issue #579 adds Ack):
+    //   Time | Freq | Aircraft | Mode | Label | Block | Ack | Text
+    let columns: [ColumnSpec; 8] = [
         ("Time", render_time, false),
         ("Freq", render_freq, false),
         ("Aircraft", render_aircraft, false),
         ("Mode", render_mode, false),
         ("Label", render_label, false),
         ("Block", render_block, false),
+        ("Ack", render_ack, false),
         ("Text", render_text, true),
     ];
 
@@ -421,7 +422,7 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     // clone on the comparator hot path) and falling back to
     // `Ordering::Equal` when the slot is empty (model churn).
     // Issue #585.
-    let sorters: [gtk4::CustomSorter; 7] = [
+    let sorters: [gtk4::CustomSorter; 8] = [
         // Time column sorts on the wrapper's `last_seen`, not
         // the original frame timestamp. After a collapse hit,
         // `record_duplicate` advances `last_seen` in place
@@ -447,6 +448,7 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         make_message_sorter(|a, b| a.mode.cmp(&b.mode)),
         make_message_sorter(|a, b| a.label.cmp(&b.label)),
         make_message_sorter(|a, b| a.block_id.cmp(&b.block_id)),
+        make_message_sorter(|a, b| a.ack.cmp(&b.ack)),
         make_message_sorter(|a, b| cmp_case_insensitive(&a.text, &b.text)),
     ];
 
@@ -712,6 +714,14 @@ fn render_label(obj: &AcarsMessageObject) -> String {
 }
 fn render_block(obj: &AcarsMessageObject) -> String {
     render_inner(obj, |m| char::from(m.block_id).to_string())
+}
+fn render_ack(obj: &AcarsMessageObject) -> String {
+    render_inner(obj, |m| match m.ack {
+        b'\x15' => "NAK".to_string(),
+        b'!' => "!".to_string(),
+        c if c.is_ascii_graphic() => char::from(c).to_string(),
+        c => format!("0x{c:02X}"),
+    })
 }
 fn render_text(obj: &AcarsMessageObject) -> String {
     render_inner(obj, |m| {
