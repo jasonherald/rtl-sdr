@@ -94,7 +94,7 @@ mod tests {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p sdr-acars label::tests --features sdr-transcription/whisper-cpu`
-Expected: FAIL with `assertion `left == right` failed` for the positive lookups (the stub returns `None` for everything).
+Expected: FAIL with ``assertion `left == right` failed`` for the positive lookups (the stub returns `None` for everything).
 
 - [ ] **Step 3: Replace `lookup` body with the populated table**
 

@@ -631,10 +631,11 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
             state.acars_recent.borrow_mut().clear();
             // Don't reset acars_total_count — that's the
             // running total since toggle-on, distinct from the
-            // visible count. Status label refresh in the
-            // items_changed handler recomputes "filtered / total"
-            // from the now-empty filter_model + total_count.
-            handles.status_label.set_label("0 / 0 messages");
+            // visible count. Status label refresh fires from
+            // items_changed on both filter models above and
+            // recomputes "filtered / total <messages|aircraft>"
+            // from whichever tab is currently visible (CR round 1
+            // on PR #597).
         });
     }
 
@@ -691,20 +692,46 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     // stack.visible_child_name(). Re-evaluated on:
     //   - either filter model's items-changed signal
     //   - stack visible-child-notify
+    //
+    // CR round 1 on PR #597: capture WeakRefs (not strong clones)
+    // for each GTK object. The signal handlers below own the
+    // Rc<refresh>; if the refresh captured strong refs, the
+    // chain `filter_model → handler → Rc → filter_model` would
+    // hold the model alive past viewer close. WeakRef + upgrade-
+    // or-return matches the ScannerForceDisable pattern in
+    // window.rs.
     {
-        let stack = handles.stack.clone();
-        let status = handles.status_label.clone();
-        let store = handles.store.clone();
-        let aircraft_store = handles.aircraft_store.clone();
-        let filter_model = handles.filter_model.clone();
-        let aircraft_filter_model = handles.aircraft_filter_model.clone();
+        let stack_weak = handles.stack.downgrade();
+        let status_weak = handles.status_label.downgrade();
+        let store_weak = handles.store.downgrade();
+        let aircraft_store_weak = handles.aircraft_store.downgrade();
+        let filter_model_weak = handles.filter_model.downgrade();
+        let aircraft_filter_model_weak = handles.aircraft_filter_model.downgrade();
         let refresh = std::rc::Rc::new(move || {
+            let Some(stack) = stack_weak.upgrade() else {
+                return;
+            };
+            let Some(status) = status_weak.upgrade() else {
+                return;
+            };
             let on_aircraft = stack.visible_child_name().as_deref() == Some("aircraft");
             if on_aircraft {
+                let Some(aircraft_store) = aircraft_store_weak.upgrade() else {
+                    return;
+                };
+                let Some(aircraft_filter_model) = aircraft_filter_model_weak.upgrade() else {
+                    return;
+                };
                 let filtered = aircraft_filter_model.n_items();
                 let total = aircraft_store.n_items();
                 status.set_label(&format!("{filtered} / {total} aircraft"));
             } else {
+                let Some(store) = store_weak.upgrade() else {
+                    return;
+                };
+                let Some(filter_model) = filter_model_weak.upgrade() else {
+                    return;
+                };
                 let filtered = filter_model.n_items();
                 let total = store.n_items();
                 status.set_label(&format!("{filtered} / {total} messages"));
@@ -1029,7 +1056,11 @@ fn render_ack(obj: &AcarsMessageObject) -> String {
     render_inner(obj, |m| match m.ack {
         b'\x15' => "NAK".to_string(),
         b'!' => "!".to_string(),
-        c if c.is_ascii_graphic() => char::from(c).to_string(),
+        // CR round 1 on PR #597: 0x20..=0x7E (printable
+        // ASCII inclusive of space) rather than is_ascii_graphic
+        // which excludes space. ACARS ACK can be a literal space
+        // and we want to render it as ' ', not "0x20".
+        c if (0x20..=0x7E).contains(&c) => char::from(c).to_string(),
         c => format!("0x{c:02X}"),
     })
 }
