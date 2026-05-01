@@ -392,6 +392,19 @@ pub fn engage(
     if current.source_type != SourceType::RtlSdr {
         return Err(AcarsEnableError::UnsupportedSourceType(current.source_type));
     }
+    // Reject empty / invalid Custom regions before computing
+    // geometry. `from_config_id("custom")` builds a placeholder
+    // `Custom(Box::new([]))` that should never reach engage —
+    // window.rs::startup_replay validates and falls back to the
+    // default region on stale config, but defending here keeps
+    // an `target_center_hz = 0.0` from leaking through if any
+    // future path constructs an empty Custom and dispatches it.
+    // CR round 1 on PR #598.
+    if let AcarsRegion::Custom(chans) = region {
+        validate_custom_channels(chans).map_err(|e| {
+            AcarsEnableError::ChannelBankInit(format!("invalid custom-channel set: {e}"))
+        })?;
+    }
     Ok(EngagePlan {
         target_source_rate_hz: ACARS_SOURCE_RATE_HZ,
         target_center_hz: region.center_hz(),
@@ -445,6 +458,47 @@ mod tests {
         assert_eq!(plan.snapshot.vfo_offset_hz, -25_000.0);
         assert_eq!(plan.snapshot.source_type, SourceType::RtlSdr);
         assert_eq!(plan.snapshot.frontend_decim, 4);
+    }
+
+    #[test]
+    fn engage_rejects_empty_custom_region() {
+        // CR round 1 on PR #598: an empty `Custom` region (the
+        // placeholder `from_config_id("custom")` returns when
+        // saved channels haven't been validated yet) must not
+        // reach engage. Without this guard, `center_hz()`
+        // returns 0.0 and the controller would retune to 0 Hz.
+        let region = AcarsRegion::Custom(Box::new([]));
+        match engage(&rtl_state(), &region) {
+            Err(AcarsEnableError::ChannelBankInit(msg)) => {
+                assert!(
+                    msg.contains("invalid custom-channel set"),
+                    "error wraps validate_custom_channels output: {msg}"
+                );
+            }
+            other => panic!("expected ChannelBankInit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engage_rejects_oversized_custom_region() {
+        #[allow(clippy::cast_precision_loss)]
+        let chans: Vec<f64> = (0..=MAX_CUSTOM_CHANNELS)
+            .map(|i| 131_000_000.0 + (i as f64) * 100_000.0)
+            .collect();
+        let region = AcarsRegion::Custom(chans.into_boxed_slice());
+        match engage(&rtl_state(), &region) {
+            Err(AcarsEnableError::ChannelBankInit(msg)) => {
+                assert!(msg.contains("Too many custom channels"), "msg={msg}");
+            }
+            other => panic!("expected ChannelBankInit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engage_accepts_valid_custom_region() {
+        let region = AcarsRegion::Custom(Box::new([131_550_000.0, 131_525_000.0]));
+        let plan = engage(&rtl_state(), &region).expect("valid Custom region engages");
+        assert_eq!(plan.target_center_hz, region.center_hz());
     }
 
     #[test]
