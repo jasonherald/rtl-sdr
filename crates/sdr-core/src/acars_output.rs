@@ -124,6 +124,47 @@ impl UdpFeeder {
     }
 }
 
+/// Output-writer bundle owned by `DspState`. Keeps the JSONL
+/// writer, UDP feeder, station ID, and per-writer warn-rate-
+/// limit timestamps together so the `acars_decode_tap`
+/// signature stays narrow. Issue #578. Async refactor in
+/// progress per #596 — fields will migrate to a worker
+/// thread + shared config lock in subsequent tasks.
+pub struct AcarsOutputs {
+    pub jsonl: Option<JsonlWriter>,
+    pub udp: Option<UdpFeeder>,
+    pub jsonl_enabled: bool,
+    pub network_enabled: bool,
+    pub station_id: Option<String>,
+    pub jsonl_warn_at: Option<std::time::Instant>,
+    pub udp_warn_at: Option<std::time::Instant>,
+    pub pending_jsonl_path: Option<String>,
+    pub pending_network_addr: Option<String>,
+}
+
+impl AcarsOutputs {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            jsonl: None,
+            udp: None,
+            jsonl_enabled: false,
+            network_enabled: false,
+            station_id: None,
+            jsonl_warn_at: None,
+            udp_warn_at: None,
+            pending_jsonl_path: None,
+            pending_network_addr: None,
+        }
+    }
+}
+
+impl Default for AcarsOutputs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

@@ -226,51 +226,7 @@ fn poll_rtl_tcp_connection_state(state: &mut DspState, dsp_tx: &mpsc::Sender<Dsp
     }
 }
 
-/// Output-writer bundle owned by `DspState`. Keeps the
-/// JSONL writer, UDP feeder, station ID, and per-writer
-/// warn-rate-limit timestamps together so the
-/// `acars_decode_tap` signature stays narrow. Issue #578.
-struct AcarsOutputs {
-    jsonl: Option<crate::acars_output::JsonlWriter>,
-    udp: Option<crate::acars_output::UdpFeeder>,
-    /// User's enable intent for the JSONL writer. Persists
-    /// across disengage / open-failure so path changes can
-    /// trigger reopen, and ACARS re-engage can restore the
-    /// writer. Issue #578.
-    jsonl_enabled: bool,
-    /// User's enable intent for the UDP feeder. Same pattern
-    /// as `jsonl_enabled`.
-    network_enabled: bool,
-    station_id: Option<String>,
-    /// Last warn timestamp for JSONL write failures. 30 s
-    /// rate limit prevents log spam from a misconfigured
-    /// path. Issue #578.
-    jsonl_warn_at: Option<std::time::Instant>,
-    /// Last warn timestamp for UDP send failures.
-    udp_warn_at: Option<std::time::Instant>,
-    /// Latest user-set JSONL path (resolved when opening).
-    /// `None` ⇒ use default `~/sdr-recordings/acars.jsonl`.
-    pending_jsonl_path: Option<String>,
-    /// Latest user-set feeder addr. `None` ⇒ default
-    /// `feed.airframes.io:5550`.
-    pending_network_addr: Option<String>,
-}
-
-impl AcarsOutputs {
-    const fn new() -> Self {
-        Self {
-            jsonl: None,
-            udp: None,
-            jsonl_enabled: false,
-            network_enabled: false,
-            station_id: None,
-            jsonl_warn_at: None,
-            udp_warn_at: None,
-            pending_jsonl_path: None,
-            pending_network_addr: None,
-        }
-    }
-}
+use crate::acars_output::AcarsOutputs;
 
 /// Minimum interval between repeated warn-log emissions for
 /// the same writer. Issue #578.
