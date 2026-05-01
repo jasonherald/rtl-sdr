@@ -43,6 +43,30 @@ pub struct ViewerHandles {
     /// until they scroll back. Bypasses `ColumnView::scroll_to`
     /// which needs gtk4 `v4_12` (workspace is on `v4_10`).
     pub scrolled_window: gtk4::ScrolledWindow,
+    /// "By Aircraft" tab parallel store, one row per unique
+    /// tail seen since session start. Issue #579.
+    pub aircraft_store: gtk4::gio::ListStore,
+    /// Filter applied to `aircraft_store`. Same `filter_entry`
+    /// drives both this and the stream `filter`; this one
+    /// matches tail substring only (no label/text — those don't
+    /// exist on aircraft rows).
+    pub aircraft_filter: gtk4::CustomFilter,
+    /// `FilterListModel` wrapping `aircraft_store` for the
+    /// aircraft column view.
+    pub aircraft_filter_model: gtk4::FilterListModel,
+    /// O(1) tail → `AircraftEntryObject` lookup so the message-
+    /// append site in `window.rs` can find-or-insert without
+    /// scanning the store. Holds clones of the same glib
+    /// objects that live in `aircraft_store`; updates flow
+    /// through to the column view via the shared refcount.
+    pub aircraft_index: std::cell::RefCell<
+        std::collections::HashMap<arrayvec::ArrayString<8>, AircraftEntryObject>,
+    >,
+    /// `GtkStack` switching between the "stream" page (existing
+    /// chronological view) and "aircraft" page (per-tail
+    /// summary). Cloned into the click-to-filter handler on the
+    /// aircraft column view to switch back to the stream tab.
+    pub stack: gtk4::Stack,
 }
 
 /// Recency window length in seconds (10 minutes). Split into a
@@ -489,6 +513,16 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
     content.append(&scroll);
     window.set_content(Some(&content));
 
+    // Placeholder aircraft store + filter + stack for the
+    // "By Aircraft" tab. Wired to a real column view + click
+    // handlers in subsequent tasks; this stub keeps the
+    // struct buildable so the field additions land cleanly.
+    let aircraft_store = gtk4::gio::ListStore::new::<AircraftEntryObject>();
+    let aircraft_filter = gtk4::CustomFilter::new(|_obj| true);
+    let aircraft_filter_model =
+        gtk4::FilterListModel::new(Some(aircraft_store.clone()), Some(aircraft_filter.clone()));
+    let stack = gtk4::Stack::new();
+
     // Hoist handles so all signal handlers below can clone from it.
     let handles = Rc::new(ViewerHandles {
         store,
@@ -499,6 +533,11 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         filter_entry: filter_entry.clone(),
         collapse_button: collapse_button.clone(),
         scrolled_window: scroll.clone(),
+        aircraft_store,
+        aircraft_filter,
+        aircraft_filter_model,
+        aircraft_index: std::cell::RefCell::new(std::collections::HashMap::new()),
+        stack,
     });
     *state.acars_viewer_handles.borrow_mut() = Some(Rc::clone(&handles));
 
