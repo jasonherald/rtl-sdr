@@ -678,7 +678,10 @@ fn render_ack(obj: &AcarsMessageObject) -> String {
     render_inner(obj, |m| match m.ack {
         b'\x15' => "NAK".to_string(),
         b'!' => "!".to_string(),
-        c if c.is_ascii_graphic() => char::from(c).to_string(),
+        // Printable ASCII range 0x20..=0x7E (inclusive of
+        // space, exclusive of DEL). `is_ascii_graphic`
+        // excludes space, which is a legitimate ACK byte.
+        c if (0x20..=0x7E).contains(&c) => char::from(c).to_string(),
         c => format!("0x{c:02X}"),
     })
 }
@@ -1441,12 +1444,13 @@ Replace the existing Clear-button block (lines 418-432) with:
             handles.aircraft_store.remove_all();
             handles.aircraft_index.borrow_mut().clear();
             state.acars_recent.borrow_mut().clear();
-            // Don't reset acars_total_count — that's the
-            // running total since toggle-on, distinct from the
-            // visible count. Status label refresh in the
-            // items_changed handler recomputes "filtered / total"
-            // from the now-empty filter_model + total_count.
-            handles.status_label.set_label("0 / 0 messages");
+            // Status label is recomputed by the existing
+            // items_changed / visible-child refresh wiring —
+            // both `store.remove_all()` and `aircraft_store
+            // .remove_all()` fire items_changed, which the
+            // tab-aware refresh closure handles. Don't hard-
+            // code wording here; that would leave the aircraft
+            // tab saying "0 / 0 messages" until the next event.
         });
     }
 ```
