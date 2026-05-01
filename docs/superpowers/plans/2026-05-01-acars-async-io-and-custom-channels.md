@@ -951,40 +951,11 @@ super::acars_decode_tap(
 
 i.e., drop the `mut` and the `&mut`. The tests should still pass — they were exercising the bank-init / decode path, not the I/O fields.
 
-- [ ] **Step 3: Update the handlers**
+- [ ] **Step 3: Update the station-id handler**
 
-Replace the bodies of `handle_set_acars_jsonl_path`, `handle_set_acars_network_addr`, `handle_set_acars_station_id` (currently around lines 4480-4540) with:
+`handle_set_acars_station_id` doesn't need the intent-preservation pattern that the path/addr handlers use (`station_id` is a single user-typed string with no separate "enable" toggle). Replace its body with the trim+cap+empty-as-None pattern:
 
 ```rust
-fn handle_set_acars_jsonl_path(
-    state: &mut DspState,
-    dsp_tx: &mpsc::Sender<DspToUi>,
-    path: &str,
-) {
-    let resolved: Option<std::path::PathBuf> = if path.is_empty() {
-        None
-    } else {
-        Some(resolve_jsonl_path(path))
-    };
-    acars_config_write(&state.acars_outputs.config).jsonl_path = resolved;
-    state.acars_outputs.notify_config_changed();
-}
-
-fn handle_set_acars_network_addr(
-    state: &mut DspState,
-    _dsp_tx: &mpsc::Sender<DspToUi>,
-    addr: &str,
-) {
-    let trimmed = addr.trim();
-    let resolved = if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    };
-    acars_config_write(&state.acars_outputs.config).network_addr = resolved;
-    state.acars_outputs.notify_config_changed();
-}
-
 fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
     // Trim, bound to 8 chars (matches acarsdec's `idstation`
     // field width), and treat empty-after-trim as None so
@@ -1000,6 +971,8 @@ fn handle_set_acars_station_id(state: &mut DspState, station_id: &str) {
     state.acars_outputs.notify_config_changed();
 }
 ```
+
+The corresponding `handle_set_acars_jsonl_path` and `handle_set_acars_network_addr` handlers use the canonical intent-preservation pattern — see **Step 5** below for the full bodies. CR round 2 on PR #598 caught that an earlier draft of this section showed a simpler direct-config-write variant for those two handlers, which would regress the disable/enable restore behaviour by collapsing user intent into runtime writer state. Don't apply that older pattern; route through `acars_last_user_jsonl_path` / `acars_last_user_network_addr` per Step 5.
 
 The `acars_config_write` helper recovers from `RwLock` poisoning rather than panicking; without it, a panic in the writer thread would propagate to every later settings edit.
 
@@ -2224,7 +2197,7 @@ When the app starts up, the `startup_replay` (or equivalent) reads `acars_region
 - [ ] **Step 1: Find the existing startup-replay block**
 
 ```bash
-grep -n "from_config_id\|acars_region\|SetAcarsRegion" /data/source/rtl-sdr/crates/sdr-ui/src/window.rs | head -10
+grep -n "from_config_id\|acars_region\|SetAcarsRegion" crates/sdr-ui/src/window.rs | head -10
 ```
 
 Find the block where `Config::acars_region()` is read on startup. Likely in a function called `startup_replay`, `apply_startup_config`, or similar.
