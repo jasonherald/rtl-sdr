@@ -99,7 +99,7 @@ impl SstvImageRenderer {
     /// Returns `true` when at least one new line was written (the view
     /// should queue a redraw). Returns `false` on surface errors (logged,
     /// not propagated — a failed redraw shouldn't kill the UI).
-    pub fn update_from_snapshot(&mut self, snap: &SstvSnapshot) -> bool {
+    pub fn update_from_snapshot(&mut self, snap: SstvSnapshot) -> bool {
         let mut old_lines = self.lines_written;
 
         // Rebuild surface on dimension change (new image / new mode).
@@ -161,7 +161,10 @@ impl SstvImageRenderer {
 
         let changed = new_lines > old_lines;
         self.lines_written = new_lines;
-        self.last_snapshot = Some(snap.clone());
+        // Move the snapshot directly into the cache; no clone. The
+        // pixel borrow above ends with `drop(data)`, so NLL lets us
+        // consume `snap` here. Per CR round 3 on PR #599.
+        self.last_snapshot = Some(snap);
         changed
     }
 
@@ -396,7 +399,10 @@ impl SstvImageView {
     /// lost while the user inspects the image.
     pub fn update_from_handle(&self, handle: &SstvImageHandle) {
         if let Some(snap) = handle.snapshot() {
-            let changed = self.renderer.borrow_mut().update_from_snapshot(&snap);
+            // Move the snapshot into the renderer; it caches a single
+            // copy in `last_snapshot` for redraws and avoids cloning.
+            // Per CR round 3 on PR #599.
+            let changed = self.renderer.borrow_mut().update_from_snapshot(snap);
             if changed && !self.paused.get() {
                 self.drawing_area.queue_draw();
             }
@@ -604,7 +610,10 @@ fn show_toast_in<W: gtk4::prelude::IsA<gtk4::Window>>(window: &W, toast: adw::To
 
 /// Wire the `app.sstv-open` action onto `app`. Activating it (via the
 /// app menu or `Ctrl+Shift+V`) opens a non-modal SSTV viewer window.
-/// If a viewer is already open, activating is a no-op.
+/// If a viewer is already open, activating it presents (focuses) the
+/// existing window and re-sends the current `SstvImageHandle` to the
+/// DSP so the viewer reflects the latest state — mirrors the LRPT
+/// viewer's behavior (CR round 1 on PR #599).
 pub fn connect_sstv_action(
     app: &adw::Application,
     parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,

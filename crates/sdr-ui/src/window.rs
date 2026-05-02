@@ -1955,17 +1955,24 @@ fn handle_dsp_message(
             // The SSTV decoder has closed out a full image frame.
             // Accumulate it into the pass buffer so the
             // `SaveSstvPass` interpreter can write every image that
-            // arrived during the pass to disk.  The viewer is
-            // refreshed one last time so the final frame is visible.
+            // arrived during the pass to disk.
+            //
+            // We deliberately do NOT call `view.update_from_handle`
+            // here: by the time this message arrives the controller's
+            // tap has already called `SstvImageHandle::take_completed`,
+            // which clears the in-flight pixel buffer for the next
+            // VIS detection. Reading from the now-empty handle would
+            // either no-op (snapshot returns None) or actively wipe
+            // the displayed frame. The final row was already rendered
+            // by the previous `SstvLineDecoded` refresh, so the
+            // viewer already shows the correct end state.
+            // Per CR round 3 on PR #599.
             let completed = sdr_radio::sstv_image::CompletedSstvImage {
                 width,
                 height,
                 pixels,
             };
             state.sstv_completed_images.borrow_mut().push(completed);
-            if let Some(view) = state.sstv_viewer.borrow().as_ref() {
-                view.update_from_handle(&state.sstv_image.handle());
-            }
             tracing::info!(
                 width,
                 height,

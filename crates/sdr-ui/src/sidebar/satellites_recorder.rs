@@ -377,12 +377,13 @@ impl AutoRecorder {
     ///
     /// **Crate-private** so external callers can only use
     /// [`Self::new`], which encodes today's "fully wired"
-    /// reality (`[Apt]`). Per CR round 2 on PR #541: exposing
-    /// the variadic builder publicly would let the wiring
-    /// layer opt into protocols whose LOS flow isn't actually
-    /// safe yet. When Task 7 of epic #469 finishes the LRPT
-    /// wiring, flip `new()` to default to `[Apt, Lrpt]` rather
-    /// than re-exporting this builder.
+    /// reality (`[Apt, Lrpt, Sstv]` as of epic #472). Per CR
+    /// round 2 on PR #541: exposing the variadic builder
+    /// publicly would let the wiring layer opt into protocols
+    /// whose LOS flow isn't actually safe yet. When V2 modes
+    /// (Robot / Scottie / Martin / PD240) flow through the
+    /// SSTV wiring via slowrx.rs V2, no constructor change is
+    /// needed — they all dispatch as `ImagingProtocol::Sstv`.
     #[must_use]
     fn with_supported_protocols(supported: &[sdr_sat::ImagingProtocol]) -> Self {
         Self {
