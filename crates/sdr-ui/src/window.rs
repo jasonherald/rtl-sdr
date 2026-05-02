@@ -11158,7 +11158,27 @@ fn connect_satellites_panel(
                             &state_a,
                         );
                         state_a.sstv_image.clear();
-                        state_a.sstv_completed_images.borrow_mut().clear();
+                        // Don't clear blindly: a prior pass's
+                        // `SaveSstvPass` may have intentionally retained
+                        // its `CompletedSstvImage`s on partial export
+                        // failure (CR round 4 on PR #599). Carry them
+                        // forward into `sstv_pending_export` so the next
+                        // successful save attempt writes them to disk
+                        // instead of silently dropping them on AOS. Per
+                        // CR round 5 on PR #599.
+                        {
+                            let mut completed = state_a.sstv_completed_images.borrow_mut();
+                            if !completed.is_empty() {
+                                tracing::warn!(
+                                    "AOS: carrying {} retained SSTV images from prior failed save into pending_export",
+                                    completed.len()
+                                );
+                                state_a
+                                    .sstv_pending_export
+                                    .borrow_mut()
+                                    .append(&mut completed);
+                            }
+                        }
                         if let Some(view) = state_a.sstv_viewer.borrow().as_ref() {
                             view.clear();
                         }
@@ -11692,18 +11712,29 @@ fn connect_satellites_panel(
                 // `gio::spawn_blocking` so multi-image PNG encoding
                 // doesn't freeze the UI right when the auto-record
                 // toast is landing. Per CodeRabbit #9 on PR #599.
-                let images: Vec<sdr_radio::sstv_image::CompletedSstvImage> = state_a
-                    .sstv_completed_images
-                    .borrow()
-                    .iter()
-                    .cloned()
-                    .collect();
-                // Capture exact count snapshotted so the success
-                // path can drain only those — late frames pushed
-                // by `DspToUi::SstvImageComplete` while we're
-                // awaiting the worker stay buffered for the next
-                // save cycle. Per CR round 4 on PR #599.
-                let exported_image_count = images.len();
+                // Drain any images carried over from a prior pass's
+                // failed save (preserved at AOS in
+                // `sstv_pending_export`) so the next successful save
+                // writes them out instead of silently retaining them
+                // forever. Per CR round 5 on PR #599.
+                let mut images: Vec<sdr_radio::sstv_image::CompletedSstvImage> =
+                    std::mem::take(&mut *state_a.sstv_pending_export.borrow_mut());
+                let pending_export_count = images.len();
+                images.extend(state_a.sstv_completed_images.borrow().iter().cloned());
+                // Capture exact count snapshotted from the *current*
+                // pass so the success path can drain only those —
+                // late frames pushed by
+                // `DspToUi::SstvImageComplete` while we're awaiting
+                // the worker stay buffered for the next save cycle.
+                // Per CR round 4 on PR #599.
+                let exported_image_count = images.len() - pending_export_count;
+                // Clone the pending-export prefix so the failure
+                // path can put it back into `sstv_pending_export`
+                // for retry on the next save attempt — `images`
+                // itself is moved into the blocking worker. Per CR
+                // round 5 on PR #599.
+                let pending_export_backup: Vec<sdr_radio::sstv_image::CompletedSstvImage> =
+                    images.iter().take(pending_export_count).cloned().collect();
                 let toast_overlay_weak_for_save = toast_overlay_weak.clone();
                 let state_sstv_close = Rc::clone(&state_a);
                 // Snapshot the WeakRef BEFORE spawning so a
@@ -11822,8 +11853,7 @@ fn connect_satellites_panel(
                             // while we were awaiting the worker
                             // stay buffered. Per CR round 4 on
                             // PR #599.
-                            let mut completed =
-                                state_sstv_close.sstv_completed_images.borrow_mut();
+                            let mut completed = state_sstv_close.sstv_completed_images.borrow_mut();
                             let to_drain = exported_image_count.min(completed.len());
                             completed.drain(..to_drain);
                             // Only release the recording-pass slot
@@ -11840,7 +11870,20 @@ fn connect_satellites_panel(
                         // Failure path: still clear the slot so the
                         // recorder isn't stuck in a permanent "pass
                         // in flight" state, but leave the image
-                        // buffer intact for retry.
+                        // buffer intact for retry. Also put any
+                        // images that came from `sstv_pending_export`
+                        // back so they keep getting carried forward
+                        // until a save actually succeeds. Per CR
+                        // round 5 on PR #599.
+                        if !pending_export_backup.is_empty() {
+                            let mut pending = state_sstv_close.sstv_pending_export.borrow_mut();
+                            // Prepend in case a parallel AOS already
+                            // queued additional retained items while
+                            // the worker was running.
+                            let mut combined = pending_export_backup;
+                            combined.append(&mut pending);
+                            *pending = combined;
+                        }
                         let mut slot = state_sstv_close.sstv_recording_pass.borrow_mut();
                         if *slot == exported_sstv_pass {
                             *slot = None;

@@ -275,6 +275,16 @@ pub struct AppState {
     /// them all in arrival order (`img0.png`, `img1.png`, …).
     /// Per epic #472.
     pub sstv_completed_images: RefCell<Vec<sdr_radio::sstv_image::CompletedSstvImage>>,
+    /// Carry-over slot for SSTV images whose LOS save failed: the
+    /// `SaveSstvPass` failure path leaves them in
+    /// `sstv_completed_images`, but the *next* pass's AOS would
+    /// otherwise wipe that buffer to start fresh. The AOS branch
+    /// instead drains them into here so they survive across
+    /// passes; the next successful `SaveSstvPass` writes them
+    /// alongside the new pass's images. Today there's no manual
+    /// "export pending" UI — items in this Vec are recovered at
+    /// the next LOS-save success. Per CR round 5 #20 on PR #599.
+    pub sstv_pending_export: RefCell<Vec<sdr_radio::sstv_image::CompletedSstvImage>>,
     /// `(satellite_norad_id, aos_time)` for the currently-recording
     /// SSTV pass, or `None` between passes. Mirrors `apt_recording_pass`
     /// and `lrpt_recording_pass` — used by `is_recording()` and the
@@ -444,6 +454,7 @@ impl AppState {
             sstv_viewer_window: RefCell::new(None),
             sstv_image: sdr_radio::sstv_image::SstvImage::new(),
             sstv_completed_images: RefCell::new(Vec::new()),
+            sstv_pending_export: RefCell::new(Vec::new()),
             sstv_recording_pass: RefCell::new(None),
             acars_enabled: Cell::new(false),
             acars_recent: RefCell::new(VecDeque::with_capacity(
