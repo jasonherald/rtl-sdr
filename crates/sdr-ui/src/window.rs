@@ -11767,7 +11767,17 @@ fn connect_satellites_panel(
                                 errors.join("; ")
                             )
                         };
-                        (msg, saved > 0)
+                        // Only treat as full success when every image
+                        // saved cleanly. Partial success must NOT
+                        // clear the buffer — the failed images stay
+                        // in memory so a future export can retry
+                        // them. (LRPT's analogous path treats
+                        // partial-success as success because LRPT's
+                        // source IQ is consumed live and re-decode
+                        // isn't possible; SSTV's CompletedSstvImage
+                        // buffer makes retry trivial.)
+                        // Per CR round 2 on PR #599.
+                        (msg, errors.is_empty() && saved > 0)
                     })
                     .await
                     .unwrap_or_else(|e| {

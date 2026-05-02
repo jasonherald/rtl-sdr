@@ -1054,12 +1054,21 @@ mod tests {
         );
         // The recorder should have transitioned out of Idle.
         assert!(!matches!(r.state(), State::Idle));
-        // At minimum a StartAutoRecord must be in the action batch.
+        // Pin the protocol payload (and satellite) so SSTV-specific
+        // dispatch regressions fail loudly here rather than silently
+        // falling through to "wrong protocol but a StartAutoRecord
+        // was present" — which the previous looser assertion would
+        // have permitted. Per CR round 2 on PR #599.
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::StartAutoRecord { .. })),
-            "expected StartAutoRecord for ISS SSTV pass"
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartAutoRecord {
+                    protocol: sdr_sat::ImagingProtocol::Sstv,
+                    satellite,
+                    ..
+                } if satellite == "ISS (ZARYA)"
+            )),
+            "expected StartAutoRecord(Sstv) for ISS (ZARYA) pass; got {actions:?}"
         );
     }
 

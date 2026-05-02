@@ -446,6 +446,18 @@ impl SstvImageView {
         };
         glib::spawn_future_local(async move {
             let join = gio::spawn_blocking(move || {
+                // Ensure the parent directory exists. First-run exports
+                // target `~/sdr-recordings/sstv-iss-{ts}/` which the
+                // recorder creates at AOS, but a manual export to a
+                // brand-new directory should work too. Per CR round 2
+                // on PR #599.
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
+                        op: "create_dir_all",
+                        path: parent.to_path_buf(),
+                        source: e,
+                    })?;
+                }
                 write_sstv_rgb_png(&path, &snap.pixels, snap.width, snap.height)
             })
             .await;
