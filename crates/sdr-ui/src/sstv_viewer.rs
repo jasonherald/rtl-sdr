@@ -52,6 +52,12 @@ const VIEWER_WINDOW_HEIGHT: i32 = 560;
 /// when the window is wider/taller than the image aspect ratio.
 const BACKGROUND_RGB: [f64; 3] = [0.05, 0.05, 0.06];
 
+/// Subtitle shown in the viewer's window title before any VIS header
+/// has been detected for the current image (or after [`SstvImageView::clear`]).
+/// Replaced by the mode name (e.g. `"PD120"`) on the first
+/// [`crate::messages::DspToUi::SstvVisDetected`] event.
+const SSTV_VIEWER_PLACEHOLDER_SUBTITLE: &str = "Waiting for VIS";
+
 // ─── Pure Cairo renderer ────────────────────────────────────────────────────
 
 /// Pure Cairo renderer for a live SSTV image.
@@ -365,6 +371,12 @@ pub struct SstvImageView {
     /// [`Self::set_handle`] after construction.
     /// Per CR round 4 on PR #599.
     handle: Rc<RefCell<Option<SstvImageHandle>>>,
+    /// Optional handle to the window's [`adw::WindowTitle`] so
+    /// [`Self::set_mode_label`] can refresh the subtitle when a new
+    /// VIS header arrives. Set by [`open_sstv_viewer_window`] after
+    /// the header is built; `None` for tests / detached views that
+    /// don't have a window. Per epic #472 mode-display follow-up.
+    title_widget: Rc<RefCell<Option<adw::WindowTitle>>>,
 }
 
 impl Default for SstvImageView {
@@ -396,6 +408,7 @@ impl SstvImageView {
             renderer,
             paused,
             handle: Rc::new(RefCell::new(None)),
+            title_widget: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -407,6 +420,26 @@ impl SstvImageView {
     /// round 4 on PR #599.
     pub fn set_handle(&self, handle: SstvImageHandle) {
         *self.handle.borrow_mut() = Some(handle);
+    }
+
+    /// Attach the window's [`adw::WindowTitle`] so
+    /// [`Self::set_mode_label`] can refresh the subtitle on VIS
+    /// detection. Called from [`open_sstv_viewer_window`] after
+    /// the header is built. Idempotent — replaces any previously-
+    /// attached title. Per epic #472 mode-display follow-up.
+    pub fn set_title_widget(&self, title: adw::WindowTitle) {
+        *self.title_widget.borrow_mut() = Some(title);
+    }
+
+    /// Update the viewer's window-title subtitle to show the
+    /// detected SSTV mode (e.g. `"PD120"`). No-op if no title
+    /// widget has been attached (test / detached views). Called
+    /// from `window.rs`'s `DspToUi::SstvVisDetected` arm. Per
+    /// epic #472 mode-display follow-up.
+    pub fn set_mode_label(&self, label: &str) {
+        if let Some(title) = self.title_widget.borrow().as_ref() {
+            title.set_subtitle(label);
+        }
     }
 
     /// The underlying `GtkDrawingArea`. Pack this into a layout container.
@@ -435,13 +468,16 @@ impl SstvImageView {
     /// shared [`SstvImageHandle`] (if attached via
     /// [`Self::set_handle`]) so the next [`Self::update_from_handle`]
     /// doesn't replay the rows we just cleared. Per CR round 4 on
-    /// PR #599.
+    /// PR #599. Resets the window-title subtitle to the placeholder
+    /// so the user sees "Waiting for VIS" until the next mode is
+    /// detected; per epic #472 mode-display follow-up.
     pub fn clear(&self) {
         if let Some(handle) = self.handle.borrow().as_ref() {
             handle.clear();
         }
         self.renderer.borrow_mut().clear();
         self.drawing_area.queue_draw();
+        self.set_mode_label(SSTV_VIEWER_PLACEHOLDER_SUBTITLE);
     }
 
     /// Toggle pause / resume. Pausing freezes the visible canvas;
@@ -539,6 +575,15 @@ pub fn open_sstv_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         .build();
 
     let header = adw::HeaderBar::new();
+
+    // Two-line title widget: primary title is the static window
+    // title (e.g. "ISS SSTV"); subtitle starts as a placeholder
+    // and updates to the detected mode name (PD120 / PD180 /
+    // PD240 / future) on each `DspToUi::SstvVisDetected` event.
+    // Per epic #472 mode-display follow-up.
+    let title_widget = adw::WindowTitle::new(title, SSTV_VIEWER_PLACEHOLDER_SUBTITLE);
+    header.set_title_widget(Some(&title_widget));
+    view.set_title_widget(title_widget);
 
     // Pause / Resume toggle.
     let pause_btn = gtk4::ToggleButton::builder()

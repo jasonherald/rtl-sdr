@@ -918,6 +918,14 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
                     hedr_shift_hz,
                     "SSTV VIS detected — new image starting"
                 );
+                // Surface the mode in the viewer's header so the
+                // user can see which PD-family variant is being
+                // decoded. `&'static str` because the slowrx mode
+                // name list is bounded and stable. Per epic #472
+                // mode-display follow-up.
+                let _ = dsp_tx.send(DspToUi::SstvVisDetected {
+                    mode_label: sstv_mode_label(mode),
+                });
             }
             slowrx::SstvEvent::LineDecoded {
                 mode,
@@ -967,6 +975,25 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
                 // doesn't require a source change here.
             }
         }
+    }
+}
+
+/// Map a [`slowrx::SstvMode`] to a `&'static str` mode name for
+/// the UI's viewer-header display. The string list intentionally
+/// uses `&'static str` (not `String`) because the slowrx mode
+/// names are bounded and stable — VIS detect fires once per
+/// image and we don't want to allocate per event.
+///
+/// Wildcard fallback `"SSTV"` covers future slowrx modes that
+/// land before we add an explicit arm here. `SstvMode` is
+/// `#[non_exhaustive]` so this match must always have one.
+/// Per epic #472 mode-display follow-up.
+fn sstv_mode_label(mode: slowrx::SstvMode) -> &'static str {
+    match mode {
+        slowrx::SstvMode::Pd120 => "PD120",
+        slowrx::SstvMode::Pd180 => "PD180",
+        slowrx::SstvMode::Pd240 => "PD240",
+        _ => "SSTV",
     }
 }
 

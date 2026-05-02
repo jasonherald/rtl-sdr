@@ -162,6 +162,22 @@ pub enum DspToUi {
     /// returned `DspToUi` value once per drain.
     AptLine(Box<AptLine>),
     // --- SSTV decoder (#472 — ISS SSTV) ---
+    /// VIS header detected — the decoder has identified the SSTV
+    /// mode and a new image is starting. Emitted from the DSP
+    /// thread when `sstv_decode_tap` receives a
+    /// `slowrx::SstvEvent::VisDetected`.
+    ///
+    /// `mode_label` is the static, human-readable name of the
+    /// detected mode (e.g. `"PD120"`, `"PD180"`, `"PD240"`).
+    /// Strings are `&'static str` because the slowrx mode name
+    /// list is bounded and stable; there's no allocation per VIS
+    /// event. The UI surfaces this in the SSTV viewer's window
+    /// title subtitle so the user can see which mode the active
+    /// image is being decoded as.
+    SstvVisDetected {
+        /// Human-readable mode name (e.g. `"PD120"`).
+        mode_label: &'static str,
+    },
     /// One decoded SSTV scan line. Emitted from the DSP thread when
     /// `sstv_decode_tap` receives a `slowrx::SstvEvent::LineDecoded`.
     /// The UI handler uses this as a redraw trigger for the live

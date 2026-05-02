@@ -775,6 +775,7 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::AcarsOutputError { .. }
         // SSTV variants (epic #472) — Linux-only for V1; macOS will
         // get its own ticket when the FFI layer gains an SSTV viewer.
+        | DspToUi::SstvVisDetected { .. }
         | DspToUi::SstvLineDecoded(_)
         | DspToUi::SstvImageComplete { .. } => return None,
     };
@@ -1346,6 +1347,22 @@ mod tests {
         assert!(
             translate_event(&msg).is_none(),
             "AcarsOutputError must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
+    fn translate_sstv_vis_detected_is_dropped_at_ffi_boundary() {
+        // Same drop-at-boundary contract as `SstvLineDecoded` /
+        // `SstvImageComplete` — the mode-display follow-up keeps
+        // SSTV strictly Linux-only at the FFI boundary until the
+        // macOS viewer ticket lands. Per epic #472 mode-display
+        // follow-up.
+        let msg = DspToUi::SstvVisDetected {
+            mode_label: "PD120",
+        };
+        assert!(
+            translate_event(&msg).is_none(),
+            "SstvVisDetected must not translate to a wire event yet",
         );
     }
 
