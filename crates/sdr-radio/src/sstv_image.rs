@@ -83,16 +83,28 @@ impl Inner {
     }
 
     /// Copy one scan line's pixels into the buffer.
+    ///
+    /// Duplicate or out-of-order writes are idempotent on the
+    /// pixel data and do not advance the counter past
+    /// `line_index + 1`, preventing `lines_written` from
+    /// drifting above `height` even when slowrx re-emits a
+    /// row (rare edge case observed on noisy signals).
     fn write_line(&mut self, line_index: u32, pixels: &[[u8; 3]]) {
         if self.width == 0 {
             return; // `init_if_needed` wasn't called first; skip defensively.
+        }
+        if line_index >= self.height {
+            return; // out-of-bounds row — silently drop.
         }
         let w = self.width as usize;
         let row_start = (line_index as usize) * w;
         let row_end = row_start + w;
         if row_end <= self.pixels.len() && pixels.len() >= w {
             self.pixels[row_start..row_end].copy_from_slice(&pixels[..w]);
-            self.lines_written += 1;
+            // Track the highest written row+1, not a count of
+            // writes — makes duplicate and out-of-order writes
+            // idempotent and prevents overflow past `height`.
+            self.lines_written = self.lines_written.max(line_index.saturating_add(1));
         }
     }
 }
@@ -248,7 +260,11 @@ impl SstvImageHandle {
         if g.is_empty() {
             return None;
         }
-        let lines = g.lines_written as usize;
+        // Clamp defensively: `lines_written` should never exceed
+        // `height` after the `write_line` fix, but belt-and-
+        // suspenders keeps `snapshot` panic-safe even if the
+        // accounting somehow drifted.
+        let lines = g.lines_written.min(g.height) as usize;
         let w = g.width as usize;
         Some(SstvSnapshot {
             width: g.width,
@@ -408,5 +424,57 @@ mod tests {
         );
         // First pixel should be [255, 0, 0].
         assert_eq!(&flat[0..3], &[255_u8, 0, 0]);
+    }
+
+    /// Duplicate `write_line` calls for the same row must not
+    /// advance `lines_written` — idempotent pixel write.
+    /// Regression for the CR #5 finding (PR #599): the old
+    /// `+= 1` counter drifted above `height` on re-sends.
+    #[test]
+    fn duplicate_write_does_not_advance_counter() {
+        let img = SstvImage::new();
+        let h = img.handle();
+        h.write_line(0, W, H, &red_row());
+        h.write_line(0, W, H, &red_row()); // duplicate
+        h.write_line(0, W, H, &red_row()); // duplicate again
+        let snap = h.snapshot().unwrap();
+        assert_eq!(
+            snap.lines_written, 1,
+            "duplicate writes must not advance lines_written past 1"
+        );
+    }
+
+    /// Out-of-order writes must not inflate `lines_written`
+    /// beyond the highest row index seen.
+    #[test]
+    fn out_of_order_writes_track_highest_row() {
+        let img = SstvImage::new();
+        let h = img.handle();
+        h.write_line(5, W, H, &red_row()); // write row 5 first
+        h.write_line(2, W, H, &blank_row()); // then row 2
+        let snap = h.snapshot().unwrap();
+        // lines_written should be 6 (highest row index 5 + 1),
+        // not 2 (a naive count of calls).
+        assert_eq!(
+            snap.lines_written, 6,
+            "out-of-order write: lines_written must be max(row_index)+1"
+        );
+    }
+
+    /// An out-of-bounds row index (>= height) must be silently
+    /// dropped; neither the pixel buffer nor `lines_written`
+    /// should be affected.
+    #[test]
+    fn out_of_bounds_row_is_silently_dropped() {
+        let img = SstvImage::new();
+        let h = img.handle();
+        h.write_line(0, W, H, &red_row()); // valid
+        h.write_line(H, W, H, &red_row()); // OOB: index == height
+        h.write_line(H + 99, W, H, &red_row()); // OOB: way past
+        let snap = h.snapshot().unwrap();
+        assert_eq!(
+            snap.lines_written, 1,
+            "OOB row must not advance lines_written"
+        );
     }
 }

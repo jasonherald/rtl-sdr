@@ -947,10 +947,17 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
                     .sstv_image
                     .as_ref()
                     .and_then(sdr_radio::sstv_image::SstvImageHandle::take_completed);
+                let width = image.width;
+                let height = image.height;
+                // `map_or` consumes `image.pixels` directly in the
+                // `None` arm, avoiding the `.clone()` the
+                // `map_or_else` call had. The `Some` arm returns
+                // the handle's buffer — both arms are owned moves.
+                let pixels = completed.map_or(image.pixels, |c| c.pixels);
                 let _ = dsp_tx.send(DspToUi::SstvImageComplete {
-                    width: image.width,
-                    height: image.height,
-                    pixels: completed.map_or_else(|| image.pixels.clone(), |c| c.pixels),
+                    width,
+                    height,
+                    pixels,
                 });
             }
             _ => {
@@ -3563,6 +3570,15 @@ fn reset_imaging_decoders(state: &mut DspState) {
     // `sstv_mono_buf` is left allocated (reused), and the
     // `sstv_init_failed_at_rate` memo is cleared so the next
     // source-start gets a fresh init attempt. Per epic #472.
+    //
+    // Clear the shared image handle so stale pixels from a
+    // mid-image LOS don't bleed into the next pass's live
+    // viewer. The handle survives here (the DSP tap re-uses it
+    // across passes if the user keeps the source running);
+    // only the in-flight buffer is wiped.
+    if let Some(handle) = state.sstv_image.as_ref() {
+        handle.clear();
+    }
     state.sstv_decoder = None;
     state.sstv_mono_buf.clear();
     state.sstv_init_failed_at_rate = None;

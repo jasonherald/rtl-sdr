@@ -1222,4 +1222,50 @@ mod tests {
         let _: UiToDsp = UiToDsp::SetAcarsNetworkAddr("127.0.0.1:5550".to_string());
         let _: UiToDsp = UiToDsp::SetAcarsStationId("STN1".to_string());
     }
+
+    #[test]
+    fn sstv_dsp_to_ui_variants_construct() {
+        // Shape regression for the two SSTV events added in
+        // epic #472. Catches silent payload changes — if the
+        // line_index field is renamed or the struct gains a
+        // field, the pattern match here fails at compile or
+        // runtime before it can silently break the UI handler.
+        // Per CodeRabbit round 1 on PR #599.
+        let line_decoded = DspToUi::SstvLineDecoded(42);
+        assert!(matches!(
+            line_decoded,
+            DspToUi::SstvLineDecoded(idx) if idx == 42
+        ));
+
+        let image_complete = DspToUi::SstvImageComplete {
+            width: 640,
+            height: 496,
+            pixels: vec![[255_u8, 0, 0]; 640 * 496],
+        };
+        assert!(matches!(
+            image_complete,
+            DspToUi::SstvImageComplete {
+                width: 640,
+                height: 496,
+                ref pixels,
+            } if pixels.len() == 640 * 496
+        ));
+    }
+
+    #[test]
+    fn sstv_ui_to_dsp_variants_construct() {
+        // Shape regression for the two SSTV control commands
+        // added in epic #472. A future rename of `SetSstvImage`
+        // / `ClearSstvImage` or a change to the
+        // `SstvImageHandle` payload type trips this regression
+        // net rather than silently breaking the controller's
+        // `sstv_decode_tap` plumbing.
+        // Per CodeRabbit round 1 on PR #599.
+        let img = sdr_radio::sstv_image::SstvImage::new();
+        let set_sstv = UiToDsp::SetSstvImage(img.handle());
+        assert!(matches!(set_sstv, UiToDsp::SetSstvImage(_)));
+
+        let clear_sstv = UiToDsp::ClearSstvImage;
+        assert!(matches!(clear_sstv, UiToDsp::ClearSstvImage));
+    }
 }

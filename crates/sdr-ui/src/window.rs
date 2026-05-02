@@ -11661,10 +11661,18 @@ fn connect_satellites_panel(
                 });
             }
             RecorderAction::SaveSstvPass(dir) => {
-                // Drain the completed-image buffer that was filled
-                // during the pass by `DspToUi::SstvImageComplete`
-                // handlers above, then write each frame as
-                // `img{N}.png` in the per-pass directory.
+                // Snapshot (clone) the completed-image buffer that
+                // was filled during the pass by
+                // `DspToUi::SstvImageComplete` handlers above.
+                // We deliberately do NOT drain here — the buffer
+                // is only cleared after the worker confirms a
+                // successful save. If `create_dir_all` fails, a
+                // PNG write fails, or the worker panics, the
+                // originals remain for a future retry or manual
+                // export. The clear-on-success path below does a
+                // compare-and-clear guarded by `exported_sstv_pass`
+                // so an overlapping pass doesn't have its buffer
+                // wiped by a late completion from a prior pass.
                 //
                 // Reading from `state.sstv_completed_images`
                 // (rather than the shared `SstvImage` handle)
@@ -11673,15 +11681,15 @@ fn connect_satellites_panel(
                 // live viewer so closing the viewer window
                 // mid-pass doesn't lose the imagery.
                 //
-                // Snapshot + drain on the main thread (cheap
-                // — just a `Vec` swap), then off-load encoding
-                // + file I/O to `gio::spawn_blocking` so multi-
-                // image PNG encoding doesn't freeze the UI right
-                // when the auto-record toast is landing.
+                // Clone + off-load encoding + file I/O to
+                // `gio::spawn_blocking` so multi-image PNG encoding
+                // doesn't freeze the UI right when the auto-record
+                // toast is landing. Per CodeRabbit #9 on PR #599.
                 let images: Vec<sdr_radio::sstv_image::CompletedSstvImage> = state_a
                     .sstv_completed_images
-                    .borrow_mut()
-                    .drain(..)
+                    .borrow()
+                    .iter()
+                    .cloned()
                     .collect();
                 let toast_overlay_weak_for_save = toast_overlay_weak.clone();
                 let state_sstv_close = Rc::clone(&state_a);
@@ -11775,10 +11783,25 @@ fn connect_satellites_panel(
                         )
                     });
                     post_toast(&toast_overlay_weak_for_save, &result_msg);
-                    // Clear the recording-pass slot (compare-and-clear
-                    // so an overlapping pass doesn't have its slot
+                    // On success: clear the completed-image buffer
+                    // and the recording-pass slot (compare-and-clear
+                    // so an overlapping pass's slot and buffer aren't
                     // wiped by a late completion callback).
-                    {
+                    // On failure: leave the buffer intact for a
+                    // subsequent retry or manual export — the user
+                    // can still inspect the in-memory images.
+                    // Per CodeRabbit #9 on PR #599.
+                    if save_ok {
+                        let mut slot = state_sstv_close.sstv_recording_pass.borrow_mut();
+                        if *slot == exported_sstv_pass {
+                            state_sstv_close.sstv_completed_images.borrow_mut().clear();
+                            *slot = None;
+                        }
+                    } else {
+                        // Failure path: still clear the slot so the
+                        // recorder isn't stuck in a permanent "pass
+                        // in flight" state, but leave the image
+                        // buffer intact for retry.
                         let mut slot = state_sstv_close.sstv_recording_pass.borrow_mut();
                         if *slot == exported_sstv_pass {
                             *slot = None;

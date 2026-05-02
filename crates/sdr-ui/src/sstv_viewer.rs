@@ -100,9 +100,22 @@ impl SstvImageRenderer {
     /// should queue a redraw). Returns `false` on surface errors (logged,
     /// not propagated — a failed redraw shouldn't kill the UI).
     pub fn update_from_snapshot(&mut self, snap: &SstvSnapshot) -> bool {
+        let mut old_lines = self.lines_written;
+
         // Rebuild surface on dimension change (new image / new mode).
         if snap.width != self.width || snap.height != self.height {
             self.rebuild_surface(snap.width, snap.height);
+            old_lines = 0;
+        } else if snap.lines_written < old_lines {
+            // Same dimensions but the line counter rolled back — a
+            // new SSTV image started with the same mode (e.g.
+            // PD120 → PD120). Without this branch the delta logic
+            // below sees `new_lines < old_lines` → false → no blit,
+            // and stale pixels from the previous image leak through.
+            // Clear the surface and reset the cursor so the new
+            // image paints from row 0. Per CodeRabbit #7 on PR #599.
+            self.clear();
+            old_lines = 0;
         }
         let Some(ref mut surface) = self.surface else {
             return false;
@@ -125,7 +138,6 @@ impl SstvImageRenderer {
 
         let w = snap.width as usize;
         let new_lines = snap.lines_written;
-        let old_lines = self.lines_written;
         // Write only the lines that arrived since the last update.
         for row in (old_lines as usize)..(new_lines as usize) {
             let row_offset = row * stride;
@@ -605,6 +617,24 @@ pub fn open_sstv_viewer_if_needed(
     state: &Rc<crate::state::AppState>,
 ) {
     if state.sstv_viewer.borrow().is_some() {
+        // Re-send the image handle so the tap stays wired even if
+        // a future code path ever clears it (idempotent). Then
+        // raise the existing window so `Ctrl+Shift+V` actually
+        // surfaces a buried / minimised viewer rather than being a
+        // silent no-op. Weak-ref upgrade fails closed: if the
+        // window was garbage-collected but the AppState slot wasn't
+        // cleared yet, we just skip. Mirrors the LRPT viewer's
+        // present-on-repeat-open pattern (CodeRabbit round 13 on
+        // PR #543). Per CodeRabbit #8 on PR #599.
+        state.send_dsp(UiToDsp::SetSstvImage(state.sstv_image.handle()));
+        if let Some(window) = state
+            .sstv_viewer_window
+            .borrow()
+            .as_ref()
+            .and_then(glib::WeakRef::upgrade)
+        {
+            window.present();
+        }
         return;
     }
     let Some(parent) = parent_provider() else {

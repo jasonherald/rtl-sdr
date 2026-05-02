@@ -1910,10 +1910,13 @@ mod tests {
         // 1:1 — pin it so a future variant addition without
         // updating `protocol()` fails this test loudly instead
         // of silently dispatching to the wrong save action.
+        // Per CodeRabbit round 1 on PR #599: extend to cover SSTV.
         let apt = PassOutput::AptPng(PathBuf::from("/tmp/apt.png"));
         let lrpt = PassOutput::LrptDir(PathBuf::from("/tmp/lrpt-dir"));
+        let sstv = PassOutput::SstvDir(PathBuf::from("/tmp/sstv-dir"));
         assert_eq!(apt.protocol(), sdr_sat::ImagingProtocol::Apt);
         assert_eq!(lrpt.protocol(), sdr_sat::ImagingProtocol::Lrpt);
+        assert_eq!(sstv.protocol(), sdr_sat::ImagingProtocol::Sstv);
     }
 
     #[test]
@@ -1926,6 +1929,17 @@ mod tests {
     fn save_action_for_lrpt_emits_save_lrpt_pass() {
         let action = save_action_for(&PassOutput::LrptDir(PathBuf::from("/tmp/lrpt-dir")));
         assert!(matches!(action, Action::SaveLrptPass(_)));
+    }
+
+    #[test]
+    fn save_action_for_sstv_emits_save_sstv_pass() {
+        // Pin the SSTV arm of `save_action_for` — mirrors the
+        // APT/LRPT tests above. A future rename of
+        // `Action::SaveSstvPass` or a mis-route to `SaveLrptPass`
+        // fails here before it can silently discard ISS imagery.
+        // Per CodeRabbit round 1 on PR #599.
+        let action = save_action_for(&PassOutput::SstvDir(PathBuf::from("/tmp/sstv-dir")));
+        assert!(matches!(action, Action::SaveSstvPass(_)));
     }
 
     /// LRPT recorder configured with both Apt + Lrpt support so
