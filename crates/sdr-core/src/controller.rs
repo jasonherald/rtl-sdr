@@ -926,8 +926,9 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
             } => {
                 // Write into the shared image handle (if the UI wired one).
                 if let Some(ref handle) = state.sstv_image {
-                    // Derive width/height from the mode spec. PD120/PD180 are
-                    // 640 px wide; other modes vary. `SstvMode` is
+                    // Derive width/height from the mode spec. The PD
+                    // family (PD120 / PD180 / PD240) is all 640 px
+                    // wide; other modes vary. `SstvMode` is
                     // `#[non_exhaustive]` so we use the spec helper
                     // (`slowrx::for_mode` — the free function in
                     // `slowrx::modespec`, re-exported at the crate root).

@@ -170,9 +170,10 @@ pub enum DspToUi {
     /// only needs the index to know a new row is ready.
     ///
     /// `line_index` is 0-based. Cadence depends on the SSTV mode:
-    /// PD120 produces ~120 lines at ~1 line/sec; PD180 produces
-    /// ~180 lines. ISS ARISS events typically send ~12 images per
-    /// active pass window.
+    /// PD120 produces 248 line pairs (496 rows) over ~120 s;
+    /// PD180 over ~180 s; PD240 over ~240 s (all 640 × 496).
+    /// ISS ARISS events typically send ~12 images per active pass
+    /// window.
     SstvLineDecoded(u32),
     /// One complete SSTV image. Emitted from the DSP thread when
     /// `sstv_decode_tap` receives a `slowrx::SstvEvent::ImageComplete`.
@@ -182,7 +183,8 @@ pub enum DspToUi {
     /// pixel `Vec` doesn't inflate the enum's stack footprint on
     /// the drain path. Per epic #472.
     SstvImageComplete {
-        /// Width in pixels (e.g. 640 for PD120/PD180).
+        /// Width in pixels (640 for the entire PD family —
+        /// PD120 / PD180 / PD240).
         width: u32,
         /// Height in scan lines.
         height: u32,
