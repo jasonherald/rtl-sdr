@@ -117,7 +117,8 @@ impl Inner {
 /// for the next VIS detection without waiting for the save.
 #[derive(Debug, Clone)]
 pub struct CompletedSstvImage {
-    /// Pixel width (e.g. 640 for PD120/PD180).
+    /// Pixel width (640 for the entire PD family —
+    /// PD120 / PD180 / PD240).
     pub width: u32,
     /// Pixel height (total scan lines).
     pub height: u32,
@@ -252,8 +253,9 @@ impl SstvImageHandle {
 
     /// Non-destructive snapshot of the in-flight image for the live
     /// viewer. Clones only the written rows, so a 50-line snapshot
-    /// from a 496-line PD120 image copies ~50 × 640 × 3 ≈ 96 KB —
-    /// cheap compared to the full-image clone.
+    /// from a 496-line PD-family image (PD120 / PD180 / PD240)
+    /// copies ~50 × 640 × 3 ≈ 96 KB — cheap compared to the
+    /// full-image clone.
     #[must_use]
     pub fn snapshot(&self) -> Option<SstvSnapshot> {
         let g = lock_or_recover(&self.inner);
@@ -287,7 +289,8 @@ impl SstvImageHandle {
 mod tests {
     use super::*;
 
-    /// Width + height used by all tests. Matches PD120's spec (640 × 496).
+    /// Width + height used by all tests. Matches the entire PD
+    /// family's spec (PD120 / PD180 / PD240 are all 640 × 496).
     const W: u32 = 640;
     const H: u32 = 496;
 

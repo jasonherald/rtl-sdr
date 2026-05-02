@@ -380,10 +380,11 @@ impl AutoRecorder {
     /// reality (`[Apt, Lrpt, Sstv]` as of epic #472). Per CR
     /// round 2 on PR #541: exposing the variadic builder
     /// publicly would let the wiring layer opt into protocols
-    /// whose LOS flow isn't actually safe yet. When V2 modes
-    /// (Robot / Scottie / Martin / PD240) flow through the
-    /// SSTV wiring via slowrx.rs V2, no constructor change is
-    /// needed — they all dispatch as `ImagingProtocol::Sstv`.
+    /// whose LOS flow isn't actually safe yet. The SSTV path is
+    /// mode-agnostic: PD120, PD180, and PD240 (slowrx 0.2.1)
+    /// already dispatch as `ImagingProtocol::Sstv`, and any
+    /// future slowrx V2 modes (Robot / Scottie / Martin) will
+    /// land the same way without a constructor change.
     #[must_use]
     fn with_supported_protocols(supported: &[sdr_sat::ImagingProtocol]) -> Self {
         Self {

@@ -5,14 +5,15 @@
 //! shared [`sdr_radio::sstv_image::SstvImageHandle`] as it accumulates
 //! during a satellite pass. ARISS events typically send ~12 images per
 //! 10-minute pass window; each image is announced by a VIS header, decoded
-//! line by line (~1 line/sec for PD120), and completed at
-//! `SstvEvent::ImageComplete`.
+//! line by line (~2 lines/sec for PD120, ~1.4 for PD180, ~1 for PD240),
+//! and completed at `SstvEvent::ImageComplete`.
 //!
 //! Three pieces:
 //!
 //! * [`SstvImageRenderer`] — pure Cairo renderer. Owns an ARGB32
-//!   [`cairo::ImageSurface`] sized for the current image (PD120: 640 × 496).
-//!   No GTK dependency, fully unit-testable.
+//!   [`cairo::ImageSurface`] sized for the current image (the entire PD
+//!   family is 640 × 496 — PD120, PD180, PD240). No GTK dependency,
+//!   fully unit-testable.
 //! * [`SstvImageView`] — GTK widget wrapping a renderer. Driven by the
 //!   `DspToUi::SstvLineDecoded` handler in `window.rs` which triggers a
 //!   `snapshot()` + redraw on each new line. Cloneable (all state is
@@ -41,8 +42,9 @@ use crate::viewer::ViewerError;
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
-/// Default viewer window size. ISS SSTV in PD120 mode produces 640 × 496
-/// images; headroom is given for the header bar.
+/// Default viewer window size. ISS SSTV in any PD-family mode
+/// (PD120 / PD180 / PD240) produces 640 × 496 images; headroom is
+/// given for the header bar.
 const VIEWER_WINDOW_WIDTH: i32 = 700;
 const VIEWER_WINDOW_HEIGHT: i32 = 560;
 
@@ -109,11 +111,13 @@ impl SstvImageRenderer {
         } else if snap.lines_written < old_lines {
             // Same dimensions but the line counter rolled back — a
             // new SSTV image started with the same mode (e.g.
-            // PD120 → PD120). Without this branch the delta logic
-            // below sees `new_lines < old_lines` → false → no blit,
-            // and stale pixels from the previous image leak through.
-            // Clear the surface and reset the cursor so the new
-            // image paints from row 0. Per CodeRabbit #7 on PR #599.
+            // PD120 → PD120) OR a different PD-family mode (e.g.
+            // PD120 → PD240, all 640 × 496). Without this branch
+            // the delta logic below sees `new_lines < old_lines`
+            // → false → no blit, and stale pixels from the
+            // previous image leak through. Clear the surface and
+            // reset the cursor so the new image paints from row
+            // 0. Per CodeRabbit #7 on PR #599.
             self.clear();
             old_lines = 0;
         }
@@ -739,7 +743,8 @@ mod tests {
     use super::*;
 
     /// Build an `SstvSnapshot` with `lines_written` rows of solid grey
-    /// (so writes are deterministic). PD120 / PD180 width 640.
+    /// (so writes are deterministic). PD-family modes (PD120 / PD180
+    /// / PD240) all use width 640.
     fn snap(width: u32, height: u32, lines_written: u32) -> SstvSnapshot {
         let n = (width as usize) * (height as usize);
         SstvSnapshot {
@@ -803,10 +808,11 @@ mod tests {
 
     #[test]
     fn renderer_same_dimension_rollover_clears_for_new_image() {
-        // PD120 → PD120 (same dims) starts a fresh image — slowrx
-        // resets the line counter on the new VIS detection. The
-        // renderer must detect the rollover and clear stale rows.
-        // Per CR round 1 #7 on PR #599; this test pins that fix.
+        // Same-dimensions rollover (PD120 → PD120, or PD120 → PD180,
+        // or any other PD-family mode swap) starts a fresh image —
+        // slowrx resets the line counter on the new VIS detection.
+        // The renderer must detect the rollover and clear stale
+        // rows. Per CR round 1 #7 on PR #599; this test pins that fix.
         let mut r = SstvImageRenderer::new();
         let _ = r.update_from_snapshot(snap(640, 496, 496)); // full first image
         assert_eq!(r.lines_written, 496);
@@ -819,8 +825,8 @@ mod tests {
 
     #[test]
     fn renderer_dimension_change_rebuilds_surface() {
-        // PD120 (640×496) → some hypothetical 320×240 mode would
-        // resize. Surface gets rebuilt; old contents discarded.
+        // PD-family (640×496) → some hypothetical 320×240 mode
+        // would resize. Surface gets rebuilt; old contents discarded.
         let mut r = SstvImageRenderer::new();
         let _ = r.update_from_snapshot(snap(640, 496, 100));
         let _ = r.update_from_snapshot(snap(320, 240, 50));

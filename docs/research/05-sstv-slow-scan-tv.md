@@ -30,7 +30,7 @@ For this guide, the focus is **2m (145.800 MHz) ISS SSTV** since that's what you
 The ARISS (Amateur Radio on the International Space Station) program periodically transmits SSTV images from ISS to celebrate anniversaries, educational outreach, or cosmonaut personal projects. Schedule:
 
 - Typical frequency: 145.800 MHz narrow FM
-- Mode: typically **PD120** or **PD180** (Russian cosmonaut choices)
+- Mode: typically **PD120**, **PD180**, or **PD240** (Russian cosmonaut choices)
 - Duration: usually 2–5 days per event
 - Images: 12 different pictures cycled, transmitted ~every 3 minutes
 - Events announced at **ariss.org** and **amsat.org** a few weeks in advance
@@ -91,6 +91,7 @@ Common modes you'll encounter:
 | **PD90** | 320×256 | 90 sec | Color YCrCb | ISS |
 | **PD120** | 640×496 | 2 min | Color YCrCb | ISS (most common recent) |
 | **PD180** | 640×496 | 3 min | Color YCrCb | ISS (high quality option) |
+| **PD240** | 640×496 | 4 min | Color YCrCb | ISS (highest quality PD-family option) |
 | **Martin M1** | 320×256 | 114 sec | Color RGB | Ham HF |
 | **Martin M2** | 320×256 | 58 sec | Color RGB | Ham HF |
 | **Scottie S1** | 320×256 | 110 sec | Color RGB | Ham HF |
@@ -148,6 +149,7 @@ The 7-bit VIS code identifies the mode:
 | 0x63 | PD90 |
 | 0x5F | PD120 |
 | 0x60 | PD180 |
+| 0x61 | PD240 |
 
 (Full VIS table in any SSTV decoder source. The `black.qsl.net/sstv-handbook/` reference has all of them.)
 
