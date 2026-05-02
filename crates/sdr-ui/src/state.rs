@@ -54,10 +54,15 @@ pub fn rtl_tcp_state_discriminant(state: &sdr_types::RtlTcpConnectionState) -> u
 pub struct PendingSstvExport {
     /// Original per-pass directory (e.g.
     /// `~/sdr-recordings/sstv-iss-2026-05-02-201234/`). The retry
-    /// writes `img0.png`, `img1.png`, … here so all of a pass's
-    /// images stay co-located even when the first save attempt
-    /// failed.
+    /// writes images here so all of a pass's images stay
+    /// co-located even when the first save attempt failed.
     pub dir: PathBuf,
+    /// First image's filename index within `dir`. The retry
+    /// writes `img{start_index}.png`, `img{start_index+1}.png`, …
+    /// so a late-tail retry for a pass that already saved
+    /// `img0.png` … `img11.png` doesn't clobber those when it
+    /// flushes images 12 onward. Per CR round 8 #27 on PR #599.
+    pub start_index: usize,
     /// Images to retry. Order is preserved so retried filenames
     /// match what the original save would have written.
     pub images: Vec<sdr_radio::sstv_image::CompletedSstvImage>,

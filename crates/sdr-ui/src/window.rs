@@ -186,9 +186,12 @@ fn save_sstv_batches(
     let mut total_failed = 0_usize;
     let mut error_summary: Vec<String> = Vec::new();
 
-    // Save each previously-retained batch to its own directory.
+    // Save each previously-retained batch to its own directory,
+    // honouring its `start_index` so a late-tail retry doesn't
+    // overwrite the prefix that already saved successfully on the
+    // first attempt. Per CR round 8 #27 on PR #599.
     for batch in pending_batches {
-        let (saved, errs) = save_sstv_batch(&batch.dir, &batch.images);
+        let (saved, errs) = save_sstv_batch(&batch.dir, &batch.images, batch.start_index);
         total_saved += saved;
         let failed = errs.len();
         total_failed += failed;
@@ -201,7 +204,7 @@ fn save_sstv_batches(
     // Save the current pass.
     let current_dir_display = current_dir.display().to_string();
     let current_image_count = current_images.len();
-    let (cur_saved, cur_errs) = save_sstv_batch(&current_dir, &current_images);
+    let (cur_saved, cur_errs) = save_sstv_batch(&current_dir, &current_images, 0);
     total_saved += cur_saved;
     total_failed += cur_errs.len();
     let current_ok = cur_errs.is_empty() && (cur_saved > 0 || current_image_count == 0);
@@ -213,6 +216,10 @@ fn save_sstv_batches(
         );
         retained.push(PendingSstvExport {
             dir: current_dir,
+            // Original attempt started at index 0; on retry we
+            // re-attempt the entire batch from the same start to
+            // keep filenames stable. Per CR round 8 #27 on PR #599.
+            start_index: 0,
             images: current_images,
         });
     }
@@ -242,13 +249,23 @@ fn save_sstv_batches(
     }
 }
 
-/// Save a single batch of SSTV images into `dir`. Returns
+/// Save a single batch of SSTV images into `dir`, naming files
+/// `img{start_index}.png`, `img{start_index+1}.png`, … . Returns
 /// `(saved_count, per_image_error_messages)`. A directory-creation
 /// failure surfaces as one error covering the whole batch; image
 /// write failures surface per image.
+///
+/// `start_index` lets a late-tail retry append after the prefix
+/// that already saved on the first attempt (round-7 #26 left late
+/// frames in `sstv_completed_images`; we now move them into a
+/// retry batch keyed to the same dir, with `start_index =
+/// exported_image_count` so the retry's `img12.png` doesn't
+/// clobber a successfully-saved `img0.png`). Per CR round 8 #27
+/// on PR #599.
 fn save_sstv_batch(
     dir: &std::path::Path,
     images: &[sdr_radio::sstv_image::CompletedSstvImage],
+    start_index: usize,
 ) -> (usize, Vec<String>) {
     if images.is_empty() {
         return (0, Vec::new());
@@ -259,7 +276,8 @@ fn save_sstv_batch(
     }
     let mut saved = 0_usize;
     let mut errors: Vec<String> = Vec::new();
-    for (idx, img) in images.iter().enumerate() {
+    for (offset, img) in images.iter().enumerate() {
+        let idx = start_index + offset;
         let path = dir.join(format!("img{idx}.png"));
         match crate::sstv_viewer::write_sstv_rgb_png(&path, &img.pixels, img.width, img.height) {
             Ok(()) => {
@@ -11883,6 +11901,12 @@ fn connect_satellites_panel(
                         if !current_images_backup.is_empty() {
                             retained.push(PendingSstvExport {
                                 dir: dir_backup.clone(),
+                                // Original attempt would have
+                                // started at index 0; on panic
+                                // retry we reuse that start so
+                                // filenames remain stable. Per
+                                // CR round 8 #27 on PR #599.
+                                start_index: 0,
                                 images: current_images_backup,
                             });
                         }
@@ -11944,6 +11968,16 @@ fn connect_satellites_panel(
                                 state_sstv_close.sstv_pending_export.borrow_mut().push(
                                     PendingSstvExport {
                                         dir: dir_for_msg.clone(),
+                                        // Late frames belong AFTER
+                                        // the prefix that already
+                                        // saved successfully on this
+                                        // pass — `exported_image_count`
+                                        // images went out at indices
+                                        // 0..exported_image_count, so
+                                        // the retry starts at that
+                                        // index. Per CR round 8 #27
+                                        // on PR #599.
+                                        start_index: exported_image_count,
                                         images: late_tail,
                                     },
                                 );
