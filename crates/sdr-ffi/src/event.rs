@@ -772,7 +772,11 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::AcarsEnabledChanged(_)
         // Output-error toast (issue #578) — Linux-only writer path;
         // macOS ticket will handle when FFI layer gets ACARS output.
-        | DspToUi::AcarsOutputError { .. } => return None,
+        | DspToUi::AcarsOutputError { .. }
+        // SSTV variants (epic #472) — Linux-only for V1; macOS will
+        // get its own ticket when the FFI layer gains an SSTV viewer.
+        | DspToUi::SstvLineDecoded(_)
+        | DspToUi::SstvImageComplete { .. } => return None,
     };
 
     Some((event, owned_cstring, owned_vec))

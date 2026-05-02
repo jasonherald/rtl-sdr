@@ -545,6 +545,7 @@ pub fn build_window(
         // it internally — passing twice keeps the call sites
         // symmetric. Per epic #469 task 7.5.
         crate::lrpt_viewer::connect_lrpt_action(app, &parent_provider, &state);
+        crate::sstv_viewer::connect_sstv_action(app, &parent_provider, &state);
     }
 
     // Set initial status bar values and mode-specific control visibility.
@@ -1934,6 +1935,43 @@ fn handle_dsp_message(
             if let Some(view) = state.apt_viewer.borrow().as_ref() {
                 view.push_line(&line);
             }
+        }
+        DspToUi::SstvLineDecoded(_line_index) => {
+            // A new SSTV scan line has arrived — refresh the open
+            // viewer (if any) from the shared SstvImage handle.
+            // The viewer polls the handle via `update_from_handle`
+            // which reads whatever the DSP tap has written since
+            // the last call.  When no viewer is open we silently
+            // drop, mirroring APT semantics above.
+            if let Some(view) = state.sstv_viewer.borrow().as_ref() {
+                view.update_from_handle(&state.sstv_image.handle());
+            }
+        }
+        DspToUi::SstvImageComplete {
+            width,
+            height,
+            pixels,
+        } => {
+            // The SSTV decoder has closed out a full image frame.
+            // Accumulate it into the pass buffer so the
+            // `SaveSstvPass` interpreter can write every image that
+            // arrived during the pass to disk.  The viewer is
+            // refreshed one last time so the final frame is visible.
+            let completed = sdr_radio::sstv_image::CompletedSstvImage {
+                width,
+                height,
+                pixels,
+            };
+            state.sstv_completed_images.borrow_mut().push(completed);
+            if let Some(view) = state.sstv_viewer.borrow().as_ref() {
+                view.update_from_handle(&state.sstv_image.handle());
+            }
+            tracing::info!(
+                width,
+                height,
+                "SSTV image complete; {} in buffer",
+                state.sstv_completed_images.borrow().len()
+            );
         }
         DspToUi::ScannerMutexStopped(reason) => {
             tracing::info!(?reason, "scanner mutex stopped");
@@ -11099,6 +11137,37 @@ fn connect_satellites_panel(
                         let aos = chrono::Utc::now();
                         *state_a.lrpt_recording_pass.borrow_mut() = Some((norad_id, aos));
                     }
+                    sdr_sat::ImagingProtocol::Sstv => {
+                        // **Order is load-bearing.** Open the viewer
+                        // (which sends `UiToDsp::SetSstvImage`) and
+                        // clear both the shared handle and the canvas
+                        // BEFORE starting playback / retuning so no
+                        // leftover rows from a previous pass land in
+                        // the fresh image buffer.  Mirrors the LRPT
+                        // arm's clear-before-start discipline from
+                        // CR round 8 on PR #543.
+                        crate::sstv_viewer::open_sstv_viewer_if_needed(
+                            &parent_provider_a,
+                            &state_a,
+                        );
+                        state_a.sstv_image.clear();
+                        state_a.sstv_completed_images.borrow_mut().clear();
+                        if let Some(view) = state_a.sstv_viewer.borrow().as_ref() {
+                            view.clear();
+                        }
+                        // ISS SSTV is audible NFM — do NOT force the
+                        // audio chain off.  The user's squelch /
+                        // CTCSS / FM-IF-NR settings are correct for
+                        // the mode; we only suppress them for
+                        // silent-passthrough decoders (LRPT) and the
+                        // APT path (subcarrier noise). Per CLAUDE.md
+                        // and step 8 of epic #472 task spec.
+                        set_playing_a(true);
+                        tune_a(freq_hz, mode, bandwidth_hz);
+                        state_a.dispatch_vfo_offset(0.0);
+                        let aos = chrono::Utc::now();
+                        *state_a.sstv_recording_pass.borrow_mut() = Some((norad_id, aos));
+                    }
                 }
             }
             RecorderAction::StartAutoAudioRecord(path) => {
@@ -11586,6 +11655,147 @@ fn connect_satellites_panel(
                     {
                         tracing::info!(
                             "auto-record LOS: closing LRPT viewer window after PNG save"
+                        );
+                        window.close();
+                    }
+                });
+            }
+            RecorderAction::SaveSstvPass(dir) => {
+                // Drain the completed-image buffer that was filled
+                // during the pass by `DspToUi::SstvImageComplete`
+                // handlers above, then write each frame as
+                // `img{N}.png` in the per-pass directory.
+                //
+                // Reading from `state.sstv_completed_images`
+                // (rather than the shared `SstvImage` handle)
+                // mirrors the LRPT design from CodeRabbit round 7
+                // on PR #543: the save path is decoupled from the
+                // live viewer so closing the viewer window
+                // mid-pass doesn't lose the imagery.
+                //
+                // Snapshot + drain on the main thread (cheap
+                // — just a `Vec` swap), then off-load encoding
+                // + file I/O to `gio::spawn_blocking` so multi-
+                // image PNG encoding doesn't freeze the UI right
+                // when the auto-record toast is landing.
+                let images: Vec<sdr_radio::sstv_image::CompletedSstvImage> = state_a
+                    .sstv_completed_images
+                    .borrow_mut()
+                    .drain(..)
+                    .collect();
+                let toast_overlay_weak_for_save = toast_overlay_weak.clone();
+                let state_sstv_close = Rc::clone(&state_a);
+                // Snapshot the WeakRef BEFORE spawning so a
+                // viewer reopen during the async save can't
+                // trick us into closing the wrong window.
+                // Mirrors the LRPT pattern from CR round 2 on
+                // PR #575.
+                let exported_sstv_window_weak =
+                    state_a.sstv_viewer_window.borrow().as_ref().cloned();
+                // Snapshot the recording-pass tuple for
+                // compare-and-clear on completion — mirrors the
+                // LRPT and APT patterns from PR #571 / #575.
+                let exported_sstv_pass = *state_a.sstv_recording_pass.borrow();
+                glib::spawn_future_local(async move {
+                    let dir_for_msg = dir.clone();
+                    let (result_msg, save_ok) = gio::spawn_blocking(move || {
+                        if images.is_empty() {
+                            tracing::warn!(
+                                "auto-record SaveSstvPass but no SSTV images were decoded — pass produced no imagery",
+                            );
+                            return (
+                                format!(
+                                    "Pass complete, but no SSTV images decoded — nothing saved to {}",
+                                    dir.display()
+                                ),
+                                false,
+                            );
+                        }
+                        if let Err(e) = std::fs::create_dir_all(&dir) {
+                            tracing::warn!(
+                                "auto-record SaveSstvPass: failed to create directory {dir:?}: {e}",
+                            );
+                            return (
+                                format!("Pass complete but couldn't create {}: {e}", dir.display()),
+                                false,
+                            );
+                        }
+                        let mut saved = 0_usize;
+                        let mut errors: Vec<String> = Vec::new();
+                        for (idx, img) in images.iter().enumerate() {
+                            let path = dir.join(format!("img{idx}.png"));
+                            match crate::sstv_viewer::write_sstv_rgb_png(
+                                &path,
+                                &img.pixels,
+                                img.width,
+                                img.height,
+                            ) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        ?path,
+                                        width = img.width,
+                                        height = img.height,
+                                        "auto-record SSTV image saved",
+                                    );
+                                    saved += 1;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "auto-record SSTV export img{idx} to {path:?} failed: {e}",
+                                    );
+                                    errors.push(format!("img{idx}: {e}"));
+                                }
+                            }
+                        }
+                        let msg = if errors.is_empty() {
+                            format!(
+                                "Pass complete — {saved} SSTV image(s) saved to {}",
+                                dir.display()
+                            )
+                        } else {
+                            format!(
+                                "Pass complete — {saved} image(s) saved, {} failed: {}",
+                                errors.len(),
+                                errors.join("; ")
+                            )
+                        };
+                        (msg, saved > 0)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "auto-record SaveSstvPass: worker thread panicked: {e:?}",
+                        );
+                        (
+                            format!(
+                                "Pass complete but PNG worker panicked (target was {})",
+                                dir_for_msg.display()
+                            ),
+                            false,
+                        )
+                    });
+                    post_toast(&toast_overlay_weak_for_save, &result_msg);
+                    // Clear the recording-pass slot (compare-and-clear
+                    // so an overlapping pass doesn't have its slot
+                    // wiped by a late completion callback).
+                    {
+                        let mut slot = state_sstv_close.sstv_recording_pass.borrow_mut();
+                        if *slot == exported_sstv_pass {
+                            *slot = None;
+                        }
+                    }
+                    // Close the viewer on successful save — cleans
+                    // up for the next pass. On failure, keep it
+                    // open so the user can inspect the in-memory
+                    // image and retry. Mirrors LRPT semantics from
+                    // CR round 9 on PR #554.
+                    if save_ok
+                        && let Some(window) = exported_sstv_window_weak
+                            .as_ref()
+                            .and_then(glib::WeakRef::upgrade)
+                    {
+                        tracing::info!(
+                            "auto-record LOS: closing SSTV viewer window after PNG save"
                         );
                         window.close();
                     }

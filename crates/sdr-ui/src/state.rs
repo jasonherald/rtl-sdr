@@ -253,6 +253,33 @@ pub struct AppState {
     /// Cleared between passes via `LrptImage::clear` rather
     /// than reconstructed.
     pub lrpt_image: sdr_radio::lrpt_image::LrptImage,
+    /// Currently-open ISS SSTV viewer, or `None` when no viewer
+    /// is open. Same lifecycle pattern as `apt_viewer`. Set by
+    /// [`crate::sstv_viewer::open_sstv_viewer_if_needed`]; cleared
+    /// by the window's `close-request` handler. Per epic #472.
+    pub sstv_viewer: RefCell<Option<crate::sstv_viewer::SstvImageView>>,
+    /// Weak handle to the open SSTV viewer window. Cleared alongside
+    /// `sstv_viewer`. Weak so `AppState` doesn't keep the window
+    /// alive past its natural lifetime. Per epic #472.
+    pub sstv_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
+    /// Long-lived shared SSTV image handle. Allocated once per
+    /// process; the DSP tap pushes decoded scan lines into it,
+    /// the viewer reads it, and the LOS save drains completed
+    /// images via `SstvImage::handle()`. Cleared between images
+    /// by `take_completed` inside the DSP tap. Per epic #472.
+    pub sstv_image: sdr_radio::sstv_image::SstvImage,
+    /// Accumulated completed SSTV images for this pass, drained
+    /// at LOS by `SaveSstvPass`. Each entry is a `CompletedSstvImage`
+    /// received via `DspToUi::SstvImageComplete`. The wiring layer
+    /// appends images here as they arrive so the LOS save can write
+    /// them all in arrival order (`img0.png`, `img1.png`, …).
+    /// Per epic #472.
+    pub sstv_completed_images: RefCell<Vec<sdr_radio::sstv_image::CompletedSstvImage>>,
+    /// `(satellite_norad_id, aos_time)` for the currently-recording
+    /// SSTV pass, or `None` between passes. Mirrors `apt_recording_pass`
+    /// and `lrpt_recording_pass` — used by `is_recording()` and the
+    /// LOS compare-and-clear guard. Per epic #472.
+    pub sstv_recording_pass: RefCell<Option<(u32, chrono::DateTime<chrono::Utc>)>>,
     /// ACARS toggle (mirrors persisted `acars_enabled`).
     pub acars_enabled: Cell<bool>,
     /// Bounded ring of recent decoded messages. Cap is set
@@ -413,6 +440,11 @@ impl AppState {
             lrpt_viewer: RefCell::new(None),
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),
+            sstv_viewer: RefCell::new(None),
+            sstv_viewer_window: RefCell::new(None),
+            sstv_image: sdr_radio::sstv_image::SstvImage::new(),
+            sstv_completed_images: RefCell::new(Vec::new()),
+            sstv_recording_pass: RefCell::new(None),
             acars_enabled: Cell::new(false),
             acars_recent: RefCell::new(VecDeque::with_capacity(
                 crate::acars_config::default_recent_keep() as usize,
@@ -451,6 +483,7 @@ impl AppState {
     pub fn is_recording(&self) -> bool {
         self.apt_recording_pass.borrow().is_some()
             || self.lrpt_recording_pass.borrow().is_some()
+            || self.sstv_recording_pass.borrow().is_some()
             || self.audio_recording_active.get()
             || self.iq_recording_active.get()
     }
@@ -614,6 +647,10 @@ mod tests {
         assert!(!s.audio_recording_active.get());
         assert!(!s.iq_recording_active.get());
         assert!(s.lrpt_recording_pass.borrow().is_none());
+        assert!(
+            s.sstv_recording_pass.borrow().is_none(),
+            "no SSTV pass in flight at construction"
+        );
     }
 
     #[test]
@@ -624,18 +661,20 @@ mod tests {
 
     #[test]
     fn is_recording_table() {
-        // Each row: (apt, lrpt, audio, iq, expected)
+        // Each row: (apt, lrpt, sstv, audio, iq, expected)
         let cases = [
-            (false, false, false, false, false),
-            (true, false, false, false, true),
-            (false, true, false, false, true),
-            (false, false, true, false, true),
-            (false, false, false, true, true),
-            (true, true, true, true, true),
-            (true, false, false, true, true),
-            (false, true, true, false, true),
+            (false, false, false, false, false, false),
+            (true, false, false, false, false, true),
+            (false, true, false, false, false, true),
+            (false, false, true, false, false, true),
+            (false, false, false, true, false, true),
+            (false, false, false, false, true, true),
+            (true, true, true, true, true, true),
+            (true, false, false, false, true, true),
+            (false, true, false, true, false, true),
+            (false, false, true, false, true, true),
         ];
-        for (apt, lrpt, audio, iq, expected) in cases {
+        for (apt, lrpt, sstv, audio, iq, expected) in cases {
             let s = make_test_state();
             if apt {
                 *s.apt_recording_pass.borrow_mut() = Some((33_591, chrono::Utc::now()));
@@ -646,12 +685,17 @@ mod tests {
                 // round 2 on PR #575.
                 *s.lrpt_recording_pass.borrow_mut() = Some((33_592, chrono::Utc::now()));
             }
+            if sstv {
+                // ISS NORAD 25_544 — the only SSTV entry in the
+                // catalog. Per epic #472.
+                *s.sstv_recording_pass.borrow_mut() = Some((25_544, chrono::Utc::now()));
+            }
             s.audio_recording_active.set(audio);
             s.iq_recording_active.set(iq);
             assert_eq!(
                 s.is_recording(),
                 expected,
-                "row apt={apt} lrpt={lrpt} audio={audio} iq={iq}",
+                "row apt={apt} lrpt={lrpt} sstv={sstv} audio={audio} iq={iq}",
             );
         }
     }

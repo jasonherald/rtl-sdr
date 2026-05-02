@@ -23,6 +23,7 @@ use sdr_dsp::channel::RxVfo;
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::source_manager::Source;
 use sdr_radio::lrpt_decoder::LrptDecoder;
+use slowrx::SstvDecoder;
 
 use crate::sink_slot::{
     AudioSinkSlot, AudioSinkType, DEFAULT_NETWORK_SINK_HOST, DEFAULT_NETWORK_SINK_PORT,
@@ -535,6 +536,31 @@ struct DspState {
     /// log at the IQ block rate (~100 Hz) until source-stop.
     /// Per `CodeRabbit` round 12 on PR #543.
     lrpt_init_failed: bool,
+    /// ISS SSTV decoder. Lazy-init on first `sstv_decode_tap` call
+    /// at the `RadioModule`'s current audio sample rate (typically
+    /// 48 kHz). The decoder internally resamples to `11_025` Hz, so
+    /// any rate within `slowrx`'s accepted range is fine.
+    /// `None` means "not yet built" — built once, kept across demod
+    /// toggles so re-entering NFM during a pass picks up where it
+    /// left off. Per epic #472.
+    sstv_decoder: Option<slowrx::SstvDecoder>,
+    /// Pre-allocated mono downmix buffer for the SSTV decoder input.
+    /// Reused across DSP blocks, resized in place each call so we
+    /// don't alloc inside the hot loop. Mirrors `apt_mono_buf`.
+    sstv_mono_buf: Vec<f32>,
+    /// Most recent audio sample rate that `SstvDecoder::new` rejected,
+    /// or `None` if every prior init succeeded / hasn't been tried.
+    /// Guards against the audio-block hot loop retrying on a rate the
+    /// decoder will never accept. Cleared in `cleanup` alongside the
+    /// decoder reset so a fresh source restart gets one fresh attempt.
+    /// Mirrors `apt_init_failed_at_rate`. Per epic #472.
+    sstv_init_failed_at_rate: Option<u32>,
+    /// Shared SSTV image handle. `None` until the UI side wires it
+    /// via `UiToDsp::SetSstvImage`; when `None` the tap runs but
+    /// lines are discarded (manual NFM use without a viewer is
+    /// silent-but-harmless). Set at AOS by the auto-record wiring;
+    /// cleared at LOS by `UiToDsp::ClearSstvImage`. Per epic #472.
+    sstv_image: Option<sdr_radio::sstv_image::SstvImageHandle>,
     /// Live ACARS bank. May be temporarily `None` while ACARS
     /// is still engaged — specifically, the `Start` path
     /// invalidates this so `acars_decode_tap`'s lazy-init can
@@ -672,6 +698,10 @@ impl DspState {
             lrpt_decoder: None,
             lrpt_image: None,
             lrpt_init_failed: false,
+            sstv_decoder: None,
+            sstv_mono_buf: Vec::new(),
+            sstv_init_failed_at_rate: None,
+            sstv_image: None,
             acars_bank: None,
             acars_pre_lock: None,
             acars_init_failed: false,
@@ -815,6 +845,121 @@ fn lrpt_decode_tap(
         return;
     };
     decoder.process(radio_input);
+}
+
+/// ISS SSTV decode tap. Mirrors [`apt_decode_tap`]'s shape: lazy-init
+/// the [`SstvDecoder`] at the `RadioModule`'s current audio sample
+/// rate, downmix the post-`radio.process` stereo audio block to mono,
+/// feed the decoder, and dispatch events through the DSP→UI channel.
+///
+/// Only runs in NFM mode — the SSTV 1200–2300 Hz subcarrier rides on
+/// wide-FM-style audio which the NFM demod captures cleanly.
+///
+/// Events dispatched:
+/// - `SstvEvent::LineDecoded` → calls `image_handle.write_line` if
+///   the handle is wired; also sends `DspToUi::SstvLineDecoded` for
+///   the viewer's redraw trigger.
+/// - `SstvEvent::ImageComplete` → calls `image_handle.take_completed`
+///   and sends `DspToUi::SstvImageComplete` so the wiring layer can
+///   queue the completed image for LOS save.
+/// - `SstvEvent::VisDetected` → logged via `tracing::info!` only.
+///
+/// Per epic #472.
+fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_count: usize) {
+    // Lazy-init. Audio rate comes from `RadioModule::audio_sample_rate`
+    // (typically 48 kHz, well within slowrx's accepted range).
+    if state.sstv_decoder.is_none() {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rate_hz = state.radio.audio_sample_rate() as u32;
+        // Guard against retry-spamming the warn log on a rate the
+        // decoder will reject. Mirrors `apt_init_failed_at_rate`.
+        if state.sstv_init_failed_at_rate == Some(rate_hz) {
+            return;
+        }
+        match SstvDecoder::new(rate_hz) {
+            Ok(decoder) => {
+                tracing::info!("SSTV decoder initialised at {rate_hz} Hz");
+                state.sstv_decoder = Some(decoder);
+                state.sstv_init_failed_at_rate = None;
+            }
+            Err(e) => {
+                tracing::warn!("SSTV decoder init failed at {rate_hz} Hz: {e}");
+                state.sstv_init_failed_at_rate = Some(rate_hz);
+                return;
+            }
+        }
+    }
+    let Some(decoder) = state.sstv_decoder.as_mut() else {
+        return;
+    };
+
+    // Mono downmix. SSTV is mono — averaging L+R is equivalent to
+    // either channel for FM-demodulated audio. Mirrors `apt_mono_buf`.
+    state.sstv_mono_buf.clear();
+    state.sstv_mono_buf.extend(
+        state.audio_buf[..audio_count]
+            .iter()
+            .map(|s| (s.l + s.r) * 0.5),
+    );
+
+    // `SstvDecoder::process` returns a `Vec<SstvEvent>` — iterate and
+    // dispatch. `SstvEvent` is `#[non_exhaustive]`, so a wildcard arm
+    // handles future mode additions without a compile break.
+    for event in decoder.process(&state.sstv_mono_buf) {
+        match event {
+            slowrx::SstvEvent::VisDetected {
+                mode,
+                sample_offset,
+                hedr_shift_hz,
+            } => {
+                tracing::info!(
+                    ?mode,
+                    sample_offset,
+                    hedr_shift_hz,
+                    "SSTV VIS detected — new image starting"
+                );
+            }
+            slowrx::SstvEvent::LineDecoded {
+                mode,
+                line_index,
+                ref pixels,
+            } => {
+                // Write into the shared image handle (if the UI wired one).
+                if let Some(ref handle) = state.sstv_image {
+                    // Derive width/height from the mode spec. PD120/PD180 are
+                    // 640 px wide; other modes vary. `SstvMode` is
+                    // `#[non_exhaustive]` so we use the spec helper
+                    // (`slowrx::for_mode` — the free function in
+                    // `slowrx::modespec`, re-exported at the crate root).
+                    let spec = slowrx::for_mode(mode);
+                    handle.write_line(line_index, spec.line_pixels, spec.image_lines, pixels);
+                }
+                let _ = dsp_tx.send(DspToUi::SstvLineDecoded(line_index));
+            }
+            slowrx::SstvEvent::ImageComplete { image, .. } => {
+                // `take_completed` atomically swaps out the in-flight
+                // pixel buffer and resets for the next VIS detection.
+                // Move the completed image (via the shared handle's
+                // take path) into the DspToUi message for the wiring
+                // layer to save at LOS. If no handle is wired, fall
+                // back to the slowrx-owned `image` directly.
+                let completed = state
+                    .sstv_image
+                    .as_ref()
+                    .and_then(sdr_radio::sstv_image::SstvImageHandle::take_completed);
+                let _ = dsp_tx.send(DspToUi::SstvImageComplete {
+                    width: image.width,
+                    height: image.height,
+                    pixels: completed.map_or_else(|| image.pixels.clone(), |c| c.pixels),
+                });
+            }
+            _ => {
+                // `SstvEvent` is `#[non_exhaustive]` — silently
+                // ignore future variants so a slowrx 0.2 update
+                // doesn't require a source change here.
+            }
+        }
+    }
 }
 
 /// ACARS decode tap. Mirrors `lrpt_decode_tap`'s shape: takes
@@ -2228,6 +2373,23 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // round 1 on PR #543.
         }
 
+        UiToDsp::SetSstvImage(handle) => {
+            tracing::info!("SSTV image handle attached — decoder tap will push lines");
+            state.sstv_image = Some(handle);
+            // Decoder state intentionally NOT dropped here —
+            // same contract as `SetLrptImage`. The handle is
+            // a long-lived singleton; re-attaching is a no-op
+            // for the decoder. Lifecycle stays owned by the
+            // source-stop cleanup path. Per epic #472.
+        }
+
+        UiToDsp::ClearSstvImage => {
+            tracing::info!("SSTV image handle cleared — line writes silently discarded");
+            state.sstv_image = None;
+            // Decoder stays alive — mirrors `ClearLrptImage`.
+            // Per epic #472.
+        }
+
         UiToDsp::ResetImagingDecoders => {
             // Between-pass reset for the auto-record flow when
             // the source stays open across pass boundaries
@@ -3393,6 +3555,17 @@ fn reset_imaging_decoders(state: &mut DspState) {
         state.lrpt_decoder = None;
     }
     state.lrpt_init_failed = false;
+
+    // SSTV decoder reset: drop and re-init on next tap call so
+    // the next pass starts from a clean VIS-detection state.
+    // Mirrors the LRPT `drop + None` approach — slowrx doesn't
+    // expose a `reset()` method so we reconstruct lazily. The
+    // `sstv_mono_buf` is left allocated (reused), and the
+    // `sstv_init_failed_at_rate` memo is cleared so the next
+    // source-start gets a fresh init attempt. Per epic #472.
+    state.sstv_decoder = None;
+    state.sstv_mono_buf.clear();
+    state.sstv_init_failed_at_rate = None;
 }
 
 /// Rebuild the IQ frontend with the current sample rate, preserving user settings.
@@ -3690,6 +3863,14 @@ fn process_iq_block(
                             && state.radio.current_mode() == sdr_types::DemodMode::Nfm
                         {
                             apt_decode_tap(state, dsp_tx, audio_count);
+                            // ISS SSTV decode tap (#472). Also NFM-gated —
+                            // the SSTV 1200–2300 Hz subcarrier rides the
+                            // same wide-FM audio path as NOAA APT. Both
+                            // decoders run in parallel when in NFM mode;
+                            // only one will see a valid VIS header for
+                            // the active signal, so the other runs cheaply
+                            // as a no-op pass through the correlator.
+                            sstv_decode_tap(state, dsp_tx, audio_count);
                         }
 
                         // Emit CTCSS sustained-gate edges for the UI

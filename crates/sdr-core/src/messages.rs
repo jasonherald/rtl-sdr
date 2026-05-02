@@ -161,6 +161,34 @@ pub enum DspToUi {
     /// `mpsc::Receiver::try_recv()` hot path that copies the
     /// returned `DspToUi` value once per drain.
     AptLine(Box<AptLine>),
+    // --- SSTV decoder (#472 — ISS SSTV) ---
+    /// One decoded SSTV scan line. Emitted from the DSP thread when
+    /// `sstv_decode_tap` receives a `slowrx::SstvEvent::LineDecoded`.
+    /// The UI handler uses this as a redraw trigger for the live
+    /// viewer — the actual pixels are written into the shared
+    /// `SstvImageHandle` before this message is sent, so the viewer
+    /// only needs the index to know a new row is ready.
+    ///
+    /// `line_index` is 0-based. Cadence depends on the SSTV mode:
+    /// PD120 produces ~120 lines at ~1 line/sec; PD180 produces
+    /// ~180 lines. ISS ARISS events typically send ~12 images per
+    /// active pass window.
+    SstvLineDecoded(u32),
+    /// One complete SSTV image. Emitted from the DSP thread when
+    /// `sstv_decode_tap` receives a `slowrx::SstvEvent::ImageComplete`.
+    /// The UI wiring layer accumulates these for LOS save —
+    /// `interpret_action::SaveSstvPass` drains them into per-image
+    /// PNG files named `img0.png`, `img1.png`, etc. Boxed so the
+    /// pixel `Vec` doesn't inflate the enum's stack footprint on
+    /// the drain path. Per epic #472.
+    SstvImageComplete {
+        /// Width in pixels (e.g. 640 for PD120/PD180).
+        width: u32,
+        /// Height in scan lines.
+        height: u32,
+        /// Row-major RGB triples, length = `width * height`.
+        pixels: Vec<[u8; 3]>,
+    },
     /// One decoded ACARS frame. Boxed because `AcarsMessage`
     /// holds an inline `String` body and `arrayvec` fields,
     /// so the enum's stack footprint stays small.
@@ -388,6 +416,21 @@ pub enum UiToDsp {
     /// next source-stop, mirroring the APT decoder's
     /// "decoder kept across mode toggles" behavior.
     ClearLrptImage,
+    /// Hand the DSP thread a clone of the shared
+    /// `sdr_radio::sstv_image::SstvImageHandle` the live SSTV
+    /// viewer reads from. Sent by the wiring layer at AOS for
+    /// SSTV auto-record passes (or whenever the user opens the
+    /// SSTV viewer manually). The DSP thread stores the handle
+    /// and writes decoded scan lines into it whenever the SSTV
+    /// decoder tap runs (`current_mode` == `DemodMode::Nfm`).
+    /// Per epic #472.
+    SetSstvImage(sdr_radio::sstv_image::SstvImageHandle),
+    /// Drop the shared SSTV image handle. Sent at LOS / when
+    /// the live viewer closes — the DSP decoder continues
+    /// running (lines are silently discarded) until the next
+    /// source-stop. Mirrors the LRPT `ClearLrptImage` pattern.
+    /// Per epic #472.
+    ClearSstvImage,
     /// Start sending audio to the transcription engine.
     EnableTranscription(std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>),
     /// Stop sending audio to the transcription engine.

@@ -55,9 +55,9 @@ pub const IMAGING_BAND_MAX_HZ: u64 = 148_000_000;
 
 /// Imaging protocol the receiver should use for a given catalog
 /// satellite. Drives the auto-record dispatch in
-/// `sidebar::satellites_recorder` so APT vs LRPT vs SSTV (future)
-/// each get their own decoder + viewer without the recorder
-/// itself caring about protocol details.
+/// `sidebar::satellites_recorder` so APT vs LRPT vs SSTV each get
+/// their own decoder + viewer without the recorder itself caring
+/// about protocol details.
 ///
 /// `None` on a [`KnownSatellite::imaging_protocol`] means "in the
 /// catalog for pass-prediction display purposes, but auto-record
@@ -71,9 +71,13 @@ pub enum ImagingProtocol {
     Apt,
     /// Meteor-M Low-Rate Picture Transmission (QPSK + CCSDS framing
     /// on 137 MHz). Decoded by `sdr_dsp::lrpt::LrptDemod` +
-    /// `sdr_lrpt::LrptPipeline`. Wiring lands in Task 7 (epic #469).
+    /// `sdr_lrpt::LrptPipeline`. Shipped in epic #469.
     Lrpt,
-    // Sstv variant added in epic #472 for ISS SSTV reception.
+    /// Slow-Scan Television (FM audio with PLL pixel decode on
+    /// 145.800 MHz). Used during ARISS SSTV events from the ISS.
+    /// Decoded by the `slowrx` crate via `sdr_radio::sstv_image`.
+    /// Shipped in epic #472.
+    Sstv,
 }
 
 /// A satellite the user-facing scheduler ships with by default. The list
@@ -118,9 +122,8 @@ pub struct KnownSatellite {
     /// (so the user sees upcoming passes and can manually tune)
     /// but the auto-record path doesn't have a decoder + viewer
     /// for it yet. NOAA APT shipped in epic #468; Meteor LRPT
-    /// flips from `None` to `Some(Lrpt)` in Task 7 of epic #469
-    /// alongside the live LRPT viewer; ISS SSTV gets `Some(Sstv)`
-    /// in epic #472.
+    /// shipped in Task 7 of epic #469; ISS SSTV shipped in epic
+    /// #472 with `Some(Sstv)`.
     pub imaging_protocol: Option<ImagingProtocol>,
 }
 
@@ -188,17 +191,21 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
     // failed shortly after, no usable TLE on Celestrak (404 from the
     // GP API). Per #506.
     // ISS SSTV — epic #472. 145.800 MHz is the primary downlink for
-    // SSTV transmission events and the ARISS voice repeater; both
-    // ride wide-FM and use the same tune-and-listen flow.
-    // `imaging_protocol: None` until epic #472 ships the SSTV
-    // decoder + viewer.
+    // SSTV transmission events during ARISS events; ISS rides wide-FM
+    // so the standard NFM demod path captures it cleanly.
+    // `imaging_protocol: Some(Sstv)` enrolls ISS in the auto-record
+    // flow: at AOS the recorder opens the SSTV viewer and signals the
+    // DSP to attach the `SstvDecoder`; at LOS the per-pass directory
+    // is written via `Action::SaveSstvPass`. Audio recording is NOT
+    // suppressed for SSTV — the user-toggle applies as usual (SSTV is
+    // audible unlike LRPT's silent QPSK). Shipped in epic #472.
     KnownSatellite {
         name: "ISS (ZARYA)",
         norad_id: 25_544,
         downlink_hz: 145_800_000,
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
-        imaging_protocol: None,
+        imaging_protocol: Some(ImagingProtocol::Sstv),
     },
 ];
 
@@ -303,14 +310,17 @@ mod tests {
                 s.name,
             );
         }
-        // ISS → None. Becomes Some(Sstv) in epic #472.
+        // ISS → Some(Sstv). Shipped in epic #472. The `slowrx`-backed
+        // SSTV decoder + viewer + per-pass directory save are all wired
+        // end-to-end, so the catalog entry flips from None to Some(Sstv).
         let iss = KNOWN_SATELLITES
             .iter()
             .find(|s| s.name.contains("ISS"))
             .expect("ISS in catalog");
         assert_eq!(
-            iss.imaging_protocol, None,
-            "ISS should be None until epic #472"
+            iss.imaging_protocol,
+            Some(ImagingProtocol::Sstv),
+            "ISS should be Some(Sstv) after epic #472"
         );
     }
 }

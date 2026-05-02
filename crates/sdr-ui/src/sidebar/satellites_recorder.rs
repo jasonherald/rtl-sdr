@@ -51,7 +51,10 @@ const SETTLE_SECS: i64 = 3;
 /// APT writes a single PNG; LRPT writes one PNG per AVHRR
 /// channel (APID) into a directory, since LRPT is multispectral
 /// and a single file can't represent all the data the user
-/// actually wants to keep. Per epic #469 task 7.4.
+/// actually wants to keep. SSTV writes a directory of per-image
+/// PNGs — ISS ARISS events send ~12 images per pass and each
+/// image is distinct content, so a directory matches LRPT's
+/// multi-artifact model. Per epic #469 task 7.4 + epic #472.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PassOutput {
     /// Single PNG file (NOAA APT). Wiring layer dispatches via
@@ -62,6 +65,11 @@ pub enum PassOutput {
     /// the directory is created lazily by the wiring layer's
     /// per-channel save loop.
     LrptDir(PathBuf),
+    /// Directory holding one PNG per decoded SSTV image (ISS SSTV).
+    /// Wiring layer dispatches via [`Action::SaveSstvPass`].
+    /// Named `img0.png`, `img1.png`, etc. in arrival order.
+    /// Per epic #472.
+    SstvDir(PathBuf),
 }
 
 impl PassOutput {
@@ -72,6 +80,7 @@ impl PassOutput {
         match self {
             Self::AptPng(_) => sdr_sat::ImagingProtocol::Apt,
             Self::LrptDir(_) => sdr_sat::ImagingProtocol::Lrpt,
+            Self::SstvDir(_) => sdr_sat::ImagingProtocol::Sstv,
         }
     }
 }
@@ -269,6 +278,14 @@ pub enum Action {
     /// strategy is statically separated — no path-meaning
     /// overload.
     SaveLrptPass(PathBuf),
+    /// Save all decoded SSTV images from this pass into `dir`.
+    /// Fired on `Recording → Finalizing` for SSTV passes.
+    /// Wiring layer creates the directory and writes one PNG
+    /// per completed image accumulated in `AppState::sstv_completed_images`:
+    /// `img0.png`, `img1.png`, etc. in arrival order. Distinct
+    /// from `SaveLrptPass` so the wiring layer's dispatch is
+    /// statically typed — per epic #472.
+    SaveSstvPass(PathBuf),
     /// Stop the in-flight WAV writer opened by
     /// [`Action::StartAutoAudioRecord`]. Fired alongside
     /// [`Action::SavePng`] on LOS, but only when audio recording
@@ -338,14 +355,14 @@ impl Default for AutoRecorder {
 impl AutoRecorder {
     /// Build a recorder that arms on every imaging protocol the
     /// wiring layer has fully wired in `interpret_action`
-    /// (decoder tap, viewer open, LOS save). As of epic #469
-    /// task 7 that's `[Apt, Lrpt]`; ISS SSTV adds `Sstv` once
-    /// epic #472 ships.
+    /// (decoder tap, viewer open, LOS save). As of epic #472
+    /// that's `[Apt, Lrpt, Sstv]`.
     #[must_use]
     pub fn new() -> Self {
         Self::with_supported_protocols(&[
             sdr_sat::ImagingProtocol::Apt,
             sdr_sat::ImagingProtocol::Lrpt,
+            sdr_sat::ImagingProtocol::Sstv,
         ])
     }
 
@@ -529,6 +546,7 @@ impl AutoRecorder {
             let output = match protocol {
                 sdr_sat::ImagingProtocol::Apt => PassOutput::AptPng(png_path_for(pass, now)),
                 sdr_sat::ImagingProtocol::Lrpt => PassOutput::LrptDir(lrpt_dir_for(pass, now)),
+                sdr_sat::ImagingProtocol::Sstv => PassOutput::SstvDir(sstv_dir_for(pass, now)),
             };
             // Audio recording is suppressed for LRPT regardless
             // of the user toggle: the LRPT demod is a silent
@@ -538,8 +556,9 @@ impl AutoRecorder {
             // ~115 MB per pass for no value. (`144 kHz` is the
             // demod's IF rate, not the WAV writer's; an earlier
             // draft conflated the two.) The toggle still
-            // applies to APT — voice/audio capture is genuinely
-            // useful there.
+            // applies to APT and SSTV — both produce audible
+            // audio (SSTV is audible FSK modulation) that some
+            // users may want to record.
             let want_audio = audio_record_on && protocol != sdr_sat::ImagingProtocol::Lrpt;
             let audio_path = want_audio.then(|| audio_path_for(pass, now));
             let mut actions = Vec::with_capacity(3);
@@ -712,6 +731,19 @@ fn lrpt_dir_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
     pass_recording_dir(pass, now, "lrpt")
 }
 
+/// Build the export directory for an ISS SSTV pass:
+/// `~/sdr-recordings/sstv-ISS--ZARYA--2026-04-25-143015`.
+///
+/// The wiring layer creates the directory lazily and writes one
+/// PNG per completed SSTV image inside it (`img0.png`,
+/// `img1.png`, …). ARISS events typically emit ~12 images per
+/// pass — a directory mirrors the LRPT model for multi-artifact
+/// passes. Per epic #472.
+#[must_use]
+fn sstv_dir_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
+    pass_recording_dir(pass, now, "sstv")
+}
+
 /// Build the audio-recording path for a satellite + timestamp:
 /// `~/sdr-recordings/audio-NOAA-19-2026-04-25-143015.wav`.
 /// Pairs with [`png_path_for`] — same sat slug + timestamp so a
@@ -731,6 +763,7 @@ fn save_action_for(output: &PassOutput) -> Action {
     match output {
         PassOutput::AptPng(p) => Action::SavePng(p.clone()),
         PassOutput::LrptDir(p) => Action::SaveLrptPass(p.clone()),
+        PassOutput::SstvDir(p) => Action::SaveSstvPass(p.clone()),
     }
 }
 
@@ -976,18 +1009,37 @@ mod tests {
     }
 
     #[test]
-    fn idle_does_not_arm_for_unflagged_satellite() {
-        // ISS is in the catalog but `imaging_protocol: None`
-        // (SSTV decoder + viewer ship in epic #472). The
-        // recorder must skip it — tuning would succeed but no
-        // decoder would produce imagery, and the LOS-side save
-        // would emit an action with no backing data.
-        //
-        // Pre-task-7 of epic #469 this test used Meteor as the
-        // unflagged-protocol fixture; once Meteor flipped to
-        // `Some(Lrpt)` we needed a different unflagged catalog
-        // entry. ISS is the canonical "in the catalog for
-        // pass display, no auto-record yet" case.
+    fn idle_does_not_arm_for_unknown_satellite() {
+        // A satellite that isn't in the catalog at all produces no
+        // tune target, so the recorder must skip it.  We use a
+        // fictional name so this test doesn't accidentally break
+        // when a real catalog entry gets its protocol filled in
+        // (as happened when Meteor → Lrpt, then ISS → Sstv shipped
+        // in epic #472). Pre-epic-#472 this test used "ISS (ZARYA)"
+        // as the fixture because ISS had `imaging_protocol: None`;
+        // now that ISS ships with `Some(Sstv)` the fixture is a
+        // name that will never appear in the catalog.
+        let mut r = AutoRecorder::new();
+        let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
+        let mut pass = synthetic_noaa19(now, 3, 720, 50.0);
+        pass.satellite = "UNKNOWN-SAT-99".to_string();
+        let actions = r.tick(
+            now,
+            &[pass],
+            true,
+            false,
+            DEFAULT_MIN_ELEV_DEG,
+            default_tune(),
+        );
+        assert!(matches!(r.state(), State::Idle));
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn idle_arms_for_iss_sstv_pass() {
+        // ISS has `imaging_protocol: Some(Sstv)` since epic #472.
+        // The recorder must arm for it when auto-record is on and
+        // the pass is within AOS_LEAD_SECS.
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         let mut pass = synthetic_noaa19(now, 3, 720, 50.0);
@@ -1000,8 +1052,15 @@ mod tests {
             DEFAULT_MIN_ELEV_DEG,
             default_tune(),
         );
-        assert!(matches!(r.state(), State::Idle));
-        assert!(actions.is_empty());
+        // The recorder should have transitioned out of Idle.
+        assert!(!matches!(r.state(), State::Idle));
+        // At minimum a StartAutoRecord must be in the action batch.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::StartAutoRecord { .. })),
+            "expected StartAutoRecord for ISS SSTV pass"
+        );
     }
 
     #[test]
