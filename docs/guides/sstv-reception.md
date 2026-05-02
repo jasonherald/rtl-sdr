@@ -11,24 +11,24 @@ flows in this app.
 The big difference from APT and LRPT: **SSTV from the ISS is not
 a regular daily occurrence.** The International Space Station only
 transmits SSTV during scheduled ARISS (Amateur Radio on the
-International Space Station) commemoration events, which happen 2-4
-times per year and run for 2-5 days at a stretch. You can't just
-arm the auto-record toggle on a quiet weekday and expect imagery —
-you need to time it to an active event.
+International Space Station) commemoration events, which (as of May
+2026) happen 2-4 times per year and run for 2-5 days at a stretch.
+You can't just arm the auto-record toggle on a quiet weekday and
+expect imagery — you need to time it to an active event.
 
 ---
 
 ## What you'll see
 
-During an active ARISS event, the ISS transmits a rotation of ~12
-photographs over a 2-5 day window. Each pass over your location
-typically captures 1-3 of them, depending on the pass duration and
-where the cycle was when the satellite came into view.
+During an active ARISS event (as of May 2026), the ISS transmits
+a rotation of ~12 photographs over a 2-5 day window. Each pass over
+your location typically captures 1-3 of them, depending on the pass
+duration and where the cycle was when the satellite came into view.
 
-Modes used: **PD120** (most common), **PD180** (high quality), and
-**PD240** (highest quality). All three produce 640 × 496 colour
-images. The viewer's window-title subtitle shows which mode the
-current image is being decoded as.
+Modes used (as of May 2026): **PD120** (most common), **PD180**
+(high quality), and **PD240** (highest quality). All three produce
+640 × 496 colour images. The viewer's window-title subtitle shows
+which mode the current image is being decoded as.
 
 > **TODO:** hero screenshot — a real ISS SSTV image we received
 > during an ARISS event, ideally showing the mode subtitle in the
@@ -53,12 +53,12 @@ auto-record if there's no active event. Check both:
   cross-posts ARISS event announcements and sometimes adds
   technical notes (e.g. "PD120 this time, not PD180").
 
-Past events have run from a few hours to five full days. Event
-windows are announced as continuous, but in practice the ISS crew
-power-cycles the SSTV transmitter during station activities so
-some passes during the window will be silent. Plan to attempt
-several passes per day during an event rather than relying on any
-one.
+Past events (as of May 2026) have run from a few hours to five
+full days. Event windows are announced as continuous, but in
+practice the ISS crew power-cycles the SSTV transmitter during
+station activities so some passes during the window will be silent.
+Plan to attempt several passes per day during an event rather than
+relying on any one.
 
 ---
 
@@ -73,7 +73,7 @@ imperfectly but usefully on high-elevation passes.
 ### Best: 2 m / 70 cm vertical or J-pole
 
 The ISS's onboard antennas are roughly omnidirectional and
-**vertically polarized**, unlike weather satellites' RHCP. A
+**vertically polarised**, unlike weather satellites' RHCP. A
 straight vertical antenna (a 2 m amateur whip, a J-pole, a
 quarter-wave ground plane) is the right match. Most of these
 antennas double as 70 cm receivers, which is convenient for ISS
@@ -84,7 +84,7 @@ voice comms on 437 MHz too.
 If you already have a 137 MHz V-dipole built for APT, tilt one of
 the arms vertical (or stand it on end) and you'll get a usable
 145 MHz pattern. You're operating it 8 MHz off-resonance and at the
-wrong polarization, so expect the SNR to be a few dB worse than a
+wrong polarisation, so expect the SNR to be a few dB worse than a
 purpose-built 2 m antenna — but workable on passes above ~30°
 elevation.
 
@@ -239,9 +239,9 @@ shared image buffer regardless of viewer presence.
 ## Manual SSTV mode
 
 Unlike APT and LRPT, **SSTV doesn't have a dedicated mode in the
-demod dropdown** today. The SSTV decoder runs only when the
-satellite recorder armed it for an ISS pass. To use the viewer
-outside the auto-record path:
+demod dropdown** (as of May 2026). The SSTV decoder runs only
+when the satellite recorder armed it for an ISS pass. To use the
+viewer outside the auto-record path:
 
 - `Ctrl+Shift+V` opens the SSTV viewer window even when no pass is
   in progress. The decoder is wired to NFM audio, so as long as
@@ -274,11 +274,11 @@ completed during the pass. Most common causes, in order:
 2. **Pass too low.** SSTV's PD-family decoders are line-rate-
    locked rather than per-line resyncable; a horizon-grazing pass
    may carry signal but never sustain enough SNR for VIS detection.
-3. **Antenna polarization mismatch.** A horizontal antenna (e.g.
+3. **Antenna polarisation mismatch.** A horizontal antenna (e.g.
    the 137 MHz V-dipole used flat for APT) nulls vertically-
-   polarized 145 MHz signals. Lay the antenna vertical.
-4. **Wrong frequency due to Doppler.** The recorder doesn't
-   currently apply Doppler correction for SSTV; the ±3 kHz shift
+   polarised 145 MHz signals. Lay the antenna vertical.
+4. **Wrong frequency due to Doppler.** The recorder doesn't apply
+   Doppler correction for SSTV (as of May 2026); the ±3 kHz shift
    on 145.800 MHz is normally inside the 12.5 kHz channel
    bandwidth, but if you've narrowed the bandwidth it may not be.
    Reset bandwidth to 12.5 kHz.

@@ -43,7 +43,7 @@ wedges = something's off (see [When things go wrong](#when-things-go-wrong)).
 
 ## Antenna
 
-NOAA APT is at 137 MHz with right-hand circular polarization,
+NOAA APT is at 137 MHz with right-hand circular polarisation,
 broadcast from ~850 km up. You don't need anything fancy to hear
 it, but you do need *something* — a stock RTL-SDR with the rubber
 duck antenna it shipped with will give you noise.
@@ -290,7 +290,7 @@ hand-export from the viewer after fixing the underlying issue.
 - **ISS SSTV** (epic [#472](https://github.com/jasonherald/rtl-sdr/issues/472))
   — the International Space Station occasionally broadcasts
   SSTV images on 145.800 MHz during commemoration events.
-  Different band, different antenna polarization, completely
+  Different band, different antenna polarisation, completely
   different decoder. Shipped end-to-end — see
   [`sstv-reception.md`](sstv-reception.md) for the walkthrough.
   Watch [ariss-sstv.blogspot.com](https://ariss-sstv.blogspot.com)
