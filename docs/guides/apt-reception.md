@@ -290,9 +290,10 @@ hand-export from the viewer after fixing the underlying issue.
 - **ISS SSTV** (epic [#472](https://github.com/jasonherald/rtl-sdr/issues/472))
   — the International Space Station occasionally broadcasts
   SSTV images on 145.800 MHz during commemoration events.
-  Different band, similar antenna, completely different
-  decoder. Watch
-  [ariss-sstv.blogspot.com](https://ariss-sstv.blogspot.com)
+  Different band, different antenna polarization, completely
+  different decoder. Shipped end-to-end — see
+  [`sstv-reception.md`](sstv-reception.md) for the walkthrough.
+  Watch [ariss-sstv.blogspot.com](https://ariss-sstv.blogspot.com)
   for upcoming events.
 - **Calibration tuning** — if you're getting consistently good
   images, look at the AVHRR channel telemetry to identify

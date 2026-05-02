@@ -2083,6 +2083,18 @@ fn handle_dsp_message(
                 view.push_line(&line);
             }
         }
+        DspToUi::SstvVisDetected { mode_label } => {
+            // The decoder identified an SSTV mode from a fresh VIS
+            // header. Surface it in the viewer's title so the user
+            // can see whether they're getting PD120 / PD180 / PD240
+            // (or a future slowrx mode) without having to read
+            // `tracing::info!` in the journal. No-op when the
+            // viewer isn't open. Per epic #472 mode-display
+            // follow-up.
+            if let Some(view) = state.sstv_viewer.borrow().as_ref() {
+                view.set_mode_label(mode_label);
+            }
+        }
         DspToUi::SstvLineDecoded(_line_index) => {
             // A new SSTV scan line has arrived — refresh the open
             // viewer (if any) from the shared SstvImage handle.
