@@ -14,6 +14,7 @@ sdr-pipeline.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+slowrx.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

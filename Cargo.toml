@@ -304,6 +304,13 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # without touching ~/.config/autostart/ on the dev box.
 tempfile = "3"
 
+# SSTV decode (ISS SSTV reception, epic #472). Wraps the slowrx FM-demod +
+# VIS detect + PLL + line decode chain; accepts any audio sample rate up to
+# `slowrx::resample::MAX_INPUT_SAMPLE_RATE_HZ` and internally resamples to
+# 11_025 Hz. Both `rustfft` and `thiserror` that slowrx brings are already
+# in the workspace dep tree, so no new transitive deps are added.
+slowrx = "0.2"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 

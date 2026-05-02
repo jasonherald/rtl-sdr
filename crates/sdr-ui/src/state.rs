@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 
@@ -43,6 +44,28 @@ pub fn rtl_tcp_state_discriminant(state: &sdr_types::RtlTcpConnectionState) -> u
         sdr_types::RtlTcpConnectionState::AuthRequired => RTL_TCP_STATE_DISC_AUTH_REQUIRED,
         sdr_types::RtlTcpConnectionState::AuthFailed => RTL_TCP_STATE_DISC_AUTH_FAILED,
     }
+}
+
+/// A retry batch of SSTV images that failed to fully export at LOS,
+/// keyed by the pass directory they were originally destined for so
+/// the next save attempt writes them back to the correct
+/// `sstv-iss-{ts}` folder. Per CR round 6 #21 on PR #599.
+#[derive(Debug, Clone)]
+pub struct PendingSstvExport {
+    /// Original per-pass directory (e.g.
+    /// `~/sdr-recordings/sstv-iss-2026-05-02-201234/`). The retry
+    /// writes images here so all of a pass's images stay
+    /// co-located even when the first save attempt failed.
+    pub dir: PathBuf,
+    /// First image's filename index within `dir`. The retry
+    /// writes `img{start_index}.png`, `img{start_index+1}.png`, …
+    /// so a late-tail retry for a pass that already saved
+    /// `img0.png` … `img11.png` doesn't clobber those when it
+    /// flushes images 12 onward. Per CR round 8 #27 on PR #599.
+    pub start_index: usize,
+    /// Images to retry. Order is preserved so retried filenames
+    /// match what the original save would have written.
+    pub images: Vec<sdr_radio::sstv_image::CompletedSstvImage>,
 }
 
 /// Shared application state, designed for single-threaded GTK main loop access.
@@ -253,6 +276,42 @@ pub struct AppState {
     /// Cleared between passes via `LrptImage::clear` rather
     /// than reconstructed.
     pub lrpt_image: sdr_radio::lrpt_image::LrptImage,
+    /// Currently-open ISS SSTV viewer, or `None` when no viewer
+    /// is open. Same lifecycle pattern as `apt_viewer`. Set by
+    /// [`crate::sstv_viewer::open_sstv_viewer_if_needed`]; cleared
+    /// by the window's `close-request` handler. Per epic #472.
+    pub sstv_viewer: RefCell<Option<crate::sstv_viewer::SstvImageView>>,
+    /// Weak handle to the open SSTV viewer window. Cleared alongside
+    /// `sstv_viewer`. Weak so `AppState` doesn't keep the window
+    /// alive past its natural lifetime. Per epic #472.
+    pub sstv_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
+    /// Long-lived shared SSTV image handle. Allocated once per
+    /// process; the DSP tap pushes decoded scan lines into it,
+    /// the viewer reads it, and the LOS save drains completed
+    /// images via `SstvImage::handle()`. Cleared between images
+    /// by `take_completed` inside the DSP tap. Per epic #472.
+    pub sstv_image: sdr_radio::sstv_image::SstvImage,
+    /// Accumulated completed SSTV images for this pass, drained
+    /// at LOS by `SaveSstvPass`. Each entry is a `CompletedSstvImage`
+    /// received via `DspToUi::SstvImageComplete`. The wiring layer
+    /// appends images here as they arrive so the LOS save can write
+    /// them all in arrival order (`img0.png`, `img1.png`, …).
+    /// Per epic #472.
+    pub sstv_completed_images: RefCell<Vec<sdr_radio::sstv_image::CompletedSstvImage>>,
+    /// Dir-tagged retry buffer for SSTV images whose LOS save
+    /// failed. Each entry is a [`PendingSstvExport`] keyed by the
+    /// pass's original `sstv-iss-{ts}` directory so retries write
+    /// back to the right pass folder instead of bleeding into the
+    /// current pass's directory. The next `SaveSstvPass` retries
+    /// each batch against its own dir; entries that still fail
+    /// stay queued for another attempt. Per CR round 6 #21 on
+    /// PR #599 (refines round 5 #20's dir-less design).
+    pub sstv_pending_export: RefCell<Vec<PendingSstvExport>>,
+    /// `(satellite_norad_id, aos_time)` for the currently-recording
+    /// SSTV pass, or `None` between passes. Mirrors `apt_recording_pass`
+    /// and `lrpt_recording_pass` — used by `is_recording()` and the
+    /// LOS compare-and-clear guard. Per epic #472.
+    pub sstv_recording_pass: RefCell<Option<(u32, chrono::DateTime<chrono::Utc>)>>,
     /// ACARS toggle (mirrors persisted `acars_enabled`).
     pub acars_enabled: Cell<bool>,
     /// Bounded ring of recent decoded messages. Cap is set
@@ -413,6 +472,12 @@ impl AppState {
             lrpt_viewer: RefCell::new(None),
             lrpt_viewer_window: RefCell::new(None),
             lrpt_image: sdr_radio::lrpt_image::LrptImage::new(),
+            sstv_viewer: RefCell::new(None),
+            sstv_viewer_window: RefCell::new(None),
+            sstv_image: sdr_radio::sstv_image::SstvImage::new(),
+            sstv_completed_images: RefCell::new(Vec::new()),
+            sstv_pending_export: RefCell::new(Vec::new()),
+            sstv_recording_pass: RefCell::new(None),
             acars_enabled: Cell::new(false),
             acars_recent: RefCell::new(VecDeque::with_capacity(
                 crate::acars_config::default_recent_keep() as usize,
@@ -439,18 +504,26 @@ impl AppState {
         }
     }
 
-    /// `true` if the app is actively writing pass artifacts to disk —
-    /// any APT pass, LRPT pass, audio recording, or IQ recording.
+    /// `true` if the app is actively writing pass artifacts to disk
+    /// OR holds in-memory imagery that hasn't been flushed yet — any
+    /// APT pass, LRPT pass, SSTV pass, audio recording, IQ recording,
+    /// or queued [`PendingSstvExport`] retry batches.
     /// Used to gate the tray-Quit confirmation modal.
     ///
     /// Maintenance contract: every new "we're writing pass artifacts"
     /// state added to `AppState` MUST be OR-ed in here, and the
     /// table-driven test in `is_recording_table` must be extended.
     /// Otherwise a future recording type can be silently dropped on Quit.
+    ///
+    /// Per CR round 9 #28 on PR #599 for the `sstv_pending_export`
+    /// branch — without it, an LOS save failure would leave decoded
+    /// imagery only in memory and the user could quit without warning.
     #[must_use]
     pub fn is_recording(&self) -> bool {
         self.apt_recording_pass.borrow().is_some()
             || self.lrpt_recording_pass.borrow().is_some()
+            || self.sstv_recording_pass.borrow().is_some()
+            || !self.sstv_pending_export.borrow().is_empty()
             || self.audio_recording_active.get()
             || self.iq_recording_active.get()
     }
@@ -614,6 +687,10 @@ mod tests {
         assert!(!s.audio_recording_active.get());
         assert!(!s.iq_recording_active.get());
         assert!(s.lrpt_recording_pass.borrow().is_none());
+        assert!(
+            s.sstv_recording_pass.borrow().is_none(),
+            "no SSTV pass in flight at construction"
+        );
     }
 
     #[test]
@@ -624,34 +701,63 @@ mod tests {
 
     #[test]
     fn is_recording_table() {
-        // Each row: (apt, lrpt, audio, iq, expected)
+        // Per repo rule on named constants for magic numbers
+        // (`crates/CLAUDE.md`). Per CR round 6 on PR #599.
+        const ISS_NORAD_ID: u32 = 25_544;
+        const NOAA_19_NORAD_ID: u32 = 33_591;
+        const NOAA_LRPT_PLACEHOLDER_ID: u32 = 33_592;
+        // Each row: (apt, lrpt, sstv, audio, iq, sstv_pending, expected)
+        // The `sstv_pending` column covers in-memory retry batches
+        // queued by an LOS save failure (or a late-tail post-success
+        // move). Without OR-ing this into `is_recording()` the tray
+        // Quit path would treat the app as idle and silently drop the
+        // pending imagery. Per CR round 9 #28 on PR #599.
         let cases = [
-            (false, false, false, false, false),
-            (true, false, false, false, true),
-            (false, true, false, false, true),
-            (false, false, true, false, true),
-            (false, false, false, true, true),
-            (true, true, true, true, true),
-            (true, false, false, true, true),
-            (false, true, true, false, true),
+            (false, false, false, false, false, false, false),
+            (true, false, false, false, false, false, true),
+            (false, true, false, false, false, false, true),
+            (false, false, true, false, false, false, true),
+            (false, false, false, true, false, false, true),
+            (false, false, false, false, true, false, true),
+            (false, false, false, false, false, true, true),
+            (true, true, true, true, true, true, true),
+            (true, false, false, false, true, false, true),
+            (false, true, false, true, false, false, true),
+            (false, false, true, false, true, false, true),
+            (false, false, false, false, false, true, true),
         ];
-        for (apt, lrpt, audio, iq, expected) in cases {
+        for (apt, lrpt, sstv, audio, iq, sstv_pending, expected) in cases {
             let s = make_test_state();
             if apt {
-                *s.apt_recording_pass.borrow_mut() = Some((33_591, chrono::Utc::now()));
+                *s.apt_recording_pass.borrow_mut() = Some((NOAA_19_NORAD_ID, chrono::Utc::now()));
             }
             if lrpt {
                 // NORAD 33_592 = NOAA 19 placeholder; matches the
                 // shape `apt_recording_pass` uses above. Per CR
                 // round 2 on PR #575.
-                *s.lrpt_recording_pass.borrow_mut() = Some((33_592, chrono::Utc::now()));
+                *s.lrpt_recording_pass.borrow_mut() =
+                    Some((NOAA_LRPT_PLACEHOLDER_ID, chrono::Utc::now()));
+            }
+            if sstv {
+                // ISS NORAD 25_544 — the only SSTV entry in the
+                // catalog. Per epic #472.
+                *s.sstv_recording_pass.borrow_mut() = Some((ISS_NORAD_ID, chrono::Utc::now()));
             }
             s.audio_recording_active.set(audio);
             s.iq_recording_active.set(iq);
+            if sstv_pending {
+                // Single empty placeholder batch is enough — the
+                // guard checks `is_empty()`, not image count.
+                s.sstv_pending_export.borrow_mut().push(PendingSstvExport {
+                    dir: std::path::PathBuf::from("/tmp/test-sstv-pending"),
+                    start_index: 0,
+                    images: Vec::new(),
+                });
+            }
             assert_eq!(
                 s.is_recording(),
                 expected,
-                "row apt={apt} lrpt={lrpt} audio={audio} iq={iq}",
+                "row apt={apt} lrpt={lrpt} sstv={sstv} audio={audio} iq={iq} sstv_pending={sstv_pending}",
             );
         }
     }

@@ -772,7 +772,11 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         | DspToUi::AcarsEnabledChanged(_)
         // Output-error toast (issue #578) — Linux-only writer path;
         // macOS ticket will handle when FFI layer gets ACARS output.
-        | DspToUi::AcarsOutputError { .. } => return None,
+        | DspToUi::AcarsOutputError { .. }
+        // SSTV variants (epic #472) — Linux-only for V1; macOS will
+        // get its own ticket when the FFI layer gains an SSTV viewer.
+        | DspToUi::SstvLineDecoded(_)
+        | DspToUi::SstvImageComplete { .. } => return None,
     };
 
     Some((event, owned_cstring, owned_vec))
@@ -1342,6 +1346,38 @@ mod tests {
         assert!(
             translate_event(&msg).is_none(),
             "AcarsOutputError must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
+    fn translate_sstv_line_decoded_is_dropped_at_ffi_boundary() {
+        // SSTV variants (epic #472) are Linux-only for V1; the
+        // macOS FFI layer will get its own ticket when the FFI
+        // layer gains an SSTV viewer. Pin the drop-at-boundary
+        // contract so a future change that accidentally surfaces
+        // SSTV through the C ABI trips this assert first.
+        // Per CodeRabbit round 1 on PR #599.
+        let msg = DspToUi::SstvLineDecoded(0);
+        assert!(
+            translate_event(&msg).is_none(),
+            "SstvLineDecoded must not translate to a wire event yet",
+        );
+    }
+
+    #[test]
+    fn translate_sstv_image_complete_is_dropped_at_ffi_boundary() {
+        // Same drop-at-boundary contract as `SstvLineDecoded`
+        // above — the pixel Vec should never flow through the
+        // C ABI until the macOS viewer ticket ships. Per
+        // CodeRabbit round 1 on PR #599.
+        let msg = DspToUi::SstvImageComplete {
+            width: 1,
+            height: 1,
+            pixels: vec![[0_u8, 0, 0]],
+        };
+        assert!(
+            translate_event(&msg).is_none(),
+            "SstvImageComplete must not translate to a wire event yet",
         );
     }
 

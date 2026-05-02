@@ -58,6 +58,7 @@ dirs-next.workspace = true
 # and the crate's `lib.rs` cfg dispatch resolves to the stub backend.
 sdr-sink-audio.workspace = true
 sdr-transcription.workspace = true
+slowrx.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sdr-sink-audio = { workspace = true, features = ["pipewire"] }

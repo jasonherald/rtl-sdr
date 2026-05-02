@@ -33,7 +33,7 @@ use crate::sidebar::source_panel::{
     NETWORK_PROTOCOL_UDP_IDX,
 };
 use crate::spectrum;
-use crate::state::AppState;
+use crate::state::{AppState, PendingSstvExport};
 use crate::status_bar::{self, StatusBar};
 
 /// Default recording directory under the user's home.
@@ -149,6 +149,153 @@ fn apply_manual_tune(
     status_bar.update_frequency(freq_hz);
     spectrum_handle.set_center_frequency(freq_hz);
     radio_panel.update_distance_frequency(freq_hz);
+}
+
+/// Outcome of `save_sstv_batches` reported back to the GTK main
+/// thread. Used by the `RecorderAction::SaveSstvPass` arm. Per CR
+/// round 6 #21 on PR #599.
+struct SstvSaveOutcome {
+    /// User-facing toast text summarising the per-batch save
+    /// results.
+    message: String,
+    /// `true` iff every image in the *current* pass batch saved
+    /// cleanly. Drives the compare-and-clear of
+    /// `state.sstv_completed_images` and viewer auto-close.
+    current_ok: bool,
+    /// Batches that still need to be saved on a future attempt:
+    /// any prior pending batch where at least one image failed,
+    /// plus the current batch if it had any failures (re-keyed
+    /// to the *current* `dir`). On the next `SaveSstvPass` each
+    /// retained batch is retried against its own preserved `dir`
+    /// — never the new pass's directory.
+    retained: Vec<PendingSstvExport>,
+}
+
+/// Worker-thread save routine: iterate prior failed batches first
+/// (each into its own original `dir`), then save the current
+/// pass's images into `current_dir`. Retain any batch that had
+/// any per-image failures so the next `SaveSstvPass` can retry it
+/// in its own folder. Per CR round 6 #21 on PR #599.
+fn save_sstv_batches(
+    pending_batches: Vec<PendingSstvExport>,
+    current_images: Vec<sdr_radio::sstv_image::CompletedSstvImage>,
+    current_dir: std::path::PathBuf,
+) -> SstvSaveOutcome {
+    let mut retained: Vec<PendingSstvExport> = Vec::new();
+    let mut total_saved = 0_usize;
+    let mut total_failed = 0_usize;
+    let mut error_summary: Vec<String> = Vec::new();
+
+    // Save each previously-retained batch to its own directory,
+    // honouring its `start_index` so a late-tail retry doesn't
+    // overwrite the prefix that already saved successfully on the
+    // first attempt. Per CR round 8 #27 on PR #599.
+    for batch in pending_batches {
+        let (saved, errs) = save_sstv_batch(&batch.dir, &batch.images, batch.start_index);
+        total_saved += saved;
+        let failed = errs.len();
+        total_failed += failed;
+        if failed > 0 {
+            error_summary.extend(errs.iter().map(|e| format!("{}: {e}", batch.dir.display())));
+            retained.push(batch);
+        }
+    }
+
+    // Save the current pass.
+    let current_dir_display = current_dir.display().to_string();
+    let current_image_count = current_images.len();
+    let (cur_saved, cur_errs) = save_sstv_batch(&current_dir, &current_images, 0);
+    total_saved += cur_saved;
+    total_failed += cur_errs.len();
+    let current_ok = cur_errs.is_empty() && (cur_saved > 0 || current_image_count == 0);
+    if !cur_errs.is_empty() {
+        error_summary.extend(
+            cur_errs
+                .iter()
+                .map(|e| format!("{current_dir_display}: {e}")),
+        );
+        retained.push(PendingSstvExport {
+            dir: current_dir,
+            // Original attempt started at index 0; on retry we
+            // re-attempt the entire batch from the same start to
+            // keep filenames stable. Per CR round 8 #27 on PR #599.
+            start_index: 0,
+            images: current_images,
+        });
+    }
+
+    let message = if total_saved == 0 && total_failed == 0 {
+        // No prior pending batches and the current pass produced
+        // no images — same warn-and-skip semantics as before.
+        tracing::warn!(
+            "auto-record SaveSstvPass but no SSTV images were decoded — pass produced no imagery",
+        );
+        format!(
+            "Pass complete, but no SSTV images decoded — nothing saved to {current_dir_display}"
+        )
+    } else if total_failed == 0 {
+        format!("Pass complete — {total_saved} SSTV image(s) saved")
+    } else {
+        format!(
+            "Pass complete — {total_saved} image(s) saved, {total_failed} failed: {}",
+            error_summary.join("; ")
+        )
+    };
+
+    SstvSaveOutcome {
+        message,
+        current_ok,
+        retained,
+    }
+}
+
+/// Save a single batch of SSTV images into `dir`, naming files
+/// `img{start_index}.png`, `img{start_index+1}.png`, … . Returns
+/// `(saved_count, per_image_error_messages)`. A directory-creation
+/// failure surfaces as one error covering the whole batch; image
+/// write failures surface per image.
+///
+/// `start_index` lets a late-tail retry append after the prefix
+/// that already saved on the first attempt (round-7 #26 left late
+/// frames in `sstv_completed_images`; we now move them into a
+/// retry batch keyed to the same dir, with `start_index =
+/// exported_image_count` so the retry's `img12.png` doesn't
+/// clobber a successfully-saved `img0.png`). Per CR round 8 #27
+/// on PR #599.
+fn save_sstv_batch(
+    dir: &std::path::Path,
+    images: &[sdr_radio::sstv_image::CompletedSstvImage],
+    start_index: usize,
+) -> (usize, Vec<String>) {
+    if images.is_empty() {
+        return (0, Vec::new());
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!("auto-record SaveSstvPass: failed to create directory {dir:?}: {e}",);
+        return (0, vec![format!("create_dir_all failed: {e}")]);
+    }
+    let mut saved = 0_usize;
+    let mut errors: Vec<String> = Vec::new();
+    for (offset, img) in images.iter().enumerate() {
+        let idx = start_index + offset;
+        let path = dir.join(format!("img{idx}.png"));
+        match crate::sstv_viewer::write_sstv_rgb_png(&path, &img.pixels, img.width, img.height) {
+            Ok(()) => {
+                tracing::info!(
+                    ?path,
+                    width = img.width,
+                    height = img.height,
+                    "auto-record SSTV image saved",
+                );
+                saved += 1;
+            }
+            Err(e) => {
+                tracing::warn!("auto-record SSTV export img{idx} to {path:?} failed: {e}",);
+                errors.push(format!("img{idx}: {e}"));
+            }
+        }
+    }
+    (saved, errors)
 }
 
 /// Apply the canonical tune-target dispatch — the 13 widget /
@@ -545,6 +692,7 @@ pub fn build_window(
         // it internally — passing twice keeps the call sites
         // symmetric. Per epic #469 task 7.5.
         crate::lrpt_viewer::connect_lrpt_action(app, &parent_provider, &state);
+        crate::sstv_viewer::connect_sstv_action(app, &parent_provider, &state);
     }
 
     // Set initial status bar values and mode-specific control visibility.
@@ -1934,6 +2082,50 @@ fn handle_dsp_message(
             if let Some(view) = state.apt_viewer.borrow().as_ref() {
                 view.push_line(&line);
             }
+        }
+        DspToUi::SstvLineDecoded(_line_index) => {
+            // A new SSTV scan line has arrived — refresh the open
+            // viewer (if any) from the shared SstvImage handle.
+            // The viewer polls the handle via `update_from_handle`
+            // which reads whatever the DSP tap has written since
+            // the last call.  When no viewer is open we silently
+            // drop, mirroring APT semantics above.
+            if let Some(view) = state.sstv_viewer.borrow().as_ref() {
+                view.update_from_handle(&state.sstv_image.handle());
+            }
+        }
+        DspToUi::SstvImageComplete {
+            width,
+            height,
+            pixels,
+        } => {
+            // The SSTV decoder has closed out a full image frame.
+            // Accumulate it into the pass buffer so the
+            // `SaveSstvPass` interpreter can write every image that
+            // arrived during the pass to disk.
+            //
+            // We deliberately do NOT call `view.update_from_handle`
+            // here: by the time this message arrives the controller's
+            // tap has already called `SstvImageHandle::take_completed`,
+            // which clears the in-flight pixel buffer for the next
+            // VIS detection. Reading from the now-empty handle would
+            // either no-op (snapshot returns None) or actively wipe
+            // the displayed frame. The final row was already rendered
+            // by the previous `SstvLineDecoded` refresh, so the
+            // viewer already shows the correct end state.
+            // Per CR round 3 on PR #599.
+            let completed = sdr_radio::sstv_image::CompletedSstvImage {
+                width,
+                height,
+                pixels,
+            };
+            state.sstv_completed_images.borrow_mut().push(completed);
+            tracing::info!(
+                width,
+                height,
+                "SSTV image complete; {} in buffer",
+                state.sstv_completed_images.borrow().len()
+            );
         }
         DspToUi::ScannerMutexStopped(reason) => {
             tracing::info!(?reason, "scanner mutex stopped");
@@ -11099,6 +11291,44 @@ fn connect_satellites_panel(
                         let aos = chrono::Utc::now();
                         *state_a.lrpt_recording_pass.borrow_mut() = Some((norad_id, aos));
                     }
+                    sdr_sat::ImagingProtocol::Sstv => {
+                        // **Order is load-bearing.** Open the viewer
+                        // (which sends `UiToDsp::SetSstvImage`) and
+                        // clear both the shared handle and the canvas
+                        // BEFORE starting playback / retuning so no
+                        // leftover rows from a previous pass land in
+                        // the fresh image buffer.  Mirrors the LRPT
+                        // arm's clear-before-start discipline from
+                        // CR round 8 on PR #543.
+                        crate::sstv_viewer::open_sstv_viewer_if_needed(
+                            &parent_provider_a,
+                            &state_a,
+                        );
+                        state_a.sstv_image.clear();
+                        // Failed-pass images now live in
+                        // `sstv_pending_export` keyed by their
+                        // original pass directory (moved there at
+                        // `SaveSstvPass` time, not here at AOS).
+                        // The current-pass buffer is the round-4
+                        // simple clear. Per CR round 6 #21 on
+                        // PR #599 (refines round 5 #20).
+                        state_a.sstv_completed_images.borrow_mut().clear();
+                        if let Some(view) = state_a.sstv_viewer.borrow().as_ref() {
+                            view.clear();
+                        }
+                        // ISS SSTV is audible NFM — do NOT force the
+                        // audio chain off.  The user's squelch /
+                        // CTCSS / FM-IF-NR settings are correct for
+                        // the mode; we only suppress them for
+                        // silent-passthrough decoders (LRPT) and the
+                        // APT path (subcarrier noise). Per CLAUDE.md
+                        // and step 8 of epic #472 task spec.
+                        set_playing_a(true);
+                        tune_a(freq_hz, mode, bandwidth_hz);
+                        state_a.dispatch_vfo_offset(0.0);
+                        let aos = chrono::Utc::now();
+                        *state_a.sstv_recording_pass.borrow_mut() = Some((norad_id, aos));
+                    }
                 }
             }
             RecorderAction::StartAutoAudioRecord(path) => {
@@ -11586,6 +11816,206 @@ fn connect_satellites_panel(
                     {
                         tracing::info!(
                             "auto-record LOS: closing LRPT viewer window after PNG save"
+                        );
+                        window.close();
+                    }
+                });
+            }
+            RecorderAction::SaveSstvPass(dir) => {
+                // Per-pass auto-record save. Each pass's images are
+                // written into their own `sstv-iss-{ts}` directory.
+                // Failed-pass batches are kept in
+                // `sstv_pending_export` keyed by their *original*
+                // `dir`, then retried separately against that dir
+                // at the next LOS — they never bleed into the
+                // current pass's directory. Per CR round 6 #21 on
+                // PR #599.
+                //
+                // Reading from `state.sstv_completed_images`
+                // (rather than the shared `SstvImage` handle)
+                // mirrors the LRPT design from CodeRabbit round 7
+                // on PR #543: the save path is decoupled from the
+                // live viewer so closing the viewer window
+                // mid-pass doesn't lose the imagery.
+                //
+                // Encoding + file I/O is offloaded to
+                // `gio::spawn_blocking` so multi-image PNG encoding
+                // doesn't freeze the UI right when the auto-record
+                // toast is landing. Per CodeRabbit #9 on PR #599.
+                let pending_batches: Vec<PendingSstvExport> =
+                    std::mem::take(&mut *state_a.sstv_pending_export.borrow_mut());
+                let current_images: Vec<sdr_radio::sstv_image::CompletedSstvImage> = state_a
+                    .sstv_completed_images
+                    .borrow()
+                    .iter()
+                    .cloned()
+                    .collect();
+                // Snapshot count of the *current* pass so the
+                // success path can drain only those — late frames
+                // pushed by `DspToUi::SstvImageComplete` while we
+                // were awaiting the worker stay buffered for the
+                // next save cycle. Per CR round 4 on PR #599.
+                let exported_image_count = current_images.len();
+                let toast_overlay_weak_for_save = toast_overlay_weak.clone();
+                let state_sstv_close = Rc::clone(&state_a);
+                // Snapshot the WeakRef BEFORE spawning so a
+                // viewer reopen during the async save can't
+                // trick us into closing the wrong window.
+                // Mirrors the LRPT pattern from CR round 2 on
+                // PR #575.
+                let exported_sstv_window_weak =
+                    state_a.sstv_viewer_window.borrow().as_ref().cloned();
+                // Snapshot the recording-pass tuple for
+                // compare-and-clear on completion — mirrors the
+                // LRPT and APT patterns from PR #571 / #575.
+                let exported_sstv_pass = *state_a.sstv_recording_pass.borrow();
+                // Clone the worker inputs so a `spawn_blocking`
+                // panic doesn't lose the imagery we already drained
+                // from `sstv_pending_export`. The originals move
+                // into the worker; the backups feed the panic
+                // fallback's `retained` list. Per CR round 7 #25 on
+                // PR #599.
+                let pending_batches_backup = pending_batches.clone();
+                let current_images_backup = current_images.clone();
+                let dir_backup = dir.clone();
+                glib::spawn_future_local(async move {
+                    let dir_for_msg = dir_backup.clone();
+                    let join = gio::spawn_blocking(move || {
+                        save_sstv_batches(pending_batches, current_images, dir)
+                    })
+                    .await;
+                    let SstvSaveOutcome {
+                        message,
+                        current_ok,
+                        retained,
+                    } = join.unwrap_or_else(|e| {
+                        tracing::warn!("auto-record SaveSstvPass: worker thread panicked: {e:?}",);
+                        // Re-construct the full retain list from
+                        // the backups: prior pending batches
+                        // (preserved as-is) plus the current pass
+                        // re-keyed to its dir, so neither is
+                        // silently dropped by the failure-path
+                        // drain below. Per CR round 7 #25 on PR
+                        // #599.
+                        let mut retained = pending_batches_backup;
+                        if !current_images_backup.is_empty() {
+                            retained.push(PendingSstvExport {
+                                dir: dir_backup.clone(),
+                                // Original attempt would have
+                                // started at index 0; on panic
+                                // retry we reuse that start so
+                                // filenames remain stable. Per
+                                // CR round 8 #27 on PR #599.
+                                start_index: 0,
+                                images: current_images_backup,
+                            });
+                        }
+                        SstvSaveOutcome {
+                            message: format!(
+                                "Pass complete but PNG worker panicked (target was {})",
+                                dir_for_msg.display()
+                            ),
+                            current_ok: false,
+                            retained,
+                        }
+                    });
+                    post_toast(&toast_overlay_weak_for_save, &message);
+                    // Restore retained batches (pending that still
+                    // failed + the current batch if it failed) into
+                    // `sstv_pending_export`. New pending items
+                    // queued by a parallel AOS slip in *after* the
+                    // retained set so retry order honours
+                    // chronological pass start.
+                    if !retained.is_empty() {
+                        let mut pending = state_sstv_close.sstv_pending_export.borrow_mut();
+                        let mut combined = retained;
+                        combined.append(&mut pending);
+                        *pending = combined;
+                    }
+                    // Drain only the current-pass images we
+                    // actually snapshotted. Late frames pushed
+                    // while the worker was running stay buffered
+                    // for the next save cycle. Compare-and-clear
+                    // by the recording-pass tuple so an
+                    // overlapping pass's buffer/slot isn't wiped
+                    // by a late completion callback. Per CR round
+                    // 4 on PR #599.
+                    let mut slot = state_sstv_close.sstv_recording_pass.borrow_mut();
+                    if *slot == exported_sstv_pass {
+                        if current_ok {
+                            let mut completed = state_sstv_close.sstv_completed_images.borrow_mut();
+                            let to_drain = exported_image_count.min(completed.len());
+                            completed.drain(..to_drain);
+                            // Late frames pushed by
+                            // `DspToUi::SstvImageComplete` while
+                            // the worker was running stay in
+                            // `completed`. Without further action
+                            // they'd survive the export, then get
+                            // wiped by the next AOS — breaking the
+                            // per-pass auto-save contract. Move
+                            // them into `sstv_pending_export`
+                            // keyed to *this* pass's `dir` so the
+                            // next `SaveSstvPass` retries them
+                            // into the correct folder. Per CR
+                            // round 7 #26 on PR #599.
+                            if !completed.is_empty() {
+                                let late_tail: Vec<_> = completed.drain(..).collect();
+                                tracing::info!(
+                                    "auto-record SaveSstvPass: queueing {} late SSTV frame(s) for retry into {}",
+                                    late_tail.len(),
+                                    dir_for_msg.display()
+                                );
+                                state_sstv_close.sstv_pending_export.borrow_mut().push(
+                                    PendingSstvExport {
+                                        dir: dir_for_msg.clone(),
+                                        // Late frames belong AFTER
+                                        // the prefix that already
+                                        // saved successfully on this
+                                        // pass — `exported_image_count`
+                                        // images went out at indices
+                                        // 0..exported_image_count, so
+                                        // the retry starts at that
+                                        // index. Per CR round 8 #27
+                                        // on PR #599.
+                                        start_index: exported_image_count,
+                                        images: late_tail,
+                                    },
+                                );
+                            }
+                            *slot = None;
+                        } else {
+                            // Failure path: clear the slot so the
+                            // recorder isn't stuck in a permanent
+                            // "pass in flight" state. The current
+                            // images are already in `retained`
+                            // (queued for retry under their own
+                            // `dir`), so the buffer can be safely
+                            // drained too — keeping them would
+                            // duplicate-save on the next attempt.
+                            let mut completed = state_sstv_close.sstv_completed_images.borrow_mut();
+                            let to_drain = exported_image_count.min(completed.len());
+                            completed.drain(..to_drain);
+                            *slot = None;
+                        }
+                    }
+                    drop(slot);
+                    // Close the viewer on successful save AND only
+                    // when the buffer is empty — if late frames
+                    // arrived while saving, keep the viewer open
+                    // so the user can see them rather than burying
+                    // a tail. On failure: also keep open so the
+                    // user can inspect the in-memory image and
+                    // retry. Mirrors LRPT semantics from CR round
+                    // 9 on PR #554, refined per CR round 4 #18 on
+                    // PR #599.
+                    if current_ok
+                        && state_sstv_close.sstv_completed_images.borrow().is_empty()
+                        && let Some(window) = exported_sstv_window_weak
+                            .as_ref()
+                            .and_then(glib::WeakRef::upgrade)
+                    {
+                        tracing::info!(
+                            "auto-record LOS: closing SSTV viewer window after PNG save"
                         );
                         window.close();
                     }

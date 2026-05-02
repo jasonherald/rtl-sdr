@@ -130,7 +130,7 @@ Four config keys per side live in `activity_bar.rs`: `ui_sidebar_{left,right}_{s
 
 ### Satellite reception
 
-NOAA APT (epic #468) and Meteor-M LRPT (epic #469) are both shipped end-to-end. ISS SSTV (#472) is the remaining weather-sat epic and will reuse the same scaffolding.
+NOAA APT (epic #468), Meteor-M LRPT (epic #469), and ISS SSTV (epic #472) are all shipped end-to-end.
 
 **Key files:**
 
@@ -145,14 +145,17 @@ NOAA APT (epic #468) and Meteor-M LRPT (epic #469) are both shipped end-to-end. 
 - `crates/sdr-radio/src/lrpt_decoder.rs` — LRPT counterpart of `apt_decode_tap`: bridges the post-VFO IQ buffer to `LrptDemod` (QPSK) → `LrptPipeline` (Viterbi → ASM sync → derand → RS → demux → JPEG) → `LrptImage` shared assembler. Per-APID line watermark prevents double-push.
 - `crates/sdr-radio/src/demod/lrpt.rs` — `LrptDemodulator`: silent-passthrough demod that pins `RadioModule`'s IF rate to 144 ksps (`sdr_dsp::lrpt::SAMPLE_RATE_HZ`) so the controller's `lrpt_decode_tap` reads `radio_input` at the rate the QPSK demod expects.
 - `crates/sdr-ui/src/lrpt_viewer.rs` — Multi-channel live LRPT viewer with per-APID Cairo surfaces, dynamic channel dropdown, Pause/Resume + Export PNG header buttons. Polls the shared `LrptImage` at 4 Hz; PNG export uses `gio::spawn_blocking` so encoding doesn't freeze the GTK main loop.
+- `crates/sdr-radio/src/sstv_image.rs` — Shared SSTV image handle (`Arc<Mutex<Inner>>`). DSP tap writes via `write_line`; UI reads via `snapshot()`; `take_completed()` drains the finished frame and resets for the next VIS detection. `SstvImage::clear()` convenience wrapper delegates to the handle.
+- `crates/sdr-ui/src/sstv_viewer.rs` — Live SSTV viewer. `SstvImageRenderer` owns the Cairo ARGB32 surface; `SstvImageView` is the GTK widget (cloneable via Rc). `open_sstv_viewer_if_needed` opens the window and wires `UiToDsp::SetSstvImage`. `write_sstv_rgb_png` is the Cairo-based PNG encoder used by both manual Export and the auto-record LOS save. Wired via `connect_sstv_action` (`Ctrl+Shift+V`).
 
 **User-facing walkthroughs:** `docs/guides/apt-reception.md`, `docs/guides/lrpt-reception.md`.
 
 **Output paths** (all under `~/sdr-recordings/`):
 - APT: `apt-{satellite-slug}-{local-timestamp}.png` (single PNG per pass).
 - LRPT: `lrpt-{satellite-slug}-{local-timestamp}/apid{N}.png` (per-pass directory holding one PNG per AVHRR APID — LRPT is multispectral). Audio recording is suppressed for LRPT regardless of the user toggle: the demod is silent and ~170 MB of stereo silence per pass would be wasteful.
+- SSTV: `sstv-{satellite-slug}-{local-timestamp}/img{N}.png` (per-pass directory, one PNG per completed image frame — ARISS events typically send ~12 per pass). Audio recording is NOT suppressed for SSTV: ISS SSTV is audible NFM and the audio recording captures the raw signal.
 
-`png_path_for` and `lrpt_dir_for` in `satellites_recorder.rs` are the single sources of truth for those paths; the recorder's `PassOutput` enum dispatches APT to `Action::SavePng` and LRPT to `Action::SaveLrptPass`.
+`png_path_for`, `lrpt_dir_for`, and `sstv_dir_for` in `satellites_recorder.rs` are the single sources of truth for those paths; the recorder's `PassOutput` enum dispatches APT to `Action::SavePng`, LRPT to `Action::SaveLrptPass`, and SSTV to `Action::SaveSstvPass`.
 
 ## C++ Reference
 

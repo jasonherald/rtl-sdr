@@ -27,6 +27,7 @@ pub mod radioreference;
 pub mod shortcuts;
 pub mod sidebar;
 pub mod spectrum;
+pub mod sstv_viewer;
 pub mod state;
 pub mod status_bar;
 pub mod ui_helpers;
