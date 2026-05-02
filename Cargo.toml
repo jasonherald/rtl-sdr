@@ -309,7 +309,7 @@ tempfile = "3"
 # `slowrx::resample::MAX_INPUT_SAMPLE_RATE_HZ` and internally resamples to
 # 11_025 Hz. Both `rustfft` and `thiserror` that slowrx brings are already
 # in the workspace dep tree, so no new transitive deps are added.
-slowrx = "0.1"
+slowrx = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
