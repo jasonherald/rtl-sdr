@@ -354,6 +354,13 @@ pub struct SstvImageView {
     drawing_area: gtk4::DrawingArea,
     renderer: Rc<RefCell<SstvImageRenderer>>,
     paused: Rc<Cell<bool>>,
+    /// Optional shared-source handle. When set, [`Self::clear`] also
+    /// clears the in-flight pixel buffer in the shared
+    /// [`SstvImageHandle`], so the next [`Self::update_from_handle`]
+    /// doesn't replay the rows the user just cleared. Set via
+    /// [`Self::set_handle`] after construction.
+    /// Per CR round 4 on PR #599.
+    handle: Rc<RefCell<Option<SstvImageHandle>>>,
 }
 
 impl Default for SstvImageView {
@@ -384,7 +391,18 @@ impl SstvImageView {
             drawing_area,
             renderer,
             paused,
+            handle: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Attach a shared [`SstvImageHandle`] so [`Self::clear`] also
+    /// wipes the source-side pixel buffer. Without this, a Clear
+    /// button click would only wipe the local renderer cache and
+    /// the next snapshot replay would restore every cleared row.
+    /// Idempotent — replaces any previously-set handle. Per CR
+    /// round 4 on PR #599.
+    pub fn set_handle(&self, handle: SstvImageHandle) {
+        *self.handle.borrow_mut() = Some(handle);
     }
 
     /// The underlying `GtkDrawingArea`. Pack this into a layout container.
@@ -409,8 +427,15 @@ impl SstvImageView {
         }
     }
 
-    /// Wipe all buffered data and queue a redraw.
+    /// Wipe all buffered data and queue a redraw. Also clears the
+    /// shared [`SstvImageHandle`] (if attached via
+    /// [`Self::set_handle`]) so the next [`Self::update_from_handle`]
+    /// doesn't replay the rows we just cleared. Per CR round 4 on
+    /// PR #599.
     pub fn clear(&self) {
+        if let Some(handle) = self.handle.borrow().as_ref() {
+            handle.clear();
+        }
         self.renderer.borrow_mut().clear();
         self.drawing_area.queue_draw();
     }
@@ -663,6 +688,11 @@ pub fn open_sstv_viewer_if_needed(
         return;
     };
     let (view, window) = open_sstv_viewer_window(&parent, "ISS SSTV");
+    // Attach the shared handle to the view so the Clear button
+    // and any other `view.clear()` callsite wipes the source-side
+    // pixel buffer too — otherwise the next `update_from_handle`
+    // replays the old rows. Per CR round 4 on PR #599.
+    view.set_handle(state.sstv_image.handle());
     *state.sstv_viewer.borrow_mut() = Some(view);
     *state.sstv_viewer_window.borrow_mut() = Some(window.downgrade());
 

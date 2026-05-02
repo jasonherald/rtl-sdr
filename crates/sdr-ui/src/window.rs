@@ -11698,6 +11698,12 @@ fn connect_satellites_panel(
                     .iter()
                     .cloned()
                     .collect();
+                // Capture exact count snapshotted so the success
+                // path can drain only those — late frames pushed
+                // by `DspToUi::SstvImageComplete` while we're
+                // awaiting the worker stay buffered for the next
+                // save cycle. Per CR round 4 on PR #599.
+                let exported_image_count = images.len();
                 let toast_overlay_weak_for_save = toast_overlay_weak.clone();
                 let state_sstv_close = Rc::clone(&state_a);
                 // Snapshot the WeakRef BEFORE spawning so a
@@ -11811,8 +11817,24 @@ fn connect_satellites_panel(
                     if save_ok {
                         let mut slot = state_sstv_close.sstv_recording_pass.borrow_mut();
                         if *slot == exported_sstv_pass {
-                            state_sstv_close.sstv_completed_images.borrow_mut().clear();
-                            *slot = None;
+                            // Drain only the images we actually
+                            // exported. Late frames that arrived
+                            // while we were awaiting the worker
+                            // stay buffered. Per CR round 4 on
+                            // PR #599.
+                            let mut completed =
+                                state_sstv_close.sstv_completed_images.borrow_mut();
+                            let to_drain = exported_image_count.min(completed.len());
+                            completed.drain(..to_drain);
+                            // Only release the recording-pass slot
+                            // if no late frames are pending.
+                            // Otherwise leave it set so the user
+                            // can see "buffered images for pass X"
+                            // semantics if/when a manual export
+                            // path lands later.
+                            if completed.is_empty() {
+                                *slot = None;
+                            }
                         }
                     } else {
                         // Failure path: still clear the slot so the
@@ -11824,12 +11846,17 @@ fn connect_satellites_panel(
                             *slot = None;
                         }
                     }
-                    // Close the viewer on successful save — cleans
-                    // up for the next pass. On failure, keep it
-                    // open so the user can inspect the in-memory
-                    // image and retry. Mirrors LRPT semantics from
-                    // CR round 9 on PR #554.
+                    // Close the viewer on successful save AND only
+                    // when the buffer is empty — if late frames
+                    // arrived while saving, keep the viewer open
+                    // so the user can see them rather than burying
+                    // a tail. On failure: also keep open so the
+                    // user can inspect the in-memory image and
+                    // retry. Mirrors LRPT semantics from CR round
+                    // 9 on PR #554, refined per CR round 4 #18 on
+                    // PR #599.
                     if save_ok
+                        && state_sstv_close.sstv_completed_images.borrow().is_empty()
                         && let Some(window) = exported_sstv_window_weak
                             .as_ref()
                             .and_then(glib::WeakRef::upgrade)
