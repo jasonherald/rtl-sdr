@@ -504,19 +504,26 @@ impl AppState {
         }
     }
 
-    /// `true` if the app is actively writing pass artifacts to disk —
-    /// any APT pass, LRPT pass, audio recording, or IQ recording.
+    /// `true` if the app is actively writing pass artifacts to disk
+    /// OR holds in-memory imagery that hasn't been flushed yet — any
+    /// APT pass, LRPT pass, SSTV pass, audio recording, IQ recording,
+    /// or queued [`PendingSstvExport`] retry batches.
     /// Used to gate the tray-Quit confirmation modal.
     ///
     /// Maintenance contract: every new "we're writing pass artifacts"
     /// state added to `AppState` MUST be OR-ed in here, and the
     /// table-driven test in `is_recording_table` must be extended.
     /// Otherwise a future recording type can be silently dropped on Quit.
+    ///
+    /// Per CR round 9 #28 on PR #599 for the `sstv_pending_export`
+    /// branch — without it, an LOS save failure would leave decoded
+    /// imagery only in memory and the user could quit without warning.
     #[must_use]
     pub fn is_recording(&self) -> bool {
         self.apt_recording_pass.borrow().is_some()
             || self.lrpt_recording_pass.borrow().is_some()
             || self.sstv_recording_pass.borrow().is_some()
+            || !self.sstv_pending_export.borrow().is_empty()
             || self.audio_recording_active.get()
             || self.iq_recording_active.get()
     }
@@ -699,20 +706,27 @@ mod tests {
         const ISS_NORAD_ID: u32 = 25_544;
         const NOAA_19_NORAD_ID: u32 = 33_591;
         const NOAA_LRPT_PLACEHOLDER_ID: u32 = 33_592;
-        // Each row: (apt, lrpt, sstv, audio, iq, expected)
+        // Each row: (apt, lrpt, sstv, audio, iq, sstv_pending, expected)
+        // The `sstv_pending` column covers in-memory retry batches
+        // queued by an LOS save failure (or a late-tail post-success
+        // move). Without OR-ing this into `is_recording()` the tray
+        // Quit path would treat the app as idle and silently drop the
+        // pending imagery. Per CR round 9 #28 on PR #599.
         let cases = [
-            (false, false, false, false, false, false),
-            (true, false, false, false, false, true),
-            (false, true, false, false, false, true),
-            (false, false, true, false, false, true),
-            (false, false, false, true, false, true),
-            (false, false, false, false, true, true),
-            (true, true, true, true, true, true),
-            (true, false, false, false, true, true),
-            (false, true, false, true, false, true),
-            (false, false, true, false, true, true),
+            (false, false, false, false, false, false, false),
+            (true, false, false, false, false, false, true),
+            (false, true, false, false, false, false, true),
+            (false, false, true, false, false, false, true),
+            (false, false, false, true, false, false, true),
+            (false, false, false, false, true, false, true),
+            (false, false, false, false, false, true, true),
+            (true, true, true, true, true, true, true),
+            (true, false, false, false, true, false, true),
+            (false, true, false, true, false, false, true),
+            (false, false, true, false, true, false, true),
+            (false, false, false, false, false, true, true),
         ];
-        for (apt, lrpt, sstv, audio, iq, expected) in cases {
+        for (apt, lrpt, sstv, audio, iq, sstv_pending, expected) in cases {
             let s = make_test_state();
             if apt {
                 *s.apt_recording_pass.borrow_mut() = Some((NOAA_19_NORAD_ID, chrono::Utc::now()));
@@ -731,10 +745,19 @@ mod tests {
             }
             s.audio_recording_active.set(audio);
             s.iq_recording_active.set(iq);
+            if sstv_pending {
+                // Single empty placeholder batch is enough — the
+                // guard checks `is_empty()`, not image count.
+                s.sstv_pending_export.borrow_mut().push(PendingSstvExport {
+                    dir: std::path::PathBuf::from("/tmp/test-sstv-pending"),
+                    start_index: 0,
+                    images: Vec::new(),
+                });
+            }
             assert_eq!(
                 s.is_recording(),
                 expected,
-                "row apt={apt} lrpt={lrpt} sstv={sstv} audio={audio} iq={iq}",
+                "row apt={apt} lrpt={lrpt} sstv={sstv} audio={audio} iq={iq} sstv_pending={sstv_pending}",
             );
         }
     }
