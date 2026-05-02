@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 
@@ -43,6 +44,23 @@ pub fn rtl_tcp_state_discriminant(state: &sdr_types::RtlTcpConnectionState) -> u
         sdr_types::RtlTcpConnectionState::AuthRequired => RTL_TCP_STATE_DISC_AUTH_REQUIRED,
         sdr_types::RtlTcpConnectionState::AuthFailed => RTL_TCP_STATE_DISC_AUTH_FAILED,
     }
+}
+
+/// A retry batch of SSTV images that failed to fully export at LOS,
+/// keyed by the pass directory they were originally destined for so
+/// the next save attempt writes them back to the correct
+/// `sstv-iss-{ts}` folder. Per CR round 6 #21 on PR #599.
+#[derive(Debug, Clone)]
+pub struct PendingSstvExport {
+    /// Original per-pass directory (e.g.
+    /// `~/sdr-recordings/sstv-iss-2026-05-02-201234/`). The retry
+    /// writes `img0.png`, `img1.png`, … here so all of a pass's
+    /// images stay co-located even when the first save attempt
+    /// failed.
+    pub dir: PathBuf,
+    /// Images to retry. Order is preserved so retried filenames
+    /// match what the original save would have written.
+    pub images: Vec<sdr_radio::sstv_image::CompletedSstvImage>,
 }
 
 /// Shared application state, designed for single-threaded GTK main loop access.
@@ -275,16 +293,15 @@ pub struct AppState {
     /// them all in arrival order (`img0.png`, `img1.png`, …).
     /// Per epic #472.
     pub sstv_completed_images: RefCell<Vec<sdr_radio::sstv_image::CompletedSstvImage>>,
-    /// Carry-over slot for SSTV images whose LOS save failed: the
-    /// `SaveSstvPass` failure path leaves them in
-    /// `sstv_completed_images`, but the *next* pass's AOS would
-    /// otherwise wipe that buffer to start fresh. The AOS branch
-    /// instead drains them into here so they survive across
-    /// passes; the next successful `SaveSstvPass` writes them
-    /// alongside the new pass's images. Today there's no manual
-    /// "export pending" UI — items in this Vec are recovered at
-    /// the next LOS-save success. Per CR round 5 #20 on PR #599.
-    pub sstv_pending_export: RefCell<Vec<sdr_radio::sstv_image::CompletedSstvImage>>,
+    /// Dir-tagged retry buffer for SSTV images whose LOS save
+    /// failed. Each entry is a [`PendingSstvExport`] keyed by the
+    /// pass's original `sstv-iss-{ts}` directory so retries write
+    /// back to the right pass folder instead of bleeding into the
+    /// current pass's directory. The next `SaveSstvPass` retries
+    /// each batch against its own dir; entries that still fail
+    /// stay queued for another attempt. Per CR round 6 #21 on
+    /// PR #599 (refines round 5 #20's dir-less design).
+    pub sstv_pending_export: RefCell<Vec<PendingSstvExport>>,
     /// `(satellite_norad_id, aos_time)` for the currently-recording
     /// SSTV pass, or `None` between passes. Mirrors `apt_recording_pass`
     /// and `lrpt_recording_pass` — used by `is_recording()` and the
@@ -672,6 +689,11 @@ mod tests {
 
     #[test]
     fn is_recording_table() {
+        // Per repo rule on named constants for magic numbers
+        // (`crates/CLAUDE.md`). Per CR round 6 on PR #599.
+        const ISS_NORAD_ID: u32 = 25_544;
+        const NOAA_19_NORAD_ID: u32 = 33_591;
+        const NOAA_LRPT_PLACEHOLDER_ID: u32 = 33_592;
         // Each row: (apt, lrpt, sstv, audio, iq, expected)
         let cases = [
             (false, false, false, false, false, false),
@@ -688,18 +710,19 @@ mod tests {
         for (apt, lrpt, sstv, audio, iq, expected) in cases {
             let s = make_test_state();
             if apt {
-                *s.apt_recording_pass.borrow_mut() = Some((33_591, chrono::Utc::now()));
+                *s.apt_recording_pass.borrow_mut() = Some((NOAA_19_NORAD_ID, chrono::Utc::now()));
             }
             if lrpt {
                 // NORAD 33_592 = NOAA 19 placeholder; matches the
                 // shape `apt_recording_pass` uses above. Per CR
                 // round 2 on PR #575.
-                *s.lrpt_recording_pass.borrow_mut() = Some((33_592, chrono::Utc::now()));
+                *s.lrpt_recording_pass.borrow_mut() =
+                    Some((NOAA_LRPT_PLACEHOLDER_ID, chrono::Utc::now()));
             }
             if sstv {
                 // ISS NORAD 25_544 — the only SSTV entry in the
                 // catalog. Per epic #472.
-                *s.sstv_recording_pass.borrow_mut() = Some((25_544, chrono::Utc::now()));
+                *s.sstv_recording_pass.borrow_mut() = Some((ISS_NORAD_ID, chrono::Utc::now()));
             }
             s.audio_recording_active.set(audio);
             s.iq_recording_active.set(iq);

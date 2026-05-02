@@ -475,6 +475,14 @@ impl SstvImageView {
             on_complete(Err(ViewerError::EmptyChannel { apid: None }));
             return;
         };
+        // A cached snapshot from a fresh VIS detect (allocated, but
+        // no decoded lines yet) would otherwise produce a blank PNG.
+        // Mirrors the synchronous `export_png()` guard. Per CR round
+        // 6 on PR #599.
+        if snap.lines_written == 0 {
+            on_complete(Err(ViewerError::EmptyChannel { apid: None }));
+            return;
+        }
         glib::spawn_future_local(async move {
             let join = gio::spawn_blocking(move || {
                 // Ensure the parent directory exists. First-run exports
@@ -613,13 +621,24 @@ pub fn open_sstv_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
 }
 
 /// Default export path: `~/sdr-recordings/sstv-YYYY-MM-DD-HHMMSS.png`.
+///
+/// Two manual exports inside the same wall-clock second would otherwise
+/// collide because the file is opened with `File::create`. Probe for
+/// existing files and append `-1`, `-2`, … until a free name is found.
+/// Per CR round 6 on PR #599.
 fn default_export_path() -> PathBuf {
     let timestamp = glib::DateTime::now_local()
         .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
         .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
-    glib::home_dir()
-        .join("sdr-recordings")
-        .join(format!("sstv-{timestamp}.png"))
+    let dir = glib::home_dir().join("sdr-recordings");
+    let stem = format!("sstv-{timestamp}");
+    let mut path = dir.join(format!("{stem}.png"));
+    let mut suffix = 1_u32;
+    while path.exists() {
+        path = dir.join(format!("{stem}-{suffix}.png"));
+        suffix += 1;
+    }
+    path
 }
 
 /// Show `toast` inside the window's [`adw::ToastOverlay`], if present.
