@@ -11851,8 +11851,17 @@ fn connect_satellites_panel(
                 // compare-and-clear on completion — mirrors the
                 // LRPT and APT patterns from PR #571 / #575.
                 let exported_sstv_pass = *state_a.sstv_recording_pass.borrow();
+                // Clone the worker inputs so a `spawn_blocking`
+                // panic doesn't lose the imagery we already drained
+                // from `sstv_pending_export`. The originals move
+                // into the worker; the backups feed the panic
+                // fallback's `retained` list. Per CR round 7 #25 on
+                // PR #599.
+                let pending_batches_backup = pending_batches.clone();
+                let current_images_backup = current_images.clone();
+                let dir_backup = dir.clone();
                 glib::spawn_future_local(async move {
-                    let dir_for_msg = dir.clone();
+                    let dir_for_msg = dir_backup.clone();
                     let join = gio::spawn_blocking(move || {
                         save_sstv_batches(pending_batches, current_images, dir)
                     })
@@ -11863,19 +11872,27 @@ fn connect_satellites_panel(
                         retained,
                     } = join.unwrap_or_else(|e| {
                         tracing::warn!("auto-record SaveSstvPass: worker thread panicked: {e:?}",);
+                        // Re-construct the full retain list from
+                        // the backups: prior pending batches
+                        // (preserved as-is) plus the current pass
+                        // re-keyed to its dir, so neither is
+                        // silently dropped by the failure-path
+                        // drain below. Per CR round 7 #25 on PR
+                        // #599.
+                        let mut retained = pending_batches_backup;
+                        if !current_images_backup.is_empty() {
+                            retained.push(PendingSstvExport {
+                                dir: dir_backup.clone(),
+                                images: current_images_backup,
+                            });
+                        }
                         SstvSaveOutcome {
                             message: format!(
                                 "Pass complete but PNG worker panicked (target was {})",
                                 dir_for_msg.display()
                             ),
                             current_ok: false,
-                            // On panic we don't know which batches
-                            // failed — keep the (already-drained)
-                            // pending list empty rather than guess.
-                            // The current pass's images stay in
-                            // `sstv_completed_images` and are
-                            // dropped at next AOS.
-                            retained: Vec::new(),
+                            retained,
                         }
                     });
                     post_toast(&toast_overlay_weak_for_save, &message);
@@ -11905,9 +11922,33 @@ fn connect_satellites_panel(
                             let mut completed = state_sstv_close.sstv_completed_images.borrow_mut();
                             let to_drain = exported_image_count.min(completed.len());
                             completed.drain(..to_drain);
-                            if completed.is_empty() {
-                                *slot = None;
+                            // Late frames pushed by
+                            // `DspToUi::SstvImageComplete` while
+                            // the worker was running stay in
+                            // `completed`. Without further action
+                            // they'd survive the export, then get
+                            // wiped by the next AOS — breaking the
+                            // per-pass auto-save contract. Move
+                            // them into `sstv_pending_export`
+                            // keyed to *this* pass's `dir` so the
+                            // next `SaveSstvPass` retries them
+                            // into the correct folder. Per CR
+                            // round 7 #26 on PR #599.
+                            if !completed.is_empty() {
+                                let late_tail: Vec<_> = completed.drain(..).collect();
+                                tracing::info!(
+                                    "auto-record SaveSstvPass: queueing {} late SSTV frame(s) for retry into {}",
+                                    late_tail.len(),
+                                    dir_for_msg.display()
+                                );
+                                state_sstv_close.sstv_pending_export.borrow_mut().push(
+                                    PendingSstvExport {
+                                        dir: dir_for_msg.clone(),
+                                        images: late_tail,
+                                    },
+                                );
                             }
+                            *slot = None;
                         } else {
                             // Failure path: clear the slot so the
                             // recorder isn't stuck in a permanent
