@@ -3679,9 +3679,9 @@ dependencies = [
 
 [[package]]
 name = "slowrx"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0509e774d20235c513a919dfff5b372dd0996ffb3edb5a1fb9636c652e9e9431"
+checksum = "c0a27e7dea5ae044a8592881559a27e039ef5d6cf7cfb1446b8c14071a8b3c3e"
 dependencies = [
  "rustfft",
  "thiserror 2.0.18",
