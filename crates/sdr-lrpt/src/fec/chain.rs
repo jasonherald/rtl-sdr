@@ -1,34 +1,49 @@
 //! End-to-end FEC chain — soft i8 symbol pairs in, decoded VCDU
 //! bytes out.
 //!
-//! Stitches the per-stage primitives ([`ViterbiDecoder`],
-//! [`SyncCorrelator`], [`Derandomizer`], [`ReedSolomon`]) into a
-//! single streaming state machine matching medet's `try_frame`
-//! flow:
+//! Stitches the per-stage primitives ([`SoftSyncDetector`],
+//! [`ViterbiDecoder`], [`SyncCorrelator`], [`Derandomizer`],
+//! [`ReedSolomon`]) into a single streaming state machine
+//! matching medet's `try_frame` flow:
 //!
 //! ```text
-//!   soft i8 pair ─▶ Viterbi ─bit▶ Sync correlator ─bit▶ {hunting | capturing}
-//!                                                                   │
-//!                          ASM hit                                  │
-//!                                                                   ▼
-//!                                                       1020-byte CADU buffer
-//!                                                                   │
-//!                                                                   ▼
-//!                                          derandomize  → de-interleave (×4)
-//!                                                                   │
-//!                                                                   ▼
-//!                                       RS-decode each codeword (255 → 223 bytes)
-//!                                                                   │
-//!                                                                   ▼
-//!                                          re-interleave → 892-byte VCDU
+//!   soft i8 pair ─▶ SoftSyncDetector (8 rotated patterns)
+//!                            │
+//!                            ▼ rotation locked
+//!                   Rotation::apply (un-rotate to canonical)
+//!                            │
+//!                            ▼
+//!                         Viterbi ─bit▶ SyncCorrelator (per-CADU re-sync)
+//!                                                  │
+//!                                                  ▼
+//!                                       1020-byte CADU buffer
+//!                                                  │
+//!                                                  ▼
+//!                          derandomize  → de-interleave (×4)
+//!                                                  │
+//!                                                  ▼
+//!                       RS-decode each codeword (255 → 223 bytes)
+//!                                                  │
+//!                                                  ▼
+//!                          re-interleave → 892-byte VCDU
 //! ```
+//!
+//! [`SoftSyncDetector`] resolves the QPSK 4-fold phase ambiguity
+//! (plus optional I/Q axis swap) by pre-Viterbi soft correlation
+//! against 8 rotated forms of the encoded ASM. Without it,
+//! ~75 % of Costas acquisitions silently drop the entire pass
+//! (issue #605). Once locked, every subsequent soft pair is
+//! un-rotated by [`Rotation::apply`] before reaching Viterbi,
+//! so Viterbi always sees the canonical orientation.
 //!
 //! Layered like this so [`LrptPipeline::push_symbol`] can be a
 //! thin wrapper that drives the chain and feeds emitted VCDUs
 //! into the existing demux + image stages, while the chain
 //! itself stays unit-testable on synthetic byte streams.
 
-use crate::fec::{Derandomizer, ReedSolomon, SyncCorrelator, ViterbiDecoder};
+use crate::fec::{
+    Derandomizer, ReedSolomon, Rotation, SoftSyncDetector, SyncCorrelator, ViterbiDecoder,
+};
 
 /// Bytes captured per CADU after the ASM. Per CCSDS §10:
 /// 1024-byte CADU = 4-byte ASM + 1020-byte payload. The ASM is
@@ -53,17 +68,47 @@ const RS_MESSAGE_LEN: usize = 223;
 /// [`super::super::ccsds::Demux`] expects per VCDU.
 const VCDU_LEN: usize = RS_INTERLEAVE * RS_MESSAGE_LEN; // 892
 
-/// Per-bit chain state. Hunting until ASM, then capturing 1020
-/// bytes worth of CADU payload.
+/// Per-symbol chain state. Two-phase lock:
+///
+/// 1. [`State::HuntingRotation`]: feeding raw soft pairs to the
+///    pre-Viterbi [`SoftSyncDetector`] until one of 8 rotated
+///    ASM patterns matches. On match we know which orientation
+///    Costas locked at.
+/// 2. [`State::Locked`]: every subsequent soft pair is un-rotated
+///    by [`Rotation::apply`] before reaching Viterbi. The
+///    post-Viterbi [`SyncCorrelator`] then runs per-CADU sync
+///    on the decoded bit stream — same logic as the original
+///    chain, but now operating on a known-canonical bit stream
+///    that actually produces matches.
+///
+/// Once Locked, we stay Locked for the whole pass. Costas can
+/// drift through quarter-turns during a low-SNR pass, but
+/// re-detecting per-CADU would only re-lock at the same
+/// (correct) rotation in the steady state. If we ever observe
+/// pathological mid-pass rotation drift, a "if last K CADUs all
+/// failed RS, re-hunt rotation" fallback can be added later.
 #[derive(Debug)]
 enum State {
-    /// Looking for the ASM in the post-Viterbi bit stream.
-    Hunting,
-    /// ASM matched; capturing the next [`CADU_PAYLOAD_LEN`]
-    /// bytes of payload, packing 8 bits at a time. `partial` /
-    /// `partial_count` accumulate the in-flight byte; `bytes`
-    /// holds the completed bytes.
-    Capturing {
+    /// No rotation lock yet. Soft pairs feed
+    /// [`SoftSyncDetector`] only — Viterbi is not stepped, so it
+    /// stays in its initial state ready for fresh warmup once
+    /// rotation locks.
+    HuntingRotation,
+    /// Rotation locked. Apply [`Rotation::apply`] to every soft
+    /// pair, push through Viterbi, run per-CADU sync on the
+    /// emitted bits. `cadu` holds the in-flight CADU capture
+    /// state (same fields as the original `Capturing` variant);
+    /// `is_capturing` distinguishes "looking for next CADU's ASM
+    /// in the bit stream" from "actively capturing CADU bytes".
+    /// `inverted` is `true` when the per-CADU [`SyncCorrelator`]
+    /// matched the bitwise-inverted ASM rather than the upright
+    /// form, signalling a 180° residual after rotation lock —
+    /// captured bytes get `XOR`ed with `0xFF` before derand to
+    /// undo the inversion.
+    Locked {
+        rotation: Rotation,
+        is_capturing: bool,
+        inverted: bool,
         bytes: Vec<u8>,
         partial: u8,
         partial_count: u8,
@@ -73,6 +118,7 @@ enum State {
 /// Streaming FEC chain — push one soft i8 symbol pair per call,
 /// receive a decoded VCDU when one becomes available.
 pub struct FecChain {
+    detector: SoftSyncDetector,
     viterbi: ViterbiDecoder,
     sync: SyncCorrelator,
     derand: Derandomizer,
@@ -90,11 +136,12 @@ impl FecChain {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            detector: SoftSyncDetector::new(),
             viterbi: ViterbiDecoder::new(),
             sync: SyncCorrelator::new(),
             derand: Derandomizer::new(),
             rs: ReedSolomon::new(),
-            state: State::Hunting,
+            state: State::HuntingRotation,
         }
     }
 
@@ -102,55 +149,149 @@ impl FecChain {
     /// worth from the demod). Returns `Some(VCDU bytes)` on the
     /// call that completes a successful CADU decode; otherwise
     /// `None`. Failed RS decodes are silently dropped — the
-    /// chain returns to hunting for the next ASM.
+    /// chain returns to hunting for the next ASM (without losing
+    /// rotation lock).
     pub fn push_symbol(&mut self, soft: [i8; 2]) -> Option<Vec<u8>> {
-        let bit = self.viterbi.step(soft)?;
-        self.process_bit(bit)
-    }
-
-    /// Reset the entire chain to a fresh state. Called between
-    /// passes. Per-stage internals (Viterbi traceback, sync
-    /// window, derand position) all flush; in-flight CADU
-    /// capture is dropped.
-    pub fn reset(&mut self) {
-        self.viterbi = ViterbiDecoder::new();
-        self.sync = SyncCorrelator::new();
-        self.derand.reset();
-        self.state = State::Hunting;
-    }
-
-    fn process_bit(&mut self, bit: u8) -> Option<Vec<u8>> {
-        match &mut self.state {
-            State::Hunting => {
-                if self.sync.push(bit).is_some() {
-                    self.state = State::Capturing {
+        match &self.state {
+            State::HuntingRotation => {
+                if let Some(rotation) = self.detector.push_symbol(soft) {
+                    // Rotation acquired — transition to Locked.
+                    //
+                    // **Critical**: the ASM-containing soft samples
+                    // were just consumed by `SoftSyncDetector` and
+                    // never reached Viterbi. If we don't replay
+                    // them, the post-Viterbi bit stream starts
+                    // with CADU payload bits, the per-CADU
+                    // `SyncCorrelator` never sees the ASM, and we
+                    // miss the entire first CADU. Drain the
+                    // detector's window and step Viterbi on the
+                    // un-rotated samples so the ASM is properly
+                    // queued for emission once Viterbi's
+                    // TRACEBACK_DEPTH-symbol warmup completes.
+                    let window = self.detector.drain_window();
+                    self.state = State::Locked {
+                        rotation,
+                        is_capturing: false,
+                        inverted: false,
                         bytes: Vec::with_capacity(CADU_PAYLOAD_LEN),
                         partial: 0,
                         partial_count: 0,
                     };
+                    let mut emitted: Option<Vec<u8>> = None;
+                    for pair_chunk in window.chunks_exact(2) {
+                        let pair = [pair_chunk[0], pair_chunk[1]];
+                        let rotated = rotation.apply(pair);
+                        if let Some(bit) = self.viterbi.step(rotated) {
+                            // Replay during a 32-symbol drain
+                            // can't possibly emit a bit (Viterbi
+                            // needs TRACEBACK_DEPTH=224 symbols),
+                            // but defensively route any bit
+                            // through `process_bit` so a future
+                            // Viterbi tweak doesn't regress.
+                            if let Some(vcdu) = self.process_bit(bit) {
+                                // Multiple CADUs in one push are
+                                // impossible at our chunk size,
+                                // but if it ever happened we'd
+                                // drop the second one — flag it.
+                                debug_assert!(emitted.is_none(), "drain emitted multiple VCDUs",);
+                                emitted = Some(vcdu);
+                            }
+                        }
+                    }
+                    return emitted;
                 }
                 None
             }
-            State::Capturing {
-                bytes,
-                partial,
-                partial_count,
-            } => {
-                *partial = (*partial << 1) | (bit & 1);
-                *partial_count += 1;
-                if *partial_count == 8 {
-                    bytes.push(*partial);
-                    *partial = 0;
-                    *partial_count = 0;
-                }
-                if bytes.len() == CADU_PAYLOAD_LEN {
-                    let cadu = std::mem::take(bytes);
-                    self.state = State::Hunting;
-                    return self.decode_cadu(cadu);
-                }
-                None
+            State::Locked { rotation, .. } => {
+                let rotated = rotation.apply(soft);
+                let bit = self.viterbi.step(rotated)?;
+                self.process_bit(bit)
             }
         }
+    }
+
+    /// Reset the entire chain to a fresh state. Called between
+    /// passes. Per-stage internals (Viterbi traceback, sync
+    /// window, derand position, rotation detector) all flush;
+    /// in-flight CADU capture is dropped.
+    pub fn reset(&mut self) {
+        self.detector.reset();
+        self.viterbi = ViterbiDecoder::new();
+        self.sync = SyncCorrelator::new();
+        self.derand.reset();
+        self.state = State::HuntingRotation;
+    }
+
+    /// Currently-locked rotation, or `None` while the chain is
+    /// still hunting. Exposed for diagnostics / future status-bar
+    /// readouts; the FEC chain itself routes the rotation
+    /// internally.
+    #[must_use]
+    pub fn locked_rotation(&self) -> Option<Rotation> {
+        match self.state {
+            State::Locked { rotation, .. } => Some(rotation),
+            State::HuntingRotation => None,
+        }
+    }
+
+    fn process_bit(&mut self, bit: u8) -> Option<Vec<u8>> {
+        let State::Locked {
+            is_capturing,
+            inverted,
+            bytes,
+            partial,
+            partial_count,
+            ..
+        } = &mut self.state
+        else {
+            // Unreachable: process_bit is only called from the
+            // Locked arm of push_symbol. Match-irrefutable would
+            // require pulling the fields apart further; leave
+            // the early-return as a defensive guard.
+            return None;
+        };
+        if !*is_capturing {
+            // Per-CADU ASM hunt on the post-Viterbi bit stream.
+            // This re-syncs every CADU regardless of bit-level
+            // jitter; rotation is already locked. The hit's
+            // `inverted` flag tells us whether the rotation
+            // detector picked the right of two 180°-symmetric
+            // patterns — if not, captured payload bytes get
+            // XORed with 0xFF below.
+            if let Some(hit) = self.sync.push(bit) {
+                *is_capturing = true;
+                *inverted = hit.inverted;
+            }
+            return None;
+        }
+        // Capturing CADU payload: 8 bits → 1 byte, accumulate
+        // until CADU_PAYLOAD_LEN bytes are in hand.
+        *partial = (*partial << 1) | (bit & 1);
+        *partial_count += 1;
+        if *partial_count == 8 {
+            // If the pre-Viterbi rotation lock was 180° off,
+            // every emitted byte is the bit-inverted form of
+            // what derand expects. Flip them at capture time so
+            // derand → RS see the canonical bytes. Per medet's
+            // `try_frame` residual-flip safety net.
+            let byte = if *inverted { *partial ^ 0xFF } else { *partial };
+            bytes.push(byte);
+            *partial = 0;
+            *partial_count = 0;
+        }
+        if bytes.len() == CADU_PAYLOAD_LEN {
+            let cadu = std::mem::take(bytes);
+            // Reset to "hunting for the next ASM in the same
+            // rotation" — keep rotation lock, fresh sync state,
+            // clear the inversion flag (next ASM hunt re-decides).
+            *is_capturing = false;
+            *inverted = false;
+            *partial = 0;
+            *partial_count = 0;
+            self.sync = SyncCorrelator::new();
+            return self.decode_cadu(cadu);
+        }
+        None
     }
 
     /// Decode one captured CADU payload: derandomize, de-interleave
@@ -195,52 +336,22 @@ mod tests {
     #[test]
     fn fec_chain_constructible_and_resets() {
         let mut c = FecChain::new();
-        assert!(matches!(c.state, State::Hunting));
+        assert!(matches!(c.state, State::HuntingRotation));
+        assert_eq!(c.locked_rotation(), None);
         c.reset();
-        assert!(matches!(c.state, State::Hunting));
+        assert!(matches!(c.state, State::HuntingRotation));
+        assert_eq!(c.locked_rotation(), None);
     }
 
     #[test]
     fn fec_chain_returns_none_during_warmup() {
-        // Viterbi needs TRACEBACK_DEPTH symbol pairs before it
-        // emits its first bit. Until then, push_symbol must
-        // return None on every call.
+        // Until rotation locks (which requires a clean ASM in the
+        // soft stream), push_symbol returns None on every call.
         let mut c = FecChain::new();
         for _ in 0..10 {
             let result = c.push_symbol([0, 0]);
             assert!(result.is_none());
         }
-    }
-
-    /// Pump a full clean ASM bit pattern through the chain's
-    /// `process_bit` (skipping Viterbi). After ASM the next
-    /// 1020 bytes are zeros (which derand will XOR to PN, then
-    /// RS will fail on because zeros aren't a valid codeword).
-    /// We're not testing the VCDU contents — just that the
-    /// state machine cleanly transitions Hunting → Capturing
-    /// → Hunting without a panic.
-    #[test]
-    fn process_bit_state_machine_transitions_after_asm() {
-        let mut c = FecChain::new();
-        // Push the ASM bits one at a time, MSB-first.
-        let asm = crate::fec::ASM;
-        for i in 0..32 {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "ASM is u32; shift index 0..32 is safe"
-            )]
-            let bit = ((asm >> (31 - i)) & 1) as u8;
-            let _ = c.process_bit(bit);
-        }
-        // After ASM the chain must be capturing.
-        assert!(matches!(c.state, State::Capturing { .. }));
-        // Push 1020 × 8 zero bits to fill the CADU buffer.
-        for _ in 0..(CADU_PAYLOAD_LEN * 8) {
-            let _ = c.process_bit(0);
-        }
-        // CADU complete → decode_cadu attempted → returned to
-        // Hunting (whether RS succeeded or not).
-        assert!(matches!(c.state, State::Hunting));
     }
 
     #[test]
@@ -316,5 +427,128 @@ mod tests {
         // 32 + 8160 = 8192 bits. Pin so a future constant tweak
         // that breaks the protocol layout fails loudly.
         assert_eq!(CADU_TOTAL_BITS, 8192);
+    }
+
+    /// Forward QPSK rotation transform that builds pattern N
+    /// in [`super::super::soft_sync::build_patterns`]. Test-only
+    /// — the production path only ever applies the *inverse*
+    /// (`Rotation::ALL[N].apply`) to received samples.
+    ///
+    /// Pinned in `chain.rs` so the round-trip test below
+    /// catches any `soft_sync.rs` refactor that changes the
+    /// forward table without simultaneously updating `apply()`.
+    fn forward_rotation(idx: usize, p: [i8; 2]) -> [i8; 2] {
+        let neg = |x: i8| x.saturating_neg();
+        let [i, q] = p;
+        match idx {
+            0 => [i, q],
+            1 => [q, neg(i)],
+            2 => [neg(i), neg(q)],
+            3 => [neg(q), i],
+            4 => [q, i],
+            5 => [i, neg(q)],
+            6 => [neg(q), neg(i)],
+            7 => [neg(i), q],
+            _ => unreachable!(),
+        }
+    }
+
+    /// Build a clean encoded soft stream for one full CADU
+    /// (ASM + RS-encoded + derandomised payload that decodes
+    /// back to `original_vcdu`), padded with enough trailing
+    /// zero input bits to flush Viterbi's traceback so the
+    /// chain emits the VCDU before the soft buffer runs out.
+    fn synthesise_cadu_soft(original_vcdu: &[u8]) -> Vec<i8> {
+        // RS-encode: de-interleave VCDU → 4 messages, encode
+        // each, re-interleave into 1020-byte CADU payload.
+        let rs = ReedSolomon::new();
+        let mut messages = [[0_u8; RS_MESSAGE_LEN]; RS_INTERLEAVE];
+        for col in 0..RS_INTERLEAVE {
+            for i in 0..RS_MESSAGE_LEN {
+                messages[col][i] = original_vcdu[i * RS_INTERLEAVE + col];
+            }
+        }
+        let codewords: Vec<[u8; RS_CODEWORD_LEN]> = messages.iter().map(|m| rs.encode(m)).collect();
+        let mut cadu_payload = vec![0_u8; CADU_PAYLOAD_LEN];
+        for col in 0..RS_INTERLEAVE {
+            for i in 0..RS_CODEWORD_LEN {
+                cadu_payload[i * RS_INTERLEAVE + col] = codewords[col][i];
+            }
+        }
+        // Apply derand so the chain's derand re-XOR recovers the
+        // RS-encoded form.
+        let mut derand = Derandomizer::new();
+        derand.reset();
+        for byte in &mut cadu_payload {
+            *byte = derand.process(*byte);
+        }
+        // Build the ASM + payload bitstream (MSB first).
+        let mut bits: Vec<u8> = Vec::with_capacity(32 + CADU_PAYLOAD_LEN * 8);
+        for i in 0..32 {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "ASM is u32, shift index 0..32 is safe"
+            )]
+            let bit = ((crate::fec::ASM >> (31 - i)) & 1) as u8;
+            bits.push(bit);
+        }
+        for &byte in &cadu_payload {
+            for j in 0..8 {
+                bits.push((byte >> (7 - j)) & 1);
+            }
+        }
+        // Trailing zero bits: enough to push every CADU bit out
+        // of Viterbi's TRACEBACK_DEPTH window. 32 ASM + 8160
+        // payload + slack = 8500 input bits for a comfortable
+        // margin (Viterbi's traceback is 224 symbols).
+        bits.extend(std::iter::repeat_n(0_u8, 500));
+        crate::fec::viterbi::ccsds_encode(&bits)
+    }
+
+    /// **Gold-standard test for issue #605.** Build a clean
+    /// CADU, convolutionally encode it, apply each of 8 forward
+    /// rotation transforms (one per QPSK phase + I/Q-swap
+    /// orientation Costas can lock at), push through
+    /// `FecChain`, and assert the chain recovers the original
+    /// VCDU at every rotation. Before the `SoftSyncDetector`
+    /// fix, this test would have failed for 7 of 8 rotations —
+    /// the chain only decoded at the upright phase.
+    #[test]
+    fn fec_chain_decodes_through_each_of_eight_rotations() {
+        // Distinct, non-uniform VCDU content so any byte-order
+        // bug surfaces visibly.
+        let mut original_vcdu = vec![0_u8; VCDU_LEN];
+        for (i, b) in original_vcdu.iter_mut().enumerate() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "modulo 256 fits in u8 by definition"
+            )]
+            let byte = ((i * 7 + 11) % 256) as u8;
+            *b = byte;
+        }
+        let soft = synthesise_cadu_soft(&original_vcdu);
+        for (idx, rot) in Rotation::ALL.iter().enumerate() {
+            let mut chain = FecChain::new();
+            let mut decoded: Option<Vec<u8>> = None;
+            for pair_chunk in soft.chunks_exact(2) {
+                let pair = [pair_chunk[0], pair_chunk[1]];
+                let rotated = forward_rotation(idx, pair);
+                if let Some(vcdu) = chain.push_symbol(rotated)
+                    && decoded.is_none()
+                {
+                    decoded = Some(vcdu);
+                }
+            }
+            assert_eq!(
+                chain.locked_rotation(),
+                Some(*rot),
+                "rotation {idx} ({rot:?}): chain should report the matching rotation",
+            );
+            assert_eq!(
+                decoded.as_ref(),
+                Some(&original_vcdu),
+                "rotation {idx} ({rot:?}): chain failed to decode VCDU",
+            );
+        }
     }
 }
