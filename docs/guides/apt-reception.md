@@ -264,11 +264,15 @@ reaches the dongle's front-end, or a 137 MHz LNA/SAW combo (e.g.
 SAWbird+ NOAA) that does both notch and band-specific gain. See
 [FM broadcast notch](#fm-broadcast-notch-filter) for the rationale.
 
-A useful sanity check: the audio recording (`audio-NOAA-*.wav`)
-should contain a clear 2400 Hz tone with audible amplitude
-modulation at the 0.5-second line rate. If the WAV plays back as
-pure hiss with no perceptible 2400 Hz tone, no APT carrier reached
-the demod regardless of what you saw on the waterfall.
+A useful sanity check: the audio recording (saved alongside the
+PNG in `~/sdr-recordings/` as `audio-{satellite}-{timestamp}.wav`
+when the "also save audio" toggle is on) typically contains an
+audible 2400 Hz tone whose amplitude modulates at the APT line
+period (0.5 s, ≈2 lines/sec) once a carrier is present. If the
+WAV plays back as pure hiss with no perceptible 2400 Hz tone for
+the whole pass, no APT carrier reached the demod regardless of
+what you saw on the waterfall — borderline / fading conditions
+will sit somewhere in between.
 
 ### Image has wavy horizontal banding
 

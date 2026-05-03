@@ -8925,7 +8925,27 @@ fn update_bandwidth_row_range_for_mode(
     // sounding right. Per silent-fail investigation following
     // the NOAA 15 pass.
     let target = if current < min_bw || current > max_bw {
-        sdr_radio::demod::default_bandwidth_for_mode(mode).ok()
+        // Match on the result so a `default_bandwidth_for_mode`
+        // failure is logged and we still emit a corrective value
+        // — falling through with `None` would leave the row at
+        // its now-out-of-range pre-clamp value, defeating the
+        // whole snap. The min/max fallback is the same edge of
+        // the range we're crossing, so the user always sees a
+        // value inside the new mode's allowed band even when
+        // the lookup helper goes sideways. Per CR round 1 on
+        // PR #612.
+        let safe = match sdr_radio::demod::default_bandwidth_for_mode(mode) {
+            Ok(default_bw) => default_bw,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    ?mode,
+                    "default_bandwidth_for_mode failed — falling back to range edge"
+                );
+                if current < min_bw { min_bw } else { max_bw }
+            }
+        };
+        Some(safe)
     } else {
         None
     };
