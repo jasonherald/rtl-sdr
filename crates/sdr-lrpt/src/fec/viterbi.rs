@@ -183,60 +183,67 @@ pub fn parity_8(b: u8) -> u8 {
     v & 1
 }
 
+/// CCSDS rate-1/2 K=7 convolutional encoder (medet polynomial
+/// convention). For each input bit produces 2 saturated soft
+/// samples (±127) suitable for feeding [`ViterbiDecoder::step`]
+/// or [`super::SoftSyncDetector::push_symbol`] in tests.
+///
+/// Drains the encoder with K-1 trailing zero bits so the output
+/// captures every encoded bit pair for `bits.len()` input bits.
+///
+/// `pub(crate)` and `#[cfg(test)]` because this is a test-only
+/// utility shared between the viterbi tests and the FEC-chain
+/// round-trip / rotation tests; no production code path uses it
+/// (the Meteor satellite is the encoder in production).
 #[cfg(test)]
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-mod tests {
-    use super::*;
-
+pub(crate) fn ccsds_encode(bits: &[u8]) -> Vec<i8> {
     /// Soft-symbol magnitude for clean-signal test fixtures.
     /// Saturated to ±127 — the largest distance the soft slicer
     /// produces, modeling a noiseless encoded stream.
     const CLEAN_SOFT_MAG: i8 = 127;
-
-    /// Encode a bitstream with the standard CCSDS convolutional
-    /// encoder (medet polynomial convention, full 7-bit shift
-    /// register, input bit at position K-1 = 6). Used to generate
-    /// test fixtures: known input → known encoded output → assert
-    /// decoder recovers the input within tolerance.
-    pub(super) fn ccsds_encode(bits: &[u8]) -> Vec<i8> {
-        let mut shift_reg: u8 = 0;
-        let mut out = Vec::with_capacity((bits.len() + K - 1) * 2);
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "K = 7, shift count fits in u8"
-        )]
-        let high_bit_pos: u8 = (K - 1) as u8; // = 6
-        let push_pair = |out: &mut Vec<i8>, g1: u8, g2: u8| {
-            out.push(if g1 == 0 {
-                CLEAN_SOFT_MAG
-            } else {
-                -CLEAN_SOFT_MAG
-            });
-            out.push(if g2 == 0 {
-                CLEAN_SOFT_MAG
-            } else {
-                -CLEAN_SOFT_MAG
-            });
-        };
-        for &b in bits {
-            shift_reg = (shift_reg >> 1) | ((b & 1) << high_bit_pos);
-            push_pair(
-                &mut out,
-                parity_8(shift_reg & POLYA),
-                parity_8(shift_reg & POLYB),
-            );
-        }
-        // Flush — append K-1 zeros to drain the encoder.
-        for _ in 0..(K - 1) {
-            shift_reg >>= 1;
-            push_pair(
-                &mut out,
-                parity_8(shift_reg & POLYA),
-                parity_8(shift_reg & POLYB),
-            );
-        }
-        out
+    let mut shift_reg: u8 = 0;
+    let mut out = Vec::with_capacity((bits.len() + K - 1) * 2);
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "K = 7, shift count fits in u8"
+    )]
+    let high_bit_pos: u8 = (K - 1) as u8; // = 6
+    let push_pair = |out: &mut Vec<i8>, g1: u8, g2: u8| {
+        out.push(if g1 == 0 {
+            CLEAN_SOFT_MAG
+        } else {
+            -CLEAN_SOFT_MAG
+        });
+        out.push(if g2 == 0 {
+            CLEAN_SOFT_MAG
+        } else {
+            -CLEAN_SOFT_MAG
+        });
+    };
+    for &b in bits {
+        shift_reg = (shift_reg >> 1) | ((b & 1) << high_bit_pos);
+        push_pair(
+            &mut out,
+            parity_8(shift_reg & POLYA),
+            parity_8(shift_reg & POLYB),
+        );
     }
+    // Flush — append K-1 zeros to drain the encoder.
+    for _ in 0..(K - 1) {
+        shift_reg >>= 1;
+        push_pair(
+            &mut out,
+            parity_8(shift_reg & POLYA),
+            parity_8(shift_reg & POLYB),
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+mod tests {
+    use super::*;
 
     #[test]
     fn parity_8_matches_xor_fold() {
@@ -290,7 +297,6 @@ mod tests {
 
 #[cfg(test)]
 mod proptests {
-    use super::tests::ccsds_encode;
     use super::*;
     use proptest::prelude::*;
 
