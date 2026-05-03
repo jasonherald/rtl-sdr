@@ -2,7 +2,10 @@
 
 A walkthrough from "I have an RTL-SDR and the app installed" to "I just
 received a satellite image off my own antenna." Aimed at a first-timer
-who hasn't decoded weather satellites before.
+who hasn't decoded weather satellites before. If you're brand new to
+the app, [`getting-started.md`](getting-started.md) tours the activity
+bar and gets a first signal up in under five minutes — worth doing
+once before tackling a satellite pass.
 
 The whole thing takes about as long as the pass itself — 10–15
 minutes of attended time once you've got an antenna up.

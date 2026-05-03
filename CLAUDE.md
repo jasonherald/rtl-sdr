@@ -148,7 +148,7 @@ NOAA APT (epic #468), Meteor-M LRPT (epic #469), and ISS SSTV (epic #472) are al
 - `crates/sdr-radio/src/sstv_image.rs` — Shared SSTV image handle (`Arc<Mutex<Inner>>`). DSP tap writes via `write_line`; UI reads via `snapshot()`; `take_completed()` drains the finished frame and resets for the next VIS detection. `SstvImage::clear()` convenience wrapper delegates to the handle.
 - `crates/sdr-ui/src/sstv_viewer.rs` — Live SSTV viewer. `SstvImageRenderer` owns the Cairo ARGB32 surface; `SstvImageView` is the GTK widget (cloneable via Rc). `open_sstv_viewer_if_needed` opens the window and wires `UiToDsp::SetSstvImage`. `write_sstv_rgb_png` is the Cairo-based PNG encoder used by both manual Export and the auto-record LOS save. Wired via `connect_sstv_action` (`Ctrl+Shift+V`).
 
-**User-facing walkthroughs:** `docs/guides/apt-reception.md`, `docs/guides/lrpt-reception.md`, `docs/guides/sstv-reception.md`.
+**User-facing walkthroughs:** `docs/guides/apt-reception.md`, `docs/guides/lrpt-reception.md`, `docs/guides/sstv-reception.md`. The two onboarding entry points are `docs/guides/getting-started.md` (first-FM-station tour) and `docs/guides/sdr-concepts.md` (IQ / sample rate / decimation / FFT / bandwidth, against this app's UI).
 
 **Output paths** (all under `~/sdr-recordings/`):
 - APT: `apt-{satellite-slug}-{local-timestamp}.png` (single PNG per pass).

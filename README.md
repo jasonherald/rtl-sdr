@@ -249,6 +249,12 @@ sdr-rs
 3. Choose demodulation mode (WFM, NFM, AM, USB, LSB, etc.)
 4. Press **Play**
 
+### New to SDR?
+
+- [`docs/guides/getting-started.md`](docs/guides/getting-started.md) — first-time-user walkthrough: tour of the activity bar, your first FM-broadcast signal in under five minutes, concrete next things to try.
+- [`docs/guides/sdr-concepts.md`](docs/guides/sdr-concepts.md) — IQ, sample rate, decimation, FFT, why bandwidth matters — explained against this app's UI. Reading this lets you reason about *why* something isn't working, not just what to try.
+- [`docs/guides/apt-reception.md`](docs/guides/apt-reception.md) / [`lrpt-reception.md`](docs/guides/lrpt-reception.md) / [`sstv-reception.md`](docs/guides/sstv-reception.md) — receive your first weather satellite image / Meteor LRPT pass / ISS SSTV photograph end-to-end.
+
 ### Keyboard Shortcuts
 
 | Key | Action |
