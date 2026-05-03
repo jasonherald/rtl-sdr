@@ -1678,17 +1678,69 @@ final class CoreModel {
     //  Scanner — issue #447 (ABI 0.20)
     // ----------------------------------------------------------
 
+    /// Pull-style accessor the scanner-channel projection uses
+    /// to read the current bookmark list without owning a
+    /// strong reference to `BookmarksStore`. Set once at
+    /// startup by the app's scene (`SDRMacApp.task`) — the
+    /// closure captures the store weakly, so a future test
+    /// harness can substitute a fixture without going through
+    /// the live `BookmarksStore`. Per #490.
+    var bookmarksProvider: (() -> [Bookmark])?
+
     /// Toggle the scanner master switch. Optimistic — we flip
     /// `scannerEnabled` immediately so the UI doesn't lag, but
     /// the engine's `scannerStateChanged` reply is authoritative
-    /// for the resulting phase (`scannerState`). Until #490
-    /// lands the per-bookmark `scan_enabled` projection,
-    /// flipping this on with no scan-enabled bookmarks leaves
-    /// the engine in `.idle` (no rotation to drive), and the
-    /// panel's State row reflects that.
+    /// for the resulting phase (`scannerState`).
+    ///
+    /// On every flip we re-project the current scan-enabled
+    /// bookmarks and push the channel list — the engine clears
+    /// its rotation when the master switch goes off, and a
+    /// fresh start needs the channels in place before `Idle →
+    /// Retuning` can happen. Per #490 (paired with the schema
+    /// + UI + projection landing in the same PR).
     func setScannerEnabled(_ on: Bool) {
         scannerEnabled = on
         capture { try core?.setScannerEnabled(on) }
+        refreshScannerChannels()
+    }
+
+    /// Project the current scan-enabled bookmarks into the
+    /// scanner's `ScannerChannel` shape and push the list to
+    /// the engine. Mirrors the Linux
+    /// `project_and_push_scanner_channels` helper —
+    /// per-bookmark dwell/hang overrides are folded onto the
+    /// scanner default values held on the model.
+    ///
+    /// Bookmarks without a center frequency are skipped — a
+    /// scanner channel needs a tune target and there's nothing
+    /// sensible to fall back to. Bookmarks without a demod
+    /// mode default to NFM (the canonical scanner-voice mode);
+    /// bookmarks without an explicit bandwidth default to
+    /// 12.5 kHz (NFM voice channel width). These match the
+    /// Mac default-bandwidth-for-mode policy elsewhere in the
+    /// model and keep partial-recall bookmarks usable in the
+    /// scanner without forcing the user to fully populate
+    /// every field. Per #490.
+    func refreshScannerChannels() {
+        guard let core, let provider = bookmarksProvider else { return }
+        let bookmarks = provider()
+        let dwell = UInt32(scannerDefaultDwellMs)
+        let hang = UInt32(scannerDefaultHangMs)
+        let channels: [SdrCore.ScannerChannel] = bookmarks.compactMap { b in
+            guard b.scanEnabled == true, let freq = b.centerFrequencyHz else {
+                return nil
+            }
+            return SdrCore.ScannerChannel(
+                name: b.name,
+                frequencyHz: UInt64(freq.rounded()),
+                demodMode: b.demodMode ?? .nfm,
+                bandwidthHz: b.bandwidthHz ?? 12_500.0,
+                priority: b.priority ?? 0,
+                dwellMs: dwell,
+                hangMs: hang
+            )
+        }
+        capture { try core.setScannerChannels(channels) }
     }
 
     /// Lock out the channel currently latched (if any) for the
@@ -1732,6 +1784,10 @@ final class CoreModel {
         let clamped = min(max(ms, range.lowerBound), range.upperBound)
         scannerDefaultDwellMs = clamped
         UserDefaults.standard.set(clamped, forKey: Self.scannerDefaultDwellMsDefaultsKey)
+        // Re-push the channel list with the new fallback —
+        // any bookmark without a per-channel override picks
+        // up the new dwell on the next rotation. Per #490.
+        refreshScannerChannels()
     }
 
     /// Update the default hang time per-channel (ms). Same
@@ -1742,6 +1798,7 @@ final class CoreModel {
         let clamped = min(max(ms, range.lowerBound), range.upperBound)
         scannerDefaultHangMs = clamped
         UserDefaults.standard.set(clamped, forKey: Self.scannerDefaultHangMsDefaultsKey)
+        refreshScannerChannels()
     }
 
     /// `UserDefaults` key for the scanner default-dwell (ms).

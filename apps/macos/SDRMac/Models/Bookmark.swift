@@ -67,6 +67,44 @@ struct Bookmark: Codable, Identifiable, Hashable {
     /// Per issue #339 (flyout) / #241 (RadioReference import).
     var rrCategory: String?
 
+    // MARK: Scanner participation
+
+    /// Include this bookmark in scanner rotation. `nil` is
+    /// treated as `false` (off) — same default as the Linux
+    /// `Bookmark.scan_enabled` field, which serializes via
+    /// `#[serde(default)]` and so produces the same on-disk
+    /// shape (key absent OR `false`) for an existing bookmark
+    /// the user hasn't opted in. Per issue #490, mirrors
+    /// Linux PR #375.
+    var scanEnabled: Bool?
+
+    /// Priority tier — `nil` or `0` is normal rotation, `>= 1`
+    /// is priority (the scanner state machine checks priority
+    /// channels more often). Schema parity with the Linux
+    /// `Bookmark.priority: u8` field. The bookmark-row toggle
+    /// in the flyout is a Bool affordance over this — see
+    /// `priorityEnabled` below.
+    ///
+    /// `UInt8?` rather than `Bool?` because the Linux side
+    /// already encodes higher tiers (reserved for #365 priority-
+    /// interrupt follow-up). Storing the underlying integer
+    /// keeps the Mac-saved `bookmarks.json` round-trippable
+    /// through the Linux frontend without losing tier
+    /// information that a future Linux release might write.
+    var priority: UInt8?
+
+    /// `Bool`-valued view of `priority` for the UI toggle.
+    /// `true` when `priority >= 1`. Setting to `true` writes
+    /// `1` (single non-zero tier the Mac UI surfaces today);
+    /// setting to `false` clears to `nil` rather than `0` so
+    /// the JSON omits the key for never-configured bookmarks
+    /// — matches the Linux `#[serde(default)]` "absent → 0"
+    /// shape on round-trip.
+    var priorityEnabled: Bool {
+        get { (priority ?? 0) >= 1 }
+        set { priority = newValue ? 1 : nil }
+    }
+
     /// JSON key mapping so the on-disk schema matches the
     /// Linux side's snake_case field name (`rr_category`).
     /// Enables a user who runs both frontends to share the
@@ -87,5 +125,11 @@ struct Bookmark: Codable, Identifiable, Hashable {
         case deemphasis
         case rrCategory = "rr_category"
         case agcType = "agc_type"
+        // Snake_case JSON keys that match the Linux
+        // `Bookmark` struct field names exactly so a
+        // `bookmarks.json` written by either frontend
+        // round-trips through the other unchanged. Per #490.
+        case scanEnabled = "scan_enabled"
+        case priority
     }
 }
