@@ -232,6 +232,21 @@ pub struct SavedTune {
     /// Pre-AOS FM IF NR toggle. Forced OFF at AOS, restored at
     /// LOS. Per #556.
     pub fm_if_nr_enabled: bool,
+    /// Pre-AOS de-emphasis `ComboRow` selection (0 = None, 1 = EU
+    /// 50 µs, 2 = US 75 µs). Forced to 0 (None) at AOS for the
+    /// satellite-image decoders, restored at LOS. The 2400 Hz
+    /// APT subcarrier sits in the rolloff of US 75 µs (cutoff
+    /// ~2122 Hz), so a user listening to FM broadcast pre-pass
+    /// would otherwise have the subcarrier attenuated through
+    /// the entire pass. Per silent-fail investigation following
+    /// the NOAA 15 pass.
+    pub deemphasis_idx: u32,
+    /// Pre-AOS audio notch toggle. Forced OFF at AOS, restored
+    /// at LOS. A user-set notch anywhere in the 1.5-3 kHz
+    /// audio band (typical "remove a hum" use) would null the
+    /// APT subcarrier. Per silent-fail investigation following
+    /// the NOAA 15 pass.
+    pub notch_enabled: bool,
 }
 
 /// Side effects the wiring layer must perform on each transition.
@@ -909,6 +924,8 @@ mod tests {
             squelch_db: -50.0,
             ctcss_mode: CtcssMode::Off,
             fm_if_nr_enabled: false,
+            deemphasis_idx: 0,
+            notch_enabled: false,
         }
     }
 
@@ -1254,6 +1271,12 @@ mod tests {
             squelch_db: SAVED_SQUELCH_DB,
             ctcss_mode: CtcssMode::Tone(SAVED_CTCSS_TONE_HZ),
             fm_if_nr_enabled: true,
+            // pin: pre-AOS deemphasis (US 75 µs index = 2) and
+            // notch must come back at LOS so the user's
+            // FM-broadcast listening setup isn't silently
+            // wiped after the pass.
+            deemphasis_idx: 2,
+            notch_enabled: true,
         };
         // Walk all transitions.
         r.tick(
@@ -1318,6 +1341,14 @@ mod tests {
                     matches!(t.ctcss_mode, CtcssMode::Tone(hz) if (hz - SAVED_CTCSS_TONE_HZ).abs() < f32::EPSILON)
                 );
                 assert!(t.fm_if_nr_enabled);
+                // Pre-AOS deemphasis (US 75 µs = idx 2) and
+                // notch enabled both survive the auto-record
+                // round trip — the user's FM-broadcast
+                // listening setup isn't silently wiped after
+                // the pass. Per silent-fail investigation
+                // following the NOAA 15 pass.
+                assert_eq!(t.deemphasis_idx, 2);
+                assert!(t.notch_enabled);
             }
             other => panic!("expected RestoreTune, got {other:?}"),
         }

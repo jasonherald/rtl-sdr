@@ -347,12 +347,25 @@ fn tune_to_target(
     state.center_frequency.set(freq_f64);
     state.demod_mode.set(mode);
     state.send_dsp(UiToDsp::Tune(freq_f64));
-    state.send_dsp(UiToDsp::SetBandwidth(bw_hz));
     freq_selector.set_frequency(freq_hz);
     spectrum_handle.set_center_frequency(freq_f64);
+    // **Order is load-bearing.** `set_selected` triggers the
+    // dropdown's `notify::selected` handler which dispatches
+    // `UiToDsp::SetDemodMode(mode)` synchronously. The DSP's
+    // `SetDemodMode` handler resets `state.bandwidth` to the new
+    // mode's `default_bandwidth` (e.g. 12.5 kHz for NFM) — see
+    // `crates/sdr-core/src/controller.rs::SetDemodMode`. So the
+    // explicit `SetBandwidth(bw_hz)` MUST land *after* the mode
+    // switch, otherwise SetDemodMode silently overwrites it and
+    // the satellite auto-record path (e.g. NOAA APT at 38 kHz)
+    // ends up at NFM's 12.5 kHz default — a 12.5 kHz channel
+    // filter throws away most of APT's ~38 kHz signal energy and
+    // the decoder hears static. Per silent-fail investigation
+    // following the NOAA 15 pass.
     if let Some(idx) = demod_selector::demod_mode_to_index(mode) {
         demod_dropdown.set_selected(idx);
     }
+    state.send_dsp(UiToDsp::SetBandwidth(bw_hz));
     // Update the bandwidth row's allowed range for the new mode
     // BEFORE setting the value. The dropdown notify above only
     // queues `SetDemodMode` to the DSP; the range update only
@@ -361,13 +374,12 @@ fn tune_to_target(
     // below would clamp to the previous mode's range AND fire
     // its own notify that dispatches a wrong `SetBandwidth`,
     // overriding the correct `SetBandwidth(bw_hz)` we just sent
-    // at line 202. WFM→NFM retunes are the common failure case.
+    // above. WFM→NFM retunes are the common failure case.
     // Per CR round 2 on PR #574.
     update_bandwidth_row_range_for_mode(radio_panel, state, mode);
     // Suppress the bandwidth row's notify around `set_value` so
     // it doesn't redispatch a redundant `SetBandwidth` —
-    // `tune_to_target` already sent the canonical command at
-    // line 202 above.
+    // `tune_to_target` already sent the canonical command above.
     state.suppress_bandwidth_notify.set(true);
     bandwidth_row.set_value(bw_hz);
     state.suppress_bandwidth_notify.set(false);
@@ -11011,6 +11023,19 @@ fn connect_satellites_panel(
         let squelch_level_row_a = panels.radio.squelch_level_row.clone();
         let ctcss_row_a = panels.radio.ctcss_row.clone();
         let fm_if_nr_row_a = panels.radio.fm_if_nr_row.clone();
+        // AF-chain widgets that also have to be disabled at AOS for
+        // the satellite-image decoders. The 2400 Hz APT subcarrier
+        // sits in the rolloff of US 75 µs / EU 50 µs deemphasis
+        // (cutoff ~2122 Hz / ~3183 Hz respectively); a notch
+        // anywhere in the 1.5-3 kHz audio band would also kill the
+        // subcarrier. Like the gates above, these flip via the
+        // widget's `notify` handler so the DSP gets a normal
+        // `SetDeemphasis(None)` / `SetNotchEnabled(false)` and the
+        // LOS restore-from-config path runs the same way it does for
+        // squelch / CTCSS / FM-IF-NR. Per silent-fail investigation
+        // following the NOAA 15 pass.
+        let deemphasis_row_a = panels.radio.deemphasis_row.clone();
+        let notch_enabled_row_a = panels.radio.notch_enabled_row.clone();
         // Composite-save toggle — read at LOS by the
         // `SaveLrptPass` handler. Strong clone so the closure
         // doesn't need to upgrade a weak ref against panel
@@ -11159,6 +11184,26 @@ fn connect_satellites_panel(
                     }
                     if fm_if_nr_row_a.is_active() {
                         fm_if_nr_row_a.set_active(false);
+                    }
+                    // De-emphasis ComboRow index 0 = "None". Both
+                    // US 75 µs (cutoff ~2122 Hz) and EU 50 µs
+                    // (cutoff ~3183 Hz) attenuate the 2400 Hz APT
+                    // subcarrier that lives in the demodulated
+                    // audio. Force to "None" so the AF chain
+                    // passes the subcarrier through flat. Per
+                    // silent-fail investigation following the
+                    // NOAA 15 pass.
+                    let deemp_off_idx: u32 = 0;
+                    if deemphasis_row_a.selected() != deemp_off_idx {
+                        deemphasis_row_a.set_selected(deemp_off_idx);
+                    }
+                    // Notch: a user-set notch frequency anywhere in
+                    // the 1.5-3 kHz audio band (the typical "remove
+                    // a hum" use case) would null the APT subcarrier.
+                    // Force off; LOS restore reapplies the persisted
+                    // value via the same notify chain.
+                    if notch_enabled_row_a.is_active() {
+                        notch_enabled_row_a.set_active(false);
                     }
                 };
                 match protocol {
@@ -12113,6 +12158,20 @@ fn connect_satellites_panel(
                 if saved.fm_if_nr_enabled != fm_if_nr_row_a.is_active() {
                     fm_if_nr_row_a.set_active(saved.fm_if_nr_enabled);
                 }
+                // Restore the AF-chain widgets the AOS path
+                // forced off — deemphasis (US 75 µs / EU 50 µs
+                // attenuates the 2400 Hz APT subcarrier) and
+                // notch (a user-set notch in the 1.5-3 kHz band
+                // nulls the subcarrier). Same notify-fires-set
+                // pattern as the gate restores above. Per
+                // silent-fail investigation following the NOAA
+                // 15 pass.
+                if saved.deemphasis_idx != deemphasis_row_a.selected() {
+                    deemphasis_row_a.set_selected(saved.deemphasis_idx);
+                }
+                if saved.notch_enabled != notch_enabled_row_a.is_active() {
+                    notch_enabled_row_a.set_active(saved.notch_enabled);
+                }
                 // Re-arm the scanner if it was running pre-AOS.
                 // The AOS-side `tune_a` call goes through
                 // `tune_to_satellite`, which fires
@@ -12188,6 +12247,14 @@ fn connect_satellites_panel(
         let squelch_level_row_tick = panels.radio.squelch_level_row.clone();
         let ctcss_row_tick = panels.radio.ctcss_row.clone();
         let fm_if_nr_row_tick = panels.radio.fm_if_nr_row.clone();
+        // AF-chain widgets that the satellite-image AOS path
+        // also force-disables (deemphasis attenuates the 2400 Hz
+        // APT subcarrier; a notch in the 1.5-3 kHz band nulls
+        // it). Snapshotted here on the same 1-Hz tick as the
+        // gate widgets so the LOS restore path can return them
+        // to their pre-AOS values.
+        let deemphasis_row_tick = panels.radio.deemphasis_row.clone();
+        let notch_enabled_row_tick = panels.radio.notch_enabled_row.clone();
         let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
             let Some(panel) = panel_weak_tick.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -12251,6 +12318,8 @@ fn connect_satellites_panel(
                     ctcss_row_tick.selected(),
                 ),
                 fm_if_nr_enabled: fm_if_nr_row_tick.is_active(),
+                deemphasis_idx: deemphasis_row_tick.selected(),
+                notch_enabled: notch_enabled_row_tick.is_active(),
             };
             // Read the user's selected quality tier on every
             // tick — cheap (just a ComboRow.selected() call), and
