@@ -13,12 +13,12 @@ sidebar panel does what, the workflow is short.
 
 ## What you bought, and what it does
 
-An **RTL-SDR** is a $30 USB device that started life as a European
-TV tuner. Someone discovered the chip exposes raw radio samples
-over USB, and it became the cheapest software-defined radio
-receiver on the planet. It's not a transmitter; it can only listen.
-It covers roughly 24-1700 MHz with one common gap, which is enough
-to pick up:
+An **RTL-SDR** is a ~$30 USB device (as of May 2026) that started
+life as a European TV tuner. Someone discovered the chip exposes
+raw radio samples over USB, and it became the cheapest
+software-defined radio receiver on the planet. It's not a
+transmitter; it can only listen. It covers roughly 24-1700 MHz
+with one common gap, which is enough to pick up:
 
 - FM broadcast (88-108 MHz)
 - Air-band aviation voice (118-137 MHz)
@@ -29,12 +29,20 @@ to pick up:
 - Plus the noise floor between all of those, which is its own
   kind of fun.
 
+> **Legal note:** Monitoring rules vary by country and (in the US)
+> by state. Broadcast and amateur radio are universally legal to
+> listen to; intercepting, recording, retransmitting, or acting on
+> the content of two-way private communications often is not. If
+> you're not sure, check your local regulator (FCC in the US,
+> Ofcom in the UK, etc.) before tuning to anything that isn't
+> obviously a public broadcast.
+
 A **software-defined radio** moves the radio's "dial" and
 "demodulator" out of dedicated hardware and into software. The
 RTL-SDR sends raw I/Q samples (the digital representation of
 whatever's on the antenna) to your computer, and SDR-RS does
 everything past that — channel filter, FM/AM/SSB demodulation,
-audio output, recording, decoding. That's why one $30 dongle can
+audio output, recording, decoding. That's why one cheap dongle can
 listen to a dozen different protocols: the protocol logic is just
 code.
 
