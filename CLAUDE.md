@@ -126,7 +126,9 @@ Every activity panel is an `AdwPreferencesPage` of flat `AdwPreferencesGroup`s w
 
 **Session persistence:**
 
-Four config keys per side live in `activity_bar.rs`: `ui_sidebar_{left,right}_{selected,open,width_px}`. Load at launch via `load_session(config)`, apply before wiring handlers (seed-then-wire prevents the initial `set_active` / `set_show_sidebar` calls from writing back). On change, persist via `save_*` helpers. Pixel widths are converted to `AdwOverlaySplitView`'s `[0, 1]` fraction via `apply_sidebar_width`'s one-shot `notify::width` handler once the split view has its first real allocation.
+Three config keys per side (six total) live in `activity_bar.rs`: `ui_sidebar_{left,right}_{selected,open,width_px}`. Load at launch via `load_session(config)`, apply before wiring handlers (seed-then-wire prevents the initial `set_active` / `set_show_sidebar` calls from writing back). On change, persist via `save_*` helpers. Pixel widths are converted to `AdwOverlaySplitView`'s `[0, 1]` fraction via `apply_sidebar_width`'s one-shot `notify::width` handler once the split view has its first real allocation.
+
+**macOS counterpart:** the same activity-bar pattern is implemented in SwiftUI on the Mac side, sharing the same six `ui_sidebar_*` config keys via the engine's config FFI (ABI 0.21+). Contributor docs for the SwiftUI version live in `apps/macos/README.md` → "Sidebar architecture (macOS)".
 
 ### Satellite reception
 
