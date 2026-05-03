@@ -193,7 +193,7 @@ impl FecChain {
                                 // impossible at our chunk size,
                                 // but if it ever happened we'd
                                 // drop the second one — flag it.
-                                debug_assert!(emitted.is_none(), "drain emitted multiple VCDUs",);
+                                debug_assert!(emitted.is_none(), "drain emitted multiple VCDUs");
                                 emitted = Some(vcdu);
                             }
                         }
@@ -280,7 +280,13 @@ impl FecChain {
             *partial_count = 0;
         }
         if bytes.len() == CADU_PAYLOAD_LEN {
-            let cadu = std::mem::take(bytes);
+            // `mem::replace` (vs `mem::take`) preserves the
+            // pre-allocated capacity for the next CADU's bytes
+            // buffer — `mem::take` would leave `bytes` as a
+            // zero-capacity Vec and force a fresh allocation
+            // on every CADU in the locked steady-state path.
+            // Per CR round 1 on PR #606.
+            let cadu = std::mem::replace(bytes, Vec::with_capacity(CADU_PAYLOAD_LEN));
             // Reset to "hunting for the next ASM in the same
             // rotation" — keep rotation lock, fresh sync state,
             // clear the inversion flag (next ASM hunt re-decides).

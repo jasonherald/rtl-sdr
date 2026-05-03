@@ -378,12 +378,20 @@ fn rotate_signs(signs: [i8; ASM_ENCODED_BITS], r: usize) -> [i8; ASM_ENCODED_BIT
         // sees (-I, -Q); at +270° sees (-Q, I). We're building
         // the EXPECTED received pattern at each rotation so the
         // detector can correlate against incoming samples.
-        let (ri, rq) = match r % 4 {
-            0 => (i, q),
+        //
+        // `r & 3` normalises any `usize` input to 0..=3, so the
+        // catch-all arm is mathematically unreachable. Folding
+        // 0 with `_` keeps the helper panic-free in library code
+        // (per CLAUDE.md and CR round 1 on PR #606) — Rust's
+        // exhaustiveness checker can't refine the type from the
+        // bitmask, so a catch-all is required regardless; making
+        // it the identity (= the same body 0 would take) is the
+        // safe default.
+        let (ri, rq) = match r & 3 {
             1 => (q, -i),
             2 => (-i, -q),
             3 => (-q, i),
-            _ => unreachable!(),
+            _ => (i, q),
         };
         out[sym * 2] = ri;
         out[sym * 2 + 1] = rq;
