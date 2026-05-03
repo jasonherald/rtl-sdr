@@ -317,6 +317,18 @@ fn build_acars_viewer_window(state: &Rc<AppState>) -> adw::Window {
         .default_height(ACARS_VIEWER_WINDOW_HEIGHT)
         .modal(false)
         .build();
+    // Link to the GApplication so Wayland's
+    // `xdg_toplevel_set_app_id` carries `com.sdr.rs` and the
+    // WM can resolve our icon. Unlike the satellite-image
+    // viewers we don't have a parent window to inherit from
+    // (this opens from the aviation-panel button click), so
+    // pull the active app via the gio default-application
+    // registry. See apt_viewer.rs for the full rationale.
+    if let Some(app) =
+        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok())
+    {
+        window.set_application(Some(&app));
+    }
 
     // ─── Header bar ───
     let header = adw::HeaderBar::new();

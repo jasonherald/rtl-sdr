@@ -2322,6 +2322,11 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         .transient_for(parent)
         .modal(false)
         .build();
+    // Inherit the parent's GApplication so Wayland's
+    // `xdg_toplevel_set_app_id` carries `com.sdr.rs` and the
+    // WM can resolve our icon. See apt_viewer.rs for the full
+    // rationale.
+    window.set_application(parent.application().as_ref());
 
     let header = adw::HeaderBar::new();
 
