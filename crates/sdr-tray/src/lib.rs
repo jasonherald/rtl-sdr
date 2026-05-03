@@ -99,12 +99,18 @@ impl ksni::Tray for SdrTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        let (width, height, data) = icon::current_icon();
-        vec![ksni::Icon {
-            width,
-            height,
-            data,
-        }]
+        // Hand ksni every pre-baked size; the tray host picks the
+        // closest match for its current draw context (HiDPI scaling,
+        // accessibility large-icon mode, legacy 16 px tray slots).
+        // Per #573.
+        icon::current_icons()
+            .into_iter()
+            .map(|(width, height, data)| ksni::Icon {
+                width,
+                height,
+                data,
+            })
+            .collect()
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
