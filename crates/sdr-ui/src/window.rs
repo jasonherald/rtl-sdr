@@ -8910,10 +8910,22 @@ fn update_bandwidth_row_range_for_mode(
     adj.set_lower(min_bw);
     adj.set_upper(max_bw);
     let current = radio.bandwidth_row.value();
-    let target = if current < min_bw {
-        Some(min_bw)
-    } else if current > max_bw {
-        Some(max_bw)
+    // When the existing value is outside the new mode's range,
+    // snap to the new mode's *default* rather than its min or max.
+    // The min/max represent absolute floors/ceilings; the default
+    // is the right "this mode's natural setting" for a value that
+    // we already know belongs to a different regime. The bug this
+    // fixes: app starts with bandwidth_row at the panel's mode-
+    // agnostic 12.5 kHz default, demod dropdown loads as WFM,
+    // range update clamps to WFM_MIN (50 kHz) — which crushes
+    // FM broadcast deviation peaks and produces fuzzy/static-
+    // sounding audio. Same trap fires after a satellite NFM
+    // 38 kHz session if the user manually flips back to WFM.
+    // Falling back to WFM's 150 kHz default keeps broadcast
+    // sounding right. Per silent-fail investigation following
+    // the NOAA 15 pass.
+    let target = if current < min_bw || current > max_bw {
+        sdr_radio::demod::default_bandwidth_for_mode(mode).ok()
     } else {
         None
     };
