@@ -238,6 +238,42 @@ Possibilities:
 - **No notch filter and you're near a strong FM broadcast tower** —
   see the [FM broadcast notch](#fm-broadcast-notch-filter) section.
 
+### "I see signal in the waterfall but the image is still noise"
+
+Counter-intuitive, but the most common explanation isn't a software
+bug — it's that **what looks like a satellite signal in the waterfall
+is actually FM broadcast intermodulation**. At 137 MHz the RTL-SDR's
+front-end can produce IMD products from strong 88-108 MHz FM
+broadcast that show up as broad bumps or bands on the waterfall
+right where the satellite *should* be. They look like signal but
+carry no satellite content, so the FM demod produces only noise and
+the decoder gets nothing usable.
+
+How to tell them apart:
+
+- **Real satellite carrier**: a narrow (~38 kHz) bright vertical
+  band that drifts ±3.5 kHz over the pass (Doppler), strongest at
+  closest approach, gone before AOS and after LOS.
+- **FM broadcast IMD**: present continuously regardless of any
+  satellite pass, often with audible artefacts that correlate with
+  the strongest local FM station's modulation if you tune there.
+
+**The fix is hardware, not software.** Either an FM-bandstop notch
+(e.g. Nooelec FM Bandstop) to kill the offending energy before it
+reaches the dongle's front-end, or a 137 MHz LNA/SAW combo (e.g.
+SAWbird+ NOAA) that does both notch and band-specific gain. See
+[FM broadcast notch](#fm-broadcast-notch-filter) for the rationale.
+
+A useful sanity check: the audio recording (saved alongside the
+PNG in `~/sdr-recordings/` as `audio-{satellite}-{timestamp}.wav`
+when the "also save audio" toggle is on) typically contains an
+audible 2400 Hz tone whose amplitude modulates at the APT line
+period (0.5 s, ≈2 lines/sec) once a carrier is present. If the
+WAV plays back as pure hiss with no perceptible 2400 Hz tone for
+the whole pass, no APT carrier reached the demod regardless of
+what you saw on the waterfall — borderline / fading conditions
+will sit somewhere in between.
+
 ### Image has wavy horizontal banding
 
 FM broadcast IMD. Get a notch filter. The pattern often

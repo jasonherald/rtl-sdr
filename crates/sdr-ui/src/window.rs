@@ -8910,10 +8910,42 @@ fn update_bandwidth_row_range_for_mode(
     adj.set_lower(min_bw);
     adj.set_upper(max_bw);
     let current = radio.bandwidth_row.value();
-    let target = if current < min_bw {
-        Some(min_bw)
-    } else if current > max_bw {
-        Some(max_bw)
+    // When the existing value is outside the new mode's range,
+    // snap to the new mode's *default* rather than its min or max.
+    // The min/max represent absolute floors/ceilings; the default
+    // is the right "this mode's natural setting" for a value that
+    // we already know belongs to a different regime. The bug this
+    // fixes: app starts with bandwidth_row at the panel's mode-
+    // agnostic 12.5 kHz default, demod dropdown loads as WFM,
+    // range update clamps to WFM_MIN (50 kHz) — which crushes
+    // FM broadcast deviation peaks and produces fuzzy/static-
+    // sounding audio. Same trap fires after a satellite NFM
+    // 38 kHz session if the user manually flips back to WFM.
+    // Falling back to WFM's 150 kHz default keeps broadcast
+    // sounding right. Per silent-fail investigation following
+    // the NOAA 15 pass.
+    let target = if current < min_bw || current > max_bw {
+        // Match on the result so a `default_bandwidth_for_mode`
+        // failure is logged and we still emit a corrective value
+        // — falling through with `None` would leave the row at
+        // its now-out-of-range pre-clamp value, defeating the
+        // whole snap. The min/max fallback is the same edge of
+        // the range we're crossing, so the user always sees a
+        // value inside the new mode's allowed band even when
+        // the lookup helper goes sideways. Per CR round 1 on
+        // PR #612.
+        let safe = match sdr_radio::demod::default_bandwidth_for_mode(mode) {
+            Ok(default_bw) => default_bw,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    ?mode,
+                    "default_bandwidth_for_mode failed — falling back to range edge"
+                );
+                if current < min_bw { min_bw } else { max_bw }
+            }
+        };
+        Some(safe)
     } else {
         None
     };
