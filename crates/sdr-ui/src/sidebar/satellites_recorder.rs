@@ -247,6 +247,20 @@ pub struct SavedTune {
     /// APT subcarrier. Per silent-fail investigation following
     /// the NOAA 15 pass.
     pub notch_enabled: bool,
+    /// Pre-AOS Doppler-tracker master switch. Forced OFF at
+    /// AOS for the duration of an imaging-protocol pass,
+    /// restored at LOS. The Doppler shift on a NOAA / Meteor /
+    /// ISS pass is ±3.5 kHz worst case at 137 MHz / 145 MHz —
+    /// well inside the channel filters of all three imaging
+    /// protocols (APT 38 kHz, LRPT 144 kHz, SSTV 12.5 kHz).
+    /// During a pass the tracker's 4 Hz tick re-dispatches
+    /// `SetVfoOffset(predicted_doppler)` which can disrupt
+    /// QPSK Costas lock (LRPT) and the APT line-rate clock.
+    /// Disabling for the pass duration loses no functional
+    /// value (channel filters absorb the shift) and removes
+    /// a known disruption source. Per silent-fail investigation
+    /// following the NOAA 15 pass.
+    pub doppler_enabled: bool,
 }
 
 /// Side effects the wiring layer must perform on each transition.
@@ -926,6 +940,7 @@ mod tests {
             fm_if_nr_enabled: false,
             deemphasis_idx: 0,
             notch_enabled: false,
+            doppler_enabled: false,
         }
     }
 
@@ -1277,6 +1292,10 @@ mod tests {
             // wiped after the pass.
             deemphasis_idx: 2,
             notch_enabled: true,
+            // pin: pre-AOS Doppler-tracker switch must come
+            // back at LOS so the user's preference survives
+            // the imaging-protocol pass-time disable.
+            doppler_enabled: true,
         };
         // Walk all transitions.
         r.tick(
@@ -1349,6 +1368,11 @@ mod tests {
                 // following the NOAA 15 pass.
                 assert_eq!(t.deemphasis_idx, 2);
                 assert!(t.notch_enabled);
+                // Pre-AOS Doppler tracker enabled likewise
+                // survives the round trip — the user's
+                // preference comes back at LOS even though
+                // AOS forced it off for the pass duration.
+                assert!(t.doppler_enabled);
             }
             other => panic!("expected RestoreTune, got {other:?}"),
         }
