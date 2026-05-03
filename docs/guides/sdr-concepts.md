@@ -24,7 +24,7 @@ something else — bits, scan-lines, packets). The audio output
 plays it. That's the whole signal path. Every panel in this app
 configures one of those stages.
 
-```
+```text
 antenna → tuner → IQ samples → channel filter → demodulator → audio
           [RTL-SDR]            [Radio panel]    [demod dropdown]
 ```
@@ -188,6 +188,17 @@ SDR-RS implements 8 demods:
 - **RAW**: just outputs the IQ as audio. Doesn't sound like
   anything; useful for piping to an external decoder.
 
+There's also a satellite-specialised path that doesn't appear in
+the regular demod dropdown:
+
+- **LRPT** (Low-Rate Picture Transmission): the QPSK digital
+  channel from Meteor-M weather satellites. Not a general-purpose
+  demod — it's a silent passthrough wired by the Satellites
+  panel's auto-record flow when a Meteor pass starts (or via
+  `Ctrl+Shift+L` for manual operation). The 144 kHz channel
+  bandwidth shown later in the table refers to this path; you
+  don't pick "LRPT" from the dropdown the way you pick WFM.
+
 ### How to know which to use
 
 If you're on FM broadcast: WFM. Voice on aviation: AM. Voice on
@@ -319,7 +330,7 @@ Files land under `~/sdr-recordings/` with timestamped names.
 The left sidebar's icon order isn't aesthetic — it's the
 conceptual order of the signal chain:
 
-```
+```text
 General      → choose the source (RTL-SDR / network / file)
 Radio        → choose the demod and audio post-processing
 Audio        → choose the output device

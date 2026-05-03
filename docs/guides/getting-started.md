@@ -63,7 +63,7 @@ get a first signal working.
 
 When the app launches you'll see four regions:
 
-```
+```text
 +=========================================================+
 |  ▶ [ 100.000.000 Hz ]  WFM ▾   ━━━━ vol             ☰  |   ← header bar
 +--+---------------------------+--+--+----------------+--+
