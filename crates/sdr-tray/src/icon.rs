@@ -21,6 +21,13 @@
 //! Total committed bytes across all four sizes: 16 272 (1024 +
 //! 1936 + 4096 + 9216).
 
+/// Bytes per pixel for an ARGB32 buffer: one byte each for the
+/// alpha, red, green, and blue channels (in that order — SNI wire
+/// format). Centralised so the buffer-length math doesn't repeat a
+/// magic `4` literal at each call site. Per CR round 1 on PR #607
+/// (named-constants-for-magic-numbers rule).
+const ARGB32_BYTES_PER_PIXEL: usize = 4;
+
 /// One pre-baked tray-icon size: ksni-ready ARGB32 bytes plus the
 /// width/height ksni's `Icon` constructor takes verbatim. Bytes
 /// are layed out row-major, network-byte-order ARGB32 — the SNI
@@ -32,11 +39,12 @@ struct PreBakedIcon {
 }
 
 impl PreBakedIcon {
-    /// Compile-time assertion that `bytes.len() == width * height *
-    /// 4`. A const-fn returning the icon (rather than a const
-    /// `PreBakedIcon` literal) lets us run the assertion at the
-    /// expression site and produce a clear error message if the
-    /// SVG regen ever drops bytes.
+    /// Compile-time assertion that the buffer length matches
+    /// `width * height * ARGB32_BYTES_PER_PIXEL`. A const-fn
+    /// returning the icon (rather than a const `PreBakedIcon`
+    /// literal) lets us run the assertion at the expression
+    /// site and produce a clear error message if the SVG regen
+    /// ever drops bytes.
     #[allow(
         clippy::cast_sign_loss,
         reason = "width and height are positive icon dimensions \
@@ -45,7 +53,7 @@ impl PreBakedIcon {
     )]
     const fn new(width: i32, height: i32, bytes: &'static [u8]) -> Self {
         assert!(
-            bytes.len() == (width * height * 4) as usize,
+            bytes.len() == (width * height) as usize * ARGB32_BYTES_PER_PIXEL,
             "tray icon byte length must equal width*height*4 — \
              regenerate via scripts/regen-tray-icon.sh",
         );
@@ -94,8 +102,7 @@ const TRAY_ICON_48: PreBakedIcon = PreBakedIcon::new(
 /// matches its requested size best (typically by closest exact
 /// match, with upscaling on a miss). Smallest-first is the SNI
 /// convention.
-const TRAY_ICONS: [&PreBakedIcon; 4] =
-    [&TRAY_ICON_16, &TRAY_ICON_22, &TRAY_ICON_32, &TRAY_ICON_48];
+const TRAY_ICONS: [&PreBakedIcon; 4] = [&TRAY_ICON_16, &TRAY_ICON_22, &TRAY_ICON_32, &TRAY_ICON_48];
 
 /// Returns every pre-baked tray-icon size as `(width, height,
 /// owned ARGB32 bytes)`. Each `Vec<u8>` is a fresh copy per call
@@ -119,7 +126,7 @@ mod tests {
     fn buffer_lengths_match_dimensions() {
         for icon in TRAY_ICONS {
             let expected = usize::try_from(icon.width)
-                .and_then(|w| usize::try_from(icon.height).map(|h| w * h * 4))
+                .and_then(|w| usize::try_from(icon.height).map(|h| w * h * ARGB32_BYTES_PER_PIXEL))
                 .expect("positive icon dimensions fit in usize");
             assert_eq!(
                 icon.bytes.len(),
@@ -138,7 +145,7 @@ mod tests {
     fn every_icon_has_at_least_one_opaque_pixel() {
         for icon in TRAY_ICONS {
             assert!(
-                icon.bytes.chunks(4).any(|p| p[0] != 0),
+                icon.bytes.chunks(ARGB32_BYTES_PER_PIXEL).any(|p| p[0] != 0),
                 "icon {}x{} has zero alpha everywhere — \
                  regenerate via scripts/regen-tray-icon.sh",
                 icon.width,

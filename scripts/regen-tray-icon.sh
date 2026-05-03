@@ -35,6 +35,28 @@ cd "$(dirname "$0")/.."
 SVG=data/com.sdr.rs.svg
 SIZES=(16 22 32 48)
 
+# Preflight: fail fast with a clear message if either rasterizer
+# tool is missing, instead of bombing mid-loop with a less-obvious
+# `command not found` from inside the rsvg-convert / python3
+# pipeline. Per CR round 1 on PR #607.
+if ! command -v rsvg-convert >/dev/null 2>&1; then
+    echo "error: rsvg-convert not found (install librsvg / librsvg2-bin)" >&2
+    exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "error: python3 not found" >&2
+    exit 1
+fi
+if ! python3 - <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+sys.exit(0 if importlib.util.find_spec("PIL") else 1)
+PY
+then
+    echo "error: Python Pillow (PIL) not found (pip install Pillow)" >&2
+    exit 1
+fi
+
 if [[ ! -f $SVG ]]; then
     echo "error: $SVG not found (run from repo root)" >&2
     exit 1
