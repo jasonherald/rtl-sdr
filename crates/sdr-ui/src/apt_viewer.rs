@@ -724,6 +724,16 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         .transient_for(parent)
         .modal(false)
         .build();
+    // Link to the GApplication (inherited from the parent
+    // `AdwApplicationWindow`) so Wayland compositors set this
+    // toplevel's `app_id` to `com.sdr.rs`. Without it the WM
+    // falls back to the bare `gtk` app_id and can't resolve
+    // our icon — even though `transient_for` ties our window
+    // to the main one for stacking, the icon-lookup path uses
+    // app_id, not the parent link. `set_application` is a
+    // no-op when the parent has no application set (only true
+    // in tests / no-display contexts).
+    window.set_application(parent.application().as_ref());
 
     let header = adw::HeaderBar::new();
 

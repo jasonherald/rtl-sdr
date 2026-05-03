@@ -43,6 +43,17 @@ pub fn build_app_with_options(start_hidden: bool) -> adw::Application {
             icon_theme.add_search_path("data");
         }
 
+        // Default every window the app creates to the app icon.
+        // Without this the WM/compositor only ties the main
+        // `AdwApplicationWindow` to `com.sdr.rs` (via the matching
+        // `application_id`); the satellite-image viewers (APT /
+        // LRPT / SSTV) and the ACARS log viewer use bare
+        // `adw::Window::builder()` and otherwise show up in the
+        // window list / task switcher with the default fallback
+        // icon. `set_default_icon_name` covers existing AND
+        // future windows without per-builder churn.
+        gtk4::Window::set_default_icon_name(APP_ID);
+
         // Periodically trim the glibc heap to return freed pages
         // to the OS.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
