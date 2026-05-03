@@ -653,6 +653,109 @@ public final class SdrCore: @unchecked Sendable {
         })
     }
 
+    /// One scanner channel for `setScannerChannels`. Owned-Swift
+    /// shape so callers can build the array without managing C
+    /// memory; the wrapper handles the `withCString` /
+    /// `withUnsafeBufferPointer` lifetime dance internally.
+    ///
+    /// `priority`: `0` = normal rotation, `>= 1` = priority
+    /// (matches the engine `ScannerChannel.priority` semantics).
+    /// `dwellMs` / `hangMs` are the host-resolved timings (the
+    /// caller has already folded any per-bookmark override on
+    /// top of the scanner default).
+    ///
+    /// CTCSS / voice-squelch overrides are not part of this
+    /// v1 surface — neither has a Mac UI yet. They land at the
+    /// tail of the C struct in a future minor bump.
+    public struct ScannerChannel: Sendable {
+        public var name: String
+        public var frequencyHz: UInt64
+        public var demodMode: DemodMode
+        public var bandwidthHz: Double
+        public var priority: UInt8
+        public var dwellMs: UInt32
+        public var hangMs: UInt32
+
+        public init(
+            name: String,
+            frequencyHz: UInt64,
+            demodMode: DemodMode,
+            bandwidthHz: Double,
+            priority: UInt8 = 0,
+            dwellMs: UInt32,
+            hangMs: UInt32
+        ) {
+            self.name = name
+            self.frequencyHz = frequencyHz
+            self.demodMode = demodMode
+            self.bandwidthHz = bandwidthHz
+            self.priority = priority
+            self.dwellMs = dwellMs
+            self.hangMs = hangMs
+        }
+    }
+
+    /// Replace the scanner's channel list with the host's
+    /// projection of scan-enabled bookmarks. Pass an empty
+    /// array to clear — the scanner drops its rotation set
+    /// and settles to `.idle` on the next state tick.
+    ///
+    /// Per-entry validation lives on the Rust side: invalid
+    /// UTF-8 names, unknown demod modes, non-positive
+    /// bandwidths all throw `SdrCoreError.invalidArg` before
+    /// any DSP dispatch happens.
+    ///
+    /// The names are borrowed for the call's duration via
+    /// nested `withCString`s; the engine clones each into its
+    /// own `String` before this method returns, so the
+    /// `[ScannerChannel]` argument can be discarded immediately.
+    public func setScannerChannels(_ channels: [ScannerChannel]) throws {
+        if channels.isEmpty {
+            try checkRc(sdr_core_update_scanner_channels(handle, nil, 0))
+            return
+        }
+        // Build a parallel array of `Data` holding NUL-terminated
+        // UTF-8 bytes — gives us a stable pointer per name that
+        // we can hand into `SdrScannerChannel.name_utf8`. The
+        // pointers stay valid for the duration of the
+        // `withUnsafeBufferPointer` block below; the FFI clones
+        // each name into the engine's owned `String` before
+        // returning.
+        let nameBuffers: [[CChar]] = channels.map { ch in
+            // `Array(ch.name.utf8) + [0]` builds a NUL-
+            // terminated UTF-8 byte array; reinterpret as
+            // `CChar` (signed on macOS x86_64 / ARM, matching
+            // `c_char` on the Rust side).
+            ch.name.utf8CString.map { CChar($0) }
+        }
+        try nameBuffers.withUnsafeBufferPointer { (nameBufsPtr: UnsafeBufferPointer<[CChar]>) in
+            // Build the C array on the stack (well, on the heap
+            // via Array's storage, but lifetime-bound to this
+            // closure). Each `name_utf8` points into the
+            // matching `nameBuffers[i]` storage, valid for the
+            // duration of the FFI call.
+            var cChannels: [SdrScannerChannel] = []
+            cChannels.reserveCapacity(channels.count)
+            for (idx, ch) in channels.enumerated() {
+                let namePtr = nameBufsPtr[idx].withUnsafeBufferPointer { $0.baseAddress }
+                cChannels.append(SdrScannerChannel(
+                    name_utf8: namePtr,
+                    frequency_hz: ch.frequencyHz,
+                    demod_mode: ch.demodMode.rawValue,
+                    bandwidth_hz: ch.bandwidthHz,
+                    priority: ch.priority,
+                    dwell_ms: ch.dwellMs,
+                    hang_ms: ch.hangMs
+                ))
+            }
+            try cChannels.withUnsafeBufferPointer { cPtr in
+                try checkRc(sdr_core_update_scanner_channels(
+                    handle, cPtr.baseAddress, cPtr.count
+                ))
+            }
+        }
+    }
+
     // ==========================================================
     //  Config — ABI 0.21, issue #449. Round-trips against the
     //  shared `sdr-config` JSON file passed to the engine at

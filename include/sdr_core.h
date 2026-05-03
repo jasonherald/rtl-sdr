@@ -56,8 +56,35 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 21
+#define SDR_CORE_ABI_VERSION_MINOR 22
 /*
+ * 0.22 — exposes the scanner channel-list projection
+ * (`UiToDsp::UpdateScannerChannels`) at the FFI boundary so the
+ * macOS SwiftUI scanner panel finally has channels to rotate
+ * through — completes the half-wired surface from ABI 0.20
+ * (issue #447). Pairs with the macOS bookmarks layer growing
+ * `scan_enabled` / `priority` fields under issue #490.
+ *
+ * Additive surface (existing struct layouts and enum values
+ * unchanged):
+ *   - New struct `SdrScannerChannel` carrying name + freq +
+ *     demod + bandwidth + priority + dwell + hang. Reuses the
+ *     existing `SdrDemodMode` discriminants for the
+ *     `demod_mode` field. CTCSS / voice-squelch overrides
+ *     are not surfaced in this v1 — neither has a Mac UI yet,
+ *     and both grow at the tail of this struct in a future
+ *     minor bump when those panels ship.
+ *   - New command `sdr_core_update_scanner_channels(handle,
+ *     channels, count)`. Pass `channels = NULL, count = 0` to
+ *     clear the rotation; non-null + non-zero replaces the
+ *     full channel set. Each entry is validated (UTF-8 name,
+ *     known demod, finite + positive bandwidth) before the
+ *     dispatch reaches the DSP thread, so a bad host call
+ *     can't poison the engine's state.
+ *
+ * Pre-1.0 minor bumps are breaking by project convention — old
+ * 0.21 hosts must fail fast on the exact-match ABI check.
+ *
  * 0.21 — exposes the shared `sdr-config` JSON file at the FFI
  * boundary so the macOS SwiftUI host can round-trip sidebar
  * session state (#449) and other settings against the same
@@ -1695,6 +1722,69 @@ int32_t sdr_core_unlock_scanner_channel(
     SdrCore*    handle,
     const char* name_utf8,
     uint64_t    frequency_hz
+);
+
+/* --- Scanner channel-list projection (issue #490, ABI 0.22) --- */
+
+/*
+ * One entry in the array passed to
+ * `sdr_core_update_scanner_channels`. Each entry describes a
+ * fully-resolved scanner channel: name + freq for identity
+ * (`ChannelKey`), demod / bandwidth for the retune target, and
+ * the host-resolved dwell / hang timings (per-bookmark
+ * overrides folded onto the scanner default).
+ *
+ * `name_utf8` is borrowed for the duration of the call; the
+ * engine clones the bytes into its owned `String` before
+ * returning, so the host's storage can be freed/reused
+ * immediately.
+ *
+ * `demod_mode` reuses the existing `SdrDemodMode` discriminants
+ * (defined further up the header, near `sdr_core_set_demod_mode`).
+ *
+ * `priority` follows the `sdr_scanner::ScannerChannel.priority`
+ * convention: `0` = normal rotation, `>= 1` = priority tier
+ * (checked more often by the state machine).
+ *
+ * CTCSS / voice-squelch overrides are intentionally not part of
+ * this v1 surface — neither has a Mac UI yet. When those panels
+ * ship, the surface grows at the tail of this struct (additive
+ * minor bump).
+ */
+typedef struct SdrScannerChannel {
+    const char* name_utf8;
+    uint64_t    frequency_hz;
+    int32_t     demod_mode;
+    double      bandwidth_hz;
+    uint8_t     priority;
+    uint32_t    dwell_ms;
+    uint32_t    hang_ms;
+} SdrScannerChannel;
+
+/*
+ * Replace the scanner's channel list. Routes to
+ * `UiToDsp::UpdateScannerChannels`. Pass `channels = NULL` +
+ * `count = 0` to clear — the scanner drops its rotation set
+ * and settles to `Idle` on the next state tick.
+ *
+ * Per-entry validation: rejects null `name_utf8`, non-UTF-8
+ * names, unknown `demod_mode`, and non-finite or non-positive
+ * `bandwidth_hz` with `SDR_CORE_ERR_INVALID_ARG` before any
+ * dispatch reaches the DSP thread.
+ *
+ * `channels = NULL` with `count > 0` is rejected as InvalidArg.
+ * `channels != NULL` with `count == 0` is also rejected — the
+ * pointer-vs-count consistency check catches a buggy host with
+ * a stale pointer.
+ *
+ * Concurrency: the call walks the `count`-element array on the
+ * caller's thread and sends an owned `Vec` across the DSP mpsc
+ * channel; safe from any thread.
+ */
+int32_t sdr_core_update_scanner_channels(
+    SdrCore*                 handle,
+    const SdrScannerChannel* channels,
+    size_t                   count
 );
 
 /* --- Config — shared `sdr-config` JSON (issue #449, ABI 0.21) --- */
