@@ -11036,6 +11036,17 @@ fn connect_satellites_panel(
         // following the NOAA 15 pass.
         let deemphasis_row_a = panels.radio.deemphasis_row.clone();
         let notch_enabled_row_a = panels.radio.notch_enabled_row.clone();
+        // Doppler tracker master switch — also disabled at AOS for
+        // the duration of an imaging-protocol pass. The 4 Hz tick
+        // re-dispatches `SetVfoOffset(predicted_doppler)` which
+        // can disrupt QPSK Costas lock (LRPT) and APT's line-rate
+        // clock. The ±3.5 kHz worst-case Doppler shift at 137 MHz
+        // / 145 MHz is well inside all three imaging-protocol
+        // channel filters (APT 38 kHz, LRPT 144 kHz, SSTV
+        // 12.5 kHz), so disabling for the pass loses no functional
+        // value. Per silent-fail investigation following the
+        // NOAA 15 pass.
+        let doppler_switch_a = panels.satellites.doppler_switch.clone();
         // Composite-save toggle — read at LOS by the
         // `SaveLrptPass` handler. Strong clone so the closure
         // doesn't need to upgrade a weak ref against panel
@@ -11204,6 +11215,17 @@ fn connect_satellites_panel(
                     // value via the same notify chain.
                     if notch_enabled_row_a.is_active() {
                         notch_enabled_row_a.set_active(false);
+                    }
+                    // Doppler tracker: 4 Hz `SetVfoOffset` ticks can
+                    // disrupt QPSK Costas lock and the APT line-rate
+                    // clock. The ±3.5 kHz worst-case shift fits
+                    // inside every imaging-protocol channel filter,
+                    // so disabling for the pass loses no functional
+                    // value and removes a known disruption source.
+                    // Per silent-fail investigation following the
+                    // NOAA 15 pass.
+                    if doppler_switch_a.is_active() {
+                        doppler_switch_a.set_active(false);
                     }
                 };
                 match protocol {
@@ -12172,6 +12194,15 @@ fn connect_satellites_panel(
                 if saved.notch_enabled != notch_enabled_row_a.is_active() {
                     notch_enabled_row_a.set_active(saved.notch_enabled);
                 }
+                // Doppler tracker — restore the user's pre-AOS
+                // master-switch preference. The AOS-side
+                // `force_audio_chain_off` flipped it off for the
+                // pass; this brings it back so the next pass (if
+                // they have Doppler on as their default) gets
+                // automatic correction again.
+                if saved.doppler_enabled != doppler_switch_a.is_active() {
+                    doppler_switch_a.set_active(saved.doppler_enabled);
+                }
                 // Re-arm the scanner if it was running pre-AOS.
                 // The AOS-side `tune_a` call goes through
                 // `tune_to_satellite`, which fires
@@ -12255,6 +12286,11 @@ fn connect_satellites_panel(
         // to their pre-AOS values.
         let deemphasis_row_tick = panels.radio.deemphasis_row.clone();
         let notch_enabled_row_tick = panels.radio.notch_enabled_row.clone();
+        // Doppler tracker master switch — also force-disabled at
+        // AOS for the duration of an imaging-protocol pass.
+        // Snapshotted here so the LOS restore path can return
+        // the user's pre-AOS preference.
+        let doppler_switch_tick = panels.satellites.doppler_switch.clone();
         let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
             let Some(panel) = panel_weak_tick.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -12320,6 +12356,7 @@ fn connect_satellites_panel(
                 fm_if_nr_enabled: fm_if_nr_row_tick.is_active(),
                 deemphasis_idx: deemphasis_row_tick.selected(),
                 notch_enabled: notch_enabled_row_tick.is_active(),
+                doppler_enabled: doppler_switch_tick.is_active(),
             };
             // Read the user's selected quality tier on every
             // tick — cheap (just a ComboRow.selected() call), and
