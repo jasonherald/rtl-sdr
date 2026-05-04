@@ -33,6 +33,19 @@ final class BookmarksStore {
     /// `SDRMacApp.defaultBookmarksPath()`.
     private let storagePath: URL
 
+    /// Fires after every successful `save()` (i.e., after any
+    /// add / remove / update / move / scan-toggle / priority-
+    /// toggle). The scene wires this to
+    /// `CoreModel.refreshScannerChannels()` so the engine's
+    /// scanner rotation tracks the bookmark list automatically.
+    /// Per #490.
+    ///
+    /// Stored as a closure rather than reaching into `CoreModel`
+    /// directly so this store stays decoupled from the engine —
+    /// makes the unit tests on the JSON round-trip / mutation
+    /// paths trivial without needing a `CoreModel` fixture.
+    var onChanged: (() -> Void)?
+
     init(storagePath: URL) {
         self.storagePath = storagePath
         load()
@@ -62,6 +75,28 @@ final class BookmarksStore {
 
     func move(fromOffsets source: IndexSet, toOffset destination: Int) {
         bookmarks.move(fromOffsets: source, toOffset: destination)
+        save()
+    }
+
+    /// Toggle a bookmark's `scanEnabled` flag in place. Doesn't
+    /// touch `updatedAt` — the timestamp tracks tuning-state
+    /// edits (frequency, demod, etc.), and a scanner-membership
+    /// flip isn't that. Avoids gratuitous re-sorts on the
+    /// flyout's "recent" view. Per #490.
+    func setScanEnabled(id: UUID, enabled: Bool) {
+        guard let i = bookmarks.firstIndex(where: { $0.id == id }) else { return }
+        bookmarks[i].scanEnabled = enabled
+        save()
+    }
+
+    /// Toggle a bookmark's priority tier — `true` writes `1`,
+    /// `false` clears to `nil` (so the JSON omits the key for
+    /// never-promoted bookmarks, matching the Linux serde
+    /// default shape). Same `updatedAt`-untouched policy as
+    /// `setScanEnabled` above. Per #490.
+    func setPriorityEnabled(id: UUID, enabled: Bool) {
+        guard let i = bookmarks.firstIndex(where: { $0.id == id }) else { return }
+        bookmarks[i].priorityEnabled = enabled
         save()
     }
 
@@ -107,6 +142,17 @@ final class BookmarksStore {
             try data.write(to: storagePath, options: .atomic)
         } catch {
             bookmarksLog.error("Failed to save bookmarks: \(error.localizedDescription)")
+            // Don't fire `onChanged` on a failed save —
+            // pushing scanner channels based on state that
+            // never made it to disk would leave the engine
+            // and `bookmarks.json` divergent until the next
+            // successful save (or a relaunch, where the load
+            // path would silently revert the engine to the
+            // last-on-disk state). Better to skip the
+            // notification and let the next mutation try
+            // again. Per `CodeRabbit` round 1 on PR #615.
+            return
         }
+        onChanged?()
     }
 }

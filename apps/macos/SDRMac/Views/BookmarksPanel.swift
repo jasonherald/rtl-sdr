@@ -407,6 +407,59 @@ struct BookmarkListRow: View {
             }
             .buttonStyle(.plain)
 
+            // Trailing scanner participation toggles — per
+            // #490 / Linux PR #375. Two icon-only buttons:
+            // "Scan" (radiowaves) opts the bookmark into
+            // scanner rotation; "Priority" (star) bumps it
+            // into the priority tier so the scanner state
+            // machine checks it more often. Both fields
+            // round-trip through `bookmarks.json` with
+            // matching Linux schema keys.
+            //
+            // Filled / outlined glyph is the "on / off" cue;
+            // colored fill on "on" matches the existing
+            // active-bookmark checkmark style above so the
+            // row's visual language stays consistent. Each
+            // button has both `.help` and
+            // `.accessibilityLabel` per the icon-only-button
+            // convention (PR #361 round 1).
+            Button {
+                let on = !(bookmark.scanEnabled ?? false)
+                store.setScanEnabled(id: bookmark.id, enabled: on)
+            } label: {
+                Image(systemName: (bookmark.scanEnabled ?? false)
+                    ? "radiowaves.left"
+                    : "radiowaves.left")
+                    .symbolVariant((bookmark.scanEnabled ?? false) ? .fill : .none)
+                    .foregroundStyle((bookmark.scanEnabled ?? false)
+                        ? Color.accentColor
+                        : .secondary)
+            }
+            .buttonStyle(.borderless)
+            .help((bookmark.scanEnabled ?? false)
+                ? "Remove from scanner rotation"
+                : "Add to scanner rotation")
+            .accessibilityLabel((bookmark.scanEnabled ?? false)
+                ? "Scanner enabled"
+                : "Scanner disabled")
+
+            Button {
+                store.setPriorityEnabled(id: bookmark.id,
+                                         enabled: !bookmark.priorityEnabled)
+            } label: {
+                Image(systemName: bookmark.priorityEnabled ? "star.fill" : "star")
+                    .foregroundStyle(bookmark.priorityEnabled
+                        ? Color.accentColor
+                        : .secondary)
+            }
+            .buttonStyle(.borderless)
+            .help(bookmark.priorityEnabled
+                ? "Remove priority"
+                : "Mark as priority channel")
+            .accessibilityLabel(bookmark.priorityEnabled
+                ? "Priority channel"
+                : "Normal priority")
+
             // Trailing per-row delete. Icon-only so it doesn't
             // crowd the row, with both a tooltip AND an
             // accessibility label — PR #361 round 1 flagged

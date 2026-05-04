@@ -1281,6 +1281,159 @@ pub unsafe extern "C" fn sdr_core_unlock_scanner_channel(
     }
 }
 
+// ============================================================
+//  Scanner channel projection — #490 / ABI 0.22
+// ============================================================
+//
+//  The scanner state machine only rotates through channels
+//  pushed via `UiToDsp::UpdateScannerChannels`. The Linux UI
+//  builds these from each `Bookmark` row that has
+//  `scan_enabled = true`, folding per-bookmark dwell/hang
+//  overrides on top of the UI-side defaults; this FFI command
+//  exposes the same projection path to non-Rust hosts. Per
+//  #490, paired with the macOS `BookmarksStore`'s scan +
+//  priority toggles.
+
+/// C-layout mirror of `sdr_scanner::ScannerChannel` for the
+/// `sdr_core_update_scanner_channels` array argument. Each
+/// channel is identified by `(name_utf8, frequency_hz)` —
+/// matches the engine's `ChannelKey` shape — plus the
+/// retune-time tuning fields and the resolved dwell/hang
+/// timings the host folded from per-bookmark overrides.
+///
+/// CTCSS / voice-squelch overrides are intentionally not
+/// part of this v1 surface — neither has a Mac UI yet, and
+/// representing `Option<CtcssMode>` / `Option<VoiceSquelchMode>`
+/// at the C boundary would require adding two more enums to
+/// the header. When those Mac panels ship, the surface grows
+/// at the tail of this struct (additive, ABI minor bump).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SdrScannerChannel {
+    /// Bookmark name — borrowed for the duration of the
+    /// `sdr_core_update_scanner_channels` call. The engine
+    /// copies the bytes into its own `String` before returning,
+    /// so the host's storage can be freed/reused immediately.
+    pub name_utf8: *const c_char,
+    /// Channel frequency in Hz.
+    pub frequency_hz: u64,
+    /// Demod mode. Discriminant matches the existing
+    /// `SdrDemodMode` enum already in the header.
+    pub demod_mode: i32,
+    /// Channel filter bandwidth in Hz.
+    pub bandwidth_hz: f64,
+    /// Priority tier — `0` = normal, `>= 1` = priority.
+    pub priority: u8,
+    /// Resolved dwell time (ms) — the host has folded any
+    /// per-channel override on top of the scanner default
+    /// before pushing.
+    pub dwell_ms: u32,
+    /// Resolved hang time (ms) — same projection contract as
+    /// `dwell_ms`.
+    pub hang_ms: u32,
+}
+
+/// Replace the scanner's channel list. Routes to
+/// `UiToDsp::UpdateScannerChannels`. Pass an empty list
+/// (`channels = NULL` + `count = 0`) to clear — the scanner
+/// drops its rotation set and settles to `Idle` on the next
+/// state tick. Per #490 (ABI 0.22).
+///
+/// `channels` may be null only when `count == 0`. Non-null
+/// `channels` with `count == 0` is rejected as `InvalidArg`.
+/// Each entry's `name_utf8` must be a valid NUL-terminated
+/// UTF-8 string for the duration of the call; the engine
+/// clones it.
+///
+/// # Safety
+///
+/// `handle` must be either null or a pointer previously
+/// returned by `sdr_core_create`. `channels` must be either
+/// null (with `count == 0`) or a pointer to `count`
+/// contiguous `SdrScannerChannel` records, each with a valid
+/// `name_utf8` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sdr_core_update_scanner_channels(
+    handle: *mut SdrCore,
+    channels: *const SdrScannerChannel,
+    count: usize,
+) -> i32 {
+    unsafe {
+        with_core(handle, |core| {
+            // Empty list → clear path. Both NULL+0 and
+            // non-NULL+0 ARE technically callable, but we
+            // require pointer-vs-count consistency so a buggy
+            // host with `count = 0` and a stale pointer can't
+            // mask the off-by-one against this surface.
+            if count == 0 {
+                if !channels.is_null() {
+                    set_last_error(
+                        "sdr_core_update_scanner_channels: count is 0 but channels is non-null",
+                    );
+                    return Err(SdrCoreError::InvalidArg);
+                }
+                send(core, UiToDsp::UpdateScannerChannels(Vec::new()))?;
+                return Ok(());
+            }
+            if channels.is_null() {
+                set_last_error("sdr_core_update_scanner_channels: channels is null but count > 0");
+                return Err(SdrCoreError::InvalidArg);
+            }
+            // SAFETY: caller contract — `count` contiguous
+            // records starting at `channels`.
+            let raw_slice = std::slice::from_raw_parts(channels, count);
+            let mut owned: Vec<sdr_scanner::ScannerChannel> = Vec::with_capacity(count);
+            for (idx, c) in raw_slice.iter().enumerate() {
+                if c.name_utf8.is_null() {
+                    set_last_error(format!(
+                        "sdr_core_update_scanner_channels: channel[{idx}].name_utf8 is null"
+                    ));
+                    return Err(SdrCoreError::InvalidArg);
+                }
+                let cstr = std::ffi::CStr::from_ptr(c.name_utf8);
+                let Ok(name) = cstr.to_str() else {
+                    set_last_error(format!(
+                        "sdr_core_update_scanner_channels: channel[{idx}].name_utf8 is not valid UTF-8"
+                    ));
+                    return Err(SdrCoreError::InvalidArg);
+                };
+                let Some(demod) = demod_mode_from_c(c.demod_mode) else {
+                    set_last_error(format!(
+                        "sdr_core_update_scanner_channels: channel[{idx}].demod_mode unknown ({})",
+                        c.demod_mode
+                    ));
+                    return Err(SdrCoreError::InvalidArg);
+                };
+                if !c.bandwidth_hz.is_finite() || c.bandwidth_hz <= 0.0 {
+                    set_last_error(format!(
+                        "sdr_core_update_scanner_channels: channel[{idx}].bandwidth_hz must be finite and positive, got {}",
+                        c.bandwidth_hz
+                    ));
+                    return Err(SdrCoreError::InvalidArg);
+                }
+                owned.push(sdr_scanner::ScannerChannel {
+                    key: sdr_scanner::ChannelKey {
+                        name: name.to_owned(),
+                        frequency_hz: c.frequency_hz,
+                    },
+                    demod_mode: demod,
+                    bandwidth: c.bandwidth_hz,
+                    // CTCSS / voice-squelch overrides are not
+                    // surfaced via this v1 FFI struct; both are
+                    // None for the Mac path until the matching
+                    // panels ship.
+                    ctcss: None,
+                    voice_squelch: None,
+                    priority: c.priority,
+                    dwell_ms: c.dwell_ms,
+                    hang_ms: c.hang_ms,
+                });
+            }
+            send(core, UiToDsp::UpdateScannerChannels(owned))
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -2573,6 +2726,163 @@ mod tests {
             unsafe { sdr_core_set_scanner_enabled(h, false) },
             SdrCoreError::Ok.as_int()
         );
+        destroy(h);
+    }
+
+    // ------------------------------------------------------
+    //  update_scanner_channels — ABI 0.22, issue #490
+    // ------------------------------------------------------
+
+    /// Fixture bandwidth used by the channel-projection tests.
+    /// 12.5 kHz is the canonical NFM voice channel width and
+    /// matches the `bandwidth` field on the actual NOAA-Weather
+    /// fixture name in use elsewhere in this module.
+    const TEST_SCANNER_BW_HZ: f64 = 12_500.0;
+    /// Fixture dwell — ms the host would resolve from the
+    /// scanner's default-dwell setting once per-bookmark
+    /// overrides are folded in. Just needs to be a finite,
+    /// realistic value for the projection-side tests.
+    const TEST_SCANNER_DWELL_MS: u32 = 100;
+    /// Fixture hang — same rationale as `TEST_SCANNER_DWELL_MS`.
+    const TEST_SCANNER_HANG_MS: u32 = 2_000;
+
+    #[test]
+    fn update_scanner_channels_rejects_null_handle() {
+        assert_eq!(
+            unsafe { sdr_core_update_scanner_channels(std::ptr::null_mut(), std::ptr::null(), 0) },
+            SdrCoreError::InvalidHandle.as_int()
+        );
+    }
+
+    #[test]
+    fn update_scanner_channels_empty_clears_rotation() {
+        // The empty-list path is how a host clears the
+        // scanner's rotation (e.g., user toggled scan_enabled
+        // off on every bookmark). Both null+0 callable; the
+        // engine accepts the empty Vec and the state machine
+        // settles to Idle on the next tick.
+        let h = make_handle();
+        assert_eq!(
+            unsafe { sdr_core_update_scanner_channels(h, std::ptr::null(), 0) },
+            SdrCoreError::Ok.as_int()
+        );
+        destroy(h);
+    }
+
+    #[test]
+    fn update_scanner_channels_count_zero_with_nonnull_pointer_is_invalid() {
+        // Catch a buggy host that has `count = 0` and a stale
+        // pointer — refuse rather than silently accept, so the
+        // off-by-one is caught at the boundary.
+        let h = make_handle();
+        let name = CString::new("Test").unwrap();
+        let ch = SdrScannerChannel {
+            name_utf8: name.as_ptr(),
+            frequency_hz: TEST_SCANNER_FREQ_HZ,
+            demod_mode: SDR_DEMOD_NFM,
+            bandwidth_hz: TEST_SCANNER_BW_HZ,
+            priority: 0,
+            dwell_ms: TEST_SCANNER_DWELL_MS,
+            hang_ms: TEST_SCANNER_HANG_MS,
+        };
+        let rc = unsafe { sdr_core_update_scanner_channels(h, &raw const ch, 0) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+        destroy(h);
+    }
+
+    #[test]
+    fn update_scanner_channels_null_pointer_with_count_is_invalid() {
+        let h = make_handle();
+        let rc = unsafe { sdr_core_update_scanner_channels(h, std::ptr::null(), 1) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+        destroy(h);
+    }
+
+    #[test]
+    fn update_scanner_channels_rejects_null_name_in_entry() {
+        let h = make_handle();
+        let ch = SdrScannerChannel {
+            name_utf8: std::ptr::null(),
+            frequency_hz: TEST_SCANNER_FREQ_HZ,
+            demod_mode: SDR_DEMOD_NFM,
+            bandwidth_hz: TEST_SCANNER_BW_HZ,
+            priority: 0,
+            dwell_ms: TEST_SCANNER_DWELL_MS,
+            hang_ms: TEST_SCANNER_HANG_MS,
+        };
+        let rc = unsafe { sdr_core_update_scanner_channels(h, &raw const ch, 1) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+        destroy(h);
+    }
+
+    #[test]
+    fn update_scanner_channels_rejects_unknown_demod_mode() {
+        let h = make_handle();
+        let name = CString::new("Test").unwrap();
+        let ch = SdrScannerChannel {
+            name_utf8: name.as_ptr(),
+            frequency_hz: TEST_SCANNER_FREQ_HZ,
+            demod_mode: 99, // out of range — no `SDR_DEMOD_*` matches.
+            bandwidth_hz: TEST_SCANNER_BW_HZ,
+            priority: 0,
+            dwell_ms: TEST_SCANNER_DWELL_MS,
+            hang_ms: TEST_SCANNER_HANG_MS,
+        };
+        let rc = unsafe { sdr_core_update_scanner_channels(h, &raw const ch, 1) };
+        assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+        destroy(h);
+    }
+
+    #[test]
+    fn update_scanner_channels_rejects_non_positive_bandwidth() {
+        let h = make_handle();
+        let name = CString::new("Test").unwrap();
+        for bad_bw in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let ch = SdrScannerChannel {
+                name_utf8: name.as_ptr(),
+                frequency_hz: TEST_SCANNER_FREQ_HZ,
+                demod_mode: SDR_DEMOD_NFM,
+                bandwidth_hz: bad_bw,
+                priority: 0,
+                dwell_ms: TEST_SCANNER_DWELL_MS,
+                hang_ms: TEST_SCANNER_HANG_MS,
+            };
+            let rc = unsafe { sdr_core_update_scanner_channels(h, &raw const ch, 1) };
+            assert_eq!(rc, SdrCoreError::InvalidArg.as_int());
+        }
+        destroy(h);
+    }
+
+    #[test]
+    fn update_scanner_channels_happy_path_round_trip() {
+        // Two channels — one normal, one priority. Confirms
+        // the slice walk + dispatch round-trips for a typical
+        // host call.
+        let h = make_handle();
+        let name_a = CString::new("NOAA Weather").unwrap();
+        let name_b = CString::new("FRS Ch 1").unwrap();
+        let channels = [
+            SdrScannerChannel {
+                name_utf8: name_a.as_ptr(),
+                frequency_hz: TEST_SCANNER_FREQ_HZ,
+                demod_mode: SDR_DEMOD_NFM,
+                bandwidth_hz: TEST_SCANNER_BW_HZ,
+                priority: 1, // priority tier
+                dwell_ms: TEST_SCANNER_DWELL_MS,
+                hang_ms: TEST_SCANNER_HANG_MS,
+            },
+            SdrScannerChannel {
+                name_utf8: name_b.as_ptr(),
+                frequency_hz: 462_562_500,
+                demod_mode: SDR_DEMOD_NFM,
+                bandwidth_hz: TEST_SCANNER_BW_HZ,
+                priority: 0,
+                dwell_ms: TEST_SCANNER_DWELL_MS,
+                hang_ms: TEST_SCANNER_HANG_MS,
+            },
+        ];
+        let rc = unsafe { sdr_core_update_scanner_channels(h, channels.as_ptr(), channels.len()) };
+        assert_eq!(rc, SdrCoreError::Ok.as_int());
         destroy(h);
     }
 }

@@ -37,6 +37,31 @@ struct SDRMacApp: App {
                     // driver reaching into a nil core.
                     transcription.attach(core: core)
                     appDelegate.model = core
+                    // Wire scanner-channel projection (#490).
+                    // CoreModel pulls the current bookmark list
+                    // via this provider on every projection
+                    // tick; BookmarksStore notifies on every
+                    // save so the engine's rotation stays in
+                    // sync with the user's scan/priority
+                    // toggles + adds + deletes.
+                    //
+                    // `[weak bookmarks]` / `[weak core]` avoids
+                    // a strong reference cycle even though both
+                    // are scene-owned `@State` for the app's
+                    // lifetime — defensive against a future
+                    // refactor that scopes either differently.
+                    core.bookmarksProvider = { [weak bookmarks] in
+                        bookmarks?.bookmarks ?? []
+                    }
+                    bookmarks.onChanged = { [weak core] in
+                        core?.refreshScannerChannels()
+                    }
+                    // Initial sync: a previously-saved scan-
+                    // enabled bookmark should reach the engine
+                    // before the user touches anything, so the
+                    // scanner master switch behaves correctly
+                    // from the first toggle.
+                    core.refreshScannerChannels()
                 }
         }
         .windowToolbarStyle(.unified)
