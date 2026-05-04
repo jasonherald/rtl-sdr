@@ -52,6 +52,39 @@ public enum DemodMode: Int32, Sendable, CaseIterable, Codable {
         default: return nil
         }
     }
+
+    /// Default channel bandwidth in Hz for this mode. Mirrors
+    /// the `*_DEFAULT_BANDWIDTH` constants in
+    /// `crates/sdr-radio/src/demod/<mode>.rs` exactly so a UI
+    /// "reset to mode default" affordance lands at the same
+    /// width the engine would use on a fresh demod open.
+    ///
+    /// The Linux side calls `default_bandwidth_for_mode` in
+    /// `sdr-radio` for the same answer; on the Mac path #488
+    /// chose to keep this Swift-side instead of plumbing
+    /// another FFI command — the table is small, the values
+    /// are stable engine constants (changing one is a
+    /// deliberate cross-frontend act, not a frequent thing),
+    /// and skipping the FFI hop keeps the Reset-VFO button's
+    /// pre-condition check synchronous.
+    ///
+    /// **Cross-frontend invariant:** if a Rust-side
+    /// `*_DEFAULT_BANDWIDTH` ever moves, this table needs the
+    /// matching update or the Mac reset button will mis-click.
+    /// A Linux test pins the Rust constants individually, so
+    /// drift is loud.
+    public var defaultBandwidthHz: Double {
+        switch self {
+        case .wfm: return 150_000   // crates/sdr-radio/src/demod/wfm.rs
+        case .nfm: return 12_500    // crates/sdr-radio/src/demod/nfm.rs
+        case .am:  return 10_000    // crates/sdr-radio/src/demod/am.rs
+        case .usb: return 2_800     // crates/sdr-radio/src/demod/usb.rs
+        case .lsb: return 2_800     // crates/sdr-radio/src/demod/lsb.rs
+        case .dsb: return 4_600     // crates/sdr-radio/src/demod/dsb.rs
+        case .cw:  return 200       // crates/sdr-radio/src/demod/cw.rs
+        case .raw: return 48_000    // crates/sdr-radio/src/demod/raw.rs
+        }
+    }
 }
 
 /// FM de-emphasis mode. Matches `SdrDeemphasis` in the C header.

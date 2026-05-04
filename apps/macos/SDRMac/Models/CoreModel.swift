@@ -1187,6 +1187,34 @@ final class CoreModel {
                 // panel sync; nothing extra here.
                 break
             }
+        case .vfoOffsetChanged(let hz):
+            // Engine-authoritative VFO offset. Fires for host-
+            // initiated `setVfoOffset` commands AND engine-
+            // internal resets (scanner retune to a new
+            // channel, future per-VFO controls). Update the
+            // observable field directly so the spectrum
+            // overlay + the Reset VFO button visibility track
+            // engine truth without polling. Per #488.
+            //
+            // Skip the write when the value already matches —
+            // the optimistic local update inside
+            // `setVfoOffset` would otherwise loop the field
+            // through one redundant @Observable invalidation
+            // on every drag tick.
+            if vfoOffsetHz != hz {
+                vfoOffsetHz = hz
+            }
+        case .bandwidthChanged(let hz):
+            // Symmetric with `vfoOffsetChanged` above —
+            // engine-authoritative bandwidth, fires for host
+            // commands AND engine-internal changes (scanner
+            // retune to a channel with a different bandwidth,
+            // future per-mode auto-pick). Same same-value
+            // guard rationale. Per `CodeRabbit` round 1 on
+            // PR #616.
+            if bandwidthHz != hz {
+                bandwidthHz = hz
+            }
         @unknown default:
             // Surface new engine event variants during
             // development. SdrCoreEvent is a non-frozen enum
@@ -1443,6 +1471,28 @@ final class CoreModel {
         }
         centerFrequencyHz = clamped
         capture { try core?.tune(clamped) }
+        // Recenter the VFO on every tune — the new tuner-center
+        // is the new VFO target, not the previous offset
+        // relative to the new center. Mirrors the Linux #378
+        // fix: without this, after manually tuning from
+        // 100 → 150 MHz with a +50 kHz offset, the engine
+        // continued demodulating at 150.05 MHz and the overlay
+        // looked frozen at the same screen position even though
+        // the spectrum's frequency labels had shifted. Per
+        // issue #489 (Mac parity audit confirmed the bug
+        // exists on this side too).
+        //
+        // Skip the engine round-trip when offset is already
+        // (within float-noise tolerance of) zero — most tunes
+        // start from a centered VFO and the no-op setVfoOffset
+        // would just bounce the local field. Tolerant compare
+        // because the offset is a `Double` round-tripping
+        // through the FFI; the engine echo can land at e.g.
+        // 1e-12 instead of exactly 0. Per `CodeRabbit` round 1
+        // on PR #616.
+        if abs(vfoOffsetHz) >= Self.vfoOffsetEpsilonHz {
+            setVfoOffset(0)
+        }
     }
 
     func setSampleRate(_ hz: Double) {
@@ -1453,6 +1503,71 @@ final class CoreModel {
     func setVfoOffset(_ hz: Double) {
         vfoOffsetHz = hz
         capture { try core?.setVfoOffset(hz) }
+    }
+
+    /// Tolerance for "is this at default?" comparisons on
+    /// `vfoOffsetHz` and `bandwidthHz`. Both are `Double`
+    /// values that round-trip through the FFI (and the engine
+    /// echo can land at, e.g., 1e-12 instead of exactly 0
+    /// after DSP-side resampling). Half a Hz is well below
+    /// any meaningful audible / spectral effect, so a
+    /// half-Hz tolerance lets every "at default" path agree
+    /// without misclassifying epsilon noise as a non-default
+    /// state — which would keep the floating Reset-VFO button
+    /// visible even though the user can't tell anything's off.
+    /// Per `CodeRabbit` round 1 on PR #616.
+    static let vfoOffsetEpsilonHz: Double = 0.5
+    /// Same tolerance for bandwidth-vs-default comparisons.
+    /// Aliased to the same value so the threshold stays
+    /// consistent across the affordance code paths.
+    static let bandwidthEpsilonHz: Double = 0.5
+
+    /// `true` when the current bandwidth differs from the
+    /// active demod mode's default (within
+    /// `bandwidthEpsilonHz` tolerance to defeat float round-
+    /// trip noise from the engine echo). Drives the bandwidth-
+    /// row reset icon's enable state on the Radio panel.
+    /// Per #488.
+    var isBandwidthAtModeDefault: Bool {
+        abs(bandwidthHz - demodMode.defaultBandwidthHz) < Self.bandwidthEpsilonHz
+    }
+
+    /// `true` when the VFO is at its default state — bandwidth
+    /// matches the mode default AND offset is (within tolerance
+    /// of) zero. Drives the floating Reset VFO button's
+    /// visibility on the spectrum overlay (button hides at
+    /// default, appears when the user has moved either knob).
+    /// Per #488.
+    var isVfoAtDefault: Bool {
+        isBandwidthAtModeDefault && abs(vfoOffsetHz) < Self.vfoOffsetEpsilonHz
+    }
+
+    /// One-click reset for both bandwidth AND offset. Routes
+    /// every change through the engine setters (no direct
+    /// observable mutation) so the engine echoes back via
+    /// `BandwidthChanged` / `VfoOffsetChanged` events — the
+    /// observable model stays the consumer of the engine's
+    /// authoritative state, not a parallel writer that could
+    /// drift. Per #488.
+    func resetVfo() {
+        let defaultBw = demodMode.defaultBandwidthHz
+        if abs(bandwidthHz - defaultBw) >= Self.bandwidthEpsilonHz {
+            setBandwidth(defaultBw)
+        }
+        if abs(vfoOffsetHz) >= Self.vfoOffsetEpsilonHz {
+            setVfoOffset(0)
+        }
+    }
+
+    /// Reset bandwidth only. Used by the bandwidth-row trailing
+    /// reset icon on the Radio panel — leaves offset alone so
+    /// a user who wanted to keep their offset but normalize
+    /// the channel filter width can do exactly that. Per #488.
+    func resetBandwidthToModeDefault() {
+        let defaultBw = demodMode.defaultBandwidthHz
+        if abs(bandwidthHz - defaultBw) >= Self.bandwidthEpsilonHz {
+            setBandwidth(defaultBw)
+        }
     }
 
     /// Apply a cursor-centered zoom to the display viewport.

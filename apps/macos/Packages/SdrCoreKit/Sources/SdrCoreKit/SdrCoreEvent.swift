@@ -47,6 +47,8 @@ private let kScannerStateChanged          = Int32(SDR_EVT_SCANNER_STATE_CHANGED.
 private let kScannerActiveChannelChanged  = Int32(SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED.rawValue)
 private let kScannerEmptyRotation         = Int32(SDR_EVT_SCANNER_EMPTY_ROTATION.rawValue)
 private let kScannerMutexStopped          = Int32(SDR_EVT_SCANNER_MUTEX_STOPPED.rawValue)
+private let kVfoOffsetChanged             = Int32(SDR_EVT_VFO_OFFSET_CHANGED.rawValue)
+private let kBandwidthChanged             = Int32(SDR_EVT_BANDWIDTH_CHANGED.rawValue)
 
 /// High-level event from the engine.
 ///
@@ -134,6 +136,24 @@ public enum SdrCoreEvent: Sendable, Equatable {
     /// Host shows a toast describing the transition. Per issue
     /// #447 (ABI 0.20).
     case scannerMutexStopped(ScannerMutexReason)
+
+    /// VFO offset changed. Engine echoes this for every offset
+    /// change — host commands AND engine-internal resets
+    /// (scanner retune, future per-VFO controls). Host updates
+    /// its observable `vfoOffsetHz` from this event so the
+    /// spectrum overlay stays in sync without polling. Per
+    /// issue #488 (ABI 0.23).
+    case vfoOffsetChanged(hz: Double)
+
+    /// Channel bandwidth changed. Symmetric with
+    /// `vfoOffsetChanged` above — host commands AND engine-
+    /// internal changes (scanner retune to a channel with a
+    /// different bandwidth, future per-mode auto-pick). Host
+    /// updates its observable `bandwidthHz` so the bandwidth-
+    /// row reset icon's enabled state and the floating Reset-
+    /// VFO button's visibility track engine truth without
+    /// polling. Per `CodeRabbit` round 1 on PR #616 (ABI 0.24).
+    case bandwidthChanged(hz: Double)
 
     /// Translate a C `SdrEvent` into a Swift value.
     ///
@@ -285,6 +305,12 @@ public enum SdrCoreEvent: Sendable, Equatable {
                 return nil
             }
             return .scannerMutexStopped(reason)
+
+        case kVfoOffsetChanged:
+            return .vfoOffsetChanged(hz: payload.vfo_offset_hz)
+
+        case kBandwidthChanged:
+            return .bandwidthChanged(hz: payload.bandwidth_hz)
 
         case kNetworkSinkStatus:
             let status = payload.network_sink_status
