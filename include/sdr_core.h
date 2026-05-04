@@ -56,8 +56,25 @@ extern "C" {
 /* ================================================================ */
 
 #define SDR_CORE_ABI_VERSION_MAJOR 0
-#define SDR_CORE_ABI_VERSION_MINOR 22
+#define SDR_CORE_ABI_VERSION_MINOR 23
 /*
+ * 0.23 — exposes the `VfoOffsetChanged` engine event at the FFI
+ * boundary (#488) so the macOS SwiftUI host's observable
+ * `vfoOffsetHz` can stay in sync with engine-internal resets
+ * (scanner retune to a new channel, future per-VFO controls)
+ * without polling.
+ *
+ * Additive surface (existing struct layouts and enum values
+ * unchanged):
+ *   - `SdrEventKind` gains `SDR_EVT_VFO_OFFSET_CHANGED = 18`.
+ *   - `SdrEventPayload` gains a new `vfo_offset_hz: f64` union
+ *     member. No new payload struct — the offset is a single
+ *     primitive, same shape as `sample_rate_hz` and
+ *     `display_bandwidth_hz` already in the union.
+ *
+ * Pre-1.0 minor bumps are breaking by project convention — old
+ * 0.22 hosts must fail fast on the exact-match ABI check.
+ *
  * 0.22 — exposes the scanner channel-list projection
  * (`UiToDsp::UpdateScannerChannels`) at the FFI boundary so the
  * macOS SwiftUI scanner panel finally has channels to rotate
@@ -1955,6 +1972,7 @@ typedef enum SdrEventKind {
     SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED = 15, /* ABI 0.20 — issue #447 */
     SDR_EVT_SCANNER_EMPTY_ROTATION        = 16, /* ABI 0.20 — issue #447 */
     SDR_EVT_SCANNER_MUTEX_STOPPED         = 17, /* ABI 0.20 — issue #447 */
+    SDR_EVT_VFO_OFFSET_CHANGED            = 18, /* ABI 0.23 — issue #488 */
 } SdrEventKind;
 
 /* Scanner phase. Discriminant for the `state` field of
@@ -2178,6 +2196,7 @@ typedef struct SdrEventScannerMutexStopped {
  * SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED scanner_active_channel.{name_utf8,frequency_hz}
  * SDR_EVT_SCANNER_EMPTY_ROTATION         none (all-zero payload)
  * SDR_EVT_SCANNER_MUTEX_STOPPED          scanner_mutex_stopped.reason
+ * SDR_EVT_VFO_OFFSET_CHANGED             vfo_offset_hz
  */
 typedef union SdrEventPayload {
     double sample_rate_hz;
@@ -2193,6 +2212,12 @@ typedef union SdrEventPayload {
     SdrEventScannerStateChanged          scanner_state;
     SdrEventScannerActiveChannelChanged  scanner_active_channel;
     SdrEventScannerMutexStopped          scanner_mutex_stopped;
+    /* Payload for SDR_EVT_VFO_OFFSET_CHANGED (#488 / ABI 0.23).
+     * Engine echoes this whenever the VFO offset changes — host
+     * commands AND engine-internal resets (e.g., scanner retune
+     * to a new channel) — so the observable model can stay in
+     * sync without polling. */
+    double vfo_offset_hz;
     /* Placeholder so kinds with no payload (e.g., SOURCE_STOPPED)
      * have a well-defined zeroed payload representation. */
     uint64_t _placeholder;

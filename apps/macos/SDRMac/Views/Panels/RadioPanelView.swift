@@ -45,12 +45,34 @@ private struct BandwidthSection: View {
     var body: some View {
         Section {
             LabeledContent("Bandwidth") {
-                @Bindable var m = model
-                BandwidthEntry(
-                    hz: $m.bandwidthHz,
-                    mode: model.demodMode
-                ) { hz in
-                    model.setBandwidth(hz)
+                HStack(spacing: 8) {
+                    @Bindable var m = model
+                    BandwidthEntry(
+                        hz: $m.bandwidthHz,
+                        mode: model.demodMode
+                    ) { hz in
+                        model.setBandwidth(hz)
+                    }
+                    // Trailing per-row reset to mode default.
+                    // Enabled only when the current bandwidth
+                    // differs from `demodMode.defaultBandwidthHz`
+                    // — switching demod modes re-evaluates so
+                    // the icon flips state automatically when
+                    // the user picks a new mode whose default
+                    // matches (or doesn't match) the current
+                    // bandwidth. Per #488. Routes through the
+                    // engine setter so the echo round-trips
+                    // through `BandwidthChanged` and the
+                    // observable model stays an event consumer.
+                    Button {
+                        model.resetBandwidthToModeDefault()
+                    } label: {
+                        Image(systemName: "arrow.counterclockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(model.isBandwidthAtModeDefault)
+                    .help("Reset bandwidth to \(model.demodMode.label) default")
+                    .accessibilityLabel("Reset bandwidth to mode default")
                 }
             }
         } header: {

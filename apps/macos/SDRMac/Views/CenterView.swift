@@ -34,21 +34,54 @@ struct CenterView: View {
 
     var body: some View {
         @Bindable var m = model
-        ZStack {
-            // 1. Metal spectrum + waterfall (bottom layer)
-            SpectrumWaterfallView(
-                model: model,
-                minDb: $m.minDb,
-                maxDb: $m.maxDb
-            )
-            // 2. Frequency / dB grid + labels. Non-hit-testing
-            //    so clicks pass through to the VFO overlay above.
-            SpectrumGridView(model: model)
-            // 3. VFO band + center tick + click-to-tune. On top
-            //    so its DragGesture captures clicks. The grid
-            //    underneath renders behind the translucent VFO
-            //    band — same layering as SDR++ / the GTK UI.
-            VfoOverlayView(model: model)
+        ZStack(alignment: .topTrailing) {
+            ZStack {
+                // 1. Metal spectrum + waterfall (bottom layer)
+                SpectrumWaterfallView(
+                    model: model,
+                    minDb: $m.minDb,
+                    maxDb: $m.maxDb
+                )
+                // 2. Frequency / dB grid + labels. Non-hit-testing
+                //    so clicks pass through to the VFO overlay above.
+                SpectrumGridView(model: model)
+                // 3. VFO band + center tick + click-to-tune. On top
+                //    so its DragGesture captures clicks. The grid
+                //    underneath renders behind the translucent VFO
+                //    band — same layering as SDR++ / the GTK UI.
+                VfoOverlayView(model: model)
+            }
+
+            // Floating "Reset VFO" button — top-right of the
+            // spectrum area. Visible only when the user has
+            // moved either knob away from the mode default
+            // (bandwidth ≠ default OR offset ≠ 0). One click
+            // resets both AND routes through the engine
+            // setters, so the engine echoes back via the
+            // `BandwidthChanged` / `VfoOffsetChanged` events
+            // and the observable model stays a consumer of
+            // engine truth (not a parallel writer that could
+            // drift). Per #488, mirrors the Linux PR #380
+            // floating-button behaviour.
+            //
+            // Conditional on `!model.isVfoAtDefault` so the
+            // button hides cleanly the moment a manual tune
+            // recenters the VFO (per #489's setCenter →
+            // setVfoOffset(0) cascade).
+            if !model.isVfoAtDefault {
+                Button {
+                    model.resetVfo()
+                } label: {
+                    Label("Reset VFO", systemImage: "arrow.counterclockwise")
+                        .labelStyle(.iconOnly)
+                        .padding(6)
+                }
+                .buttonStyle(.borderless)
+                .background(.regularMaterial, in: Circle())
+                .help("Reset VFO bandwidth and offset to mode defaults")
+                .accessibilityLabel("Reset VFO bandwidth and offset")
+                .padding(8)
+            }
         }
         .frame(minHeight: 300)
         // Pinch zoom — cross-platform via SwiftUI's gesture.

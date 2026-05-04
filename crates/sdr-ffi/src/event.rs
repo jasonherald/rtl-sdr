@@ -63,6 +63,7 @@ pub const SDR_EVT_SCANNER_STATE_CHANGED: i32 = 14;
 pub const SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED: i32 = 15;
 pub const SDR_EVT_SCANNER_EMPTY_ROTATION: i32 = 16;
 pub const SDR_EVT_SCANNER_MUTEX_STOPPED: i32 = 17;
+pub const SDR_EVT_VFO_OFFSET_CHANGED: i32 = 18;
 
 // ============================================================
 //  Scanner phase discriminants — must match `SdrScannerState`
@@ -300,6 +301,7 @@ pub struct SdrEventScannerMutexStopped {
 /// | `SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED` | `scanner_active_channel.{name_utf8,frequency_hz}` |
 /// | `SDR_EVT_SCANNER_EMPTY_ROTATION`  | none                         |
 /// | `SDR_EVT_SCANNER_MUTEX_STOPPED`   | `scanner_mutex_stopped.reason` |
+/// | `SDR_EVT_VFO_OFFSET_CHANGED`      | `vfo_offset_hz`              |
 ///
 /// `_placeholder` exists so `SOURCE_STOPPED` events (which carry
 /// no payload) can still construct the struct with a meaningful
@@ -320,6 +322,12 @@ pub union SdrEventPayload {
     pub scanner_state: SdrEventScannerStateChanged,
     pub scanner_active_channel: SdrEventScannerActiveChannelChanged,
     pub scanner_mutex_stopped: SdrEventScannerMutexStopped,
+    /// Payload for `SDR_EVT_VFO_OFFSET_CHANGED` (#488 / ABI
+    /// 0.23). Engine echoes this whenever the VFO offset
+    /// changes — host commands AND engine-internal resets
+    /// (e.g., scanner retune to a new channel) — so the
+    /// observable model can stay in sync without polling.
+    pub vfo_offset_hz: f64,
     /// Placeholder for kinds that carry no payload (e.g.,
     /// `SDR_EVT_SOURCE_STOPPED`). Accessing this field is always
     /// valid as a zero-byte read.
@@ -594,16 +602,17 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
         //     light up in the macOS UI whenever the CTCSS / voice-
         //     squelch panels get ported (no specific backlog issue
         //     yet — part of the full-parity backlog under #228).
-        //   - `BandwidthChanged` and `VfoOffsetChanged` are the
-        //     VFO-drag + "reset VFO" feedback-echo events
-        //     (#336 / #341). Linux-only for now; macOS SwiftUI
-        //     gets them when the equivalent VFO overlay +
-        //     reset affordances land on that side.
+        //   - `BandwidthChanged` is the VFO-drag bandwidth-
+        //     resize echo (#336). Linux-only for now; macOS
+        //     SwiftUI gets it when the bandwidth-drag affordance
+        //     lands on that side.
         //
         // Scanner Phase 1 UI events (`ScannerActiveChannelChanged`,
         // `ScannerStateChanged`, `ScannerEmptyRotation`,
         // `ScannerMutexStopped`) landed at the FFI boundary in ABI
         // 0.20 (#447) — see the dedicated arms above.
+        // `VfoOffsetChanged` landed in ABI 0.23 (#488) — also
+        // dedicated arm above.
         //
         // Adding any of these to the ABI is additive (new
         // `SDR_EVT_*` discriminant + new payload struct or reuse
@@ -753,10 +762,22 @@ fn translate_event(msg: &DspToUi) -> Option<(SdrEvent, Option<CString>, Option<V
             }
         }
 
+        DspToUi::VfoOffsetChanged(hz) => SdrEvent {
+            // Engine-side echo of every VFO-offset change
+            // (host commands AND engine-internal resets like
+            // scanner retune). Host updates its observable
+            // `vfoOffsetHz` from this event so the spectrum
+            // overlay stays in sync without polling. Per #488
+            // (ABI 0.23).
+            kind: SDR_EVT_VFO_OFFSET_CHANGED,
+            payload: SdrEventPayload {
+                vfo_offset_hz: *hz,
+            },
+        },
+
         DspToUi::FftData(_)
         | DspToUi::DemodModeChanged(_)
         | DspToUi::BandwidthChanged(_)
-        | DspToUi::VfoOffsetChanged(_)
         | DspToUi::CtcssSustainedChanged(_)
         | DspToUi::VoiceSquelchOpenChanged(_)
         // APT lines (#482) aren't surfaced through the FFI layer
@@ -1056,6 +1077,7 @@ mod tests {
         assert_eq!(SDR_EVT_SCANNER_ACTIVE_CHANNEL_CHANGED, 15);
         assert_eq!(SDR_EVT_SCANNER_EMPTY_ROTATION, 16);
         assert_eq!(SDR_EVT_SCANNER_MUTEX_STOPPED, 17);
+        assert_eq!(SDR_EVT_VFO_OFFSET_CHANGED, 18);
     }
 
     #[test]
@@ -1664,21 +1686,22 @@ mod tests {
     }
 
     #[test]
-    fn vfo_offset_changed_is_intentionally_dropped_at_ffi() {
-        // Regression guard for the ABI-v1 "intentionally withheld"
-        // contract. `VfoOffsetChanged` is the VFO-reset feedback
-        // echo (#341) — Linux-only for now; macOS SwiftUI gets it
-        // when the equivalent VFO overlay + reset affordances
-        // land on that side. If a future refactor accidentally
-        // routes this variant through `translate_event`, the
-        // assertion below flips and the ABI change becomes
-        // visible at test time rather than at a downstream host
-        // that suddenly starts receiving an unknown event kind.
+    fn vfo_offset_changed_translates_to_event() {
+        // Pin the ABI 0.23 surface (#488). Replaces the prior
+        // "intentionally withheld" regression that asserted the
+        // variant was dropped — that was the v1 contract before
+        // the macOS VFO reset affordances landed.
         /// Representative non-zero VFO offset — 25 kHz is typical
         /// of what click-to-tune and drag flows emit in practice.
         const TEST_VFO_OFFSET_HZ: f64 = 25_000.0;
         use sdr_core::DspToUi;
-        assert!(translate_event(&DspToUi::VfoOffsetChanged(TEST_VFO_OFFSET_HZ)).is_none());
+        let (event, owned, _) = translate_event(&DspToUi::VfoOffsetChanged(TEST_VFO_OFFSET_HZ))
+            .expect("VfoOffsetChanged should translate to an event in ABI 0.23");
+        assert_eq!(event.kind, SDR_EVT_VFO_OFFSET_CHANGED);
+        // SAFETY: kind matches the union variant we wrote.
+        let payload = unsafe { event.payload.vfo_offset_hz };
+        assert!((payload - TEST_VFO_OFFSET_HZ).abs() < f64::EPSILON);
+        assert!(owned.is_none());
     }
 
     #[test]

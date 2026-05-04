@@ -43,14 +43,27 @@ struct BandwidthEntry: View {
                 .focused($focused)
                 .onAppear { text = formatRate(hz) }
                 .onChange(of: hz) { _, new in
-                    if !focused { text = formatRate(new) }
+                    // External `hz` change — sync the displayed
+                    // text. Guarding on `!focused` (the previous
+                    // approach) blocked external resets when the
+                    // field still had focus from a prior commit:
+                    // the bandwidth-row reset button (#488)
+                    // changes `hz` from outside, `.onChange` fires
+                    // with the field still focused after the
+                    // user's last `Submit`, and the displayed
+                    // value would lag the model. Always sync —
+                    // the only churn this adds is a redundant
+                    // `text = formatRate(hz)` right after the
+                    // field's own `apply()` already wrote it,
+                    // which is harmless.
+                    text = formatRate(new)
                 }
                 .onChange(of: mode) { _, _ in
-                    // Mode switched — don't auto-pick a preset
-                    // (the engine handles that on its side), but
-                    // re-render in case units cross a threshold
-                    // after the model's bandwidth settles.
-                    if !focused { text = formatRate(hz) }
+                    // Mode switched — re-render in case units
+                    // cross a threshold after the model's
+                    // bandwidth settles. Same always-sync
+                    // policy as the `hz` handler above.
+                    text = formatRate(hz)
                 }
                 .onSubmit(commitFromField)
 
