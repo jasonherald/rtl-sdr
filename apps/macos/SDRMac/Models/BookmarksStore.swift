@@ -142,11 +142,16 @@ final class BookmarksStore {
             try data.write(to: storagePath, options: .atomic)
         } catch {
             bookmarksLog.error("Failed to save bookmarks: \(error.localizedDescription)")
-            // Fall through — `onChanged` still fires below
-            // because the in-memory state did update; the
-            // on-disk state diverging on an IO error is a
-            // separate problem the logger has already
-            // surfaced.
+            // Don't fire `onChanged` on a failed save —
+            // pushing scanner channels based on state that
+            // never made it to disk would leave the engine
+            // and `bookmarks.json` divergent until the next
+            // successful save (or a relaunch, where the load
+            // path would silently revert the engine to the
+            // last-on-disk state). Better to skip the
+            // notification and let the next mutation try
+            // again. Per `CodeRabbit` round 1 on PR #615.
+            return
         }
         onChanged?()
     }

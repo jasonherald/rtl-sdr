@@ -714,45 +714,56 @@ public final class SdrCore: @unchecked Sendable {
             try checkRc(sdr_core_update_scanner_channels(handle, nil, 0))
             return
         }
-        // Build a parallel array of `Data` holding NUL-terminated
-        // UTF-8 bytes — gives us a stable pointer per name that
-        // we can hand into `SdrScannerChannel.name_utf8`. The
-        // pointers stay valid for the duration of the
-        // `withUnsafeBufferPointer` block below; the FFI clones
-        // each name into the engine's owned `String` before
-        // returning.
-        let nameBuffers: [[CChar]] = channels.map { ch in
-            // `Array(ch.name.utf8) + [0]` builds a NUL-
-            // terminated UTF-8 byte array; reinterpret as
-            // `CChar` (signed on macOS x86_64 / ARM, matching
-            // `c_char` on the Rust side).
-            ch.name.utf8CString.map { CChar($0) }
+        // Heap-allocate each name via `strdup` and free it on
+        // exit. The earlier nested-`withUnsafeBufferPointer`
+        // approach extracted `$0.baseAddress` from an inner
+        // closure — that pointer escapes its closure's scope
+        // even though the underlying Array storage happened
+        // to outlive it, which is undefined behavior under
+        // Swift's pointer-lifetime contract. Per `CodeRabbit`
+        // round 1 on PR #615.
+        //
+        // The engine clones each name into an owned `String`
+        // before `sdr_core_update_scanner_channels` returns,
+        // so the `defer free` runs after the bytes have been
+        // copied — no use-after-free.
+        let namePointers: [UnsafeMutablePointer<CChar>?] = channels.map { ch in
+            ch.name.withCString { strdup($0) }
         }
-        try nameBuffers.withUnsafeBufferPointer { (nameBufsPtr: UnsafeBufferPointer<[CChar]>) in
-            // Build the C array on the stack (well, on the heap
-            // via Array's storage, but lifetime-bound to this
-            // closure). Each `name_utf8` points into the
-            // matching `nameBuffers[i]` storage, valid for the
-            // duration of the FFI call.
-            var cChannels: [SdrScannerChannel] = []
-            cChannels.reserveCapacity(channels.count)
-            for (idx, ch) in channels.enumerated() {
-                let namePtr = nameBufsPtr[idx].withUnsafeBufferPointer { $0.baseAddress }
-                cChannels.append(SdrScannerChannel(
-                    name_utf8: namePtr,
-                    frequency_hz: ch.frequencyHz,
-                    demod_mode: ch.demodMode.rawValue,
-                    bandwidth_hz: ch.bandwidthHz,
-                    priority: ch.priority,
-                    dwell_ms: ch.dwellMs,
-                    hang_ms: ch.hangMs
-                ))
-            }
-            try cChannels.withUnsafeBufferPointer { cPtr in
-                try checkRc(sdr_core_update_scanner_channels(
-                    handle, cPtr.baseAddress, cPtr.count
-                ))
-            }
+        defer { namePointers.forEach { free($0) } }
+
+        // `strdup` returns nil on allocation failure. If any
+        // entry failed, surface as `internal` rather than
+        // sending a partial channel list (the Rust side
+        // would reject a null name in any entry, but bailing
+        // here gives the host a cleaner error message).
+        guard !namePointers.contains(where: { $0 == nil }) else {
+            throw SdrCoreError(
+                code: .internal,
+                message: "setScannerChannels: failed to copy channel names"
+            )
+        }
+
+        var cChannels: [SdrScannerChannel] = []
+        cChannels.reserveCapacity(channels.count)
+        for (idx, ch) in channels.enumerated() {
+            // Force-unwrap is safe — the guard above rejected
+            // any nil entry. Casting to `UnsafePointer` since
+            // the FFI takes `*const c_char`.
+            cChannels.append(SdrScannerChannel(
+                name_utf8: UnsafePointer(namePointers[idx]!),
+                frequency_hz: ch.frequencyHz,
+                demod_mode: ch.demodMode.rawValue,
+                bandwidth_hz: ch.bandwidthHz,
+                priority: ch.priority,
+                dwell_ms: ch.dwellMs,
+                hang_ms: ch.hangMs
+            ))
+        }
+        try cChannels.withUnsafeBufferPointer { cPtr in
+            try checkRc(sdr_core_update_scanner_channels(
+                handle, cPtr.baseAddress, cPtr.count
+            ))
         }
     }
 

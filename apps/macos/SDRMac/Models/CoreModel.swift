@@ -1727,14 +1727,30 @@ final class CoreModel {
         let dwell = UInt32(scannerDefaultDwellMs)
         let hang = UInt32(scannerDefaultHangMs)
         let channels: [SdrCore.ScannerChannel] = bookmarks.compactMap { b in
-            guard b.scanEnabled == true, let freq = b.centerFrequencyHz else {
+            // Hard guards on every numeric field — `bookmarks.json`
+            // is user-editable and a hand-edited file with a
+            // negative / NaN / out-of-range frequency would
+            // otherwise trap on `UInt64(freq.rounded())`.
+            // `UInt64(exactly:)` returns nil for any value
+            // outside the type's range without trapping; the
+            // bandwidth guard rejects 0 / negative / NaN /
+            // infinity which the FFI would refuse anyway. Per
+            // `CodeRabbit` round 1 on PR #615.
+            guard b.scanEnabled == true,
+                  let freq = b.centerFrequencyHz,
+                  freq.isFinite,
+                  freq >= 0,
+                  let freqHz = UInt64(exactly: freq.rounded())
+            else {
                 return nil
             }
+            let bandwidth = b.bandwidthHz ?? 12_500.0
+            guard bandwidth.isFinite, bandwidth > 0 else { return nil }
             return SdrCore.ScannerChannel(
                 name: b.name,
-                frequencyHz: UInt64(freq.rounded()),
+                frequencyHz: freqHz,
                 demodMode: b.demodMode ?? .nfm,
-                bandwidthHz: b.bandwidthHz ?? 12_500.0,
+                bandwidthHz: bandwidth,
                 priority: b.priority ?? 0,
                 dwellMs: dwell,
                 hangMs: hang
