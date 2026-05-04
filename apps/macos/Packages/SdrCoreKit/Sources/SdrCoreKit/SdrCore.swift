@@ -655,8 +655,8 @@ public final class SdrCore: @unchecked Sendable {
 
     /// One scanner channel for `setScannerChannels`. Owned-Swift
     /// shape so callers can build the array without managing C
-    /// memory; the wrapper handles the `withCString` /
-    /// `withUnsafeBufferPointer` lifetime dance internally.
+    /// memory; the wrapper internally `strdup`s each name into
+    /// heap storage and frees it after the FFI call returns.
     ///
     /// `priority`: `0` = normal rotation, `>= 1` = priority
     /// (matches the engine `ScannerChannel.priority` semantics).
@@ -705,10 +705,16 @@ public final class SdrCore: @unchecked Sendable {
     /// bandwidths all throw `SdrCoreError.invalidArg` before
     /// any DSP dispatch happens.
     ///
-    /// The names are borrowed for the call's duration via
-    /// nested `withCString`s; the engine clones each into its
-    /// own `String` before this method returns, so the
-    /// `[ScannerChannel]` argument can be discarded immediately.
+    /// Each channel's `name` is heap-copied via `strdup` and
+    /// freed after the FFI call returns — the engine clones
+    /// each name into its own `String` before
+    /// `sdr_core_update_scanner_channels` returns, so the
+    /// `[ScannerChannel]` argument can be discarded
+    /// immediately. The earlier nested-
+    /// `withUnsafeBufferPointer` approach was UB (pointer
+    /// extracted from an inner closure outlived its scope);
+    /// `strdup` is the documented Swift→C lifetime workaround.
+    /// Per `CodeRabbit` round 1 on PR #615.
     public func setScannerChannels(_ channels: [ScannerChannel]) throws {
         if channels.isEmpty {
             try checkRc(sdr_core_update_scanner_channels(handle, nil, 0))
