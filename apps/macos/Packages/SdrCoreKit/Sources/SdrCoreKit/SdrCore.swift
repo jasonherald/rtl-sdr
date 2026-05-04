@@ -720,6 +720,24 @@ public final class SdrCore: @unchecked Sendable {
             try checkRc(sdr_core_update_scanner_channels(handle, nil, 0))
             return
         }
+
+        // Pre-validate names for embedded NUL bytes — Swift
+        // `String` allows them but C `strdup` (per POSIX) stops
+        // copying at the first `\0`, silently truncating the
+        // channel name at the FFI boundary. A truncated name
+        // breaks `ChannelKey` identity, which corrupts lockout
+        // / unlock matching and the active-channel readout.
+        // Surface as `.invalidArg` so the caller knows which
+        // entry is bad, rather than letting the engine receive
+        // a half-name that won't match anywhere. Per
+        // `CodeRabbit` round 2 on PR #615.
+        if let badIndex = channels.firstIndex(where: { $0.name.utf8.contains(0) }) {
+            throw SdrCoreError(
+                code: .invalidArg,
+                message: "setScannerChannels: channel[\(badIndex)].name contains an embedded NUL byte"
+            )
+        }
+
         // Heap-allocate each name via `strdup` and free it on
         // exit. The earlier nested-`withUnsafeBufferPointer`
         // approach extracted `$0.baseAddress` from an inner
