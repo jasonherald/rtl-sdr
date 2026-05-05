@@ -417,16 +417,23 @@ final class CoreModel {
 
     /// Most-recent poll snapshot of server stats. `nil` while
     /// the server isn't running. Aggregates only — per-client
-    /// state moved to the multi-client surface in #391 and
-    /// lands on the Mac side in #496.
+    /// state lives in `rtlTcpServerClients` (issue #401, this
+    /// PR).
     var rtlTcpServerStats: SdrRtlTcpServer.Stats? = nil
 
-    // The pre-#391 single-client `rtlTcpRecentCommands` ring
-    // is gone — recent-commands tracking is per-client now and
-    // requires the multi-client list surface (#496) to map a
-    // client id back to its commands. The panel renders the
-    // server-wide aggregates `connectedCount` / `lifetimeAccepted`
-    // / `totalBytesSent` / `totalBuffersDropped` instead.
+    /// Per-client snapshot from `SdrRtlTcpServer.clientList()`.
+    /// Refreshed alongside `rtlTcpServerStats` on the 1 Hz poll
+    /// tick. Empty while the server isn't running, after a poll
+    /// error, or when no client is connected. Issue #401.
+    var rtlTcpServerClients: [SdrRtlTcpServer.ClientInfo] = []
+
+    // The pre-#391 single-client `rtlTcpRecentCommands` ring is
+    // gone — recent-commands tracking is per-client now. The
+    // panel renders the per-client list above plus server-wide
+    // aggregates (`connectedCount` / `lifetimeAccepted` /
+    // `totalBytesSent` / `totalBuffersDropped`). A future
+    // surface for the per-client recent-commands ring (drilling
+    // into one row to see its history) lands separately.
 
     /// Last error surfaced from a rtl_tcp server start or poll
     /// attempt. Cleared on successful start; mirrors into a
@@ -441,6 +448,27 @@ final class CoreModel {
     var rtlTcpServerPort: UInt16 = 1234
     var rtlTcpServerBindAddress: SdrRtlTcpServer.Config.BindAddress = .loopback
     var rtlTcpServerMdnsEnabled: Bool = true
+
+    /// Stream-codec mask the server advertises and negotiates.
+    /// `.noneOnly` keeps every client on uncompressed IQ — the
+    /// safe default; `.noneAndLz4` opts in to LZ4 for clients
+    /// that ask. Persisted via `UserDefaults`. Issue #417.
+    var rtlTcpServerCompression: SdrRtlTcpServer.Compression = .noneOnly
+
+    /// When `true`, the mDNS advertisement carries the
+    /// `auth_required` TXT bit so clients can stage a
+    /// credential prompt before connecting. Persisted via
+    /// `UserDefaults`.
+    ///
+    /// The actual auth-key enforcement on the server (forwarding
+    /// `auth_key` / `auth_key_len` to `SdrRtlTcpServerConfig`,
+    /// validating the client's `RTLX SetAuthKey` packet) is
+    /// tracked separately in #623 — until that lands, this
+    /// toggle governs the mDNS advertisement only and the
+    /// server still accepts every connection. Persisting the
+    /// flag now keeps the schema stable for the follow-up.
+    /// Issue #417.
+    var rtlTcpServerAuthRequired: Bool = false
 
     /// Center frequency the server applies on dongle open.
     /// Defaults to 100.000 MHz matching the engine's
@@ -990,6 +1018,20 @@ final class CoreModel {
                 Int32(UserDefaults.standard.integer(forKey: Self.rtlTcpServerInitialDirectSamplingKey))
             rtlTcpServerInitialDirectSampling =
                 SdrCore.DirectSamplingMode(rawValue: raw) ?? .off
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerCompressionKey) != nil {
+            let stored = UserDefaults.standard.integer(forKey: Self.rtlTcpServerCompressionKey)
+            // Stored as the wire byte (0x01 / 0x03) — clamp into
+            // the valid range so a hand-edited plist can't carry
+            // an unknown mask through the FFI.
+            if let raw = UInt8(exactly: stored),
+               let mask = SdrRtlTcpServer.Compression(rawValue: raw) {
+                rtlTcpServerCompression = mask
+            }
+        }
+        if UserDefaults.standard.object(forKey: Self.rtlTcpServerAuthRequiredKey) != nil {
+            rtlTcpServerAuthRequired =
+                UserDefaults.standard.bool(forKey: Self.rtlTcpServerAuthRequiredKey)
         }
 
         do {
@@ -2208,11 +2250,14 @@ final class CoreModel {
             initialGainTenthsDb: rtlTcpServerInitialGainTenthsDb,
             initialPpm: rtlTcpServerInitialPpm,
             initialBiasTee: rtlTcpServerInitialBiasTee,
-            initialDirectSampling: rtlTcpServerInitialDirectSampling
+            initialDirectSampling: rtlTcpServerInitialDirectSampling,
+            compression: rtlTcpServerCompression
         )
         let mdnsEnabled = rtlTcpServerMdnsEnabled
         let nickname = rtlTcpServerNickname
         let port = rtlTcpServerPort
+        let advertisedCompression = rtlTcpServerCompression
+        let advertisedAuthRequired = rtlTcpServerAuthRequired
         // App version for the mDNS TXT record. Sourced from
         // the bundle's `CFBundleShortVersionString` so the
         // advertised version tracks the installed release
@@ -2250,6 +2295,12 @@ final class CoreModel {
                 let instanceName = nickname.isEmpty
                     ? ProcessInfo.processInfo.hostName
                     : nickname
+                // ABI 0.19 (#417): publish the codec mask we
+                // negotiated through the server config so
+                // clients see the same story on mDNS and at
+                // handshake. `authRequired` mirrors the
+                // matching toggle; `nil` here means "omit the
+                // TXT key" — pre-0.19 wire form.
                 let opts = SdrRtlTcpAdvertiser.Options(
                     port: port,
                     instanceName: instanceName,
@@ -2257,7 +2308,9 @@ final class CoreModel {
                     tuner: tunerName,
                     version: appVersion,
                     gains: gainCount,
-                    nickname: nickname
+                    nickname: nickname,
+                    compression: advertisedCompression,
+                    authRequired: advertisedAuthRequired ? true : nil
                 )
                 advertiser = try? SdrRtlTcpAdvertiser(options: opts)
                 if advertiser == nil {
@@ -2340,6 +2393,7 @@ final class CoreModel {
         // Per `CodeRabbit` round 7 on PR #362.
         rtlTcpServerStopping = true
         rtlTcpServerStats = nil
+        rtlTcpServerClients = []
 
         let prior = rtlTcpServerLifecycleTask
         let task = Task { [weak self] in
@@ -2414,6 +2468,7 @@ final class CoreModel {
         // is released. Per `CodeRabbit` round 7 on PR #362.
         rtlTcpServerStopping = false
         rtlTcpServerStats = nil
+        rtlTcpServerClients = []
         advertiser?.stop()
         server?.stop()
     }
@@ -2451,17 +2506,20 @@ final class CoreModel {
             Int(rtlTcpServerInitialDirectSampling.rawValue),
             forKey: Self.rtlTcpServerInitialDirectSamplingKey
         )
+        UserDefaults.standard.set(
+            Int(rtlTcpServerCompression.rawValue),
+            forKey: Self.rtlTcpServerCompressionKey
+        )
+        UserDefaults.standard.set(
+            rtlTcpServerAuthRequired,
+            forKey: Self.rtlTcpServerAuthRequiredKey
+        )
     }
 
-    /// Background poller that refreshes `rtlTcpServerStats`
-    /// on a one-second tick. Runs on the main actor (the whole
-    /// `CoreModel` is `@MainActor`) which matches what
-    /// `@Observable` needs for writes.
-    ///
-    /// The pre-#391 per-client `rtlTcpRecentCommands` refresh
-    /// is gone — recent-commands tracking is per-client now and
-    /// returns under a separate poll keyed by `client.id` once
-    /// the multi-client surface lands (#496).
+    /// Background poller that refreshes `rtlTcpServerStats` and
+    /// `rtlTcpServerClients` on a one-second tick. Runs on the
+    /// main actor (the whole `CoreModel` is `@MainActor`) which
+    /// matches what `@Observable` needs for writes.
     private func startRtlTcpPoller() {
         rtlTcpPollTask = Task { [weak self] in
             // Tick cadence slow enough to be negligible on the
@@ -2476,6 +2534,13 @@ final class CoreModel {
                 guard let self, let server = self.rtlTcpServer else { return }
                 do {
                     self.rtlTcpServerStats = try server.stats()
+                    // Per-client snapshot — same lock-protected
+                    // FFI handle on the same poll tick so the
+                    // aggregate counters and the client list
+                    // describe the same moment in time. Failure
+                    // here goes through the same teardown path
+                    // as `stats()` failure. Issue #401.
+                    self.rtlTcpServerClients = try server.clientList()
                 } catch {
                     // Server has gone away (stopped externally,
                     // USB unplug, panic caught by the FFI). Tear
@@ -2507,6 +2572,10 @@ final class CoreModel {
     static let rtlTcpServerInitialPpmKey = "SDRMac.rtlTcpServer.initialPpm"
     static let rtlTcpServerInitialBiasTeeKey = "SDRMac.rtlTcpServer.initialBiasTee"
     static let rtlTcpServerInitialDirectSamplingKey = "SDRMac.rtlTcpServer.initialDirectSampling"
+    /// ABI 0.19 (#400 / #417) — persisted compression mask
+    /// (wire byte) and auth-required mDNS bit.
+    static let rtlTcpServerCompressionKey = "SDRMac.rtlTcpServer.compression"
+    static let rtlTcpServerAuthRequiredKey = "SDRMac.rtlTcpServer.authRequired"
 
     /// UserDefaults keys for the persisted rtl_tcp *client*
     /// favorites and last-connected snapshot. Namespaced to

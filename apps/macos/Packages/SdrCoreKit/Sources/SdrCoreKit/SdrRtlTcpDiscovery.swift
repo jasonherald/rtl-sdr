@@ -32,6 +32,19 @@ public final class SdrRtlTcpAdvertiser: @unchecked Sendable {
         public var nickname: String
         public var txbufBytes: UInt64?
 
+        /// ABI 0.19 (#400) — codec mask the server is willing to
+        /// negotiate. `nil` omits the TXT key entirely (pre-0.19
+        /// behaviour); LZ4-aware clients that don't see the key
+        /// fall back to the legacy uncompressed format.
+        public var compression: SdrRtlTcpServer.Compression?
+
+        /// ABI 0.19 (#400) — whether the server requires
+        /// pre-shared-key auth. `nil` omits the TXT key
+        /// (servers without auth advertise nothing); `true`
+        /// publishes the bit so clients can stage a credential
+        /// prompt before connecting. Issue #417.
+        public var authRequired: Bool?
+
         public init(
             port: UInt16,
             instanceName: String,
@@ -40,7 +53,9 @@ public final class SdrRtlTcpAdvertiser: @unchecked Sendable {
             version: String,
             gains: UInt32,
             nickname: String = "",
-            txbufBytes: UInt64? = nil
+            txbufBytes: UInt64? = nil,
+            compression: SdrRtlTcpServer.Compression? = nil,
+            authRequired: Bool? = nil
         ) {
             self.port = port
             self.instanceName = instanceName
@@ -50,6 +65,8 @@ public final class SdrRtlTcpAdvertiser: @unchecked Sendable {
             self.gains = gains
             self.nickname = nickname
             self.txbufBytes = txbufBytes
+            self.compression = compression
+            self.authRequired = authRequired
         }
     }
 
@@ -83,17 +100,17 @@ public final class SdrRtlTcpAdvertiser: @unchecked Sendable {
                 options.tuner.withCString { tunerPtr in
                     options.version.withCString { versionPtr in
                         options.nickname.withCString { nicknamePtr -> Int32 in
-                            // ABI 0.19 (#400) appended four
-                            // opt-in TXT fields at the tail:
-                            // `has_codecs` / `codecs` /
-                            // `has_auth_required` /
-                            // `auth_required`. Mac-side UI for
-                            // any of these (compression toggle,
-                            // auth-required badge) follows in
-                            // #496; until then the wrapper
-                            // publishes neither key, matching
-                            // pre-0.19 advertisement behaviour
-                            // exactly.
+                            // ABI 0.19 (#400) opt-in TXT fields:
+                            //   - `has_codecs` / `codecs` —
+                            //     server's negotiable codec mask
+                            //   - `has_auth_required` /
+                            //     `auth_required` — whether the
+                            //     server demands a pre-shared
+                            //     key (#394).
+                            // Both default to "key omitted from
+                            // the TXT record" (pre-0.19 wire
+                            // form) when the matching Swift
+                            // option is `nil`. Issue #417.
                             var opts = SdrRtlTcpAdvertiseOptions(
                                 port: options.port,
                                 instance_name: instancePtr,
@@ -104,10 +121,10 @@ public final class SdrRtlTcpAdvertiser: @unchecked Sendable {
                                 nickname: nicknamePtr,
                                 has_txbuf: options.txbufBytes != nil,
                                 txbuf: options.txbufBytes ?? 0,
-                                has_codecs: false,
-                                codecs: 0,
-                                has_auth_required: false,
-                                auth_required: false
+                                has_codecs: options.compression != nil,
+                                codecs: options.compression?.rawValue ?? 0,
+                                has_auth_required: options.authRequired != nil,
+                                auth_required: options.authRequired ?? false
                             )
                             return withUnsafePointer(to: &opts) { optsPtr in
                                 sdr_rtltcp_advertiser_start(optsPtr, &rawHandle)
@@ -161,6 +178,19 @@ public final class SdrRtlTcpBrowser: @unchecked Sendable {
         public var nickname: String
         public var txbufBytes: UInt64?
         public var lastSeenSecsAgo: Double
+
+        /// ABI 0.19 (#400) — server's advertised codec mask.
+        /// `nil` when the server didn't publish the TXT key
+        /// (pre-0.19 servers, or servers explicitly omitting
+        /// it). LZ4-aware clients use this to gate "negotiate
+        /// LZ4" before the handshake. Issue #417.
+        public var compression: SdrRtlTcpServer.Compression?
+
+        /// ABI 0.19 (#400) — whether the server requires
+        /// pre-shared-key auth. `nil` when the server didn't
+        /// publish the TXT key. Clients use this to stage a
+        /// credential prompt before connecting. Issue #417.
+        public var authRequired: Bool?
     }
 
     public enum Event: Sendable, Equatable {
@@ -258,7 +288,11 @@ public final class SdrRtlTcpBrowser: @unchecked Sendable {
                     gains: announced.gains,
                     nickname: stringFromPtr(announced.nickname),
                     txbufBytes: announced.has_txbuf ? announced.txbuf : nil,
-                    lastSeenSecsAgo: announced.last_seen_secs_ago
+                    lastSeenSecsAgo: announced.last_seen_secs_ago,
+                    compression: announced.has_codecs
+                        ? SdrRtlTcpServer.Compression(rawValue: announced.codecs)
+                        : nil,
+                    authRequired: announced.has_auth_required ? announced.auth_required : nil
                 )
                 box.handler(.announced(ds))
             case Int32(SDR_RTLTCP_DISCOVERY_WITHDRAWN.rawValue):
