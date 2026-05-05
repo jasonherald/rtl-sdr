@@ -39,7 +39,10 @@ private let rtlSdrSampleRates: [UInt32] = [
 /// typical RTL-SDR rates (~16 Mbps for 2 Msps × 8 bits) so a
 /// plain "bytes" label gets unreadable in minutes. Per
 /// CodeRabbit on PR #624.
-fileprivate func formatRtlTcpBytes(_ bytes: UInt64) -> String {
+///
+/// `private` (not `fileprivate`) — they're equivalent at top
+/// level in Swift 4+, and SwiftLint prefers `private`.
+private func formatRtlTcpBytes(_ bytes: UInt64) -> String {
     let kib: UInt64 = 1_024
     let mib: UInt64 = kib * 1_024
     let gib: UInt64 = mib * 1_024
