@@ -971,8 +971,8 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
             }
             _ => {
                 // `SstvEvent` is `#[non_exhaustive]` — silently
-                // ignore future variants so a slowrx 0.2 update
-                // doesn't require a source change here.
+                // ignore future variants so a slowrx update doesn't
+                // require a source change here.
             }
         }
     }
@@ -993,6 +993,14 @@ fn sstv_mode_label(mode: slowrx::SstvMode) -> &'static str {
         slowrx::SstvMode::Pd120 => "PD120",
         slowrx::SstvMode::Pd180 => "PD180",
         slowrx::SstvMode::Pd240 => "PD240",
+        slowrx::SstvMode::Robot24 => "Robot 24",
+        slowrx::SstvMode::Robot36 => "Robot 36",
+        slowrx::SstvMode::Robot72 => "Robot 72",
+        slowrx::SstvMode::Scottie1 => "Scottie 1",
+        slowrx::SstvMode::Scottie2 => "Scottie 2",
+        slowrx::SstvMode::ScottieDx => "Scottie DX",
+        slowrx::SstvMode::Martin1 => "Martin 1",
+        slowrx::SstvMode::Martin2 => "Martin 2",
         _ => "SSTV",
     }
 }
