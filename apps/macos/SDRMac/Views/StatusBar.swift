@@ -1,8 +1,10 @@
 //
 // StatusBar.swift — compact strip at the bottom of the detail
-// column. Signal level, effective sample rate, last error.
+// column. Signal level, effective sample rate, antenna line,
+// last error.
 
 import SwiftUI
+import SdrCoreKit
 
 struct StatusBar: View {
     @Environment(CoreModel.self) private var model
@@ -11,6 +13,17 @@ struct StatusBar: View {
         HStack(spacing: 16) {
             Label("\(Int(model.signalLevelDb)) dB", systemImage: "waveform")
             Label(formatRate(model.effectiveSampleRateHz), systemImage: "metronome")
+            // Antenna-dimension line — λ/2 + λ/4 + V-angle hint
+            // for the current tuned frequency. Mirrors the GTK
+            // status bar (#157 / Linux PR #418); Mac side per
+            // issue #487. Hidden below the renderable floor
+            // (3 kHz) so a user mis-tuned near DC sees no noise
+            // here. `Antenna` lives in SdrCoreKit so the helper
+            // is share-able with future Mac surfaces.
+            if let antennaLine = Antenna.formatAntennaLine(freqHz: model.centerFrequencyHz) {
+                Label(antennaLine, systemImage: "antenna.radiowaves.left.and.right")
+                    .help("Half-wave dipole + quarter-wave element + suggested V-dipole arm angle for \(formatRate(model.centerFrequencyHz))")
+            }
             Spacer()
             if let err = model.lastError {
                 HStack(spacing: 4) {

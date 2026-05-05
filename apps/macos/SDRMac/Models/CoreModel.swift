@@ -699,6 +699,27 @@ final class CoreModel {
     var autoSquelchEnabled: Bool = false
 
     // ==========================================================
+    //  FSPL distance estimator (#486)
+    //
+    //  Pure-UI state — feeds the Radio panel's Distance Estimator
+    //  section. Math lives in `Propagation.swift` (SdrCoreKit) and
+    //  runs locally; no FFI hop because the formula is 15 lines
+    //  of stable arithmetic and a shared engine command would just
+    //  be a passthrough.
+    // ==========================================================
+
+    /// Effective radiated power at the transmitter, dBm. Default
+    /// 30 dBm (= 1 W) — a reasonable midpoint between handheld
+    /// (5 W = 37 dBm) and base-station (50 W = 47 dBm) scenarios
+    /// and matches the Linux side's first-launch default.
+    /// Persisted to `UserDefaults`.
+    var fsplErpDbm: Double = 30
+
+    /// UserDefaults key for the persisted ERP value. Absent key
+    /// leaves the 30 dBm default intact.
+    static let fsplErpDbmDefaultsKey = "SDRMac.fsplErpDbm"
+
+    // ==========================================================
     //  Bootstrap / shutdown
     // ==========================================================
 
@@ -819,6 +840,15 @@ final class CoreModel {
         }
         if UserDefaults.standard.object(forKey: Self.fileLoopingDefaultsKey) != nil {
             fileLoopingEnabled = UserDefaults.standard.bool(forKey: Self.fileLoopingDefaultsKey)
+        }
+        if UserDefaults.standard.object(forKey: Self.fsplErpDbmDefaultsKey) != nil {
+            let stored = UserDefaults.standard.double(forKey: Self.fsplErpDbmDefaultsKey)
+            // Sanity-clamp on load: if a hand-edited plist drops a
+            // non-finite or absurd value, fall back to the default
+            // rather than propagate NaN through the FSPL math.
+            if stored.isFinite, (-30...90).contains(stored) {
+                fsplErpDbm = stored
+            }
         }
         if let host = UserDefaults.standard.string(forKey: Self.networkSourceHostDefaultsKey),
            !host.isEmpty {
@@ -1696,6 +1726,16 @@ final class CoreModel {
     /// UserDefaults key for the persisted AGC type. Absent
     /// key leaves the default (`.software`) intact.
     static let agcTypeDefaultsKey = "SDRMac.agcType"
+
+    /// Update the FSPL distance estimator's transmitter ERP
+    /// (effective radiated power) in dBm. Pure UI state — no
+    /// engine round-trip; persisted to `UserDefaults` so the
+    /// user's choice survives launches. Per issue #486.
+    func setFsplErpDbm(_ dbm: Double) {
+        guard dbm.isFinite else { return }
+        fsplErpDbm = dbm
+        UserDefaults.standard.set(dbm, forKey: Self.fsplErpDbmDefaultsKey)
+    }
 
     /// Toggle loop-on-EOF for the file playback source. `true`
     /// rewinds to the start of the WAV file on EOF and keeps

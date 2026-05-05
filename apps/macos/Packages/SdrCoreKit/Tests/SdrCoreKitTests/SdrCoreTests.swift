@@ -17,16 +17,18 @@ final class SdrCoreTests: XCTestCase {
 
     func testAbiVersionMatchesCurrent() {
         // Lock in that the Swift wrapper parses the packed
-        // version from the C side consistently. Current: 0.11
-        // (0.2 device enumeration; 0.3 auto-squelch;
-        // 0.4 audio routing + recording; 0.5 IQ recording;
-        // 0.6 RadioReference; 0.7 advanced demod; 0.8 audio tap;
-        // 0.9 network audio sink; 0.10 source selection +
-        // network / file config; 0.11 rtl_tcp client commands +
-        // connection-state event — issue #325.)
+        // version from the C side consistently. The current
+        // value lives in `crates/sdr-ffi/src/lifecycle.rs::ABI_*`
+        // and the changelog block at the top of
+        // `include/sdr_core.h` — bumping either should bump
+        // both. Pre-1.0 minor bumps are breaking by policy.
+        //
+        // Current: 0.24 — VfoOffsetChanged + BandwidthChanged
+        // events (issues #488 / #489 / #490 wave). See the
+        // header changelog for the full version history.
         let v = SdrCore.abiVersion
         XCTAssertEqual(v.major, 0)
-        XCTAssertEqual(v.minor, 11)
+        XCTAssertEqual(v.minor, 24)
     }
 
     func testInitLoggingIsIdempotent() {
