@@ -699,6 +699,38 @@ final class CoreModel {
     var autoSquelchEnabled: Bool = false
 
     // ==========================================================
+    //  FSPL distance estimator (#486)
+    //
+    //  Pure-UI state — feeds the Radio panel's Distance Estimator
+    //  section. Math lives in `Propagation.swift` (SdrCoreKit) and
+    //  runs locally; no FFI hop because the formula is 15 lines
+    //  of stable arithmetic and a shared engine command would just
+    //  be a passthrough.
+    // ==========================================================
+
+    /// Effective radiated power at the transmitter, dBm. Default
+    /// 30 dBm (= 1 W) — a reasonable midpoint between handheld
+    /// (5 W = 37 dBm) and base-station (50 W = 47 dBm) scenarios
+    /// and matches the Linux side's first-launch default.
+    /// Persisted to `UserDefaults`.
+    var fsplErpDbm: Double = 30
+
+    /// Sanity range for `fsplErpDbm`. Lower bound (-30 dBm = 1 µW)
+    /// covers the weakest legal unlicensed transmitters; upper
+    /// bound (90 dBm = 1 MW) is well above any plausible
+    /// terrestrial broadcaster a hobbyist can hear with a stock
+    /// dongle. Both bootstrap restore and `setFsplErpDbm(_:)`
+    /// clamp to this range so a hand-edited plist or a
+    /// programmatic caller can't poison the FSPL math with an
+    /// absurd value that would only snap back at next launch.
+    /// Per CodeRabbit on PR #622.
+    static let fsplErpDbmRange: ClosedRange<Double> = -30...90
+
+    /// UserDefaults key for the persisted ERP value. Absent key
+    /// leaves the 30 dBm default intact.
+    static let fsplErpDbmDefaultsKey = "SDRMac.fsplErpDbm"
+
+    // ==========================================================
     //  Bootstrap / shutdown
     // ==========================================================
 
@@ -819,6 +851,15 @@ final class CoreModel {
         }
         if UserDefaults.standard.object(forKey: Self.fileLoopingDefaultsKey) != nil {
             fileLoopingEnabled = UserDefaults.standard.bool(forKey: Self.fileLoopingDefaultsKey)
+        }
+        if UserDefaults.standard.object(forKey: Self.fsplErpDbmDefaultsKey) != nil {
+            let stored = UserDefaults.standard.double(forKey: Self.fsplErpDbmDefaultsKey)
+            // Sanity-clamp on load: if a hand-edited plist drops a
+            // non-finite or absurd value, fall back to the default
+            // rather than propagate NaN through the FSPL math.
+            if stored.isFinite, Self.fsplErpDbmRange.contains(stored) {
+                fsplErpDbm = stored
+            }
         }
         if let host = UserDefaults.standard.string(forKey: Self.networkSourceHostDefaultsKey),
            !host.isEmpty {
@@ -1696,6 +1737,24 @@ final class CoreModel {
     /// UserDefaults key for the persisted AGC type. Absent
     /// key leaves the default (`.software`) intact.
     static let agcTypeDefaultsKey = "SDRMac.agcType"
+
+    /// Update the FSPL distance estimator's transmitter ERP
+    /// (effective radiated power) in dBm. Pure UI state — no
+    /// engine round-trip; persisted to `UserDefaults` so the
+    /// user's choice survives launches.
+    ///
+    /// Clamps to `Self.fsplErpDbmRange` (the same range bootstrap
+    /// applies on restore) so a programmatic caller — or a
+    /// future menu action that bypasses the panel's text-field
+    /// commit path — can't poison the math with values that
+    /// would only snap back to the default at next launch. Per
+    /// issue #486 / CodeRabbit on PR #622.
+    func setFsplErpDbm(_ dbm: Double) {
+        guard dbm.isFinite else { return }
+        let clamped = min(max(dbm, Self.fsplErpDbmRange.lowerBound), Self.fsplErpDbmRange.upperBound)
+        fsplErpDbm = clamped
+        UserDefaults.standard.set(clamped, forKey: Self.fsplErpDbmDefaultsKey)
+    }
 
     /// Toggle loop-on-EOF for the file playback source. `true`
     /// rewinds to the start of the WAV file on EOF and keeps
