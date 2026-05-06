@@ -17,8 +17,12 @@ mod sampling;
 mod streaming;
 
 pub use enumerate::{
-    get_device_count, get_device_name, get_device_usb_strings, get_index_by_serial,
+    DeviceInfo, get_device_count, get_device_name, get_device_usb_strings, get_index_by_serial,
+    list_devices,
 };
+
+mod builder;
+pub use builder::RtlSdrDeviceBuilder;
 
 use crate::constants::*;
 use crate::error::RtlSdrError;
@@ -31,6 +35,22 @@ use crate::usb;
 ///
 /// Ports `struct rtlsdr_dev` from librtlsdr. Manages the USB connection,
 /// baseband configuration, and tuner driver.
+///
+/// # Send + Sync
+///
+/// `RtlSdrDevice` is [`Send`] — you can move it across thread
+/// boundaries (e.g. into a `std::thread::spawn` worker that owns
+/// the device exclusively). It is **not** [`Sync`] — the inner
+/// per-tuner driver behind a `Box<dyn Tuner + Send>` doesn't
+/// require `Sync`, so sharing `&RtlSdrDevice` between threads
+/// would be unsound.
+///
+/// The supported pattern is single-owner: one thread holds the
+/// `RtlSdrDevice` and serialises every control method call.
+/// For background bulk reads on a worker thread without giving
+/// up `&mut` on the main thread, see [`Self::usb_handle`] /
+/// [`Self::BULK_ENDPOINT`] and the threading caveats in the
+/// crate-level docs.
 pub struct RtlSdrDevice {
     pub(crate) handle: std::sync::Arc<rusb::DeviceHandle<rusb::GlobalContext>>,
     pub(crate) tuner_type: TunerType,
@@ -71,6 +91,31 @@ impl RtlSdrDevice {
     /// server forwarding raw samples) don't need to hard-code the
     /// magic number. Universal across all RTL-SDR variants.
     pub const BULK_ENDPOINT: u8 = crate::constants::BULK_ENDPOINT;
+
+    /// Start a [`RtlSdrDeviceBuilder`] for opening with named
+    /// selectors (index or serial).
+    ///
+    /// See [`RtlSdrDeviceBuilder`] for usage. `RtlSdrDevice::open`
+    /// remains the lowest-overhead path for the "open the first
+    /// dongle" / "open by known index" cases; the builder is for
+    /// when you want to address a specific dongle by serial in a
+    /// multi-device setup.
+    #[must_use]
+    pub fn builder() -> RtlSdrDeviceBuilder {
+        RtlSdrDeviceBuilder::default()
+    }
+
+    /// Enumerate all connected RTL-SDR dongles in one call.
+    ///
+    /// Convenience shortcut for [`list_devices`] for callers that
+    /// already have `RtlSdrDevice` in scope and don't want to
+    /// import the free function separately. See
+    /// [`list_devices`]'s docs for the performance note (one USB
+    /// descriptor read per dongle — cache the result).
+    #[must_use]
+    pub fn list() -> Vec<DeviceInfo> {
+        enumerate::list_devices()
+    }
 
     /// Open an RTL-SDR device by index.
     ///
@@ -350,6 +395,43 @@ impl RtlSdrDevice {
         self.tuner_type.gains()
     }
 
+    /// Find the closest available tuner gain to a desired value.
+    ///
+    /// `desired_tenths_db` is the target gain in tenths-of-dB (the
+    /// same unit [`Self::set_tuner_gain`] takes). Returns the
+    /// gain step from [`Self::tuner_gains`] that's nearest to the
+    /// requested value. Ties go to the lower step (deterministic
+    /// `min_by_key` behaviour). Useful when an app's UI lets the
+    /// user pick a "rough" dB value (slider, dropdown of round
+    /// numbers) and you want the actual closest hardware-accepted
+    /// step without rolling your own search over the gain table.
+    ///
+    /// Each tuner family has its own discrete gain table — the
+    /// R820T2 has 29 steps from 0.0 to 49.6 dB, the E4000 has 14
+    /// steps from -1 to 49 dB, etc. The result is always one of
+    /// those exact values, never an interpolation.
+    ///
+    /// Returns `0` (a no-op gain) when the tuner has no gain table
+    /// at all — in practice only the `Unknown` tuner type, which
+    /// means the device hasn't been probed or the IC isn't in our
+    /// known-tuners list.
+    ///
+    /// ```no_run
+    /// # use sdr_rtlsdr::{RtlSdrDevice, RtlSdrError};
+    /// # fn main() -> Result<(), RtlSdrError> {
+    /// let mut dev = RtlSdrDevice::open(0)?;
+    /// dev.set_tuner_gain_mode(true)?;
+    /// // User picked "around 15 dB" in the UI; pick the actual step.
+    /// let step = dev.closest_gain(150);
+    /// dev.set_tuner_gain(step)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn closest_gain(&self, desired_tenths_db: i32) -> i32 {
+        closest_gain_in(self.tuner_gains(), desired_tenths_db)
+    }
+
     /// Get device manufacturer string.
     pub fn manufacturer(&self) -> &str {
         &self.manufact
@@ -471,5 +553,111 @@ impl Drop for RtlSdrDevice {
         if self.driver_active {
             let _ = self.handle.attach_kernel_driver(0);
         }
+    }
+}
+
+/// Find the closest entry in a tuner-gain table to `desired`,
+/// returning `0` for an empty table. Pulled out of
+/// [`RtlSdrDevice::closest_gain`] so the algorithm can be unit-
+/// tested without constructing a live device.
+///
+/// Ties go to the lower step (deterministic `min_by_key` —
+/// stable iterator order means the first equally-distant entry
+/// in the table wins, and tables are stored in ascending order).
+///
+/// The distance is computed in `i64` to avoid `i32` overflow on
+/// extreme inputs — `(g - desired).abs()` panics in debug builds
+/// when the subtraction overflows (e.g. `desired == i32::MIN`)
+/// and silently wraps in release. Real callers won't pass such
+/// values, but the algorithm shouldn't be a footgun.
+fn closest_gain_in(gains: &[i32], desired: i32) -> i32 {
+    gains
+        .iter()
+        .copied()
+        .min_by_key(|&g| (i64::from(g) - i64::from(desired)).abs())
+        .unwrap_or(0)
+}
+
+// Pin the `Send`-but-not-`Sync` contract documented on the
+// `RtlSdrDevice` struct. If a future field change ever adds a
+// non-`Send` member (e.g. a `Cell<…>` or `Rc<…>`), this assertion
+// fires at compile time so we notice before semver-breaking
+// downstream consumers who relied on moving the device into a
+// worker thread.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<RtlSdrDevice>();
+};
+
+#[cfg(test)]
+mod tests {
+    use super::closest_gain_in;
+
+    // R820T2 gain table (29 steps, tenths of dB) — pinned here
+    // rather than imported so the test exercises a known-real
+    // table shape independent of any future tuner-table edits.
+    const R820T2_GAINS: &[i32] = &[
+        0, 9, 14, 27, 37, 77, 87, 125, 144, 157, 166, 197, 207, 229, 254, 280, 297, 328, 338, 364,
+        372, 386, 402, 421, 434, 439, 445, 480, 496,
+    ];
+
+    #[test]
+    fn empty_table_returns_zero() {
+        assert_eq!(closest_gain_in(&[], 250), 0);
+        assert_eq!(closest_gain_in(&[], 0), 0);
+        assert_eq!(closest_gain_in(&[], -100), 0);
+    }
+
+    #[test]
+    fn exact_match_returns_self() {
+        for &g in R820T2_GAINS {
+            assert_eq!(
+                closest_gain_in(R820T2_GAINS, g),
+                g,
+                "exact value {g} should round to itself"
+            );
+        }
+    }
+
+    #[test]
+    fn rounds_to_nearest_step() {
+        // 150 is between 144 and 157 — closer to 157 (Δ=7) than
+        // to 144 (Δ=6). Wait — that's |150-144|=6 vs |150-157|=7,
+        // so 144 wins.
+        assert_eq!(closest_gain_in(R820T2_GAINS, 150), 144);
+
+        // 152 is exactly between 144 (Δ=8) and 157 (Δ=5) → 157.
+        assert_eq!(closest_gain_in(R820T2_GAINS, 152), 157);
+
+        // 100 is between 87 (Δ=13) and 125 (Δ=25) → 87.
+        assert_eq!(closest_gain_in(R820T2_GAINS, 100), 87);
+    }
+
+    #[test]
+    fn out_of_range_clamps_to_endpoint() {
+        // Below the minimum: clamp to first entry.
+        assert_eq!(closest_gain_in(R820T2_GAINS, -1000), 0);
+        // Above the maximum: clamp to last entry.
+        assert_eq!(closest_gain_in(R820T2_GAINS, 10_000), 496);
+    }
+
+    #[test]
+    fn ties_resolve_deterministically() {
+        // Symmetric gap: 50 is exactly between 0 and 100. With
+        // `min_by_key` over a stable iterator, the first
+        // equally-distant entry wins → 0.
+        let table = &[0, 100];
+        assert_eq!(closest_gain_in(table, 50), 0);
+    }
+
+    #[test]
+    fn i32_min_does_not_overflow() {
+        // Regression: `(g - desired).abs()` in `i32` panics in
+        // debug / wraps in release when `desired == i32::MIN`,
+        // because `0 - i32::MIN` and `i32::MIN.abs()` both
+        // overflow. The fix promotes the distance to `i64` —
+        // pin it so we don't regress. Per #631 CR round 1.
+        assert_eq!(closest_gain_in(R820T2_GAINS, i32::MIN), 0);
+        assert_eq!(closest_gain_in(R820T2_GAINS, i32::MAX), 496);
     }
 }
