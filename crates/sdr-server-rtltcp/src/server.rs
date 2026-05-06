@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use sdr_rtlsdr::device::RtlSdrDevice;
+use sdr_rtlsdr::RtlSdrDevice;
 
 use crate::broadcaster::{ClientRegistry, ClientSlot, RoleDecision};
 use crate::codec::{Codec, CodecMask, Encoder};
@@ -2266,11 +2266,7 @@ fn broadcaster_worker(
     let mut ticks_since_prune: u32 = 0;
 
     while !shutdown.load(Ordering::Relaxed) {
-        match handle.read_bulk(
-            sdr_rtlsdr::constants::BULK_ENDPOINT,
-            &mut scratch,
-            USB_READ_TIMEOUT,
-        ) {
+        match handle.read_bulk(RtlSdrDevice::BULK_ENDPOINT, &mut scratch, USB_READ_TIMEOUT) {
             Ok(n) if n > 0 => {
                 registry.broadcast(&scratch[..n]);
                 ticks_since_prune = ticks_since_prune.saturating_add(1);

@@ -3,11 +3,21 @@
 //! Each tuner IC (R820T, E4000, FC0012, etc.) implements the `Tuner` trait,
 //! providing frequency, gain, and bandwidth control via I2C.
 
-pub mod e4k;
-pub mod fc0012;
-pub mod fc0013;
-pub mod fc2580;
-pub mod r82xx;
+// Per-tuner backends carry the IC's I2C register tables transcribed
+// from upstream `librtlsdr`. Some entries aren't called from Rust
+// today but are kept for completeness so adding a hardware feature
+// later is a register-table read rather than a re-port. Scoped
+// `dead_code` allow per-module rather than crate-level so dead paths
+// in non-port code still get caught. Per #630 CR round 2.
+#[allow(dead_code)]
+pub(crate) mod e4k;
+#[allow(dead_code)]
+pub(crate) mod fc0012;
+#[allow(dead_code)]
+pub(crate) mod fc0013;
+#[allow(dead_code)]
+pub(crate) mod fc2580;
+pub(crate) mod r82xx;
 
 use crate::error::RtlSdrError;
 

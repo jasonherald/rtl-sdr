@@ -63,6 +63,15 @@ pub struct RtlSdrDevice {
 }
 
 impl RtlSdrDevice {
+    /// USB bulk-IN endpoint address for IQ sample reads.
+    ///
+    /// Exposed as a public constant so callers using the
+    /// [`Self::usb_handle`] escape hatch to do their own raw
+    /// `rusb::DeviceHandle::read_bulk` calls (e.g. an `rtl_tcp`
+    /// server forwarding raw samples) don't need to hard-code the
+    /// magic number. Universal across all RTL-SDR variants.
+    pub const BULK_ENDPOINT: u8 = crate::constants::BULK_ENDPOINT;
+
     /// Open an RTL-SDR device by index.
     ///
     /// Ports `rtlsdr_open`. Initializes the baseband, probes the tuner,

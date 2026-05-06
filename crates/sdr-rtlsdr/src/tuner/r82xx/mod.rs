@@ -5,6 +5,10 @@
 //! - `i2c`: Shadow register I2C communication
 //! - `pll`: PLL frequency synthesis
 
+// R820T2/R828D register-table constants — same faithful-port
+// rationale as the sibling tuners (`tuner/mod.rs`). Per #630 CR
+// round 2.
+#[allow(dead_code)]
 pub mod constants;
 mod i2c;
 mod pll;
