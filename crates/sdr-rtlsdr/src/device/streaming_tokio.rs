@@ -35,10 +35,10 @@ use crate::error::RtlSdrError;
 use super::RtlSdrDevice;
 
 /// Number of buffers the tokio mpsc channel holds before the
-/// reader thread blocks. Picked to give the consumer ~1 second
-/// of slack at typical RTL-SDR rates (4 × 256 KB ≈ 1 MB ≈ 0.4 s
-/// at 2 Msps × 2 bytes/sample, so 4 buffers ≈ 260 ms — enough
-/// to absorb a slow tick on the consumer without dropping a
+/// reader thread blocks. Picked to give the consumer ~250 ms
+/// of slack at typical RTL-SDR rates (4 × 256 KB ≈ 1 MB ≈
+/// 0.25 s at 2 Msps × 2 bytes/sample = 4 MB/s — enough to
+/// absorb a slow tick on the consumer without dropping a
 /// transfer, not so much that latency-sensitive consumers
 /// observe a long queue).
 const STREAM_BACKPRESSURE_DEPTH: usize = 4;
