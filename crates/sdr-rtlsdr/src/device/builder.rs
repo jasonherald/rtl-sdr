@@ -93,9 +93,12 @@ impl RtlSdrDeviceBuilder {
     /// # Errors
     ///
     /// - [`RtlSdrError::DeviceNotFound`] when the index is out of
-    ///   range OR the serial doesn't match any plugged-in dongle.
-    /// - [`RtlSdrError::InvalidParameter`] when no devices are
-    ///   plugged in but a serial selector was set.
+    ///   range OR no devices are plugged in at all (the
+    ///   underlying [`super::enumerate::get_index_by_serial`]
+    ///   returns this when its enumerate sees zero devices).
+    /// - [`RtlSdrError::InvalidParameter`] when devices are
+    ///   present but no plugged-in dongle's serial matches the
+    ///   one supplied.
     /// - Any [`RtlSdrError`] [`RtlSdrDevice::open`] would return on
     ///   the resolved index (USB transport errors, baseband-init
     ///   failure, unknown tuner, etc.).
@@ -109,20 +112,13 @@ impl RtlSdrDeviceBuilder {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::panic,
-    reason = "tests use panic!() for descriptive assertion failures"
-)]
 mod tests {
     use super::*;
 
     #[test]
     fn default_builder_uses_index_zero() {
         let b = RtlSdrDeviceBuilder::default();
-        match b.selector {
-            Selector::Index(0) => {}
-            other => panic!("expected Index(0), got {other:?}"),
-        }
+        assert!(matches!(b.selector, Selector::Index(0)));
     }
 
     #[test]
@@ -131,16 +127,10 @@ mod tests {
             .index(2)
             .serial("ABCD")
             .index(5);
-        match b.selector {
-            Selector::Index(5) => {}
-            other => panic!("expected Index(5), got {other:?}"),
-        }
+        assert!(matches!(b.selector, Selector::Index(5)));
 
         let b = RtlSdrDeviceBuilder::default().index(7).serial("WXYZ");
-        match b.selector {
-            Selector::Serial(ref s) if s == "WXYZ" => {}
-            other => panic!("expected Serial(\"WXYZ\"), got {other:?}"),
-        }
+        assert!(matches!(b.selector, Selector::Serial(ref s) if s == "WXYZ"));
     }
 
     #[test]

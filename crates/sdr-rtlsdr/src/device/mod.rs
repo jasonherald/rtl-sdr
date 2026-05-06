@@ -564,11 +564,17 @@ impl Drop for RtlSdrDevice {
 /// Ties go to the lower step (deterministic `min_by_key` —
 /// stable iterator order means the first equally-distant entry
 /// in the table wins, and tables are stored in ascending order).
+///
+/// The distance is computed in `i64` to avoid `i32` overflow on
+/// extreme inputs — `(g - desired).abs()` panics in debug builds
+/// when the subtraction overflows (e.g. `desired == i32::MIN`)
+/// and silently wraps in release. Real callers won't pass such
+/// values, but the algorithm shouldn't be a footgun.
 fn closest_gain_in(gains: &[i32], desired: i32) -> i32 {
     gains
         .iter()
         .copied()
-        .min_by_key(|&g| (g - desired).abs())
+        .min_by_key(|&g| (i64::from(g) - i64::from(desired)).abs())
         .unwrap_or(0)
 }
 
@@ -584,7 +590,7 @@ const _: fn() = || {
 };
 
 #[cfg(test)]
-mod closest_gain_tests {
+mod tests {
     use super::closest_gain_in;
 
     // R820T2 gain table (29 steps, tenths of dB) — pinned here
@@ -642,5 +648,16 @@ mod closest_gain_tests {
         // equally-distant entry wins → 0.
         let table = &[0, 100];
         assert_eq!(closest_gain_in(table, 50), 0);
+    }
+
+    #[test]
+    fn i32_min_does_not_overflow() {
+        // Regression: `(g - desired).abs()` in `i32` panics in
+        // debug / wraps in release when `desired == i32::MIN`,
+        // because `0 - i32::MIN` and `i32::MIN.abs()` both
+        // overflow. The fix promotes the distance to `i64` —
+        // pin it so we don't regress. Per #631 CR round 1.
+        assert_eq!(closest_gain_in(R820T2_GAINS, i32::MIN), 0);
+        assert_eq!(closest_gain_in(R820T2_GAINS, i32::MAX), 496);
     }
 }
