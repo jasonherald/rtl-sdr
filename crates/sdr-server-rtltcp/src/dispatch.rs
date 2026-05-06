@@ -5,7 +5,7 @@
 //! Errors are logged but do not abort the command loop (matches upstream,
 //! which ignores each call's return code inside the `switch`).
 
-use sdr_rtlsdr::device::RtlSdrDevice;
+use sdr_rtlsdr::RtlSdrDevice;
 
 use crate::protocol::{Command, CommandOp};
 

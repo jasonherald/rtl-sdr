@@ -282,8 +282,7 @@ impl Source for RtlSdrSource {
                         break;
                     };
 
-                    match handle.read_bulk(sdr_rtlsdr::constants::BULK_ENDPOINT, &mut data, timeout)
-                    {
+                    match handle.read_bulk(RtlSdrDevice::BULK_ENDPOINT, &mut data, timeout) {
                         Ok(n) if n > 0 => {
                             slot.len.store(n, Ordering::Relaxed);
                             slot.state.store(1, Ordering::Release); // mark full
