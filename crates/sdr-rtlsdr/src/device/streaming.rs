@@ -104,6 +104,12 @@ impl RtlSdrDevice {
     /// 512-byte packet — `read_sync` returns the actual byte count
     /// — but multiples of 512 avoid short final transfers.
     ///
+    /// Passing `0` selects the librtlsdr-equivalent default
+    /// (256 KB) rather than requesting a zero-length buffer —
+    /// matches the upstream "pass 0 for the default" ergonomic
+    /// and prevents a typo from silently fusing the iterator on
+    /// the first call (which would look like EOF).
+    ///
     /// # Allocation
     ///
     /// Each yielded `Vec<u8>` is a fresh allocation. At the

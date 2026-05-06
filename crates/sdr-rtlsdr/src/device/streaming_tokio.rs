@@ -77,7 +77,11 @@ impl RtlSdrDevice {
     ///
     /// let dev = RtlSdrDevice::open(0)?;
     /// dev.reset_buffer()?;
-    /// let stream = dev.stream_samples_tokio(262_144)?;
+    /// // `stream_samples_tokio` returns the device back on
+    /// // preflight failure (e.g. no tokio runtime active);
+    /// // `.map_err(|boxed| boxed.0)` discards the device and
+    /// // surfaces the underlying `RtlSdrError` so `?` works.
+    /// let stream = dev.stream_samples_tokio(262_144).map_err(|boxed| boxed.0)?;
     /// let mut stream: Pin<Box<dyn Stream<Item = _>>> = Box::pin(stream);
     /// // futures_util::StreamExt::next() — left to the consumer's choice of helper crate.
     /// # Ok(())
@@ -115,18 +119,57 @@ impl RtlSdrDevice {
     ///
     /// # Errors
     ///
-    /// - [`RtlSdrError::InvalidParameter`] if no tokio runtime
-    ///   is active when this method is called.
-    pub fn stream_samples_tokio(self, buffer_size: usize) -> Result<SampleStream, RtlSdrError> {
-        // Preflight runtime check. `tokio::task::spawn_blocking`
+    /// On preflight failure (no tokio runtime active) the
+    /// returned `Err` carries both the diagnostic
+    /// [`RtlSdrError`] and the unconsumed [`RtlSdrDevice`]
+    /// back to the caller — the configured frequency, gain,
+    /// tuner state, etc. survive so the caller can enter a
+    /// runtime and retry without re-opening:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "tokio")]
+    /// # async fn example() -> Result<(), sdr_rtlsdr::RtlSdrError> {
+    /// # use sdr_rtlsdr::RtlSdrDevice;
+    /// let dev = RtlSdrDevice::open(0)?;
+    /// // dev.set_center_freq(...) etc. ...
+    /// let stream = match dev.stream_samples_tokio(0) {
+    ///     Ok(stream) => stream,
+    ///     Err(boxed) => {
+    ///         let (err, _device) = *boxed;
+    ///         return Err(err);
+    ///     }
+    /// };
+    /// # let _ = stream;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Pattern matches the std-library "error preserves the
+    /// resource" idiom (see `Vec::push_within_capacity`,
+    /// `mpsc::Sender::send`'s `SendError<T>`). The `Err` is
+    /// boxed because [`RtlSdrDevice`] is a sizeable struct and
+    /// returning it inline would inflate every `Result` on the
+    /// happy path (clippy's `result_large_err` lint).
+    pub fn stream_samples_tokio(
+        self,
+        buffer_size: usize,
+    ) -> Result<SampleStream, Box<(RtlSdrError, Self)>> {
+        // Preflight runtime check BEFORE consuming `self`'s
+        // resources into the worker. `tokio::task::spawn_blocking`
         // doesn't document its outside-runtime behaviour but
-        // panics in practice; library code shouldn't panic, so
-        // detect explicitly via `try_current` and return an
-        // `RtlSdrError`. Per #632 CR round 1.
+        // panics in practice; library code shouldn't panic.
+        // Returning the device on the error path means a caller
+        // who forgot to enter a runtime can retry without losing
+        // their configured frequency / gain / tuner state. Per
+        // #632 CR round 2 (round 1 added the check; round 2 fixed
+        // the device-loss-on-error bug).
         if tokio::runtime::Handle::try_current().is_err() {
-            return Err(RtlSdrError::InvalidParameter(
-                "stream_samples_tokio must be called from within a Tokio runtime".to_string(),
-            ));
+            return Err(Box::new((
+                RtlSdrError::InvalidParameter(
+                    "stream_samples_tokio must be called from within a Tokio runtime".to_string(),
+                ),
+                self,
+            )));
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_BACKPRESSURE_DEPTH);
