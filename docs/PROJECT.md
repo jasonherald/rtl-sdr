@@ -19,7 +19,8 @@ crates/
   sdr-pipeline/        # Threading & streaming: Stream<T>, Block trait, Chain, Splitter, IqFrontend, managers
   # librtlsdr-rs/      # ⇧ External crate (https://crates.io/crates/librtlsdr-rs).
                        # Spun out of what used to be `sdr-rtlsdr` and consumed via
-                       # workspace dep on the published 0.1.x. Still GPL-2.0-or-later.
+                       # workspace dep on the published 0.1.x (as of May 2026).
+                       # Still GPL-2.0-or-later.
   sdr-source-rtlsdr/   # RTL-SDR source module using librtlsdr-rs
   sdr-source-network/  # TCP client + UDP receiver for IQ input
   sdr-source-file/     # WAV file IQ playback (testing/replay)
@@ -101,17 +102,23 @@ Translating from `original/SDRPlusPlus/core/src/signal_path/`.
 
 ### librtlsdr (Pure Rust Port)
 
-Translating from `original/librtlsdr/`. Replaces the C library entirely using `rusb` for USB.
+Translated from `original/librtlsdr/`. Replaces the C library entirely using `rusb` for USB.
+
+The port lives in the [`librtlsdr-rs`] crate (spun out as a standalone published crate; consumed
+from crates.io as of May 2026). Paths in the table below are relative to that crate's repo root,
+which used to be `crates/sdr-rtlsdr/` in this workspace before the spinout.
+
+[`librtlsdr-rs`]: https://crates.io/crates/librtlsdr-rs
 
 | C File | Lines | Rust Target | Purpose |
 |---|---|---|---|
-| `src/librtlsdr.c` | 2,052 | `sdr-rtlsdr/src/device.rs` | Core: USB control, RTL2832 demod chip, async bulk transfers |
-| `src/tuner_r82xx.c` | 1,366 | `sdr-rtlsdr/src/tuner/r82xx.rs` | R820T/R828D tuner driver (most common in consumer dongles) |
-| `src/tuner_e4k.c` | 1,000 | `sdr-rtlsdr/src/tuner/e4k.rs` | Elonics E4000 tuner driver |
-| `src/tuner_fc2580.c` | 494 | `sdr-rtlsdr/src/tuner/fc2580.rs` | Fitipower FC2580 tuner driver |
-| `src/tuner_fc0013.c` | 500 | `sdr-rtlsdr/src/tuner/fc0013.rs` | Fitipower FC0013 tuner driver |
-| `src/tuner_fc0012.c` | 333 | `sdr-rtlsdr/src/tuner/fc0012.rs` | Fitipower FC0012 tuner driver |
-| `include/rtl-sdr.h` | 407 | `sdr-rtlsdr/src/lib.rs` | Public API (37 functions) |
+| `src/librtlsdr.c` | 2,052 | `librtlsdr-rs/src/device/` | Core: USB control, RTL2832 demod chip, async bulk transfers |
+| `src/tuner_r82xx.c` | 1,366 | `librtlsdr-rs/src/tuner/r82xx/` | R820T/R828D tuner driver (most common in consumer dongles) |
+| `src/tuner_e4k.c` | 1,000 | `librtlsdr-rs/src/tuner/e4k.rs` | Elonics E4000 tuner driver |
+| `src/tuner_fc2580.c` | 494 | `librtlsdr-rs/src/tuner/fc2580.rs` | Fitipower FC2580 tuner driver |
+| `src/tuner_fc0013.c` | 500 | `librtlsdr-rs/src/tuner/fc0013.rs` | Fitipower FC0013 tuner driver |
+| `src/tuner_fc0012.c` | 333 | `librtlsdr-rs/src/tuner/fc0012.rs` | Fitipower FC0012 tuner driver |
+| `include/rtl-sdr.h` | 407 | `librtlsdr-rs/src/lib.rs` | Public API (37 functions) |
 
 **Total**: ~5,745 lines of C. Tuner drivers are I2C register manipulation -- maps cleanly to Rust. CLI utilities (`rtl_fm`, `rtl_tcp`, etc.) are NOT ported.
 
@@ -119,7 +126,7 @@ Translating from `original/librtlsdr/`. Replaces the C library entirely using `r
 
 | C++ File | Rust Target | Purpose |
 |---|---|---|
-| `source_modules/rtl_sdr_source/src/main.cpp` | `sdr-source-rtlsdr/src/lib.rs` | Source module using `sdr-rtlsdr`, uint8-to-f32 IQ conversion |
+| `source_modules/rtl_sdr_source/src/main.cpp` | `sdr-source-rtlsdr/src/lib.rs` | Source module using `librtlsdr-rs`, uint8-to-f32 IQ conversion |
 | `source_modules/network_source/src/main.cpp` | `sdr-source-network/src/lib.rs` | TCP client + UDP receiver, int8/16/32/f32 format conversion |
 | `source_modules/file_source/src/main.cpp` | `sdr-source-file/src/lib.rs` | WAV file IQ playback for testing and replay |
 
@@ -190,7 +197,7 @@ C++ uses VOLK (SIMD library) for vectorized math. Rust approach: write scalar lo
 
 ### 8. Pure Rust librtlsdr Port
 
-The `sdr-rtlsdr` crate replaces C `librtlsdr` entirely. Uses `rusb` for USB communication. ~5,745 LOC of C ported to safe Rust with a trait-based tuner abstraction. Eliminates the C dependency chain.
+The [`librtlsdr-rs`](https://crates.io/crates/librtlsdr-rs) crate (spun out as a standalone published crate) replaces C `librtlsdr` entirely. Uses `rusb` for USB communication. ~5,745 LOC of C ported to safe Rust with a trait-based tuner abstraction. Eliminates the C dependency chain.
 
 ---
 
@@ -302,7 +309,7 @@ The `sdr-rtlsdr` crate replaces C `librtlsdr` entirely. Uses `rusb` for USB comm
 | GTK4 UI | `gtk4`, `libadwaita` | UI framework |
 | OpenGL | `glow` | Safe OpenGL wrapper for GtkGLArea |
 | JSON config | `serde`, `serde_json` | Config persistence |
-| USB | `rusb` | Pure Rust libusb wrapper (for sdr-rtlsdr) |
+| USB | `rusb` | Pure Rust libusb wrapper (for librtlsdr-rs) |
 | Audio (Linux) | `pipewire-rs` | Native PipeWire |
 | Audio (macOS) | `coreaudio-rs` | CoreAudio |
 | WAV files | `hound` | WAV reading for file source |
@@ -353,7 +360,7 @@ The `sdr-rtlsdr` crate replaces C `librtlsdr` entirely. Uses `rusb` for USB comm
 
 **Branch**: `feature/phase-3a-rtlsdr-driver`
 
-**Scope**: `sdr-rtlsdr` -- pure Rust port of librtlsdr
+**Scope**: pure Rust port of librtlsdr (originally `crates/sdr-rtlsdr`; spun out as the [`librtlsdr-rs`](https://crates.io/crates/librtlsdr-rs) crate in May 2026)
 
 **Deliverables**:
 - `rusb` integration for USB bulk transfers and control transfers
@@ -375,7 +382,7 @@ The `sdr-rtlsdr` crate replaces C `librtlsdr` entirely. Uses `rusb` for USB comm
 **Scope**: Source and sink modules
 
 **Deliverables**:
-- `sdr-source-rtlsdr`: Source module wrapping `sdr-rtlsdr` with uint8→f32 conversion
+- `sdr-source-rtlsdr`: Source module wrapping `librtlsdr-rs` with uint8→f32 conversion
 - `sdr-source-network`: TCP client and UDP receiver with int8/16/32/f32 format conversion
 - `sdr-source-file`: WAV IQ playback using `hound` crate
 - `sdr-sink-audio`: PipeWire (Linux) / CoreAudio (macOS) with device enumeration and sample rate selection

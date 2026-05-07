@@ -11,7 +11,7 @@
     clippy::manual_midpoint,
     clippy::redundant_closure
 )]
-//! RTL-SDR source module — wraps sdr-rtlsdr for the pipeline.
+//! RTL-SDR source module — wraps librtlsdr-rs for the pipeline.
 //!
 //! Owns a USB reader thread and lock-free ring buffer. Converts raw
 //! uint8 IQ samples from the USB device to f32 Complex samples for

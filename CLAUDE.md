@@ -7,7 +7,7 @@ Rust port of SDR++ — software-defined radio application with GTK4 UI.
 22-member workspace (root binary + 21 library crates) with clear dependency boundaries.
 The driver layer (`sdr-rtlsdr`) was spun out as a standalone published crate
 [`librtlsdr-rs`](https://crates.io/crates/librtlsdr-rs) and is consumed from
-crates.io rather than path-deped.
+crates.io rather than as a path dependency.
 
 ```text
 sdr-types             → Foundation types, errors, constants (no internal deps)
