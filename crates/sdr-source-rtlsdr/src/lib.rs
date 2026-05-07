@@ -137,6 +137,226 @@ pub struct RtlSdrSource {
     running: Arc<AtomicBool>,
     ring: Option<Arc<UsbRingBuffer>>,
     reader_thread: Option<std::thread::JoinHandle<()>>,
+    /// Most-recent tuner-gain value the controller / UI dispatched
+    /// at us, in tenths of dB. `None` means nothing has been
+    /// dispatched yet — `start()` falls back to the
+    /// out-of-the-box default (`FIRST_TIME_TUNER_GAIN_TENTHS_DB`)
+    /// in that case so a fresh user with no persisted gain still
+    /// gets signal on first Play. Once the UI dispatches its
+    /// persisted value (typically right after the source becomes
+    /// available), this transitions to `Some(...)` and `start()`
+    /// honours that value forever after — fixes the regression
+    /// where source-restart paths (e.g. satellite auto-record
+    /// after a stop+start cycle) silently overrode the user's
+    /// 0 dB choice with the 29.7 dB default and saturated the
+    /// front-end on LNA-equipped chains.
+    last_tuner_gain_tenths_db: Option<i32>,
+}
+
+/// USB reader-thread main loop.
+///
+/// Drives [`sdr_rtlsdr::RtlSdrReader::iter_samples`] forever
+/// (until `cancel` flips false or the iterator yields an error),
+/// pushing each owned `Vec<u8>` into the lock-free SPSC ring for
+/// the DSP thread to consume. Pulled out of the closure inside
+/// `RtlSdrSource::start` so the start path stays under clippy's
+/// too-many-lines threshold.
+fn run_reader_thread(
+    reader: sdr_rtlsdr::RtlSdrReader,
+    ring_writer: &Arc<UsbRingBuffer>,
+    cancel: &Arc<AtomicBool>,
+) {
+    tracing::info!("USB reader thread started (ring slots={RING_SLOTS})");
+
+    // First-buffer stats: sanity check that real USB data is
+    // flowing (not all zeros, not all 127) and what its rough
+    // amplitude looks like. Periodic heartbeat: confirms the
+    // stream stays alive at the expected throughput.
+    let mut buffers_seen = 0u32;
+    let mut bytes_total: u64 = 0;
+    let mut last_stats_log = std::time::Instant::now();
+
+    // Drive `reader.iter_samples(RAW_BUF_SIZE)` — yields owned
+    // `Vec<u8>` per USB bulk transfer. One allocation per yield
+    // (~15/sec at 2 Msps × 256 KB), negligible at modern
+    // allocator speeds. A zero-alloc
+    // `iter_samples_into(&mut Vec<u8>)` variant is a future
+    // optimisation if the per-yield allocation ever shows up in
+    // profiles.
+    for chunk in reader.iter_samples(RAW_BUF_SIZE) {
+        if !cancel.load(Ordering::Acquire) {
+            break;
+        }
+
+        let buf = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("USB reader error: {e}");
+                ring_writer.error.store(true, Ordering::Release);
+                break;
+            }
+        };
+        if buf.is_empty() {
+            continue;
+        }
+
+        buffers_seen = buffers_seen.saturating_add(1);
+        bytes_total = bytes_total.saturating_add(buf.len() as u64);
+
+        if buffers_seen == 1 {
+            log_buffer_stats(&buf, "first USB buffer received");
+        }
+        if last_stats_log.elapsed() >= Duration::from_secs(5) {
+            let mb = bytes_total as f64 / 1_048_576.0;
+            tracing::debug!(
+                buffers_seen,
+                mb_total = format!("{mb:.2}"),
+                "USB reader thread heartbeat"
+            );
+            // Amplitude stats every 5 sec (info level so they're
+            // visible without bumping log verbosity). Lets us
+            // see how the IQ-byte distribution changes after
+            // bias-T toggles, gain changes, frequency retunes,
+            // and during a satellite pass — captures the
+            // saturation / quiet-noise / real-signal shapes
+            // that the previous "log only the first buffer"
+            // approach missed.
+            log_buffer_stats(&buf, "periodic USB buffer stats");
+            last_stats_log = std::time::Instant::now();
+        }
+
+        // Find an empty slot; yield briefly if the ring is full
+        // (DSP can't keep up). The pre-iter-call cancel check
+        // above bounds worst-case shutdown latency to one
+        // in-flight USB read (~65 ms typical, up to one read
+        // timeout on stalled hardware).
+        let idx = ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slot_count;
+        let slot = &ring_writer.slots[idx];
+
+        while slot.state.load(Ordering::Acquire) != 0 {
+            if !cancel.load(Ordering::Acquire) {
+                tracing::debug!("USB reader thread stopping (ring-full wait)");
+                return;
+            }
+            std::thread::yield_now();
+        }
+
+        let Ok(mut data) = slot.data.lock() else {
+            tracing::error!("ring slot mutex poisoned");
+            ring_writer.error.store(true, Ordering::Release);
+            break;
+        };
+
+        let n = buf.len();
+        data[..n].copy_from_slice(&buf);
+        drop(data);
+        slot.len.store(n, Ordering::Relaxed);
+        slot.state.store(1, Ordering::Release);
+        ring_writer.write_idx.fetch_add(1, Ordering::Relaxed);
+    }
+    tracing::debug!("USB reader thread stopped");
+}
+
+/// Histogram-style amplitude stats for one USB buffer.
+///
+/// The reader-thread `log_buffer_stats` calls below are the
+/// diagnostic backbone for LNA / saturation / signal-level
+/// debugging — three info-level lines per source-start (first
+/// buffer + every 5 sec) is the right cadence to spot
+/// regressions without spamming the log. Examples of what these
+/// stats catch:
+///
+/// - `mean` significantly off from 127.5 → tuner DC offset (rare)
+/// - `frac_at_0` or `frac_at_255` > 1% → ADC clipping / front-
+///   end saturation (gain too high)
+/// - `std_dev` < 1 → near-zero signal at the antenna (LNA dead,
+///   antenna disconnected, SAW filter blocking the band)
+/// - `std_dev` 3-10 → healthy noise floor with proper LNA gain
+/// - `std_dev` > 30 → strong in-band signal OR full clipping
+///
+/// Stats are computed in a single pass and returned so the
+/// caller can format the log line with a context-specific
+/// event name. Per the #626 RtlSdrReader-split smoke test,
+/// where the periodic `log_buffer_stats` lines were the
+/// definitive proof that bias-T + LNA + 0 dB tuner gain was
+/// producing healthy noise (std_dev 4.65, no rail clipping)
+/// rather than the saturation we'd suspected from waterfall
+/// appearance alone.
+struct BufferStats {
+    len: usize,
+    min: u8,
+    max: u8,
+    mean: f64,
+    std_dev: f64,
+    frac_at_0: f64,
+    frac_at_255: f64,
+}
+
+fn compute_buffer_stats(buf: &[u8]) -> Option<BufferStats> {
+    let len = buf.len();
+    if len == 0 {
+        return None;
+    }
+    let mut min = 255u8;
+    let mut max = 0u8;
+    let mut sum: u64 = 0;
+    let mut zeros: u64 = 0;
+    let mut peaks: u64 = 0;
+    for &b in buf {
+        if b < min {
+            min = b;
+        }
+        if b > max {
+            max = b;
+        }
+        sum += b as u64;
+        if b == 0 {
+            zeros += 1;
+        }
+        if b == 255 {
+            peaks += 1;
+        }
+    }
+    let mean = sum as f64 / len as f64;
+    let var: f64 = buf
+        .iter()
+        .map(|&b| {
+            let d = b as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / len as f64;
+    Some(BufferStats {
+        len,
+        min,
+        max,
+        mean,
+        std_dev: var.sqrt(),
+        frac_at_0: zeros as f64 / len as f64,
+        frac_at_255: peaks as f64 / len as f64,
+    })
+}
+
+/// Log the buffer-stats summary at info level with a caller-
+/// supplied event message. Used both for the one-time first-
+/// buffer log AND the periodic post-toggle heartbeat so we can
+/// see how the IQ amplitude shifts after gain / bias-T /
+/// frequency changes. Per the bias-T-saturation diagnosis
+/// during the #626 RtlSdrReader-split smoke test.
+fn log_buffer_stats(buf: &[u8], event: &'static str) {
+    let Some(stats) = compute_buffer_stats(buf) else {
+        return;
+    };
+    tracing::info!(
+        len = stats.len,
+        min = stats.min,
+        max = stats.max,
+        mean = format!("{:.2}", stats.mean),
+        std_dev = format!("{:.2}", stats.std_dev),
+        frac_at_0 = format!("{:.4}", stats.frac_at_0),
+        frac_at_255 = format!("{:.4}", stats.frac_at_255),
+        event,
+    );
 }
 
 impl RtlSdrSource {
@@ -150,6 +370,7 @@ impl RtlSdrSource {
             running: Arc::new(AtomicBool::new(false)),
             ring: None,
             reader_thread: None,
+            last_tuner_gain_tenths_db: None,
         }
     }
 
@@ -175,18 +396,61 @@ impl Source for RtlSdrSource {
     }
 
     fn start(&mut self) -> Result<(), SourceError> {
-        // R820T supports 29.7 dB exactly (gain-table index 17).
-        // See the supported-gains list in
-        // `crates/sdr-rtlsdr/src/tuner/r82xx/mod.rs` if porting
-        // to a different tuner family (E4000 / FC0012 / FC0013
-        // / FC2580 have different step tables; the post-open
-        // default-gain call below would need to be tuner-
-        // adaptive then. Per issue #407 + PR #418 smoke test
-        // feedback ("AGC off by default").
-        const DEFAULT_TUNER_GAIN_TENTHS_DB: i32 = 297;
+        // First-time-user fallback gain. R820T supports 29.7 dB
+        // exactly (gain-table index 17) — picked as a mid-range
+        // value that produces audible signal on broadcast FM
+        // without amplifier saturation for the bare-dongle (no
+        // LNA) case. Used only when the controller / UI hasn't
+        // dispatched a gain yet (`last_tuner_gain_tenths_db ==
+        // None`) — once the user's persisted setting flows in,
+        // `start()` honours that instead so the LNA-equipped
+        // setup the user explicitly configured (e.g. 0 dB tuner
+        // + SAW LNA = ~28 dB total) survives source restarts.
+        // Per issue #407 + PR #418 smoke test feedback
+        // ("AGC off by default") + the LNA-saturation bug found
+        // during the #626 RtlSdrReader-split smoke test.
+        const FIRST_TIME_TUNER_GAIN_TENTHS_DB: i32 = 297;
+        let initial_gain_tenths_db = self
+            .last_tuner_gain_tenths_db
+            .unwrap_or(FIRST_TIME_TUNER_GAIN_TENTHS_DB);
+
+        // Per-start diagnostic: this single log line lets us reconstruct
+        // the source's intent on every fresh open from a session log.
+        // Most LNA-related issues we've debugged (saturation, silence,
+        // wrong-band noise) come down to a mismatch between what the
+        // user thinks the gain / mode is and what the source actually
+        // applied. Per #626 RtlSdrReader-split smoke test debugging.
+        tracing::info!(
+            device_index = self.device_index,
+            sample_rate = self.sample_rate,
+            frequency_hz = self.frequency,
+            initial_gain_tenths_db,
+            initial_gain_db = initial_gain_tenths_db as f64 / 10.0,
+            last_dispatched_gain = ?self.last_tuner_gain_tenths_db,
+            ring_slots = RING_SLOTS,
+            buffer_bytes = RAW_BUF_SIZE,
+            "RtlSdrSource::start: opening device with config"
+        );
 
         let mut device = RtlSdrDevice::open(self.device_index)
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+
+        // Capture device identity + tuner gain ladder right after
+        // open. Logging the gain table tells us which tuner family
+        // was probed (R820T vs E4000 vs FC0012/13/2580 vs FC2580
+        // each have different step counts), and the USB strings
+        // confirm which physical dongle the workflow opened —
+        // important when more than one is plugged in or after a
+        // hot-plug. Per #626 RtlSdrReader-split smoke test
+        // debugging.
+        tracing::info!(
+            tuner_type = ?device.tuner_type(),
+            manufacturer = device.manufacturer(),
+            product = device.product(),
+            serial = device.serial(),
+            gain_table_tenths_db = ?device.tuner_gains(),
+            "RtlSdrSource::start: device opened"
+        );
 
         device
             .set_sample_rate(self.sample_rate as u32)
@@ -234,7 +498,7 @@ impl Source for RtlSdrSource {
         device
             .set_tuner_gain_mode(true)
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
-        if let Err(e) = device.set_tuner_gain(DEFAULT_TUNER_GAIN_TENTHS_DB) {
+        if let Err(e) = device.set_tuner_gain(initial_gain_tenths_db) {
             // Non-fatal: the gain-mode write above already put
             // the tuner in a valid manual state. If the
             // mid-range default fails (unexpected tuner
@@ -251,53 +515,22 @@ impl Source for RtlSdrSource {
         self.running.store(true, Ordering::Release);
 
         // Create the ring buffer and spawn the USB reader thread.
+        // The reader uses sdr-rtlsdr's `RtlSdrReader` —
+        // a streaming-focused handle acquired cheaply from the
+        // device, holding its own `Arc<DeviceHandle>` clone — so
+        // the parent thread retains `self.device = Some(device)`
+        // for control methods (`set_center_freq`, etc.) that the
+        // satellite auto-record + UI tune both call mid-stream
+        // without restarting the source. Per #626 round 4
+        // (RtlSdrReader split).
         let ring = Arc::new(UsbRingBuffer::new(RING_SLOTS, RAW_BUF_SIZE));
         let ring_writer = Arc::clone(&ring);
         let cancel = Arc::clone(&self.running);
-        let handle = device.usb_handle();
+        let reader = device.reader();
 
         let thread = std::thread::Builder::new()
             .name("usb-reader".into())
-            .spawn(move || {
-                tracing::info!("USB reader thread started (ring slots={RING_SLOTS})");
-                let timeout = Duration::from_secs(1);
-
-                while cancel.load(Ordering::Acquire) {
-                    let idx =
-                        ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slot_count;
-                    let slot = &ring_writer.slots[idx];
-
-                    // Wait for slot to be empty.
-                    if slot.state.load(Ordering::Acquire) != 0 {
-                        // Ring full — DSP can't keep up. Yield briefly.
-                        std::thread::yield_now();
-                        continue;
-                    }
-
-                    // Lock the slot's buffer for writing. Never contended because
-                    // the state flag ensures reader and writer don't overlap.
-                    let Ok(mut data) = slot.data.lock() else {
-                        tracing::error!("ring slot mutex poisoned");
-                        ring_writer.error.store(true, Ordering::Release);
-                        break;
-                    };
-
-                    match handle.read_bulk(RtlSdrDevice::BULK_ENDPOINT, &mut data, timeout) {
-                        Ok(n) if n > 0 => {
-                            slot.len.store(n, Ordering::Relaxed);
-                            slot.state.store(1, Ordering::Release); // mark full
-                            ring_writer.write_idx.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(_) | Err(rusb::Error::Timeout) => {}
-                        Err(e) => {
-                            tracing::warn!("USB reader error: {e}");
-                            ring_writer.error.store(true, Ordering::Release);
-                            break;
-                        }
-                    }
-                }
-                tracing::debug!("USB reader thread stopped");
-            })
+            .spawn(move || run_reader_thread(reader, &ring_writer, &cancel))
             .map_err(|e| SourceError::OpenFailed(format!("failed to spawn USB reader: {e}")))?;
 
         self.ring = Some(ring);
@@ -393,6 +626,35 @@ impl Source for RtlSdrSource {
     }
 
     fn set_gain(&mut self, gain_tenths: i32) -> Result<(), SourceError> {
+        // Remember the dispatched value EVEN IF the device isn't
+        // currently open, so a later `start()` call (e.g. user
+        // clicked Play after dispatching gain at app launch, or
+        // satellite auto-record restarted the source) reapplies
+        // the user's choice rather than the first-time default.
+        // Per the regression fix in the #626 RtlSdrReader-split
+        // smoke test where a 0 dB user setting was silently
+        // overridden by 29.7 dB on every start, saturating the
+        // front-end on LNA-equipped chains.
+        // Diagnostic info-level log: gain dispatches are
+        // user-paced (UI slider drag, persisted-settings replay
+        // on source open, satellite auto-record paths) so
+        // logging each one at info doesn't add meaningful noise
+        // and is invaluable when debugging
+        // saturation / silent-recording issues. The
+        // `device_open` field disambiguates "dispatched and
+        // applied to hardware" from "dispatched but stored in
+        // `last_tuner_gain_tenths_db` for the next open" —
+        // critical for the LNA-saturation-debug workflow that
+        // motivated this log. Per #626 RtlSdrReader-split smoke
+        // test debugging.
+        let device_open = self.device.is_some();
+        tracing::info!(
+            gain_tenths_db = gain_tenths,
+            gain_db = gain_tenths as f64 / 10.0,
+            device_open,
+            "RtlSdrSource::set_gain dispatch"
+        );
+        self.last_tuner_gain_tenths_db = Some(gain_tenths);
         if let Some(device) = &mut self.device {
             device
                 .set_tuner_gain(gain_tenths)
@@ -402,6 +664,16 @@ impl Source for RtlSdrSource {
     }
 
     fn set_gain_mode(&mut self, manual: bool) -> Result<(), SourceError> {
+        // Diagnostic info-level log — user-paced (fires only on
+        // a UI AGC-toggle flip or persisted-settings replay),
+        // so logging each one at info doesn't add meaningful
+        // noise. Pairs with `set_gain dispatch`: when AGC is
+        // on the manual gain is silently ignored by librtlsdr,
+        // which is a known class of bug — having both events
+        // on the same log timeline makes that diagnosis
+        // straightforward. Per #626 smoke test.
+        let device_open = self.device.is_some();
+        tracing::info!(manual, device_open, "RtlSdrSource::set_gain_mode dispatch");
         if let Some(device) = &mut self.device {
             device
                 .set_tuner_gain_mode(manual)
@@ -436,6 +708,17 @@ impl Source for RtlSdrSource {
         // every other source type (file, network) ignores the
         // command — only the live RTL-SDR USB path actually
         // toggles hardware.
+        // Diagnostic info-level log — user-paced (UI bias-T
+        // checkbox flip), so one info line per toggle is fine.
+        // Critical for LNA-debug workflows where the
+        // observable state of the dongle (waterfall noise floor,
+        // periodic-buffer-stats std_dev) only makes sense in the
+        // context of the bias-T timeline. Per #626 smoke test
+        // where bias-T off → std_dev 0.48, bias-T on → std_dev
+        // 4.65 was THE smoking-gun confirmation that the LNA was
+        // wired correctly.
+        let device_open = self.device.is_some();
+        tracing::info!(enabled, device_open, "RtlSdrSource::set_bias_tee dispatch");
         if let Some(device) = &mut self.device {
             device
                 .set_bias_tee(enabled)

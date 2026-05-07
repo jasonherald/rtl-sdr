@@ -45,6 +45,17 @@ async-std = ["dep:async-std", "dep:async-channel", "dep:futures-core"]
 # blocking work) and `async-channel`.
 smol = ["dep:blocking", "dep:async-channel", "dep:futures-core"]
 
+[dev-dependencies]
+# `tokio` with `macros + time + rt-multi-thread` for the
+# `live_streaming.rs` integration tests (which run real USB
+# bulk reads on a `multi_thread` runtime). The production
+# `tokio` feature itself only needs `sync + rt` — dev-deps
+# additions don't bleed into consumers.
+tokio = { version = "1", features = ["macros", "time", "rt-multi-thread", "sync", "rt"] }
+# `StreamExt::next` for the live tests; `0.3` matches what
+# `futures-core` resolves to in the regular dep tree.
+futures-util = "0.3"
+
 [lints]
 workspace = true
 

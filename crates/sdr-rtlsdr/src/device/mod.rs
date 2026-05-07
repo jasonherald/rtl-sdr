@@ -25,6 +25,9 @@ pub use streaming::SampleIter;
 mod builder;
 pub use builder::RtlSdrDeviceBuilder;
 
+mod reader;
+pub use reader::{ReaderIter, RtlSdrReader};
+
 #[cfg(feature = "tokio")]
 mod streaming_tokio;
 #[cfg(feature = "tokio")]
@@ -131,6 +134,26 @@ impl RtlSdrDevice {
     #[must_use]
     pub fn list() -> Vec<DeviceInfo> {
         enumerate::list_devices()
+    }
+
+    /// Build a streaming-focused [`RtlSdrReader`] handle.
+    ///
+    /// The reader is the right surface for moving the streaming
+    /// path to another thread / async runtime while the parent
+    /// retains `&mut self` for control methods like
+    /// [`Self::set_center_freq`] and [`Self::set_tuner_gain`].
+    /// See [`RtlSdrReader`]'s docs for the full pattern,
+    /// concurrency-safety caveat, and examples.
+    ///
+    /// Cheap to call — clones the underlying `Arc<DeviceHandle>`,
+    /// no USB traffic. Build a fresh reader anywhere you'd want
+    /// to start a new streaming session; the reader's methods
+    /// consume `self` so each session is its own handle.
+    #[must_use]
+    pub fn reader(&self) -> RtlSdrReader {
+        RtlSdrReader {
+            handle: std::sync::Arc::clone(&self.handle),
+        }
     }
 
     /// Open an RTL-SDR device by index.

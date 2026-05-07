@@ -128,7 +128,8 @@ pub(crate) mod tuner;
 pub(crate) mod usb;
 
 pub use device::{
-    RtlSdrDevice, get_device_count, get_device_name, get_device_usb_strings, get_index_by_serial,
+    DeviceInfo, ReaderIter, RtlSdrDevice, RtlSdrDeviceBuilder, RtlSdrReader, SampleIter,
+    get_device_count, get_device_name, get_device_usb_strings, get_index_by_serial, list_devices,
 };
 pub use error::RtlSdrError;
 /// Tuner family identifier for the IC inside the dongle.
