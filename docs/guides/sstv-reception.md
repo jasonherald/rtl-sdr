@@ -16,6 +16,14 @@ International Space Station) commemoration events, which (as of May
 You can't just arm the auto-record toggle on a quiet weekday and
 expect imagery — you need to time it to an active event.
 
+> **Frequency migration note (as of May 2026):** ARISS moved SSTV
+> from the legacy 2 m amateur slot at 145.800 MHz to UHF 70 cm at
+> **437.550 MHz** starting with Series 31 (April 2026). The catalog
+> entry tunes there automatically. Older write-ups and YouTube
+> videos still mention 145.800 — that's no longer current. Voice
+> contacts and APRS still use the 2 m slot, but SSTV events are
+> UHF until further notice.
+
 ---
 
 ## What you'll see
@@ -25,10 +33,12 @@ a rotation of ~12 photographs over a 2-5 day window. Each pass over
 your location typically captures 1-3 of them, depending on the pass
 duration and where the cycle was when the satellite came into view.
 
-Modes used (as of May 2026): **PD120** (most common), **PD180**
-(high quality), and **PD240** (highest quality). All three produce
-640 × 496 colour images. The viewer's window-title subtitle shows
-which mode the current image is being decoded as.
+Modes vary per event. Recent series have used **PD120** /
+**PD180** / **PD240** (640×496 colour) for longer slots, and
+**Robot 36** (320×240 colour) for tighter event schedules — the
+May 2026 Series 32 ("Cooperation in Space") is Robot 36. The
+viewer's window-title subtitle shows which mode the current image
+is being decoded as.
 
 > **TODO:** hero screenshot — a real ISS SSTV image we received
 > during an ARISS event, ideally showing the mode subtitle in the
@@ -45,13 +55,16 @@ gets you a paper certificate, which is a fun keepsake.
 The single most important step is timing — there's no point arming
 auto-record if there's no active event. Check both:
 
-- **[ariss-sstv.blogspot.com](https://ariss-sstv.blogspot.com)** —
-  the official ARISS SSTV blog. Posts go up several weeks before
-  each event with the start / end UTC times and the mode that will
-  be used. Subscribe via RSS if you want a heads-up.
+- **[ariss.org/upcoming-sstv-events.html](https://www.ariss.org/upcoming-sstv-events.html)** —
+  ARISS's primary event calendar. Lists upcoming series with start /
+  end UTC times, frequency, and mode. Updated 1-4 weeks before each
+  event.
+- **[@ARISS_Intl on X](https://x.com/ARISS_Intl)** — short-notice
+  announcements and last-minute schedule changes (e.g. event
+  windows extended or postponed).
 - **[amsat.org news](https://www.amsat.org/category/announcements/)** —
   cross-posts ARISS event announcements and sometimes adds
-  technical notes (e.g. "PD120 this time, not PD180").
+  technical notes.
 
 Past events (as of May 2026) have run from a few hours to five
 full days. Event windows are announced as continuous, but in
@@ -64,29 +77,42 @@ relying on any one.
 
 ## Antenna
 
-ISS SSTV is on **145.800 MHz** narrow FM — that's the 2 metre
-amateur band, **not** the 137 MHz weather-satellite band APT and
-LRPT use. You need an antenna that works at 145 MHz; the
-horizontal V-dipole tuned for 137 MHz APT will receive 145 MHz
-imperfectly but usefully on high-elevation passes.
+ARISS SSTV (as of May 2026) is on **437.550 MHz** narrow FM — that's
+the 70 cm amateur band, **not** the 137 MHz weather-satellite band APT
+and LRPT use, and **not** the legacy 2 m slot at 145.800 MHz that
+older guides reference (see the migration note above). You need an
+antenna that works at 70 cm; a horizontal V-dipole tuned for 137 MHz
+APT is too far off-resonance to be useful at 437 MHz, and a
+SAW-filter-front-end designed for the 137 MHz weather band will
+heavily attenuate the UHF signal.
 
-### Best: 2 m / 70 cm vertical or J-pole
+### Best: 70 cm vertical or 2 m / 70 cm dual-band
 
 The ISS's onboard antennas are roughly omnidirectional and
 **vertically polarised**, unlike weather satellites' RHCP. A
-straight vertical antenna (a 2 m amateur whip, a J-pole, a
-quarter-wave ground plane) is the right match. Most of these
-antennas double as 70 cm receivers, which is convenient for ISS
-voice comms on 437 MHz too.
+70 cm vertical (quarter-wave for 70 cm is ~17 cm, easy to build),
+a 2 m / 70 cm dual-band whip, or a J-pole tuned for 70 cm is the
+right match. Many ham handhelds ship with a stock dual-band
+"rubber ducky" that works adequately for high-elevation passes —
+take the antenna off the radio and connect it to the dongle.
 
-### Acceptable: APT V-dipole rotated 90°
+### Acceptable: 2 m vertical or random wire
 
-If you already have a 137 MHz V-dipole built for APT, tilt one of
-the arms vertical (or stand it on end) and you'll get a usable
-145 MHz pattern. You're operating it 8 MHz off-resonance and at the
-wrong polarisation, so expect the SNR to be a few dB worse than a
-purpose-built 2 m antenna — but workable on passes above ~30°
-elevation.
+A 2 m vertical (designed for 145 MHz) operated at 437 MHz is
+~3× higher than its design frequency — the antenna will exhibit
+multiple lobes and uneven gain, so reception works on some passes
+and not others. A simple wire at the right physical length
+(quarter-wave ~17 cm, half-wave ~34 cm) outperforms a mismatched
+commercial antenna for this specific frequency.
+
+### Bypass the 137 MHz SAW + LNA chain
+
+If your station has a SAW filter + LNA tuned for the 137 MHz
+weather-sat band, **disconnect both for ARISS reception**. SAW
+filters are passive bandpass; a 137 MHz SAW will attenuate the
+437 MHz signal by 30+ dB. Plug the 70 cm antenna directly into the
+RTL-SDR. Bias-T should be **off** — the LNA isn't useful at 70 cm
+and would just draw current.
 
 ### Improvised: SDR's stock whip
 
@@ -112,20 +138,25 @@ low passes.
 
 ## FM broadcast notch filter
 
-**Probably unnecessary** for ISS SSTV. Broadcast FM (88-108 MHz)
-intermodulation lands on 137 MHz APT and LRPT but mostly skips
-145.800 MHz, which sits in the 2 m amateur band where the IMD
-products from 88-108 MHz land outside the channel.
+**Unnecessary** for current ARISS SSTV at 437.550 MHz UHF (as of
+May 2026). Broadcast FM (88-108 MHz) is far enough below 437 MHz
+that intermodulation products don't land in-channel.
 
-If you already have a notch installed for APT, leave it in — it
-won't hurt and it does cut some noise on the 145 MHz side. If you
-don't have one, no need to buy one for SSTV alone.
+A common pager / commercial-radio band sits around 460 MHz, which
+is closer in frequency. Most stations don't see interference from
+it but if your 70 cm passes are noisier than expected, scan with a
+spectrum tool to confirm a clean band before suspecting the
+decoder.
+
+If you ever revert to monitoring legacy 145.800 MHz transmissions
+(rare, but ARISS has flipped frequencies before), an FM-broadcast
+notch helps marginally on the 2 m band.
 
 ---
 
 ## Active mission
 
-The ISS catalog entry is already in the app (NORAD 25544, 145.800
+The ISS catalog entry is already in the app (NORAD 25544, 437.550
 MHz NFM), wired with the SSTV imaging protocol. No setup needed
 beyond the standard ground-station entry.
 
@@ -183,10 +214,11 @@ passthrough and audio recording is suppressed).
 
 5 seconds before AOS, the recorder takes over your radio:
 
-- Tunes to 145.800 MHz
+- Tunes to 437.550 MHz
 - Switches the demod to NFM (you'll hear the SSTV warble through
   your speakers)
-- Sets the channel bandwidth to 12.5 kHz
+- Sets the channel bandwidth to 38 kHz (covers Doppler swing at UHF
+  with headroom)
 - Zeros the VFO offset
 - Opens a non-modal **ISS SSTV** viewer window alongside the main
   radio window
@@ -245,9 +277,10 @@ viewer outside the auto-record path:
 
 - `Ctrl+Shift+V` opens the SSTV viewer window even when no pass is
   in progress. The decoder is wired to NFM audio, so as long as
-  you're tuned to 145.800 MHz NFM with a clean signal, the
-  decoder will produce frames. This is useful if the auto-record
-  schedule missed a pass and you want to watch the next one
+  you're tuned to a live ARISS SSTV signal (437.550 MHz NFM during
+  a current event window) with a clean carrier, the decoder will
+  produce frames. This is useful if the auto-record schedule
+  missed a pass and you want to watch the next one
   manually.
 - Switching the demod mode away from NFM stops decode entirely.
 - Closing the viewer window doesn't stop the decoder — the shared
@@ -270,18 +303,21 @@ The recorder armed and the radio tuned, but no SSTV image
 completed during the pass. Most common causes, in order:
 
 1. **No active ARISS event.** Check
-   [ariss-sstv.blogspot.com](https://ariss-sstv.blogspot.com).
+   [ariss.org/upcoming-sstv-events.html](https://www.ariss.org/upcoming-sstv-events.html).
 2. **Pass too low.** SSTV's PD-family decoders are line-rate-
    locked rather than per-line resyncable; a horizon-grazing pass
    may carry signal but never sustain enough SNR for VIS detection.
 3. **Antenna polarisation mismatch.** A horizontal antenna (e.g.
    the 137 MHz V-dipole used flat for APT) nulls vertically-
-   polarised 145 MHz signals. Lay the antenna vertical.
+   polarised UHF signals. Lay the antenna vertical, or use a 70 cm
+   vertical purpose-built for the band.
 4. **Wrong frequency due to Doppler.** The recorder doesn't apply
-   Doppler correction for SSTV (as of May 2026); the ±3 kHz shift
-   on 145.800 MHz is normally inside the 12.5 kHz channel
-   bandwidth, but if you've narrowed the bandwidth it may not be.
-   Reset bandwidth to 12.5 kHz.
+   Doppler correction for SSTV (as of May 2026); on UHF 437.550 MHz
+   the shift is roughly **±10 kHz** (3× larger than on the legacy
+   2 m frequency). At the catalog's 38 kHz bandwidth that fits, but
+   if you've narrowed the channel bandwidth, the Doppler can walk
+   the signal out of the passband near AOS / LOS. Restore bandwidth
+   to 38 kHz.
 
 If the directory is created but empty, you'll see a toast
 "Pass complete, but no SSTV images decoded — nothing saved to {dir}".
