@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 sdr-types.workspace = true
 sdr-pipeline.workspace = true
-sdr-rtlsdr.workspace = true
+librtlsdr-rs.workspace = true
 sdr-config.workspace = true
 rusb.workspace = true
 thiserror.workspace = true

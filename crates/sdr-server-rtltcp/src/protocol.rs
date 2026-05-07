@@ -19,7 +19,7 @@
 //! Both are big-endian on the wire. Layout is fixed and must not change;
 //! interop with GQRX/SDR++/SoapySDR depends on exact byte compatibility.
 
-use sdr_rtlsdr::TunerType;
+use librtlsdr_rs::TunerType;
 
 /// The 4-byte magic prefix in `dongle_info_t`.
 pub const DONGLE_MAGIC: [u8; 4] = *b"RTL0";

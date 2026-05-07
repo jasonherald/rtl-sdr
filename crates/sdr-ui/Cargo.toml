@@ -47,7 +47,7 @@ sdr-radio.workspace = true
 # by the live LRPT viewer to decode the shared `LrptImage`
 # handle's per-APID scan-line buffers.
 sdr-lrpt.workspace = true
-sdr-rtlsdr.workspace = true
+librtlsdr-rs.workspace = true
 # Satellite pass predictor — used by the Satellites scheduler panel
 # to enumerate upcoming overhead passes and refresh TLEs from
 # Celestrak via the cache's blocking fetcher.

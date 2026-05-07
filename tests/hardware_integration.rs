@@ -19,11 +19,11 @@
     clippy::panic
 )]
 
+use librtlsdr_rs::RtlSdrDevice;
 use sdr_dsp::fft::{FftEngine, RustFftEngine};
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::source_manager::Source;
 use sdr_radio::RadioModule;
-use sdr_rtlsdr::RtlSdrDevice;
 use sdr_source_rtlsdr::RtlSdrSource;
 use sdr_types::{Complex, DemodMode, Stereo};
 
@@ -46,11 +46,11 @@ const TEST_FFT_SIZE: usize = 2048;
 #[test]
 #[ignore = "requires RTL-SDR hardware"]
 fn device_enumerate() {
-    let count = sdr_rtlsdr::get_device_count();
+    let count = librtlsdr_rs::get_device_count();
     assert!(count > 0, "No RTL-SDR devices found — is one plugged in?");
     tracing::info!("Found {count} RTL-SDR device(s)");
 
-    let name = sdr_rtlsdr::get_device_name(0);
+    let name = librtlsdr_rs::get_device_name(0);
     tracing::info!("Device 0: {name}");
     assert!(!name.is_empty());
 }

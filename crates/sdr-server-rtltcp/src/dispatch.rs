@@ -5,7 +5,7 @@
 //! Errors are logged but do not abort the command loop (matches upstream,
 //! which ignores each call's return code inside the `switch`).
 
-use sdr_rtlsdr::RtlSdrDevice;
+use librtlsdr_rs::RtlSdrDevice;
 
 use crate::protocol::{Command, CommandOp};
 
@@ -143,7 +143,7 @@ pub fn dispatch(dev: &mut RtlSdrDevice, cmd: Command) {
 ///     free(gains);
 /// }
 /// ```
-fn set_gain_by_index(dev: &mut RtlSdrDevice, index: u32) -> Result<(), sdr_rtlsdr::RtlSdrError> {
+fn set_gain_by_index(dev: &mut RtlSdrDevice, index: u32) -> Result<(), librtlsdr_rs::RtlSdrError> {
     let gains = dev.tuner_gains();
     let idx = index as usize;
     if idx >= gains.len() {

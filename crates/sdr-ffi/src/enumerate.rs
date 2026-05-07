@@ -5,7 +5,7 @@
 //! hosts call them at app launch to surface device presence
 //! before (and independently of) creating an engine.
 //!
-//! Under the hood these thin-wrap `sdr_rtlsdr::get_device_count`
+//! Under the hood these thin-wrap `librtlsdr_rs::get_device_count`
 //! / `get_device_name`, which in turn query libusb's device list
 //! (no USB control transfers; just matching VID/PID against what
 //! the kernel has already enumerated).
@@ -35,7 +35,7 @@ pub extern "C" fn sdr_core_device_count() -> u32 {
     // — e.g. a libusb init failure — doesn't cross the FFI boundary.
     // Failure degrades to "0 devices" which is the honest answer
     // when we couldn't enumerate at all.
-    std::panic::catch_unwind(sdr_rtlsdr::get_device_count).unwrap_or_else(|_| {
+    std::panic::catch_unwind(librtlsdr_rs::get_device_count).unwrap_or_else(|_| {
         set_last_error("sdr_core_device_count: panic during enumeration");
         0
     })
@@ -67,7 +67,7 @@ pub unsafe extern "C" fn sdr_core_device_name(
         // indices — treat that as a Device error so the host can
         // distinguish "valid but no name" (shouldn't happen for
         // real devices) from "wrong index".
-        let count = sdr_rtlsdr::get_device_count();
+        let count = librtlsdr_rs::get_device_count();
         if index >= count {
             set_last_error(format!(
                 "sdr_core_device_name: index {index} out of range (count={count})"
@@ -75,7 +75,7 @@ pub unsafe extern "C" fn sdr_core_device_name(
             return SdrCoreError::Device.as_int();
         }
 
-        let name = sdr_rtlsdr::get_device_name(index);
+        let name = librtlsdr_rs::get_device_name(index);
         if name.is_empty() {
             set_last_error(format!(
                 "sdr_core_device_name: name probe returned empty for index {index}"

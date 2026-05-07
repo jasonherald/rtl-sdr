@@ -18,7 +18,7 @@ pub enum ServerError {
 
     /// Error from the RTL-SDR device layer (open, USB, register I/O).
     #[error("RTL-SDR device error: {0}")]
-    Device(#[from] sdr_rtlsdr::RtlSdrError),
+    Device(#[from] librtlsdr_rs::RtlSdrError),
 
     /// No RTL-SDR dongles plugged in.
     #[error("no RTL-SDR device found")]

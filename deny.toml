@@ -39,6 +39,12 @@ allow = [
     "LGPL-2.0-or-later",
     "LGPL-2.1-or-later",
     "LGPL-3.0-or-later",
+    # GPL is required because librtlsdr-rs (and therefore this app, since
+    # GPL is viral across the linked binary) is GPL-2.0-or-later.
+    "GPL-2.0",
+    "GPL-2.0-or-later",
+    "GPL-3.0",
+    "GPL-3.0-or-later",
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
