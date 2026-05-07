@@ -16,7 +16,7 @@ sdr-dsp.workspace = true
 sdr-pipeline.workspace = true
 sdr-config.workspace = true
 sdr-radio.workspace = true
-sdr-rtlsdr.workspace = true
+librtlsdr-rs.workspace = true
 sdr-source-rtlsdr.workspace = true
 sdr-source-network.workspace = true
 sdr-source-file.workspace = true
@@ -101,7 +101,6 @@ members = [
     "crates/sdr-types",
     "crates/sdr-dsp",
     "crates/sdr-pipeline",
-    "crates/sdr-rtlsdr",
     "crates/sdr-source-rtlsdr",
     "crates/sdr-source-network",
     "crates/sdr-server-rtltcp",
@@ -126,7 +125,11 @@ members = [
 
 [workspace.package]
 edition = "2024"
-license = "MIT"
+# GPL-2.0-or-later because the application links librtlsdr-rs (a faithful
+# port of librtlsdr's C source — itself GPL-2.0-or-later). GPL is viral
+# across the linked binary, so the whole workspace publishes under the
+# same license rather than carrying a license-conflict story.
+license = "GPL-2.0-or-later"
 repository = "https://github.com/jasonherald/rtl-sdr"
 
 [workspace.dependencies]
@@ -134,7 +137,11 @@ repository = "https://github.com/jasonherald/rtl-sdr"
 sdr-types = { path = "crates/sdr-types" }
 sdr-dsp = { path = "crates/sdr-dsp" }
 sdr-pipeline = { path = "crates/sdr-pipeline" }
-sdr-rtlsdr = { path = "crates/sdr-rtlsdr" }
+# librtlsdr-rs is the spun-out form of what used to be `crates/sdr-rtlsdr`;
+# pulled from crates.io now that v0.1.0 is published. Async-runtime
+# integrations are opt-in via the per-runtime cargo features (currently
+# unused by this app — the source thread uses the sync iterator).
+librtlsdr-rs = "0.1"
 sdr-source-rtlsdr = { path = "crates/sdr-source-rtlsdr" }
 sdr-source-network = { path = "crates/sdr-source-network" }
 sdr-server-rtltcp = { path = "crates/sdr-server-rtltcp" }

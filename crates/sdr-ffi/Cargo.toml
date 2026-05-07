@@ -36,14 +36,14 @@ sdr-radio.workspace = true
 # surface (#447). Pulled in transitively via sdr-core anyway; same
 # explicit-dep rationale as sdr-pipeline / sdr-radio above.
 sdr-scanner.workspace = true
-# Direct dep on sdr-rtlsdr for the device-enumeration functions
+# Direct dep on librtlsdr-rs for the device-enumeration functions
 # (`sdr_core_device_count` / `sdr_core_device_name` in the C ABI).
 # These are static (no handle required), so they don't fit the
-# engine-dispatch path; they go through `sdr-rtlsdr` directly.
-sdr-rtlsdr.workspace = true
+# engine-dispatch path; they go through `librtlsdr-rs` directly.
+librtlsdr-rs.workspace = true
 # Direct dep on sdr-sink-audio for the audio-device enumeration
 # functions (`sdr_core_audio_device_count` / `_name` / `_uid`).
-# Same rationale as `sdr-rtlsdr` above — these are handle-free
+# Same rationale as `librtlsdr-rs` above — these are handle-free
 # `list_audio_sinks()` snapshots of CoreAudio / PipeWire state,
 # so they bypass the engine dispatch path.
 sdr-sink-audio.workspace = true

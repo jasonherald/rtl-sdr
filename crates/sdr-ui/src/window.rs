@@ -5741,7 +5741,7 @@ fn connect_server_panel(
     // Share is now an activity on the left activity bar — always
     // reachable via the 📡 icon. The legacy hotplug-driven
     // hide/show timer + device-count cache + device-row notify
-    // were removed with that migration; `sdr_rtlsdr::get_device_count`
+    // were removed with that migration; `librtlsdr_rs::get_device_count`
     // is no longer polled on the GTK main loop for visibility,
     // and the start-server path still rejects the "local dongle is
     // the active source" conflict via its own exclusivity guard.

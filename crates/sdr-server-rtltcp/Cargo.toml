@@ -19,7 +19,7 @@ default = ["mdns-advertise"]
 mdns-advertise = ["dep:sdr-rtltcp-discovery"]
 
 [dependencies]
-sdr-rtlsdr.workspace = true
+librtlsdr-rs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # On unix targets we use `libc::setsockopt` directly — lets us tune

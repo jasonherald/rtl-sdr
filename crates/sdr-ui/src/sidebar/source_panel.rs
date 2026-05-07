@@ -224,7 +224,7 @@ pub const RTLSDR_ABSENT_LABEL: &str = "No RTL-SDR device found";
 /// when present (e.g. `"Generic RTL2832U OEM"`), or
 /// [`RTLSDR_ABSENT_LABEL`] when the bus has no dongle. Cheap
 /// enough to call from a 3 s hotplug poller on the GTK main
-/// thread — `sdr_rtlsdr::get_device_count` is a libusb enumerate
+/// thread — `librtlsdr_rs::get_device_count` is a libusb enumerate
 /// filtered by vendor/product ID, and `get_device_name` re-runs
 /// the same enumerate to reach the Nth match.
 ///
@@ -234,10 +234,10 @@ pub const RTLSDR_ABSENT_LABEL: &str = "No RTL-SDR device found";
 /// calls), we fall back to the generic "RTL-SDR" label so the
 /// UI stays usable rather than rendering an empty combo entry.
 pub fn probe_rtlsdr_device_label() -> String {
-    if sdr_rtlsdr::get_device_count() == 0 {
+    if librtlsdr_rs::get_device_count() == 0 {
         return RTLSDR_ABSENT_LABEL.to_string();
     }
-    let name = sdr_rtlsdr::get_device_name(0);
+    let name = librtlsdr_rs::get_device_name(0);
     if name.is_empty() {
         "RTL-SDR".to_string()
     } else {

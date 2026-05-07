@@ -357,7 +357,13 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting and security scanning
 
 ## License
 
-MIT
+GPL-2.0-or-later. The application links [librtlsdr-rs] — a faithful Rust
+port of the GPL-2.0-or-later [librtlsdr] C library. Since GPL is viral
+across the linked binary, the whole application carries the same license.
+See [LICENSE](LICENSE).
+
+[librtlsdr-rs]: https://crates.io/crates/librtlsdr-rs
+[librtlsdr]: https://github.com/steve-m/librtlsdr
 
 ## Credits
 

@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use sdr_rtlsdr::RtlSdrDevice;
+use librtlsdr_rs::RtlSdrDevice;
 
 use crate::broadcaster::{ClientRegistry, ClientSlot, RoleDecision};
 use crate::codec::{Codec, CodecMask, Encoder};
@@ -394,7 +394,7 @@ impl Server {
         // port the UI/logs can show.
         let actual_bind = listener.local_addr().map_err(ServerError::Io)?;
 
-        let device_count = sdr_rtlsdr::get_device_count();
+        let device_count = librtlsdr_rs::get_device_count();
         if device_count == 0 {
             return Err(ServerError::NoDevice);
         }

@@ -17,8 +17,10 @@ crates/
   sdr-types/           # Foundation: Complex, Stereo, SampleRate, Frequency, error types, constants, enums
   sdr-dsp/             # Pure DSP: math, taps, FFT, filters, multirate, demod, convert, correction, AGC/PLL, noise
   sdr-pipeline/        # Threading & streaming: Stream<T>, Block trait, Chain, Splitter, IqFrontend, managers
-  sdr-rtlsdr/          # Pure Rust port of librtlsdr (USB via rusb, tuner drivers, RTL2832 control)
-  sdr-source-rtlsdr/   # RTL-SDR source module using sdr-rtlsdr
+  # librtlsdr-rs/      # ⇧ External crate (https://crates.io/crates/librtlsdr-rs).
+                       # Spun out of what used to be `sdr-rtlsdr` and consumed via
+                       # workspace dep on the published 0.1.x. Still GPL-2.0-or-later.
+  sdr-source-rtlsdr/   # RTL-SDR source module using librtlsdr-rs
   sdr-source-network/  # TCP client + UDP receiver for IQ input
   sdr-source-file/     # WAV file IQ playback (testing/replay)
   sdr-sink-audio/      # PipeWire (Linux) + CoreAudio (macOS)
@@ -42,7 +44,7 @@ sdr (binary)
         ├── sdr-radio
         │     └── sdr-dsp
         ├── sdr-source-rtlsdr
-        │     ├── sdr-rtlsdr
+        │     ├── librtlsdr-rs (external, crates.io)
         │     ├── sdr-pipeline
         │     └── sdr-types
         ├── sdr-source-network

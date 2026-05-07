@@ -17,8 +17,8 @@
 //! uint8 IQ samples from the USB device to f32 Complex samples for
 //! the signal processing pipeline.
 
+use librtlsdr_rs::RtlSdrDevice;
 use sdr_pipeline::source_manager::Source;
-use sdr_rtlsdr::RtlSdrDevice;
 use sdr_types::{Complex, SourceError};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -155,14 +155,14 @@ pub struct RtlSdrSource {
 
 /// USB reader-thread main loop.
 ///
-/// Drives [`sdr_rtlsdr::RtlSdrReader::iter_samples`] forever
+/// Drives [`librtlsdr_rs::RtlSdrReader::iter_samples`] forever
 /// (until `cancel` flips false or the iterator yields an error),
 /// pushing each owned `Vec<u8>` into the lock-free SPSC ring for
 /// the DSP thread to consume. Pulled out of the closure inside
 /// `RtlSdrSource::start` so the start path stays under clippy's
 /// too-many-lines threshold.
 fn run_reader_thread(
-    reader: sdr_rtlsdr::RtlSdrReader,
+    reader: librtlsdr_rs::RtlSdrReader,
     ring_writer: &Arc<UsbRingBuffer>,
     cancel: &Arc<AtomicBool>,
 ) {
