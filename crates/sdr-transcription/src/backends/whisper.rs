@@ -340,6 +340,38 @@ fn decode_and_emit_segment(
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some("en"));
+    // Force English output regardless of the model's per-segment
+    // language detection. The `.en` Whisper variants (Tiny / Base /
+    // Small / Medium .en) ignore this — they have no non-English
+    // tokens and `set_translate` is a no-op. Multilingual models
+    // (Large v3, Large v3 Turbo, CrisperWhisper) without this would
+    // sometimes output non-English on noisy radio chatter — the
+    // detector picks up phonetic similarities to other languages
+    // when audio is below the SNR threshold and the `language=en`
+    // hint is treated as soft. CrisperWhisper specifically (per #385
+    // smoke test) was producing Turkish / Greek / Spanish output on
+    // marginal scanner audio without this. Our app is English-radio
+    // focused; forcing English transcription is always correct.
+    params.set_translate(true);
+    // Lock down sampling to deterministic greedy decode — disables
+    // whisper.cpp's temperature fallback schedule (0.0 → 0.2 → 0.4
+    // → 0.6 → 0.8 on compression-ratio / log-prob failures). On
+    // marginal SNR audio the higher-temperature steps sample
+    // foreign-language alternatives that slip through `set_translate`
+    // (per #385 smoke: `Le order, Sami, physical h많. Oneary.` mixed
+    // French / Korean / English in one segment). Disabling the
+    // fallback means uncertain segments produce a low-confidence
+    // English guess (or nothing if hallucination filtering catches
+    // it) rather than a confident foreign-language sample.
+    params.set_temperature(0.0);
+    params.set_temperature_inc(0.0);
+    // Suppress the non-speech token bank (background-music notation,
+    // sound effects, etc.) and blank tokens. Reduces the
+    // hallucination surface further — every non-speech token the
+    // decoder picks is a token it didn't pick from the English
+    // vocabulary. Per #385.
+    params.set_suppress_blank(true);
+    params.set_suppress_nst(true);
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
