@@ -277,28 +277,49 @@ mod tests {
     // fabricated instances below are kept on the historical
     // 137 MHz frequencies so the test scenarios still read
     // intuitively (overlap, distinct, etc.).
+    //
+    // Numeric values broken out as named constants per CR round 1
+    // — keeps a future reader from wondering whether `137_620_000`
+    // is "important" or just "an arbitrary 137 MHz channel."
+    /// Synthetic NORAD id for `FIXTURE_A`. Arbitrary; not in any real catalog.
+    const TEST_SAT_A_NORAD_ID: u32 = 1;
+    /// Synthetic NORAD id for `FIXTURE_B`. Arbitrary; not in any real catalog.
+    const TEST_SAT_B_NORAD_ID: u32 = 2;
+    /// Synthetic NORAD id for `FIXTURE_C`. Arbitrary; not in any real catalog.
+    const TEST_SAT_C_NORAD_ID: u32 = 3;
+    /// Historical NOAA 15 APT downlink — kept here so frequency-overlap
+    /// scenarios still read like the real-world tests they replaced.
+    const TEST_SAT_A_DOWNLINK_HZ: u64 = 137_620_000;
+    /// Historical NOAA 18 APT downlink. See `TEST_SAT_A_DOWNLINK_HZ`.
+    const TEST_SAT_B_DOWNLINK_HZ: u64 = 137_912_500;
+    /// Historical NOAA 19 APT downlink. See `TEST_SAT_A_DOWNLINK_HZ`.
+    const TEST_SAT_C_DOWNLINK_HZ: u64 = 137_100_000;
+    /// Synthetic APT receive bandwidth. Doppler tracker doesn't read
+    /// this field; the value is just here so the fixtures parse.
+    const TEST_APT_BANDWIDTH_HZ: u32 = 38_000;
+
     static FIXTURE_A: KnownSatellite = KnownSatellite {
         name: "TEST_SAT_A",
-        norad_id: 1,
-        downlink_hz: 137_620_000,
+        norad_id: TEST_SAT_A_NORAD_ID,
+        downlink_hz: TEST_SAT_A_DOWNLINK_HZ,
         demod_mode: sdr_types::DemodMode::Nfm,
-        bandwidth_hz: 38_000,
+        bandwidth_hz: TEST_APT_BANDWIDTH_HZ,
         imaging_protocol: Some(sdr_sat::ImagingProtocol::Apt),
     };
     static FIXTURE_B: KnownSatellite = KnownSatellite {
         name: "TEST_SAT_B",
-        norad_id: 2,
-        downlink_hz: 137_912_500,
+        norad_id: TEST_SAT_B_NORAD_ID,
+        downlink_hz: TEST_SAT_B_DOWNLINK_HZ,
         demod_mode: sdr_types::DemodMode::Nfm,
-        bandwidth_hz: 38_000,
+        bandwidth_hz: TEST_APT_BANDWIDTH_HZ,
         imaging_protocol: Some(sdr_sat::ImagingProtocol::Apt),
     };
     static FIXTURE_C: KnownSatellite = KnownSatellite {
         name: "TEST_SAT_C",
-        norad_id: 3,
-        downlink_hz: 137_100_000,
+        norad_id: TEST_SAT_C_NORAD_ID,
+        downlink_hz: TEST_SAT_C_DOWNLINK_HZ,
         demod_mode: sdr_types::DemodMode::Nfm,
-        bandwidth_hz: 38_000,
+        bandwidth_hz: TEST_APT_BANDWIDTH_HZ,
         imaging_protocol: Some(sdr_sat::ImagingProtocol::Apt),
     };
 

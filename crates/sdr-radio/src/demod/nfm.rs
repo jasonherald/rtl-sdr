@@ -284,6 +284,42 @@ mod tests {
         );
     }
 
+    /// Skip the first 2000 samples so the post-discriminator LPF and
+    /// any startup transients have settled before peak detection.
+    /// At `NFM_IF_SAMPLE_RATE` ≈ 50 kHz this is ~40 ms — well past
+    /// the steady-state point of the modulation.
+    const FM_DEVIATION_SETTLE_SAMPLES: usize = 2000;
+    /// Total input length per deviation case. 4000 samples ≈ 80 ms
+    /// at 50 kHz IF — enough to capture multiple cycles of the
+    /// 1-kHz modulation tone after `FM_DEVIATION_SETTLE_SAMPLES` of
+    /// settle time.
+    const FM_DEVIATION_TEST_SAMPLES: usize = 4000;
+    /// Modulation tone (Hz). Chosen well below the post-discriminator
+    /// LPF cutoff so the test isn't sensitive to filter rolloff.
+    const FM_DEVIATION_MOD_FREQ_HZ: f32 = 1_000.0;
+    /// Narrow-deviation case (Hz). Comparable to commercial NFM voice
+    /// (~±2.5 kHz). Picked to be small enough that wide-vs-narrow
+    /// peaks differ by a clearly visible amount.
+    const FM_DEVIATION_NARROW_HZ: f32 = 2_000.0;
+    /// Wide-deviation case (Hz). Comparable to ham-style NFM
+    /// (~±5 kHz). With the narrow case, gives an expected ratio
+    /// of 2.5× — a useful sanity number to assert against.
+    const FM_DEVIATION_WIDE_HZ: f32 = 5_000.0;
+    /// Lower bound on the wide/narrow peak ratio. Theoretical 2.5×
+    /// minus ~20% tolerance (filter transients + discriminator-side
+    /// normalization). A value < 2.0 means deviation isn't scaling
+    /// the output linearly, which would point at a regression like
+    /// the audio-AGC reintroduction this test was created to prevent.
+    const FM_DEVIATION_RATIO_MIN: f32 = 2.0;
+    /// Upper bound on the wide/narrow peak ratio. Theoretical 2.5×
+    /// plus ~20% tolerance. A value > 3.0 means we're amplifying
+    /// the wider case beyond what FM physics allows — also a likely
+    /// regression signal.
+    const FM_DEVIATION_RATIO_MAX: f32 = 3.0;
+    /// Floor for `peaks[0]` to avoid division-by-zero in the ratio.
+    /// Picked far below any plausible real peak (~0.001).
+    const FM_DEVIATION_PEAK_EPSILON: f32 = 1e-10;
+
     #[test]
     fn test_nfm_output_amplitude_scales_with_deviation() {
         // FM is amplitude-invariant by physics — the discriminator output
@@ -296,23 +332,20 @@ mod tests {
         // whenever the modulated audio was quiet). This test pins the
         // physics: 5 kHz deviation produces ~2.5× the output amplitude
         // of 2 kHz deviation.
-        let settle = 2000;
-        let n = 4000;
-        let mod_freq = 1_000.0_f32;
-
         let mut peaks = Vec::new();
-        for &deviation_hz in &[2_000.0_f32, 5_000.0_f32] {
+        for &deviation_hz in &[FM_DEVIATION_NARROW_HZ, FM_DEVIATION_WIDE_HZ] {
             let mut demod = NfmDemodulator::new().unwrap();
-            let input: Vec<Complex> = (0..n)
+            let input: Vec<Complex> = (0..FM_DEVIATION_TEST_SAMPLES)
                 .map(|i| {
                     let t = i as f32 / NFM_IF_SAMPLE_RATE as f32;
-                    let phase = deviation_hz * (2.0 * PI * mod_freq * t).sin() / mod_freq;
+                    let phase = deviation_hz * (2.0 * PI * FM_DEVIATION_MOD_FREQ_HZ * t).sin()
+                        / FM_DEVIATION_MOD_FREQ_HZ;
                     Complex::new(phase.cos(), phase.sin())
                 })
                 .collect();
-            let mut output = vec![Stereo::default(); n];
+            let mut output = vec![Stereo::default(); FM_DEVIATION_TEST_SAMPLES];
             demod.process(&input, &mut output).unwrap();
-            let peak = output[settle..]
+            let peak = output[FM_DEVIATION_SETTLE_SAMPLES..]
                 .iter()
                 .map(|s| s.l.abs())
                 .fold(0.0_f32, f32::max);
@@ -322,9 +355,9 @@ mod tests {
         // Without AGC the peak ratio matches the deviation ratio
         // exactly — 5000/2000 = 2.5×. Allow ~20% tolerance for
         // discriminator-side normalization & filter transients.
-        let ratio = peaks[1] / peaks[0].max(1e-10);
+        let ratio = peaks[1] / peaks[0].max(FM_DEVIATION_PEAK_EPSILON);
         assert!(
-            (2.0..=3.0).contains(&ratio),
+            (FM_DEVIATION_RATIO_MIN..=FM_DEVIATION_RATIO_MAX).contains(&ratio),
             "FM output should scale linearly with deviation; peaks={peaks:?}, ratio={ratio}"
         );
     }

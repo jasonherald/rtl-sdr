@@ -78,6 +78,18 @@ pub const ISS_SSTV_DOWNLINK_HZ: u64 = 437_550_000;
 /// entry and by tests that look the entry up.
 pub const ISS_NORAD_ID: u32 = 25_544;
 
+/// Common downlink for METEOR-M2 series LRPT (Hz). Both M2-3 and
+/// M2-4 transmit on this channel. Centralized here so the catalog
+/// rows + the CR-noted bandwidth assertion test agree on one value.
+pub const METEOR_M2_LRPT_DOWNLINK_HZ: u64 = 137_900_000;
+
+/// LRPT receive bandwidth for the METEOR-M2 series (Hz). Equals the
+/// LRPT IF rate (`sdr_dsp::lrpt::SAMPLE_RATE_HZ = 144_000`) so the
+/// VFO channel filter is bypassed (`bandwidth >= out_sample_rate`)
+/// and the 108-kHz QPSK signal isn't chopped at the ±19 kHz cutoff
+/// the previous default would have imposed.
+pub const METEOR_M2_LRPT_BANDWIDTH_HZ: u32 = 144_000;
+
 /// Imaging protocol the receiver should use for a given catalog
 /// satellite. Drives the auto-record dispatch in
 /// `sidebar::satellites_recorder` so APT vs LRPT vs SSTV each get
@@ -224,15 +236,11 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
     KnownSatellite {
         name: "METEOR-M2 3",
         norad_id: 57_166,
-        downlink_hz: 137_900_000,
+        downlink_hz: METEOR_M2_LRPT_DOWNLINK_HZ,
         demod_mode: sdr_types::DemodMode::Lrpt,
-        // 144 kHz matches the LRPT IF rate so the VFO channel
-        // filter is bypassed (`bandwidth >= out_sample_rate` skips
-        // the channel filter). LRPT QPSK at 72 kbaud occupies
-        // ±55 kHz around DC after RRC pulse shaping; a narrower
-        // setting would chop the signal energy and prevent the
-        // QPSK demod from locking. Per #638.
-        bandwidth_hz: 144_000,
+        // See `METEOR_M2_LRPT_BANDWIDTH_HZ` for the bypass-the-VFO
+        // rationale; both M2-3 and M2-4 share the channel.
+        bandwidth_hz: METEOR_M2_LRPT_BANDWIDTH_HZ,
         imaging_protocol: Some(ImagingProtocol::Lrpt),
     },
     KnownSatellite {
@@ -252,9 +260,9 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // <https://usradioguy.com/meteor-satellite/>.
         name: "METEOR-M2 4",
         norad_id: 59_051,
-        downlink_hz: 137_900_000,
+        downlink_hz: METEOR_M2_LRPT_DOWNLINK_HZ,
         demod_mode: sdr_types::DemodMode::Lrpt,
-        bandwidth_hz: 144_000,
+        bandwidth_hz: METEOR_M2_LRPT_BANDWIDTH_HZ,
         imaging_protocol: Some(ImagingProtocol::Lrpt),
     },
     // ISS SSTV — epic #472. Currently 437.550 MHz UHF (ARISS Series
@@ -351,8 +359,13 @@ mod tests {
             .iter()
             .find(|s| s.norad_id == 59_051)
             .expect("METEOR-M2 4 (NORAD 59051) should be in KNOWN_SATELLITES");
-        assert_eq!(m2_4.downlink_hz, 137_900_000);
+        assert_eq!(m2_4.downlink_hz, METEOR_M2_LRPT_DOWNLINK_HZ);
         assert_eq!(m2_4.demod_mode, sdr_types::DemodMode::Lrpt);
+        // Pin the LRPT receive bandwidth so a regression to
+        // `DEFAULT_SATELLITE_BANDWIDTH_HZ` (which the silent-fail
+        // debug session showed chops the 108-kHz QPSK signal at
+        // ±19 kHz) fails fast. Per CR round 1.
+        assert_eq!(m2_4.bandwidth_hz, METEOR_M2_LRPT_BANDWIDTH_HZ);
         assert_eq!(m2_4.imaging_protocol, Some(ImagingProtocol::Lrpt));
         // Pin the wrong-id absence so a future copy-paste from a
         // stale source can't reintroduce 61024 (USA 403) under a

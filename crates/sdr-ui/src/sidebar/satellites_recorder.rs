@@ -907,21 +907,22 @@ mod tests {
     /// from `now`, lasting `duration_secs`, with the given peak
     /// elevation. Mirrors the synthetic-pass fixture pattern used
     /// by the `satellites_panel` tests.
-    fn synthetic_noaa19(
+    fn synthetic_meteor_m2_3(
         now: DateTime<Utc>,
         aos_offset_secs: i64,
         duration_secs: i64,
         peak_elev_deg: f64,
     ) -> Pass {
-        // Despite the helper name (kept for diff stability), this
-        // synthesises a METEOR-M 2 pass on the same 137.100 MHz
-        // channel NOAA 19 used to occupy. NOAA-19 was decommissioned
-        // August 13 2025 and is no longer in `KNOWN_SATELLITES`;
-        // METEOR-M 2 inherits the 137.100 MHz slot. The recorder
-        // tests don't care which protocol is dispatched at AOS
-        // (Apt vs Lrpt) — they exercise the state-machine
-        // transitions, audio-toggle paths, and back-to-back pass
-        // arming that work the same for any catalog satellite.
+        // Synthesises a METEOR-M2 3 pass for state-machine tests.
+        // Renamed from `synthetic_noaa19` per CR round 1: the helper
+        // historically built NOAA-19 passes, but NOAA-19 was
+        // decommissioned 2025-08-13 and is no longer in
+        // `KNOWN_SATELLITES`. METEOR-M2 3 is an active LRPT entry,
+        // so the helper now emits its slug. The recorder tests don't
+        // care which imaging protocol the catalog dispatches (Apt
+        // vs Lrpt) — they exercise state-machine transitions,
+        // audio-toggle paths, and back-to-back pass arming, all of
+        // which behave identically for any catalog satellite.
         let start = now + ChronoDuration::seconds(aos_offset_secs);
         Pass {
             satellite: "METEOR-M2 3".to_string(),
@@ -958,7 +959,7 @@ mod tests {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // Pass starts in 3 s — inside the 5 s lead-in.
-        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         let actions = r.tick(
             now,
             &[pass],
@@ -995,7 +996,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // Pass started 30 s ago, ends in 9.5 min — eligible by
         // every other gate (NOAA, 50° peak, end > now).
-        let pass = synthetic_noaa19(now, -30, 600, 50.0);
+        let pass = synthetic_meteor_m2_3(now, -30, 600, 50.0);
         let actions = r.tick(
             now,
             &[pass],
@@ -1020,7 +1021,7 @@ mod tests {
     fn idle_does_not_arm_when_toggle_off() {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         let actions = r.tick(
             now,
             &[pass],
@@ -1038,7 +1039,7 @@ mod tests {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // 20° peak — "marginal" tier, below the 25° "good" floor.
-        let pass = synthetic_noaa19(now, 3, 720, 20.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 20.0);
         let actions = r.tick(
             now,
             &[pass],
@@ -1064,7 +1065,7 @@ mod tests {
         // name that will never appear in the catalog.
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let mut pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let mut pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         pass.satellite = "UNKNOWN-SAT-99".to_string();
         let actions = r.tick(
             now,
@@ -1085,7 +1086,7 @@ mod tests {
         // the pass is within AOS_LEAD_SECS.
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let mut pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let mut pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         pass.satellite = "ISS (ZARYA)".to_string();
         let actions = r.tick(
             now,
@@ -1126,7 +1127,7 @@ mod tests {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // Pass ended 30 seconds ago.
-        let mut pass = synthetic_noaa19(now, -660, 600, 50.0); // started -660 s ago, ended -60 s ago
+        let mut pass = synthetic_meteor_m2_3(now, -660, 600, 50.0); // started -660 s ago, ended -60 s ago
         // Sanity: this pass is in the past from `now`'s perspective.
         assert!(pass.end < now);
         let actions = r.tick(
@@ -1165,7 +1166,7 @@ mod tests {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
         // Pass starts in 10 min. Way outside the 5 s lead-in.
-        let pass = synthetic_noaa19(now, 600, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 600, 720, 50.0);
         let actions = r.tick(
             now,
             &[pass],
@@ -1182,7 +1183,7 @@ mod tests {
     fn before_pass_advances_to_recording_after_settle() {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         // Initial arm.
         r.tick(
             now,
@@ -1221,7 +1222,7 @@ mod tests {
     fn recording_advances_to_finalizing_at_los() {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 600, 50.0); // 10 min pass
+        let pass = synthetic_meteor_m2_3(now, 3, 600, 50.0); // 10 min pass
         r.tick(
             now,
             std::slice::from_ref(&pass),
@@ -1263,7 +1264,7 @@ mod tests {
         // honest about what it claims.
         assert!(matches!(
             actions[0],
-            Action::SavePng(_) | Action::SaveLrptPass { .. } | Action::SaveSstvPass { .. }
+            Action::SavePng(_) | Action::SaveLrptPass(_) | Action::SaveSstvPass(_)
         ));
         assert!(
             !actions.iter().any(|a| matches!(a, Action::Toast { .. })),
@@ -1290,7 +1291,7 @@ mod tests {
 
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 60, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 60, 50.0);
         let saved = SavedTune {
             freq_hz: SAVED_FREQ_HZ,
             vfo_offset_hz: SAVED_VFO_OFFSET_HZ, // pin a non-zero offset for the round trip
@@ -1407,7 +1408,7 @@ mod tests {
         // stall window.
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 60, 50.0); // 1 min pass, 3 s lead-in
+        let pass = synthetic_meteor_m2_3(now, 3, 60, 50.0); // 1 min pass, 3 s lead-in
         r.tick(
             now,
             std::slice::from_ref(&pass),
@@ -1449,7 +1450,7 @@ mod tests {
     fn los_during_before_pass_still_emits_reset_imaging_decoders() {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 60, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 60, 50.0);
         r.tick(
             now,
             std::slice::from_ref(&pass),
@@ -1476,7 +1477,7 @@ mod tests {
     fn overlapping_pass_does_not_re_arm_while_recording() {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass_a = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass_a = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         // Arm + settle into Recording.
         r.tick(
             now,
@@ -1501,7 +1502,7 @@ mod tests {
         // Use METEOR-M2 3 (also catalog-resident) as the distinct
         // second satellite since NOAA-15/18/19 were decommissioned
         // in 2025 and are no longer in `KNOWN_SATELLITES`.
-        let mut pass_b = synthetic_noaa19(now, 30, 720, 60.0);
+        let mut pass_b = synthetic_meteor_m2_3(now, 30, 720, 60.0);
         pass_b.satellite = "METEOR-M2 3".to_string();
         let actions = r.tick(
             after_settle,
@@ -1524,7 +1525,7 @@ mod tests {
     #[ignore = "exercises APT-specific recorder dispatch (SavePng / audio); APT path is dormant pending a future Cubesat catalog entry — see KNOWN_SATELLITES doc comment about August 2025 NOAA POES decommissioning"]
     fn png_path_includes_satellite_slug_and_timestamp() {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 30, 15).unwrap();
-        let pass = synthetic_noaa19(now, 0, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 0, 720, 50.0);
         let path = png_path_for(&pass, now);
         let s = path.to_string_lossy().to_string();
         assert!(s.contains("apt-NOAA-19-"));
@@ -1542,7 +1543,7 @@ mod tests {
         // "audio-" prefix and the extension. This is the
         // contract `pass_recording_path` is supposed to enforce.
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 30, 15).unwrap();
-        let pass = synthetic_noaa19(now, 0, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 0, 720, 50.0);
         let png = png_path_for(&pass, now);
         let audio = audio_path_for(&pass, now);
         let png_stem = png.file_stem().unwrap().to_string_lossy().to_string();
@@ -1580,7 +1581,7 @@ mod tests {
         // lasts 720 s — large enough that an LOS-timestamped
         // png_path would be obviously wrong vs the AOS-
         // timestamped audio_path (12-minute delta).
-        let pass = synthetic_noaa19(now_aos, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now_aos, 3, 720, 50.0);
 
         // AOS — capture the audio path the recorder asked for.
         let aos_actions = r.tick(
@@ -1657,7 +1658,7 @@ mod tests {
         // StopAutoAudioRecord at LOS. PNG path is unaffected.
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         // AOS with audio_record_on = false.
         let aos_actions = r.tick(
             now,
@@ -1719,7 +1720,7 @@ mod tests {
         // PNG path the LOS emits.
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         let aos_actions = r.tick(
             now,
             std::slice::from_ref(&pass),
@@ -1825,7 +1826,7 @@ mod tests {
         // protocol-gate `continue` fires either way.
         let mut r = AutoRecorder::with_supported_protocols(&[]);
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         let actions = r.tick(
             now,
             &[pass],
@@ -1855,7 +1856,7 @@ mod tests {
         // (which would clobber the user's mid-pass state).
         let mut r = AutoRecorder::with_supported_protocols(&[]);
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
 
         // AOS: gated out, no actions, state stays Idle.
         let aos = r.tick(
@@ -1920,7 +1921,7 @@ mod tests {
         // off-by-one indexing into the catalog) fails here.
         let mut r = AutoRecorder::with_supported_protocols(&[sdr_sat::ImagingProtocol::Apt]);
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         let actions = r.tick(
             now,
             &[pass],
@@ -1939,7 +1940,7 @@ mod tests {
         });
         let (satellite, protocol) =
             dispatched.expect("supported protocol must emit StartAutoRecord");
-        // METEOR-M 2 (LRPT) — `synthetic_noaa19` is now misnamed but
+        // METEOR-M 2 (LRPT) — `synthetic_meteor_m2_3` is now misnamed but
         // produces a Meteor pass since NOAA-19 was decommissioned in
         // August 2025.
         assert_eq!(satellite, "METEOR-M2 3");
@@ -2185,7 +2186,7 @@ mod tests {
         // gate didn't accidentally mute APT audio recording.
         let mut r = lrpt_recorder();
         let now_aos = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now_aos, 3, 600, 50.0);
+        let pass = synthetic_meteor_m2_3(now_aos, 3, 600, 50.0);
         let aos_actions = r.tick(
             now_aos,
             std::slice::from_ref(&pass),
@@ -2237,7 +2238,7 @@ mod tests {
     fn los_emits_reset_imaging_decoders() {
         let mut r = AutoRecorder::new();
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
-        let pass = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         r.tick(
             now,
             std::slice::from_ref(&pass),
@@ -2280,7 +2281,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2024, 6, 15, 18, 0, 0).unwrap();
 
         // Pass 1.
-        let pass1 = synthetic_noaa19(now, 3, 720, 50.0);
+        let pass1 = synthetic_meteor_m2_3(now, 3, 720, 50.0);
         r.tick(
             now,
             std::slice::from_ref(&pass1),
@@ -2328,7 +2329,7 @@ mod tests {
 
         // Pass 2 — fresh AOS, schedule it after pass 1 completed.
         let pass2_aos = post_los_1 + ChronoDuration::seconds(60);
-        let pass2 = synthetic_noaa19(pass2_aos, 0, 720, 50.0);
+        let pass2 = synthetic_meteor_m2_3(pass2_aos, 0, 720, 50.0);
         r.tick(
             pass2_aos,
             std::slice::from_ref(&pass2),

@@ -273,9 +273,9 @@ where
 /// specific stopband attenuation (e.g. for APT decoding where we
 /// want a known >30 dB rejection of the `2·f_carrier` rectification
 /// harmonic). [`low_pass`] uses a Nuttall window with fixed
-/// attenuation pattern (~70 dB at our chosen tap-count factor),
-/// which is overkill for some applications and not enough for
-/// others.
+/// attenuation pattern (~45 dB at our chosen tap-count factor —
+/// `TAP_COUNT_FACTOR = 3.8`, matching SDR++), which is sometimes
+/// not enough rejection for tight-tolerance demods.
 ///
 /// # Errors
 ///
