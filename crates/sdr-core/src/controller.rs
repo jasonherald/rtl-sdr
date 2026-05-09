@@ -232,6 +232,74 @@ use crate::acars_output::AcarsOutputs;
 /// Mutable state owned by the DSP thread.
 ///
 /// This is a god-struct that holds every piece of DSP-thread state by
+/// Per-SSTV-pass diagnostic counters. Reset between passes by
+/// [`reset_imaging_decoders`] (which logs a summary first). Lets
+/// a post-pass log analysis answer:
+/// - "Did the satellite transmit at all?" (VIS count > 0)
+/// - "How many complete images did we get?" (image_complete_count)
+/// - "Did any decode get cut short?" (lines_decoded > 0 with
+///   image_complete_count == 0 means partial — the duty-cycle
+///   OFF window or the satellite going below horizon truncated a
+///   mid-decode image).
+///
+/// All fields are pure observational counters — incremented from
+/// the SSTV event loop in `sstv_decode_tap`. No processing impact.
+/// Per #648.
+#[derive(Debug, Default)]
+struct SstvPassStats {
+    /// VIS headers detected since the last reset. Each detection
+    /// indicates the start of a new image (Robot 36 / PD120 /
+    /// Scottie / etc.).
+    vis_count: u32,
+    /// Complete images decoded. A "complete" image is one where
+    /// the decoder emitted `SstvEvent::ImageComplete` — partial
+    /// images that ran out of audio mid-frame don't count here
+    /// (use `lines_decoded` to see if any imagery was captured).
+    image_complete_count: u32,
+    /// Total scan lines decoded across all images this pass
+    /// (complete + partial). A pass with `vis_count > 0`,
+    /// `image_complete_count == 0`, and `lines_decoded > 0` got
+    /// imagery but lost it before the final scan-line — a hint
+    /// that the pass elevation dropped or the duty-cycle OFF
+    /// window started before image completion.
+    lines_decoded: u64,
+}
+
+impl SstvPassStats {
+    /// Whether any SSTV event fired this pass. Drives the
+    /// "log summary or skip" decision in [`reset_imaging_decoders`]
+    /// — a no-op reset (e.g. between two non-SSTV passes) shouldn't
+    /// emit a "0 / 0 / 0" log line and clutter the trace.
+    fn saw_any_event(&self) -> bool {
+        self.vis_count > 0 || self.image_complete_count > 0 || self.lines_decoded > 0
+    }
+
+    /// Mutate counters for one [`slowrx::SstvEvent`]. Extracted from
+    /// the inline match arms in `sstv_decode_tap` so the counter
+    /// logic is testable without spinning up a real `SstvDecoder`
+    /// (which would need synthetic SSTV-mode tone generation, a
+    /// significant scaffolding investment that's deferred per #648).
+    /// Per #648.
+    fn record_event(&mut self, event: &slowrx::SstvEvent) {
+        match event {
+            slowrx::SstvEvent::VisDetected { .. } => {
+                self.vis_count += 1;
+            }
+            slowrx::SstvEvent::LineDecoded { .. } => {
+                self.lines_decoded += 1;
+            }
+            slowrx::SstvEvent::ImageComplete { .. } => {
+                self.image_complete_count += 1;
+            }
+            // `SstvEvent` is `#[non_exhaustive]` — silently ignore
+            // future variants so a slowrx update doesn't require a
+            // source change here. Same forward-compat stance as the
+            // event-dispatch loop in `sstv_decode_tap`.
+            _ => {}
+        }
+    }
+}
+
 /// design — the DSP thread owns everything exclusively. The
 /// `struct_excessive_bools` lint triggers at 4 bools (`running`,
 /// `dc_blocking`, `invert_iq`, `squelch_was_open`); splitting them
@@ -554,6 +622,14 @@ struct DspState {
     /// Reused across DSP blocks, resized in place each call so we
     /// don't alloc inside the hot loop. Mirrors `apt_mono_buf`.
     sstv_mono_buf: Vec<f32>,
+    /// Per-SSTV-pass statistics. Reset between passes by
+    /// `reset_imaging_decoders`, which also logs a summary line so
+    /// a `grep "SSTV pass summary"` of the log shows whether each
+    /// pass produced imagery, partial frames, or just VIS detections
+    /// without complete images. Important for duty-cycled events
+    /// like ARISS Series 32 where a pass might yield 1-3 complete
+    /// images out of 3-4 detected VIS bursts. Per #648.
+    sstv_pass_stats: SstvPassStats,
     /// Most recent audio sample rate that `SstvDecoder::new` rejected,
     /// or `None` if every prior init succeeded / hasn't been tried.
     /// Guards against the audio-block hot loop retrying on a rate the
@@ -712,6 +788,7 @@ impl DspState {
             sstv_decoder: None,
             sstv_mono_buf: Vec::new(),
             sstv_init_failed_at_rate: None,
+            sstv_pass_stats: SstvPassStats::default(),
             sstv_image: None,
             acars_bank: None,
             acars_pre_lock: None,
@@ -917,6 +994,11 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
     // dispatch. `SstvEvent` is `#[non_exhaustive]`, so a wildcard arm
     // handles future mode additions without a compile break.
     for event in decoder.process(&state.sstv_mono_buf) {
+        // Update per-pass diagnostic counters before dispatch — the
+        // counters tell us at LOS how many VIS were detected, how
+        // many images completed, and how many lines decoded across
+        // all (complete + partial) images. Per #648.
+        state.sstv_pass_stats.record_event(&event);
         match event {
             slowrx::SstvEvent::VisDetected {
                 mode,
@@ -3696,6 +3778,21 @@ fn reset_imaging_decoders(state: &mut DspState) {
     state.sstv_decoder = None;
     state.sstv_mono_buf.clear();
     state.sstv_init_failed_at_rate = None;
+    // Per-pass SSTV diagnostic summary. Skip the log when the
+    // pass produced no events — a no-op reset between two non-
+    // SSTV passes (e.g. back-to-back LRPT recordings on a
+    // shared SSTV-decoder lifecycle) shouldn't clutter the
+    // trace with a "0 VIS / 0 images" line. Per #648.
+    if state.sstv_pass_stats.saw_any_event() {
+        let stats = &state.sstv_pass_stats;
+        tracing::info!(
+            vis_count = stats.vis_count,
+            image_complete_count = stats.image_complete_count,
+            lines_decoded = stats.lines_decoded,
+            "SSTV pass summary"
+        );
+    }
+    state.sstv_pass_stats = SstvPassStats::default();
 }
 
 /// Rebuild the IQ frontend with the current sample rate, preserving user settings.
@@ -4970,6 +5067,126 @@ mod tests {
         assert!(RECV_TIMEOUT_MS > 0);
         assert!(VFO_OUTPUT_PADDING > 0);
     };
+
+    /// Synthesize a `SstvEvent::VisDetected` for tests. The
+    /// inner field values don't matter for counter-update tests
+    /// — we only care that the event variant is `VisDetected`.
+    fn fake_vis_event() -> slowrx::SstvEvent {
+        slowrx::SstvEvent::VisDetected {
+            mode: slowrx::SstvMode::Robot36,
+            sample_offset: 0,
+            hedr_shift_hz: 0.0,
+        }
+    }
+
+    /// Synthesize a `SstvEvent::LineDecoded` for tests. Empty
+    /// pixel buffer is fine — `record_event` only inspects the
+    /// variant tag, not contents.
+    fn fake_line_event() -> slowrx::SstvEvent {
+        slowrx::SstvEvent::LineDecoded {
+            mode: slowrx::SstvMode::Robot36,
+            line_index: 0,
+            pixels: Vec::new(),
+        }
+    }
+
+    /// Synthesize a `SstvEvent::ImageComplete` for tests. Uses
+    /// `SstvImage::new` (the public constructor — `SstvImage` is
+    /// `#[non_exhaustive]` so direct struct-literal init is
+    /// rejected by the compiler) with a minimal 1×1 size. The
+    /// counter logic doesn't read the image dimensions; the fake
+    /// just has to be a valid variant. `partial: false` matches
+    /// the V1 slowrx contract (only the final clean image surface
+    /// emits this event).
+    fn fake_image_complete_event() -> slowrx::SstvEvent {
+        slowrx::SstvEvent::ImageComplete {
+            image: slowrx::SstvImage::new(slowrx::SstvMode::Robot36, 1, 1),
+            partial: false,
+        }
+    }
+
+    #[test]
+    fn sstv_pass_stats_default_is_empty() {
+        let stats = SstvPassStats::default();
+        assert_eq!(stats.vis_count, 0);
+        assert_eq!(stats.image_complete_count, 0);
+        assert_eq!(stats.lines_decoded, 0);
+        assert!(
+            !stats.saw_any_event(),
+            "default stats must report no events — drives the \
+             skip-summary-log decision in reset_imaging_decoders"
+        );
+    }
+
+    #[test]
+    fn sstv_pass_stats_increments_per_event_kind() {
+        // Counter dispatch table: each event variant maps to
+        // exactly one counter. Per #648.
+        let mut stats = SstvPassStats::default();
+        stats.record_event(&fake_vis_event());
+        assert_eq!(stats.vis_count, 1);
+        assert_eq!(stats.image_complete_count, 0);
+        assert_eq!(stats.lines_decoded, 0);
+
+        stats.record_event(&fake_line_event());
+        stats.record_event(&fake_line_event());
+        assert_eq!(stats.lines_decoded, 2);
+        assert_eq!(stats.vis_count, 1, "line events must not bump vis_count");
+
+        stats.record_event(&fake_image_complete_event());
+        assert_eq!(stats.image_complete_count, 1);
+        assert_eq!(stats.vis_count, 1, "image-complete must not bump vis_count");
+        assert_eq!(
+            stats.lines_decoded, 2,
+            "image-complete must not bump lines_decoded"
+        );
+
+        assert!(
+            stats.saw_any_event(),
+            "stats with non-zero counters must report saw_any_event"
+        );
+    }
+
+    #[test]
+    fn sstv_pass_stats_counts_a_realistic_ariss_pass() {
+        // Realistic Series 32 pass: 3 VIS bursts (ARISS duty
+        // cycle = 36 sec ON / 2 min OFF, typical 7-min pass
+        // catches ~3 windows), 2 complete images, 1 partial
+        // (~80 lines into the 240-line PD120 image when LOS
+        // truncated it). This is the shape we expect post-#648
+        // log analysis to reveal. Per #648.
+        let mut stats = SstvPassStats::default();
+
+        // Burst 1: VIS → 240 lines → ImageComplete
+        stats.record_event(&fake_vis_event());
+        for _ in 0..240 {
+            stats.record_event(&fake_line_event());
+        }
+        stats.record_event(&fake_image_complete_event());
+
+        // Burst 2: VIS → 240 lines → ImageComplete
+        stats.record_event(&fake_vis_event());
+        for _ in 0..240 {
+            stats.record_event(&fake_line_event());
+        }
+        stats.record_event(&fake_image_complete_event());
+
+        // Burst 3: VIS → 80 lines → LOS (partial)
+        stats.record_event(&fake_vis_event());
+        for _ in 0..80 {
+            stats.record_event(&fake_line_event());
+        }
+        // No ImageComplete for burst 3.
+
+        assert_eq!(stats.vis_count, 3);
+        assert_eq!(stats.image_complete_count, 2);
+        assert_eq!(stats.lines_decoded, 240 + 240 + 80);
+        // The "partial image" diagnostic: vis_count > image_complete_count
+        // AND lines_decoded > 0 means we got imagery but lost it
+        // before the final scan-line.
+        assert!(stats.vis_count > stats.image_complete_count);
+        assert!(stats.lines_decoded > 0);
+    }
 
     #[test]
     fn dsp_state_creates_successfully() {

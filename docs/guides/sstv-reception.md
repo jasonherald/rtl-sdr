@@ -73,6 +73,35 @@ station activities so some passes during the window will be silent.
 Plan to attempt several passes per day during an event rather than
 relying on any one.
 
+### Duty cycles change between events
+
+ARISS Series 32 (May 8-12, 2026) ran on a **36-second ON / 2-minute
+OFF** duty cycle — the SSTV transmitter keys for 36 seconds
+(approximately one full Robot 36 frame), then sleeps for 2 minutes,
+then keys again. A typical 7-10 minute pass over your station catches
+**2-3 burst windows**, not the continuous transmission older guides
+describe. That puts a hard ceiling on per-pass yield: at one image
+per burst, a single pass produces **at most 2-3 images**, not the
+12+ you might see referenced in older ARISS event documentation.
+
+Other recent series have run different duty cycles, including
+continuous transmission (Series 27) and 1-minute / 2-minute
+splits (Series 30). The current series's duty cycle is documented
+in the ARISS event flyer — always check the flyer for the active
+series before assuming a continuous transmit.
+
+**Practical implication for log analysis.** The auto-record path
+emits a per-pass `SSTV pass summary` log line at LOS with three
+counters: `vis_count`, `image_complete_count`, `lines_decoded`.
+A successful Series 32 pass might log `vis_count = 3,
+image_complete_count = 2, lines_decoded = 560` — three burst
+detections, two complete images, the third burst truncated by LOS
+or the duty-cycle OFF period before image completion. Use these
+counters to distinguish "satellite was off / out of range"
+(`vis_count = 0`) from "satellite was on but partial decode"
+(`vis_count > image_complete_count`) — the diagnostic surface that
+shipped in #648.
+
 ---
 
 ## Antenna
