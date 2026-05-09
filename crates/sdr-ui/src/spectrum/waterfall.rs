@@ -427,6 +427,17 @@ impl WaterfallRenderer {
         self.colormap_bgra = rgba_to_bgra(&map);
     }
 
+    /// Wipe the entire waterfall surface back to its as-built blank
+    /// state. Used when the waterfall master toggle goes off
+    /// (#646) so the user doesn't see a frozen snapshot of pre-
+    /// disable data while the FFT compute is suspended. Re-enabling
+    /// the toggle starts painting from the top — same behavior as
+    /// a fresh launch with no data yet.
+    pub fn clear(&mut self) {
+        self.pixel_buf.fill(0);
+        self.top_row = 0;
+    }
+
     pub fn set_db_range(&mut self, min_db: f32, max_db: f32) {
         if min_db.is_finite() && max_db.is_finite() && max_db > min_db {
             self.min_db = min_db;
@@ -593,6 +604,37 @@ fn rgba_to_bgra(rgba: &[[u8; 4]]) -> Vec<[u8; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_zeros_pixel_buf_and_resets_top_row() {
+        // Per #646: toggling the waterfall off must wipe the
+        // surface so the user doesn't see a frozen pre-disable
+        // snapshot. Fresh `new()` state is all-zeros + top_row=0;
+        // `clear()` must restore that exact state regardless of
+        // how many lines were pushed first.
+        let mut r = WaterfallRenderer::new(64);
+        for _ in 0..10 {
+            r.push_line(&vec![-30.0_f32; 64]);
+        }
+        assert!(
+            r.pixel_buf.iter().any(|b| *b != 0),
+            "push_line must have written non-zero pixels for the test premise to hold"
+        );
+        // top_row may have advanced (it walks backwards as new
+        // rows arrive — the ring-buffer wrap shipped in PR #458).
+        // Whichever value it landed on, `clear()` should reset it.
+
+        r.clear();
+
+        assert!(
+            r.pixel_buf.iter().all(|b| *b == 0),
+            "clear must zero every byte of pixel_buf"
+        );
+        assert_eq!(
+            r.top_row, 0,
+            "clear must reset top_row so the next push_line starts at the top"
+        );
+    }
 
     #[test]
     fn downsample_preserves_peak() {

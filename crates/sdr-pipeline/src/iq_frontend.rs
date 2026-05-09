@@ -90,6 +90,16 @@ pub struct IqFrontend {
     fft_skip_counter: usize,
     /// Whether we're currently accumulating for the next FFT.
     fft_accumulating: bool,
+    /// Master FFT compute gate. When `false`, `process()` skips the
+    /// entire FFT accumulation + compute loop and returns
+    /// `fft_ready = false` unconditionally — saving the per-sample
+    /// copy into `fft_accum`, the windowing pass, and the FFT
+    /// itself. Used by the UI to suspend the waterfall display when
+    /// the user toggles it off (issue #646) or the window is
+    /// minimized (#647). Independent of `fft_rate` — rate stays
+    /// untouched so re-enabling immediately resumes at the
+    /// previously-configured frame rate without a setting round-trip.
+    fft_enabled: bool,
 
     // Scratch buffers
     decim_buf: Vec<Complex>,
@@ -175,6 +185,12 @@ impl IqFrontend {
             fft_skip_samples,
             fft_skip_counter: 0,
             fft_accumulating: true,
+            // Default-on so existing call sites that don't explicitly
+            // toggle the gate keep the historical behavior. The UI is
+            // responsible for sending `SetFftEnabled(false)` when the
+            // user toggles the waterfall off (#646) or the window is
+            // minimized (#647).
+            fft_enabled: true,
             decim_buf: Vec::new(),
             dc_scratch: Vec::new(),
             fft_work: vec![Complex::default(); fft_size],
@@ -219,6 +235,34 @@ impl IqFrontend {
     /// Get the current target FFT rate.
     pub fn fft_rate(&self) -> f64 {
         self.fft_rate
+    }
+
+    /// Toggle the master FFT compute gate. When `false`, `process()`
+    /// skips the entire FFT accumulation + compute loop and returns
+    /// `fft_ready = false` unconditionally — the per-sample copy
+    /// into `fft_accum`, the windowing pass, and the FFT itself are
+    /// all elided. Audio / demod / decimation continue to run
+    /// normally — only the spectrum-display path is suspended.
+    ///
+    /// Used by the UI to suspend the waterfall when the user toggles
+    /// it off (#646) or the window is minimized (#647). Also resets
+    /// the FFT accumulator so re-enabling starts fresh — a stale
+    /// half-frame at the moment of disable would otherwise prepend
+    /// the first FFT after re-enable, producing a brief
+    /// discontinuity in the waterfall.
+    pub fn set_fft_enabled(&mut self, enabled: bool) {
+        if self.fft_enabled == enabled {
+            return;
+        }
+        self.fft_enabled = enabled;
+        self.fft_accum_count = 0;
+        self.fft_skip_counter = 0;
+        self.fft_accumulating = true;
+    }
+
+    /// Whether the FFT compute gate is currently enabled.
+    pub fn fft_enabled(&self) -> bool {
+        self.fft_enabled
     }
 
     /// Enable or disable IQ inversion correction.
@@ -315,8 +359,14 @@ impl IqFrontend {
         // Step 1: FFT accumulation from raw input (pre-decimation).
         // Shows the full tuner bandwidth in the waterfall/FFT display,
         // matching how SDR++ renders its spectrum.
+        //
+        // Gated by `fft_enabled` (#646 / #647): when the user toggles
+        // the waterfall off, or the window is minimized, the entire
+        // accumulator + compute loop is skipped — saving the per-
+        // sample memcpy, the windowing pass, and the FFT itself.
+        // Audio / demod / decimation below continue to run normally.
         let mut fft_ready = false;
-        {
+        if self.fft_enabled {
             let mut pos = 0;
             let raw_len = input.len();
             while pos < raw_len {
@@ -754,6 +804,146 @@ mod tests {
         assert_eq!(
             fft_count, 10,
             "expected 10 FFTs at 10 FPS with non-aligned chunks, got {fft_count}"
+        );
+    }
+
+    #[test]
+    fn test_fft_enabled_default_is_true() {
+        // Existing call sites that don't explicitly toggle the gate
+        // must keep historical behavior. A `new()` IqFrontend should
+        // produce FFTs immediately. Per #646.
+        let fe = IqFrontend::new(
+            TEST_SAMPLE_RATE,
+            1,
+            TEST_FFT_SIZE,
+            FftWindow::Nuttall,
+            false,
+        )
+        .unwrap();
+        assert!(fe.fft_enabled(), "fft_enabled defaults to true");
+    }
+
+    #[test]
+    fn test_fft_disabled_suppresses_fft_ready() {
+        // With `fft_enabled = false`, `process()` must skip the
+        // accumulator + compute loop entirely — no `fft_ready = true`
+        // ever surfaces, even after enough samples for many FFTs to
+        // have completed at the current rate. Audio path still runs
+        // (output buffer is filled by Step 2). Per #646.
+        let mut fe = IqFrontend::new(
+            TEST_SAMPLE_RATE,
+            1,
+            TEST_FFT_SIZE,
+            FftWindow::Nuttall,
+            false,
+        )
+        .unwrap();
+        fe.set_fft_rate(10.0);
+        fe.set_fft_enabled(false);
+        assert!(!fe.fft_enabled());
+
+        let chunk = vec![Complex::new(1.0, 0.0); TEST_FFT_SIZE];
+        let mut output = vec![Complex::default(); TEST_FFT_SIZE];
+        let mut fft_out = vec![0.0_f32; TEST_FFT_SIZE];
+        let mut fft_count = 0;
+        let mut total_processed = 0;
+
+        for _ in 0..47 {
+            let (processed, fft_ready) = fe.process(&chunk, &mut output, &mut fft_out).unwrap();
+            total_processed += processed;
+            if fft_ready {
+                fft_count += 1;
+            }
+        }
+
+        assert_eq!(fft_count, 0, "no FFTs should fire while gate is disabled");
+        assert!(
+            total_processed > 0,
+            "audio / decimation path must still run while FFT is disabled \
+             (got 0 processed samples — the gate is leaking past Step 1)",
+        );
+    }
+
+    #[test]
+    fn test_fft_re_enable_resumes_at_configured_rate() {
+        // Toggling the gate off then back on must restore the
+        // previously-configured FFT rate without a settings round-
+        // trip. Counter resets on toggle so re-enable starts a fresh
+        // window — preventing a half-accumulated frame from the pre-
+        // disable period from being emitted as the first post-enable
+        // FFT. Per #646.
+        let mut fe = IqFrontend::new(
+            TEST_SAMPLE_RATE,
+            1,
+            TEST_FFT_SIZE,
+            FftWindow::Nuttall,
+            false,
+        )
+        .unwrap();
+        fe.set_fft_rate(10.0);
+
+        let chunk = vec![Complex::new(1.0, 0.0); TEST_FFT_SIZE];
+        let mut output = vec![Complex::default(); TEST_FFT_SIZE];
+        let mut fft_out = vec![0.0_f32; TEST_FFT_SIZE];
+
+        // Half a second disabled (no FFTs).
+        fe.set_fft_enabled(false);
+        for _ in 0..23 {
+            let (_, fft_ready) = fe.process(&chunk, &mut output, &mut fft_out).unwrap();
+            assert!(!fft_ready, "FFT should not fire while disabled");
+        }
+
+        // Re-enable + half a second of input.
+        fe.set_fft_enabled(true);
+        let mut post_enable_count = 0;
+        for _ in 0..47 {
+            let (_, fft_ready) = fe.process(&chunk, &mut output, &mut fft_out).unwrap();
+            if fft_ready {
+                post_enable_count += 1;
+            }
+        }
+        // ~10 FPS target on 1 second of input ≈ 10 FFTs after re-enable.
+        assert_eq!(
+            post_enable_count, 10,
+            "re-enable should resume at the previously-configured 10 FPS rate, got {post_enable_count}"
+        );
+    }
+
+    #[test]
+    fn test_fft_set_enabled_idempotent() {
+        // Setting the gate to its current state is a no-op — must
+        // not reset the accumulator or skip counter mid-pass. A
+        // chatty UI that re-applies the persisted toggle on every
+        // frame would otherwise stall the FFT cadence indefinitely.
+        let mut fe = IqFrontend::new(
+            TEST_SAMPLE_RATE,
+            1,
+            TEST_FFT_SIZE,
+            FftWindow::Nuttall,
+            false,
+        )
+        .unwrap();
+        fe.set_fft_rate(10.0);
+
+        let chunk = vec![Complex::new(1.0, 0.0); TEST_FFT_SIZE];
+        let mut output = vec![Complex::default(); TEST_FFT_SIZE];
+        let mut fft_out = vec![0.0_f32; TEST_FFT_SIZE];
+        let mut fft_count = 0;
+
+        for _ in 0..47 {
+            // Repeatedly setting to the existing `true` state must not
+            // disturb the accumulator. Without the early-return guard
+            // in `set_fft_enabled` this would zero `fft_skip_counter`
+            // every call and we'd never see an FFT.
+            fe.set_fft_enabled(true);
+            let (_, fft_ready) = fe.process(&chunk, &mut output, &mut fft_out).unwrap();
+            if fft_ready {
+                fft_count += 1;
+            }
+        }
+        assert_eq!(
+            fft_count, 10,
+            "idempotent set_fft_enabled(true) must not reset cadence; got {fft_count}"
         );
     }
 }

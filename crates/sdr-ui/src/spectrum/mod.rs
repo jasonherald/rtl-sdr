@@ -313,6 +313,43 @@ impl SpectrumHandle {
         self.fft_area.queue_draw();
     }
 
+    /// Wipe the waterfall surface, clear the spectrum trace data,
+    /// and reset the signal-history ring + averaging buffer. Used
+    /// when the waterfall master toggle goes off (#646) so the
+    /// user doesn't see a frozen pre-disable snapshot while the
+    /// FFT compute is suspended.
+    ///
+    /// Three states are reset:
+    /// - **Waterfall pixel buffer** (`WaterfallRenderer::clear`):
+    ///   surface returns to its as-built blank state.
+    /// - **FFT trace** (`FftPlotState::current_data` cleared): the
+    ///   spectrum line draws empty until new data arrives.
+    /// - **Signal history** (`SignalHistoryRenderer::clear`): the
+    ///   top signal-strength chart resets to its empty as-built
+    ///   state.
+    /// - **Averaging buffer**: cleared so re-enable starts a fresh
+    ///   running average instead of continuing from stale samples.
+    ///
+    /// Each `DrawingArea` is queued for a redraw so the user sees
+    /// the cleared state immediately, including when the receiver
+    /// isn't currently playing (no incoming data to trigger a
+    /// natural redraw).
+    pub fn clear_displays(&self) {
+        if let Some(s) = self.waterfall_state.borrow_mut().as_mut() {
+            s.renderer.clear();
+        }
+        if let Some(s) = self.fft_state.borrow_mut().as_mut() {
+            s.current_data.clear();
+        }
+        if let Some(s) = self.signal_history_state.borrow_mut().as_mut() {
+            s.renderer.clear();
+        }
+        self.avg_buffer.borrow_mut().clear();
+        self.fft_area.queue_draw();
+        self.waterfall_area.queue_draw();
+        self.signal_history_area.queue_draw();
+    }
+
     /// Set the spectrum averaging mode, resetting the averaging buffer.
     pub fn set_averaging_mode(&self, mode: AveragingMode) {
         self.averaging_mode.set(mode);

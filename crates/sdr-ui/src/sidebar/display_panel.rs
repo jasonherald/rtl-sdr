@@ -4,6 +4,36 @@
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
+/// Config key for the user's "Show waterfall" toggle. Mirrors the
+/// `ui_sidebar_*` naming pattern in `activity_bar.rs` so future
+/// per-pane prefs land in the same namespace. Per #646.
+pub const KEY_WATERFALL_ENABLED: &str = "ui_display_waterfall_enabled";
+
+/// Default value for the waterfall master toggle. Default-on so a
+/// fresh install matches the historical "you see the waterfall as
+/// soon as you tune in" expectation; users opt out for CPU savings
+/// on audio-only listening sessions.
+pub const DEFAULT_WATERFALL_ENABLED: bool = true;
+
+/// Read the persisted waterfall-enabled toggle. Returns
+/// [`DEFAULT_WATERFALL_ENABLED`] when the key is missing or not a
+/// bool (covers "fresh install" and "user hand-edited the config
+/// to garbage" both).
+pub fn read_waterfall_enabled(config: &std::sync::Arc<sdr_config::ConfigManager>) -> bool {
+    config.read(|v| {
+        v.get(KEY_WATERFALL_ENABLED)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(DEFAULT_WATERFALL_ENABLED)
+    })
+}
+
+/// Persist the waterfall-enabled toggle.
+pub fn save_waterfall_enabled(config: &std::sync::Arc<sdr_config::ConfigManager>, enabled: bool) {
+    config.write(|v| {
+        v[KEY_WATERFALL_ENABLED] = serde_json::json!(enabled);
+    });
+}
+
 /// Default frame rate in FPS.
 const DEFAULT_FPS: f64 = 20.0;
 /// Minimum frame rate in FPS.
@@ -68,6 +98,12 @@ pub struct DisplayPanel {
     pub max_db_row: adw::SpinRow,
     /// Toggle for spectrum fill area under the trace.
     pub fill_mode_row: adw::SwitchRow,
+    /// Toggle for the waterfall display + the underlying FFT compute.
+    /// Off suspends the FFT loop entirely (no per-sample copy, no
+    /// windowing, no FFT) for CPU savings during audio-only listening
+    /// sessions where the spectrum isn't being looked at. Audio /
+    /// recording paths are unaffected. Per #646.
+    pub waterfall_enabled_row: adw::SwitchRow,
     /// Spectrum averaging mode selector.
     pub averaging_row: adw::ComboRow,
     /// Theme selector (System / Dark / Light).
@@ -182,6 +218,18 @@ pub fn build_display_panel() -> DisplayPanel {
         .active(true)
         .build();
 
+    // --- Waterfall master toggle ---
+    // Off suspends the FFT compute + waterfall draw entirely.
+    // Audio + recording paths are independent and continue to run.
+    // Default-on so first-launch behavior matches the historical
+    // "you see the waterfall as soon as you tune in" expectation.
+    // Per #646.
+    let waterfall_enabled_row = adw::SwitchRow::builder()
+        .title("Show waterfall")
+        .subtitle("Disable to save CPU when listening only — audio + recording unaffected")
+        .active(true)
+        .build();
+
     // --- Averaging Mode ---
     let averaging_model = gtk4::StringList::new(&["None", "Peak Hold", "Average", "Min Hold"]);
     let averaging_row = adw::ComboRow::builder()
@@ -213,6 +261,7 @@ pub fn build_display_panel() -> DisplayPanel {
         .title("Waterfall")
         .description("Color mapping for the scrolling history")
         .build();
+    waterfall_group.add(&waterfall_enabled_row);
     waterfall_group.add(&color_map_row);
 
     let levels_group = adw::PreferencesGroup::builder()
@@ -264,6 +313,7 @@ pub fn build_display_panel() -> DisplayPanel {
         min_db_row,
         max_db_row,
         fill_mode_row,
+        waterfall_enabled_row,
         averaging_row,
         theme_row,
         scanner_axis_row,

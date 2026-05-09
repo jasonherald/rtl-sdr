@@ -716,6 +716,61 @@ pub fn build_window(
 
     window.add_breakpoint(breakpoint);
 
+    // Auto-pause waterfall when the window is minimized (#647).
+    // Surface-level state listening: GTK4 exposes `is_active` /
+    // `is_maximized` as window properties but minimization lives on
+    // the underlying `GdkToplevel` surface. The surface isn't
+    // realized until the window is mapped, so we wait for
+    // `connect_realize` and then attach a state-notify on the
+    // toplevel.
+    //
+    // **Best-effort.** `GdkToplevelState::MINIMIZED` is reported by
+    // most major compositors (Mutter / KWin / sway / Hyprland) but
+    // some tiling WMs don't emit it; on those, this handler simply
+    // never fires and the user's Display-panel toggle remains the
+    // only gate. Audio + recording paths are unaffected regardless
+    // — the gate only runs through the FFT compute loop.
+    {
+        let state_min = Rc::clone(&state);
+        let spectrum_min = Rc::clone(&spectrum_handle);
+        window.connect_realize(move |w| {
+            let Some(surface) = w.surface() else {
+                tracing::debug!("waterfall auto-pause: window has no surface yet — skipping");
+                return;
+            };
+            let Some(toplevel) = surface.dynamic_cast_ref::<gtk4::gdk::Toplevel>() else {
+                tracing::debug!(
+                    "waterfall auto-pause: surface is not a Toplevel — minimize \
+                     detection unsupported on this platform"
+                );
+                return;
+            };
+            let state_inner = Rc::clone(&state_min);
+            let spectrum_inner = Rc::clone(&spectrum_min);
+            toplevel.connect_state_notify(move |t| {
+                let minimized = t.state().contains(gtk4::gdk::ToplevelState::MINIMIZED);
+                let prev = state_inner.waterfall_window_minimized.get();
+                if prev == minimized {
+                    return;
+                }
+                state_inner.waterfall_window_minimized.set(minimized);
+                let resolved = state_inner.resolve_and_send_waterfall_gate();
+                // Clear when going off (about to be hidden anyway,
+                // but the unminimize-then-toggle-off path needs the
+                // surface blanked so the first paint after restore
+                // doesn't show stale data while the FFT is paused).
+                // Per #647.
+                if !resolved {
+                    spectrum_inner.clear_displays();
+                }
+                tracing::info!(
+                    minimized,
+                    "window minimize state changed — waterfall gate resolved (#647)"
+                );
+            });
+        });
+    }
+
     // Wire `app.apt-open` (Ctrl+Shift+A) — opens the live APT
     // viewer window. Done here rather than in `app.rs::activate`
     // because the action's line-routing handler reads
@@ -4019,7 +4074,7 @@ fn connect_sidebar_panels(
     connect_rtl_tcp_discovery(panels, state, config, favorites_header, &favorites);
     connect_server_panel(panels, toast_overlay, server_running);
     connect_radio_panel(panels, state, scanner_force_disable);
-    connect_display_panel(panels, state, spectrum_handle);
+    connect_display_panel(panels, state, spectrum_handle, config);
     connect_audio_panel(panels, state);
     connect_volume_persistence(panels, state, config, volume_button);
     connect_distance_estimator_persistence(panels, config);
@@ -9295,6 +9350,7 @@ fn connect_display_panel(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
     // FFT size
     let state_fft = Rc::clone(state);
@@ -9383,6 +9439,54 @@ fn connect_display_panel(
         .connect_active_notify(move |row| {
             spectrum_fill.set_fill_enabled(row.is_active());
             tracing::debug!(fill = row.is_active(), "fill mode changed");
+        });
+
+    // Waterfall master toggle (#646). Two inputs combine into the
+    // DSP gate: this user-facing toggle and the auto-pause-on-
+    // minimize handler in `wire_window_minimize_pause`. Both feed
+    // `state.resolve_and_send_waterfall_gate()` which dispatches a
+    // single `SetFftEnabled(bool)` to the engine.
+    //
+    // Seed-then-wire: `set_active` fires `connect_active_notify` on
+    // some GTK4 builds, so we apply the persisted state first, send
+    // the resolved gate to the DSP, and only then connect the
+    // handler. The handler's first call after wiring is a real user
+    // toggle, not the seed.
+    let initial_waterfall_enabled = sidebar::display_panel::read_waterfall_enabled(config);
+    state.waterfall_user_enabled.set(initial_waterfall_enabled);
+    panels
+        .display
+        .waterfall_enabled_row
+        .set_active(initial_waterfall_enabled);
+    let initial_resolved = state.resolve_and_send_waterfall_gate();
+    if !initial_resolved {
+        // Persisted-off launch: ensure the displays start blank
+        // instead of inheriting whatever the last frame painted
+        // before the previous shutdown — matters when
+        // `waterfall_state` was just initialized with non-zero
+        // pixels (race-window unlikely, but the cost is one
+        // memset).
+        spectrum_handle.clear_displays();
+    }
+    let state_wf = Rc::clone(state);
+    let config_wf = std::sync::Arc::clone(config);
+    let spectrum_wf = Rc::clone(spectrum_handle);
+    panels
+        .display
+        .waterfall_enabled_row
+        .connect_active_notify(move |row| {
+            let active = row.is_active();
+            state_wf.waterfall_user_enabled.set(active);
+            sidebar::display_panel::save_waterfall_enabled(&config_wf, active);
+            let resolved = state_wf.resolve_and_send_waterfall_gate();
+            // Clear the visible state on disable so the user doesn't
+            // see a frozen pre-disable snapshot. Skipped on enable —
+            // the next FFT frame will paint the start of fresh data
+            // naturally without an explicit clear. Per #646.
+            if !resolved {
+                spectrum_wf.clear_displays();
+            }
+            tracing::info!(active, "waterfall master toggle changed (#646)");
         });
 
     // Averaging mode selector.

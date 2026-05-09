@@ -311,6 +311,20 @@ pub enum UiToDsp {
     SetWfmStereo(bool),
     /// Set the FFT display frame rate (FPS).
     SetFftRate(f64),
+    /// Master FFT compute gate. When `false`, the IQ frontend skips
+    /// the entire FFT accumulation + compute loop — saving the
+    /// per-sample copy into the FFT accumulator, the windowing
+    /// pass, and the FFT itself. Audio / demod / decimation /
+    /// recording paths continue to run normally; only the spectrum-
+    /// display path is suspended.
+    ///
+    /// Used by the UI to pause the waterfall when the user toggles
+    /// it off via the Display sidebar (#646) or the window is
+    /// minimized (#647). Independent of `SetFftRate` — the rate is
+    /// preserved across enable / disable cycles so re-enabling
+    /// resumes at the previously-configured frame rate without a
+    /// settings round-trip.
+    SetFftEnabled(bool),
     /// Enable or disable the audio high-pass filter (voice modes).
     SetHighPass(bool),
     /// Enable or disable the audio notch filter.

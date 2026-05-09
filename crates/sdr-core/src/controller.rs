@@ -282,6 +282,12 @@ struct DspState {
     invert_iq: bool,
     window_fn: FftWindow,
     fft_rate: f64,
+    /// Master FFT compute gate. Mirrors `IqFrontend::fft_enabled` and
+    /// is reapplied to any newly-built frontend so a frontend rebuild
+    /// (e.g. on source switch / decimation change) doesn't silently
+    /// resume the waterfall when the user had it toggled off. Driven
+    /// by `UiToDsp::SetFftEnabled` (#646 / #647).
+    fft_enabled: bool,
     /// Current channel bandwidth (persisted so VFO rebuilds use it, not mode default).
     bandwidth: f64,
 
@@ -648,6 +654,11 @@ impl DspState {
             invert_iq: false,
             window_fn: FftWindow::Nuttall,
             fft_rate: DEFAULT_FFT_RATE,
+            // Default-on so existing setup paths that don't explicitly
+            // toggle the gate keep historical behavior. UI is the only
+            // caller that turns this off (Display sidebar toggle for
+            // #646; window-minimize handler for #647).
+            fft_enabled: true,
             bandwidth: initial_bandwidth,
             vfo: None,
             vfo_buf: Vec::new(),
@@ -1669,6 +1680,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 Ok(mut new_frontend) => {
                     new_frontend.set_invert_iq(state.invert_iq);
                     new_frontend.set_fft_rate(state.fft_rate);
+                    new_frontend.set_fft_enabled(state.fft_enabled);
                     state.frontend = new_frontend;
                     state.fft_buf = vec![0.0; size];
                 }
@@ -1757,6 +1769,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 Ok(mut new_frontend) => {
                     new_frontend.set_invert_iq(state.invert_iq);
                     new_frontend.set_fft_rate(state.fft_rate);
+                    new_frontend.set_fft_enabled(state.fft_enabled);
                     state.fft_buf = vec![0.0; new_frontend.fft_size()];
                     state.frontend = new_frontend;
                 }
@@ -1819,6 +1832,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             tracing::debug!(fps, "set FFT rate");
             state.fft_rate = fps;
             state.frontend.set_fft_rate(fps);
+        }
+
+        UiToDsp::SetFftEnabled(enabled) => {
+            tracing::debug!(enabled, "set FFT enabled");
+            state.fft_enabled = enabled;
+            state.frontend.set_fft_enabled(enabled);
         }
 
         UiToDsp::SetHighPass(enabled) => {
@@ -3671,6 +3690,7 @@ fn rebuild_frontend(state: &mut DspState) -> Result<(), String> {
 
     new_frontend.set_invert_iq(state.invert_iq);
     new_frontend.set_fft_rate(state.fft_rate);
+    new_frontend.set_fft_enabled(state.fft_enabled);
     state.frontend = new_frontend;
     Ok(())
 }

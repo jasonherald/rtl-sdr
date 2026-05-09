@@ -52,6 +52,16 @@ impl SignalHistoryRenderer {
         }
     }
 
+    /// Drop all accumulated samples and reset the write head.
+    /// Used when the waterfall master toggle goes off so the user
+    /// doesn't see a stale signal trace from before the gate
+    /// closed. Per #646.
+    pub fn clear(&mut self) {
+        self.samples.fill(f32::NEG_INFINITY);
+        self.write_pos = 0;
+        self.count = 0;
+    }
+
     /// Render the signal history line plot using Cairo.
     ///
     /// # Arguments
@@ -160,8 +170,32 @@ impl SignalHistoryRenderer {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Compile-time validation that signal history constants are consistent.
     const _: () = {
         assert!(super::HISTORY_SIZE > 0);
     };
+
+    #[test]
+    fn clear_resets_to_as_built_state() {
+        // Per #646: when the user toggles the waterfall off, the
+        // signal-history chart must reset rather than freezing on
+        // pre-disable samples. `clear()` returns the renderer to
+        // its `new()` state — empty count, write head at 0, samples
+        // back to NEG_INFINITY.
+        let mut r = SignalHistoryRenderer::new();
+        for db in [-30.0_f32, -25.0, -20.0, -15.0] {
+            r.push(db);
+        }
+        assert_eq!(r.count, 4, "push should bump count");
+        assert_eq!(r.write_pos, 4, "push should advance write head");
+        assert_ne!(r.samples[0], f32::NEG_INFINITY, "samples populated");
+
+        r.clear();
+
+        assert_eq!(r.count, 0);
+        assert_eq!(r.write_pos, 0);
+        assert!(r.samples.iter().all(|s| *s == f32::NEG_INFINITY));
+    }
 }

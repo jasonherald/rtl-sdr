@@ -314,6 +314,20 @@ pub struct AppState {
     pub sstv_recording_pass: RefCell<Option<(u32, chrono::DateTime<chrono::Utc>)>>,
     /// ACARS toggle (mirrors persisted `acars_enabled`).
     pub acars_enabled: Cell<bool>,
+    /// User-facing waterfall master toggle. Mirrors the persisted
+    /// `ui_display_waterfall_enabled` config key. Combined with
+    /// `waterfall_window_minimized` to drive the DSP-side
+    /// `SetFftEnabled` gate — see `resolve_waterfall_gate`. Per #646.
+    pub waterfall_user_enabled: Cell<bool>,
+    /// Transient window-minimize state. Updated by the GdkToplevel
+    /// state-notify handler when the compositor reports the
+    /// application window is minimized; reverted when restored.
+    /// Combines with `waterfall_user_enabled` to suspend FFT
+    /// compute even when the user has the toggle on. Default false
+    /// — best-effort: not all compositors fire `MINIMIZED` state
+    /// changes, in which case auto-pause is a no-op and the user
+    /// toggle remains the only gate. Per #647.
+    pub waterfall_window_minimized: Cell<bool>,
     /// Bounded ring of recent decoded messages. Cap is set
     /// from `acars_recent_keep_count` config (default 500).
     pub acars_recent: RefCell<VecDeque<AcarsMessage>>,
@@ -479,6 +493,9 @@ impl AppState {
             sstv_pending_export: RefCell::new(Vec::new()),
             sstv_recording_pass: RefCell::new(None),
             acars_enabled: Cell::new(false),
+            // Default-on; loaded from config in `connect_display_panel`.
+            waterfall_user_enabled: Cell::new(true),
+            waterfall_window_minimized: Cell::new(false),
             acars_recent: RefCell::new(VecDeque::with_capacity(
                 crate::acars_config::default_recent_keep() as usize,
             )),
@@ -502,6 +519,21 @@ impl AppState {
         if let Err(e) = self.ui_tx.send(msg) {
             tracing::warn!("failed to send DSP command: {e}");
         }
+    }
+
+    /// Compute the waterfall gate (`user_enabled && !window_minimized`),
+    /// dispatch a `SetFftEnabled(bool)` to the DSP, and return the
+    /// resolved boolean so the caller can drive any UI-side cleanup
+    /// (e.g. clearing the waterfall surface when the gate goes
+    /// false; per #646 the visible waterfall + spectrum trace + signal-
+    /// history chart must reset rather than freezing on stale data).
+    /// Called from the user-toggle handler (#646), the window-minimize
+    /// handler (#647), and once at startup so the engine starts in
+    /// the resolved state. Cheap to call — Cell reads are unsynchronized.
+    pub fn resolve_and_send_waterfall_gate(&self) -> bool {
+        let enabled = self.waterfall_user_enabled.get() && !self.waterfall_window_minimized.get();
+        self.send_dsp(UiToDsp::SetFftEnabled(enabled));
+        enabled
     }
 
     /// `true` if the app is actively writing pass artifacts to disk
