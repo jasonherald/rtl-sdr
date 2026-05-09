@@ -117,6 +117,30 @@ pub const METEOR_M2_LRPT_DOWNLINK_HZ: u64 = 137_900_000;
 /// the previous default would have imposed.
 pub const METEOR_M2_LRPT_BANDWIDTH_HZ: u32 = 144_000;
 
+/// AVHRR APIDs we expect METEOR-M2 3 to transmit during a clean
+/// pass. As of May 2026 Roscosmos has M2-3 broadcasting its
+/// **summer mode** — three visual channels c1/c2/c3 (APIDs 64/65/66),
+/// no IR. The "Natural colour (123)" composite recipe in
+/// `sdr_ui::lrpt_viewer::COMPOSITE_CATALOG` covers this set; the
+/// IR-based composites (False-colour IR, Thermal IR) are
+/// unavailable on these passes by design — Roscosmos schedules them
+/// out for the warm half of the year.
+///
+/// At LOS the wiring layer compares this set against the actually-
+/// received APIDs and warns if any expected APID is missing AND we
+/// got at least one APID otherwise (silent passes don't trigger —
+/// they're indistinguishable from "satellite was off"). Per #645.
+pub const METEOR_M2_3_EXPECTED_LRPT_APIDS: &[u16] = &[64, 65, 66];
+
+/// AVHRR APIDs we expect METEOR-M2 4 to transmit during a clean
+/// pass. M2-4 broadcasts the **standard** three-channel set —
+/// c1/c2/c4 (APIDs 64/65/68) — visible + visible + thermal IR.
+/// All three composite recipes
+/// (`sdr_ui::lrpt_viewer::COMPOSITE_CATALOG`) have full coverage on
+/// these passes. Per #645 — M2-4 is currently the easier first-decode
+/// target than M2-3 for exactly this reason.
+pub const METEOR_M2_4_EXPECTED_LRPT_APIDS: &[u16] = &[64, 65, 68];
+
 /// Imaging protocol the receiver should use for a given catalog
 /// satellite. Drives the auto-record dispatch in
 /// `sidebar::satellites_recorder` so APT vs LRPT vs SSTV each get
@@ -222,6 +246,52 @@ pub struct KnownSatellite {
     /// shipped in Task 7 of epic #469; ISS SSTV shipped in epic
     /// #472 with `Some(Sstv)`.
     pub imaging_protocol: Option<ImagingProtocol>,
+    /// Per-pass expected AVHRR APIDs for LRPT satellites. `None` for
+    /// non-LRPT satellites (ISS / future Cubesats), `Some(set)` for
+    /// Meteor-M family entries — the value reflects the current
+    /// Roscosmos broadcast schedule (M2-3 summer mode = 64/65/66,
+    /// M2-4 standard mode = 64/65/68 as of May 2026).
+    ///
+    /// Used by the wiring layer at LOS: if the satellite delivered
+    /// some APIDs but not all of these, we emit a warning so
+    /// schedule changes (e.g. Roscosmos flipping M2-3 back to
+    /// winter mode) surface as a single log line instead of silent
+    /// "missing composite" failures. Per #645.
+    ///
+    /// NOT a requirement / NOT used as a filter — every received APID
+    /// produces a per-channel PNG regardless of whether it's in this
+    /// set. The set drives diagnostics only.
+    pub expected_lrpt_apids: Option<&'static [u16]>,
+}
+
+impl KnownSatellite {
+    /// Compute the APIDs in `expected_lrpt_apids` that are not present
+    /// in the `received` slice. Returns an empty `Vec` if:
+    /// - This satellite has no expected-APID set (`expected_lrpt_apids` is `None`),
+    /// - The satellite delivered no APIDs at all (silent pass — we don't
+    ///   want to false-alarm "missing APIDs" when the receiver got
+    ///   nothing), or
+    /// - All expected APIDs were received.
+    ///
+    /// Returns the missing APIDs in catalog order (the order they appear
+    /// in `expected_lrpt_apids`) otherwise. Pure function — used by the
+    /// wiring layer at LOS to drive a single diagnostic warning per
+    /// Roscosmos schedule mismatch, no allocations on the empty path.
+    /// Per #645.
+    #[must_use]
+    pub fn missing_lrpt_apids(&self, received: &[u16]) -> Vec<u16> {
+        let Some(expected) = self.expected_lrpt_apids else {
+            return Vec::new();
+        };
+        if received.is_empty() {
+            return Vec::new();
+        }
+        expected
+            .iter()
+            .copied()
+            .filter(|apid| !received.contains(apid))
+            .collect()
+    }
 }
 
 /// Built-in catalog. Order is the order the scheduler UI displays.
@@ -251,8 +321,10 @@ pub struct KnownSatellite {
 /// active M2-3 / M2-4 birds.
 pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
     // Meteor-M LRPT — epic #469. Both M2-3 and M2-4 transmit on
-    // 137.900 MHz with 72 ksym/s QPSK and APIDs 64/65/67. They're in
-    // different orbital planes so they don't conflict simultaneously.
+    // 137.900 MHz with 72 ksym/s QPSK and AVHRR APIDs in the
+    // 64..=68 range. They're in different orbital planes so they
+    // don't conflict simultaneously.
+    //
     // `imaging_protocol: Some(Lrpt)` enrolls these in the
     // auto-record flow per epic #469 task 7. The recorder
     // constructor's `supported_protocols` set now includes
@@ -260,6 +332,15 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
     // LRPT viewer + signals the DSP to attach the decoder, and
     // the LOS save walks every decoded APID into a per-pass
     // directory.
+    //
+    // **Per-satellite APID expectations differ.** Roscosmos schedules
+    // each Meteor-M bird's broadcast set independently:
+    // M2-3 is currently in summer mode (3 visual channels), M2-4 in
+    // standard mode (2 visual + 1 IR). See
+    // `METEOR_M2_3_EXPECTED_LRPT_APIDS` /
+    // `METEOR_M2_4_EXPECTED_LRPT_APIDS` for the live values; the
+    // wiring layer warns at LOS if expected APIDs are missing
+    // (vs. silently shipping incomplete composites). Per #645.
     //
     // METEOR-M 2 (40069) is intentionally absent — battery damage from
     // a 2022 micrometeorite collision means it can't power the LRPT
@@ -273,12 +354,17 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // rationale; both M2-3 and M2-4 share the channel.
         bandwidth_hz: METEOR_M2_LRPT_BANDWIDTH_HZ,
         imaging_protocol: Some(ImagingProtocol::Lrpt),
+        // Summer mode: c1/c2/c3 (visual triplet). The Natural
+        // colour composite covers this set; the IR-based
+        // composites are unavailable until Roscosmos schedules
+        // M2-3 back to standard mode. Per #645.
+        expected_lrpt_apids: Some(METEOR_M2_3_EXPECTED_LRPT_APIDS),
     },
     KnownSatellite {
         // METEOR-M2 4 launched in 2024 and is actively transmitting
-        // LRPT — same downlink as M2-3 (137.900 MHz, 72 kbaud, APIDs
-        // 64/65/67), different orbital plane so the two never contend
-        // for the same pass.
+        // LRPT — same downlink as M2-3 (137.900 MHz, 72 kbaud,
+        // different orbital plane so the two never contend for the
+        // same pass.
         //
         // **NORAD id is 59051**, NOT 61024. The original #506
         // exclusion and some hobbyist references quote 61024, which
@@ -295,6 +381,11 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         demod_mode: sdr_types::DemodMode::Lrpt,
         bandwidth_hz: METEOR_M2_LRPT_BANDWIDTH_HZ,
         imaging_protocol: Some(ImagingProtocol::Lrpt),
+        // Standard mode: c1/c2/c4 (visible/visible/thermal IR). All
+        // three composite recipes have full coverage on these
+        // passes — currently the easier first-decode target than
+        // M2-3 for exactly that reason. Per #645.
+        expected_lrpt_apids: Some(METEOR_M2_4_EXPECTED_LRPT_APIDS),
     },
     // ISS SSTV — epic #472. Currently 437.550 MHz UHF (ARISS Series
     // 31+, April 2026 onward, see #638); the catalog tracks the live
@@ -318,6 +409,10 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
         imaging_protocol: Some(ImagingProtocol::Sstv),
+        // ISS SSTV is a single FM audio channel, not a multi-APID
+        // LRPT broadcast — the per-pass expected-APID set doesn't
+        // apply.
+        expected_lrpt_apids: None,
     },
 ];
 
@@ -428,6 +523,116 @@ mod tests {
                 .any(|s| s.norad_id == USA_403_WRONG_METEOR_NORAD_ID),
             "NORAD 61024 is USA 403, NOT METEOR-M2 4 — must not be in KNOWN_SATELLITES",
         );
+    }
+
+    #[test]
+    fn meteor_m2_3_carries_summer_mode_expected_apids() {
+        // M2-3 currently broadcasts c1/c2/c3 (visual triplet). Pin
+        // the expected-APID set so a Roscosmos schedule change back
+        // to standard mode (c1/c2/c4) shows up as a CR-able diff
+        // here, not a silent failure of the missing-APIDs warning
+        // at LOS. Per #645.
+        let m2_3 = KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == METEOR_M2_3_NORAD_ID)
+            .expect("METEOR-M2 3 should be in KNOWN_SATELLITES");
+        assert_eq!(
+            m2_3.expected_lrpt_apids,
+            Some(METEOR_M2_3_EXPECTED_LRPT_APIDS),
+        );
+        assert_eq!(METEOR_M2_3_EXPECTED_LRPT_APIDS, &[64, 65, 66]);
+    }
+
+    #[test]
+    fn meteor_m2_4_carries_standard_mode_expected_apids() {
+        // M2-4 broadcasts c1/c2/c4 (visual + visual + thermal IR) —
+        // the standard set every composite recipe in
+        // `sdr_ui::lrpt_viewer::COMPOSITE_CATALOG` covers. Per #645.
+        let m2_4 = KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == METEOR_M2_4_NORAD_ID)
+            .expect("METEOR-M2 4 should be in KNOWN_SATELLITES");
+        assert_eq!(
+            m2_4.expected_lrpt_apids,
+            Some(METEOR_M2_4_EXPECTED_LRPT_APIDS),
+        );
+        assert_eq!(METEOR_M2_4_EXPECTED_LRPT_APIDS, &[64, 65, 68]);
+    }
+
+    #[test]
+    fn iss_has_no_expected_lrpt_apids() {
+        // ISS is SSTV (single FM audio channel), not LRPT. The
+        // per-pass expected-APID set doesn't apply.
+        let iss = KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == ISS_NORAD_ID)
+            .expect("ISS should be in KNOWN_SATELLITES");
+        assert_eq!(iss.expected_lrpt_apids, None);
+    }
+
+    #[test]
+    fn missing_lrpt_apids_returns_empty_when_no_expected_set() {
+        // Satellites with `expected_lrpt_apids: None` (ISS,
+        // future non-LRPT entries) never emit the warning even if
+        // an unrelated `received` slice is passed.
+        let iss = KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == ISS_NORAD_ID)
+            .expect("ISS should be in KNOWN_SATELLITES");
+        assert!(iss.missing_lrpt_apids(&[1, 2, 3]).is_empty());
+        assert!(iss.missing_lrpt_apids(&[]).is_empty());
+    }
+
+    #[test]
+    fn missing_lrpt_apids_returns_empty_on_silent_pass() {
+        // Silent pass (received is empty) must NOT warn — that's
+        // a different failure mode (no signal / weak signal /
+        // satellite off) handled by `pass_decoded_nothing` in the
+        // wiring layer. Returning empty here keeps the warning
+        // scoped to "got SOME imagery but expected MORE."
+        let m2_3 = KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == METEOR_M2_3_NORAD_ID)
+            .expect("METEOR-M2 3 should be in KNOWN_SATELLITES");
+        assert!(m2_3.missing_lrpt_apids(&[]).is_empty());
+    }
+
+    #[test]
+    fn missing_lrpt_apids_reports_summer_mode_partial_pass() {
+        // M2-3 expects 64/65/66; if we got 64+65 only, the warning
+        // should call out 66 missing.
+        let m2_3 = KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == METEOR_M2_3_NORAD_ID)
+            .expect("METEOR-M2 3 should be in KNOWN_SATELLITES");
+        assert_eq!(m2_3.missing_lrpt_apids(&[64, 65]), vec![66]);
+    }
+
+    #[test]
+    fn missing_lrpt_apids_reports_standard_mode_partial_pass() {
+        // M2-4 expects 64/65/68; if we got 64+68 only, the warning
+        // should call out 65 missing. Order follows the catalog
+        // expected-APIDs order so future readers see the slot
+        // gap directly.
+        let m2_4 = KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == METEOR_M2_4_NORAD_ID)
+            .expect("METEOR-M2 4 should be in KNOWN_SATELLITES");
+        assert_eq!(m2_4.missing_lrpt_apids(&[64, 68]), vec![65]);
+    }
+
+    #[test]
+    fn missing_lrpt_apids_returns_empty_when_full_set_received() {
+        // Happy path: every expected APID delivered. No warning.
+        let m2_3 = KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == METEOR_M2_3_NORAD_ID)
+            .expect("METEOR-M2 3 should be in KNOWN_SATELLITES");
+        assert!(m2_3.missing_lrpt_apids(&[64, 65, 66]).is_empty());
+        // Extra received APIDs (e.g., M2-3 unexpectedly transmitting
+        // an IR channel) are fine — the function returns the
+        // complement of expected over received, ignoring extras.
+        assert!(m2_3.missing_lrpt_apids(&[64, 65, 66, 70]).is_empty());
     }
 
     #[test]
