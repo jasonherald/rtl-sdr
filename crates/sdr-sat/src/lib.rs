@@ -315,14 +315,24 @@ mod tests {
         // a decoder + protocol enum variant for any future Cubesat
         // resurrection, but no satellite currently transmits APT, so
         // the catalog has no APT entries.
-        let names: Vec<&str> = KNOWN_SATELLITES.iter().map(|s| s.name).collect();
+        //
+        // Assert directly against `imaging_protocol` rather than name
+        // substrings — a regression where someone clears or remaps the
+        // protocol on a still-named-METEOR row would slip past a
+        // name-only check. Per CR round 2 on PR #650.
+        let protocols: Vec<ImagingProtocol> = KNOWN_SATELLITES
+            .iter()
+            .filter_map(|s| s.imaging_protocol)
+            .collect();
         assert!(
-            names.iter().any(|n| n.contains("METEOR")),
-            "catalog should carry at least one METEOR (LRPT) entry",
+            protocols.contains(&ImagingProtocol::Lrpt),
+            "catalog should carry at least one satellite with imaging_protocol = Lrpt; \
+             got protocols={protocols:?}",
         );
         assert!(
-            names.iter().any(|n| n.contains("ISS")),
-            "catalog should carry the ISS (SSTV) entry",
+            protocols.contains(&ImagingProtocol::Sstv),
+            "catalog should carry at least one satellite with imaging_protocol = Sstv; \
+             got protocols={protocols:?}",
         );
     }
 
