@@ -107,6 +107,15 @@ pub struct RadioModule {
     /// on FM audio output. See #331 and the
     /// `SquelchAudioEnvelope` docstring for the full reasoning.
     squelch_envelope: sdr_dsp::noise::SquelchAudioEnvelope,
+    /// Sample-count accumulator for diagnostic stage-amplitude
+    /// logging in `process()`. We log mean-abs of every stage in
+    /// the chain (input IQ → IF chain → demod → AF) once every
+    /// ~1 second of input data, so a `grep stage_amp` of the log
+    /// during a satellite pass tells us at which stage signal
+    /// becomes flat noise. Pure diagnostic — no processing impact.
+    /// Per silent-fail demod investigation following the May 2026
+    /// NOAA APT regression.
+    samples_since_last_amp_log: u64,
 }
 
 impl RadioModule {
@@ -153,6 +162,7 @@ impl RadioModule {
             resamp_buf: Vec::new(),
             demod_buf: Vec::new(),
             squelch_envelope,
+            samples_since_last_amp_log: 0,
         })
     }
 
@@ -381,6 +391,56 @@ impl RadioModule {
         let af_count = self
             .af_chain
             .process(&self.demod_buf[..demod_count], output)?;
+
+        // Diagnostic: log per-stage mean-abs amplitudes once per
+        // ~second of input data so a `grep stage_amp` of the log
+        // during a satellite pass tells us exactly where the signal
+        // dies. Pure observational — costs ~4 mean-abs scans every
+        // ~2 million samples, negligible. Per silent-fail demod
+        // investigation following the May 2026 NOAA APT regression.
+        self.samples_since_last_amp_log = self.samples_since_last_amp_log.saturating_add(n as u64);
+        // Threshold: log roughly every ~1-2 seconds of post-decimator
+        // input. The IF rate to RadioModule is typically 50-200 kHz
+        // (NFM=50k, WFM=200k after frontend decimation), so 100k
+        // samples ≈ 0.5-2 sec depending on mode. Coarse enough to
+        // avoid log spam, fast enough to be useful during a 10-sec
+        // bench test.
+        if self.samples_since_last_amp_log >= 100_000 {
+            self.samples_since_last_amp_log = 0;
+            let mean_abs_complex = |s: &[Complex]| -> f32 {
+                if s.is_empty() {
+                    return 0.0;
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let inv_len = 1.0 / s.len() as f32;
+                s.iter()
+                    .map(|c| (c.re * c.re + c.im * c.im).sqrt())
+                    .sum::<f32>()
+                    * inv_len
+            };
+            let mean_abs_stereo = |s: &[Stereo]| -> f32 {
+                if s.is_empty() {
+                    return 0.0;
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let inv_len = 1.0 / s.len() as f32;
+                s.iter().map(|t| (t.l.abs() + t.r.abs()) * 0.5).sum::<f32>() * inv_len
+            };
+            let input_amp = mean_abs_complex(&input[..n]);
+            let if_amp = mean_abs_complex(&self.if_buf[..n]);
+            let demod_input_amp = mean_abs_complex(demod_src);
+            let demod_output_amp = mean_abs_stereo(&self.demod_buf[..demod_count]);
+            let af_output_amp = mean_abs_stereo(&output[..af_count]);
+            tracing::info!(
+                target: "stage_amp",
+                input_iq = format!("{input_amp:.5}"),
+                if_chain_out = format!("{if_amp:.5}"),
+                demod_in = format!("{demod_input_amp:.5}"),
+                demod_out_audio = format!("{demod_output_amp:.5}"),
+                af_out_audio = format!("{af_output_amp:.5}"),
+                "STAGE_AMP_DUMP"
+            );
+        }
 
         // Stage 4: Audio squelch envelope — only when the user
         // has actually enabled squelch (manual or auto). Running

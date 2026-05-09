@@ -2,7 +2,6 @@
 
 use sdr_dsp::demod::FmDemod;
 use sdr_dsp::filter::{DEEMPHASIS_TAU_US, FirFilter};
-use sdr_dsp::loops::Agc;
 use sdr_dsp::taps;
 use sdr_types::{Complex, DspError, Stereo};
 
@@ -38,47 +37,33 @@ const NFM_NYQUIST_GUARD_HZ: f64 = 1.0;
 /// Passthrough FIR tap (identity filter).
 const NFM_PASSTHROUGH_TAPS: [f32; 1] = [1.0];
 
-// Audio AGC parameters — mirror the AM demod's audio AGC
-// (set_point=1.0, attack=1/300, decay=1/3000, max_gain=1e6,
-// max_output=10.0, init_gain=1.0) so NFM audio levels are
-// normalized across stations with different deviations. Without
-// AGC, a tight-deviation commercial NFM signal (±2.5 kHz) sounds
-// much quieter than a wider-deviation ham signal (±5 kHz) even
-// though the RF level is the same — see #332.
-/// Audio AGC set point (target output amplitude).
-const NFM_AGC_SET_POINT: f32 = 1.0;
-/// Audio AGC attack coefficient.
-const NFM_AGC_ATTACK: f32 = 0.003_333_333;
-/// Audio AGC decay coefficient.
-const NFM_AGC_DECAY: f32 = 0.000_333_333;
-/// Audio AGC maximum gain ceiling.
-const NFM_AGC_MAX_GAIN: f32 = 1e6;
-/// Audio AGC maximum output amplitude (look-ahead clipping cap).
-const NFM_AGC_MAX_OUTPUT: f32 = 10.0;
-/// Audio AGC initial gain (pre-settling).
-const NFM_AGC_INIT_GAIN: f32 = 1.0;
+// NOTE: A previous version of this module ran an audio-rate AGC after the
+// post-discriminator LPF (set_point=1.0, max_gain=1e6) intended to normalize
+// loudness across stations with different FM deviations. That AGC turned out
+// to be the silent-fail demod bug for NOAA APT and Meteor LRPT: FM is
+// amplitude-invariant, so the discriminator output magnitude depends on
+// modulation index, not carrier strength. With max_gain=1e6, any band where
+// the discriminator output happened to be small (e.g. the 2400 Hz APT
+// subcarrier band when slightly attenuated upstream) saw the AGC drive gain
+// to the ceiling and amplify the discriminator's *noise floor* to unity.
+// The result was uniformly-flat audio noise — visually a strong waterfall
+// signal but inaudible APT ticks. SDR++'s reference NFM module has no
+// audio-stage AGC; we now match that exactly. Loudness normalization across
+// deviations was wishful in the first place — voice users adjust the
+// system volume; APT/LRPT users don't listen, they decode.
 
 /// Narrowband FM demodulator using `FmDemod` from sdr-dsp.
 ///
 /// Produces mono audio converted to stereo. Includes a post-discriminator
 /// lowpass filter at `bandwidth/2` matching C++ SDR++ `_lowPass` flag
-/// (default enabled).
+/// (default enabled). No audio-rate AGC — see the comment above for why.
 pub struct NfmDemodulator {
     demod: FmDemod,
     /// Post-discriminator lowpass filter at bandwidth/2.
     audio_lpf: FirFilter,
-    /// Audio-level AGC — normalizes output amplitude so stations
-    /// with different FM deviations play at comparable loudness.
-    /// Applied downstream of the LPF so we're tracking the
-    /// finished audio, not the raw discriminator output (which
-    /// includes above-cutoff noise on weak signals that would
-    /// bias the envelope tracker).
-    audio_agc: Agc,
     config: DemodConfig,
     mono_buf: Vec<f32>,
     lpf_buf: Vec<f32>,
-    /// Scratch buffer for the post-LPF AGC stage.
-    agc_buf: Vec<f32>,
 }
 
 /// Build lowpass FIR taps for post-discriminator filtering at the given bandwidth.
@@ -107,14 +92,6 @@ impl NfmDemodulator {
             Some(taps) => FirFilter::new(taps)?,
             None => FirFilter::new(NFM_PASSTHROUGH_TAPS.to_vec())?, // passthrough
         };
-        let audio_agc = Agc::new(
-            NFM_AGC_SET_POINT,
-            NFM_AGC_ATTACK,
-            NFM_AGC_DECAY,
-            NFM_AGC_MAX_GAIN,
-            NFM_AGC_MAX_OUTPUT,
-            NFM_AGC_INIT_GAIN,
-        )?;
         let config = DemodConfig {
             if_sample_rate: NFM_IF_SAMPLE_RATE,
             af_sample_rate: NFM_AF_SAMPLE_RATE,
@@ -135,11 +112,9 @@ impl NfmDemodulator {
         Ok(Self {
             demod,
             audio_lpf,
-            audio_agc,
             config,
             mono_buf: Vec::new(),
             lpf_buf: Vec::new(),
-            agc_buf: Vec::new(),
         })
     }
 }
@@ -161,17 +136,7 @@ impl Demodulator for NfmDemodulator {
         self.audio_lpf
             .process_f32(&self.mono_buf[..count], &mut self.lpf_buf[..count])?;
 
-        // Audio-level AGC — normalizes output loudness across
-        // stations with different FM deviations. Closes the FM
-        // side of the "audio distortion with AGC on" bug (#332)
-        // by removing the level dependence on RF input strength,
-        // so the tuner-side AGC's imperfect RF gain tracking no
-        // longer propagates into audible distortion.
-        self.agc_buf.resize(count, 0.0);
-        self.audio_agc
-            .process_f32(&self.lpf_buf[..count], &mut self.agc_buf[..count])?;
-
-        sdr_dsp::convert::mono_to_stereo(&self.agc_buf[..count], &mut output[..count])?;
+        sdr_dsp::convert::mono_to_stereo(&self.lpf_buf[..count], &mut output[..count])?;
         Ok(count)
     }
 
@@ -320,12 +285,17 @@ mod tests {
     }
 
     #[test]
-    fn test_nfm_audio_agc_normalizes_across_deviations() {
-        // Two FM signals with very different deviations should
-        // produce similar audio levels after the audio AGC
-        // converges. Without AGC, a ±2 kHz-deviation signal
-        // would be audibly quieter than a ±5 kHz one even though
-        // the RF power is the same — the bug that #332 closes.
+    fn test_nfm_output_amplitude_scales_with_deviation() {
+        // FM is amplitude-invariant by physics — the discriminator output
+        // magnitude depends on modulation index (deviation/sample_rate),
+        // not on carrier amplitude. SDR++'s reference NFM has no audio AGC,
+        // so a wider-deviation signal really IS louder than a narrower one
+        // at the demod output. We removed our previous audio AGC because
+        // it was the silent-fail bug for APT/LRPT (set_point=1.0 with
+        // max_gain=1e6 amplified the discriminator's noise floor to unity
+        // whenever the modulated audio was quiet). This test pins the
+        // physics: 5 kHz deviation produces ~2.5× the output amplitude
+        // of 2 kHz deviation.
         let settle = 2000;
         let n = 4000;
         let mod_freq = 1_000.0_f32;
@@ -336,8 +306,6 @@ mod tests {
             let input: Vec<Complex> = (0..n)
                 .map(|i| {
                     let t = i as f32 / NFM_IF_SAMPLE_RATE as f32;
-                    // Integrated sinusoidal modulation: phase(t) =
-                    // deviation * sin(2π·mod_freq·t) / mod_freq.
                     let phase = deviation_hz * (2.0 * PI * mod_freq * t).sin() / mod_freq;
                     Complex::new(phase.cos(), phase.sin())
                 })
@@ -351,22 +319,13 @@ mod tests {
             peaks.push(peak);
         }
 
-        // Post-AGC peak ratio should be bounded. Without AGC the
-        // no-AGC baseline matches the deviation ratio exactly —
-        // 5000/2000 = 2.5× — so the assertion bound must sit
-        // BELOW 2.5 for the test to actually catch an AGC bypass.
-        // A ratio of 2.0 leaves ~20% margin for the envelope
-        // follower's finite settling time at the 2000-sample
-        // mark while still failing decisively if the AGC stage
-        // is removed or short-circuited.
-        let ratio = if peaks[0] > peaks[1] {
-            peaks[0] / peaks[1].max(1e-10)
-        } else {
-            peaks[1] / peaks[0].max(1e-10)
-        };
+        // Without AGC the peak ratio matches the deviation ratio
+        // exactly — 5000/2000 = 2.5×. Allow ~20% tolerance for
+        // discriminator-side normalization & filter transients.
+        let ratio = peaks[1] / peaks[0].max(1e-10);
         assert!(
-            ratio < 2.0,
-            "audio AGC should normalize across FM deviations, peaks = {peaks:?}, ratio = {ratio}"
+            (2.0..=3.0).contains(&ratio),
+            "FM output should scale linearly with deviation; peaks={peaks:?}, ratio={ratio}"
         );
     }
 

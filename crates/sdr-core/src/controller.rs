@@ -1382,7 +1382,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if acars_lock_rejects_geometry_change(state, dsp_tx, "Tune") {
                 return;
             }
-            tracing::debug!(frequency_hz = freq, "tune command");
+            // INFO-level so silent-fail demod regressions can be diagnosed
+            // by grepping the log alone. Pairs with `tune_to_target`'s
+            // TUNE_REQUEST line on the UI side.
+            tracing::info!(target: "tune", requested_hz = freq, "DSP_APPLY_REQUEST");
             on_tune_change(state);
             state.center_freq = freq;
             if let Some(source) = &mut state.source
@@ -1390,6 +1393,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             {
                 tracing::warn!("tune failed: {e}");
                 let _ = dsp_tx.send(DspToUi::Error(format!("Tune failed: {e}")));
+            } else {
+                tracing::info!(
+                    target: "tune",
+                    applied_hz = state.center_freq,
+                    "DSP_APPLIED"
+                );
             }
         }
 
@@ -1397,7 +1406,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDemodMode") {
                 return;
             }
-            tracing::debug!(?mode, "set demod mode");
+            // INFO-level so silent-fail demod regressions can be diagnosed
+            // by grepping the log alone. Pairs with `tune_to_target`'s
+            // TUNE_REQUEST line on the UI side.
+            tracing::info!(target: "set_demod_mode", ?mode, "DSP_APPLY_REQUEST");
             on_tune_change(state);
             let old_mode = state.radio.current_mode();
             if let Err(e) = state.radio.set_mode(mode) {
@@ -1442,6 +1454,20 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 // old backend, then notify the UI. The UI's eventual
                 // `DisableTranscription` is idempotent on an already-cleared
                 // tap.
+                // Pin the post-apply DSP state so we can confirm the
+                // mode + bandwidth + IF rate the engine actually
+                // committed to. Pairs with the DSP_APPLY_REQUEST log
+                // above for diagnose-from-log. Note: bandwidth has
+                // just been reset to the new mode's default; an
+                // upcoming SetBandwidth from the UI / recorder will
+                // override it with the desired value.
+                tracing::info!(
+                    target: "set_demod_mode",
+                    applied_mode = ?mode,
+                    applied_bandwidth_hz = state.bandwidth,
+                    applied_if_sample_rate = state.radio.demod_config().if_sample_rate,
+                    "DSP_APPLIED"
+                );
                 if old_mode != mode {
                     state.transcription_tx = None;
                     // Same hard-boundary treatment for the generic
@@ -1478,7 +1504,10 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetBandwidth(bw) => {
-            tracing::debug!(bandwidth_hz = bw, "set bandwidth");
+            // INFO-level so silent-fail demod regressions can be diagnosed
+            // by grepping the log alone. Pairs with `tune_to_target`'s
+            // TUNE_REQUEST line on the UI side.
+            tracing::info!(target: "set_bandwidth", requested_hz = bw, "DSP_APPLY_REQUEST");
             on_tune_change(state);
             // Update the VFO channel filter first; only persist on success.
             if let Some(vfo) = &mut state.vfo {
@@ -1494,6 +1523,15 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             }
             // Also pass to the radio module (some demods use it internally).
             state.radio.set_bandwidth(bw);
+            // Companion log to DSP_APPLY_REQUEST above. If `requested`
+            // and `applied` differ, the VFO clamped the value to its
+            // valid range — visible from a single line.
+            tracing::info!(
+                target: "set_bandwidth",
+                requested_hz = bw,
+                applied_hz = state.bandwidth,
+                "DSP_APPLIED"
+            );
             // Notify UI so widgets that initiate bandwidth changes
             // via a different path (VFO drag handles on the
             // spectrum) can reflect the new value in the Radio

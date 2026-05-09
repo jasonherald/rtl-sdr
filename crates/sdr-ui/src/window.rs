@@ -342,6 +342,20 @@ fn tune_to_target(
     bw_hz: f64,
     reason: &'static str,
 ) {
+    // Verification logging: print the entire tune request as a
+    // single structured line so a `grep tune_to_target ~/.cache/sdr-rs/sdr.log`
+    // gives a complete picture of every retune (manual or auto-record).
+    // Paired with the DSP-side `SetDemodMode`/`SetBandwidth` info logs,
+    // this makes silent-fail demod regressions diagnosable from log
+    // alone instead of needing a live debug session.
+    tracing::info!(
+        target: "tune_to_target",
+        freq_hz = freq_hz,
+        mode = ?mode,
+        bw_hz = bw_hz,
+        reason = reason,
+        "TUNE_REQUEST"
+    );
     scanner_force_disable.trigger(reason);
     let freq_f64 = freq_hz as f64;
     state.center_frequency.set(freq_f64);
@@ -393,6 +407,19 @@ fn tune_to_target(
     // the DSP never received.
     status_bar.update_frequency(freq_f64);
     status_bar.update_demod(header::demod_mode_label(mode), bw_hz);
+    // Companion to the TUNE_REQUEST log above — confirms the dispatch
+    // path completed without panic. The DSP-side will emit its own
+    // `SetDemodMode`/`SetBandwidth` info logs when it processes the
+    // queued messages; cross-referencing those against this line
+    // tells us whether requested == applied.
+    tracing::info!(
+        target: "tune_to_target",
+        freq_hz = freq_hz,
+        mode = ?mode,
+        bw_hz = bw_hz,
+        reason = reason,
+        "TUNE_DISPATCH_COMPLETE"
+    );
 }
 
 /// Build the main application window and return the shared
@@ -697,6 +724,19 @@ pub fn build_window(
         let app_for_provider = app.clone();
         let parent_provider: Rc<dyn Fn() -> Option<gtk4::Window>> =
             Rc::new(move || app_for_provider.windows().into_iter().next());
+        // APT viewer wiring (`Ctrl+Shift+A` / `app.apt-open`).
+        // NOAA-15 / NOAA-18 / NOAA-19 — the only operational
+        // APT transmitters — were decommissioned in mid-2025
+        // (see `KNOWN_SATELLITES` doc comment in `sdr-sat`), so
+        // there's no satellite in our catalog with
+        // `imaging_protocol: Some(Apt)` and the auto-record path
+        // never fires APT. We deliberately keep the manual
+        // viewer keycombo registered so the user can still tune
+        // to a 137 MHz APT-band signal manually (e.g., to test
+        // reception against an alternative APT source like a
+        // future Cubesat or a SDR replay) and see decoded
+        // imagery in the live viewer. Per user request during
+        // M2-4 testing.
         crate::apt_viewer::connect_apt_action(app, &parent_provider, &state);
         // Same wiring for the LRPT viewer (`Ctrl+Shift+L` /
         // `app.lrpt-open`). Sharing the parent_provider closure
@@ -11715,14 +11755,27 @@ fn connect_satellites_panel(
                 // at `RecorderAction::SavePng`. Per CR round 2 on
                 // PR #575.
                 let exported_lrpt_pass = *state_a.lrpt_recording_pass.borrow();
+                // Capture "no APIDs decoded" up front. This case has
+                // no in-memory imagery to retry — the viewer is empty
+                // — so the LOS close gate should fire even though
+                // `save_ok` will be false. Without this, the viewer
+                // would sit open with a blank canvas across silent
+                // Meteor passes (Russian sats are intermittent;
+                // many passes produce no LRPT). Per silent-pass
+                // diagnosis 2026-05-08.
+                let pass_decoded_nothing = snapshots.is_empty();
                 glib::spawn_future_local(async move {
                     let dir_for_msg = dir.clone();
                     // Tuple return: (toast message, saved-at-least-one).
                     // The flag gates the post-save viewer close —
-                    // we keep the viewer open on total-failure
-                    // outcomes so the user can inspect the in-
-                    // memory image and manually retry the export.
-                    // Per CR round 9 on PR #554.
+                    // we keep the viewer open ONLY on real save
+                    // failures (disk full, dir create errored,
+                    // worker panicked) where in-memory imagery
+                    // exists and a manual retry is possible. The
+                    // "no APIDs decoded" branch is closed via
+                    // `pass_decoded_nothing` below, since there's
+                    // nothing to retry. Per CR round 9 on PR #554
+                    // + silent-pass cleanup 2026-05-08.
                     let (result_msg, save_ok) = gio::spawn_blocking(move || {
                         if snapshots.is_empty() {
                             tracing::warn!(
@@ -11920,14 +11973,38 @@ fn connect_satellites_panel(
                     // into closing the wrong window — same shape
                     // as the APT path's snapshot pattern. Per CR
                     // round 2 on PR #575.
-                    if save_ok
+                    // Close-gate logic:
+                    //
+                    //   save_ok               → close (PNGs are on disk;
+                    //                            nothing to keep viewer
+                    //                            open for)
+                    //   pass_decoded_nothing  → close (no imagery to
+                    //                            retry; viewer canvas
+                    //                            is empty — common on
+                    //                            silent Russian Meteor
+                    //                            passes)
+                    //   !save_ok && !pass_decoded_nothing
+                    //                         → keep open (real save
+                    //                            failure with in-memory
+                    //                            imagery — user can
+                    //                            inspect + retry export)
+                    //
+                    // Both close branches log the reason so the
+                    // overnight pass log answers "did the viewer
+                    // reset properly between passes?" with a single
+                    // grep.
+                    let should_close = save_ok || pass_decoded_nothing;
+                    if should_close
                         && let Some(window) = exported_lrpt_window_weak
                             .as_ref()
                             .and_then(glib::WeakRef::upgrade)
                     {
-                        tracing::info!(
-                            "auto-record LOS: closing LRPT viewer window after PNG save"
-                        );
+                        let reason = if save_ok {
+                            "PNGs saved"
+                        } else {
+                            "no APIDs decoded — nothing to retry"
+                        };
+                        tracing::info!("auto-record LOS: closing LRPT viewer window ({reason})");
                         window.close();
                     }
                 });
