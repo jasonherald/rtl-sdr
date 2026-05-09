@@ -359,6 +359,49 @@ fn log_buffer_stats(buf: &[u8], event: &'static str) {
     );
 }
 
+/// Apply a bias-T toggle to a dongle that isn't currently being
+/// streamed by an active [`RtlSdrSource`]. Briefly opens the device
+/// at `device_index`, calls `set_bias_tee(enabled)`, and drops the
+/// handle — releasing it back to other consumers (or to the next
+/// `start()` call).
+///
+/// **When to call this.** The streaming path on a live
+/// [`RtlSdrSource`] is `RtlSdrSource::set_bias_tee`; this helper
+/// covers the **paused / pre-play** case where there is no source
+/// instance and therefore no held device handle. Without it, a user
+/// flipping bias-T off between sessions would leave their SAWbird+
+/// (or other LNA powered by the bias-T supply) in whatever state the
+/// last play session set it to — see #652.
+///
+/// **Bias-T state is sticky across device close.** RTL-SDR Blog v3
+/// dongles latch the GPIO output until the dongle is power-cycled
+/// or the GPIO is explicitly toggled. So setting the line here
+/// persists past the device drop — the SAWbird+ stays on (or off)
+/// after this returns. The next `RtlSdrSource::start()` will
+/// re-apply the same value via `rtl_sdr_replay_persisted_settings`,
+/// keeping behavior consistent across the pause boundary.
+///
+/// # Errors
+///
+/// Returns [`SourceError::TuneFailed`] if the device can't be
+/// opened (busy / not present / older V3 clone without bias-T
+/// circuitry — driver returns Err on those, same as the live
+/// path).
+pub fn apply_bias_tee_idle(device_index: u32, enabled: bool) -> Result<(), SourceError> {
+    tracing::info!(
+        device_index,
+        enabled,
+        "apply_bias_tee_idle: brief open + set_bias_tee + drop"
+    );
+    let device = RtlSdrDevice::open(device_index)
+        .map_err(|e| SourceError::TuneFailed(format!("open for bias-T: {e}")))?;
+    device
+        .set_bias_tee(enabled)
+        .map_err(|e| SourceError::TuneFailed(format!("set_bias_tee: {e}")))?;
+    // Device drops at end of scope, releasing the USB handle.
+    Ok(())
+}
+
 impl RtlSdrSource {
     /// Create a new RTL-SDR source for the device at the given index.
     pub fn new(device_index: u32) -> Self {

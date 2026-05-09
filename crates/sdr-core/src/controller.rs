@@ -34,7 +34,7 @@ use sdr_radio::RadioModule;
 // both live behind `AudioSinkSlot` (see `crate::sink_slot`) so the
 // controller's audio path stays uniform regardless of which sink
 // the user has selected.
-use sdr_source_rtlsdr::RtlSdrSource;
+use sdr_source_rtlsdr::{RtlSdrSource, apply_bias_tee_idle};
 use sdr_types::{Complex, RtlTcpConnectionState, SinkError, Stereo};
 
 use crate::fft_buffer::SharedFftBuffer;
@@ -2269,12 +2269,33 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // (e.g. startup before the user hits Play) survives
             // until `open_source` runs. Per CR on PR #550.
             state.bias_tee_enabled = enabled;
-            if let Some(source) = &mut state.source
-                && let Err(e) = source.set_bias_tee(enabled)
-            {
-                tracing::warn!("set bias tee failed: {e}");
-                let _ = dsp_tx.send(DspToUi::Error(format!("Bias tee failed: {e}")));
+            if let Some(source) = &mut state.source {
+                // Live-stream path: dongle is open and held by the
+                // running source.
+                if let Err(e) = source.set_bias_tee(enabled) {
+                    tracing::warn!("set bias tee failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!("Bias tee failed: {e}")));
+                }
+            } else if state.source_type == SourceType::RtlSdr {
+                // Idle path (#652): no live source, but the user has
+                // selected RTL-SDR. Briefly open the dongle, set the
+                // GPIO, and drop. Lets a user toggle bias-T between
+                // sessions to power their SAWbird+ on/off without
+                // having to start playback first. The RTL-SDR Blog v3
+                // GPIO latches state across device close, so the
+                // change persists until the next toggle (or until a
+                // streaming session reapplies via
+                // `rtl_sdr_replay_persisted_settings`).
+                if let Err(e) = apply_bias_tee_idle(DEVICE_INDEX, enabled) {
+                    tracing::warn!("idle bias-T toggle failed: {e}");
+                    let _ = dsp_tx.send(DspToUi::Error(format!(
+                        "Bias tee toggle failed (device busy or unavailable): {e}"
+                    )));
+                }
             }
+            // For non-RTL-SDR source types (file / network), bias-T
+            // doesn't apply — silent no-op consistent with
+            // `RtlSdrSource::set_bias_tee`'s default trait fallback.
         }
 
         UiToDsp::SetDirectSampling(mode) => {
