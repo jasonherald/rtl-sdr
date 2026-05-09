@@ -135,6 +135,18 @@ pub const PO_101_NORAD_ID: u32 = 43_678;
 /// covers the ±3 kHz deviation typical voice traffic uses.
 pub const HAM_VOICE_NFM_BANDWIDTH_HZ: u32 = 12_500;
 
+/// AO-7 LSB downlink centre (Hz). Tunes to the middle of the Mode-B
+/// linear-transponder downlink passband (145.925-145.975 MHz); the
+/// user can drag-tune across to follow individual SSB QSOs.
+pub const AO_7_DOWNLINK_HZ: u64 = 145_950_000;
+
+/// SO-50 FM voice repeater downlink (Hz). Per AMSAT.
+pub const SO_50_DOWNLINK_HZ: u64 = 436_795_000;
+
+/// PO-101 FM voice repeater downlink (Hz). Per AMSAT — operator-
+/// scheduled, intermittent activation.
+pub const PO_101_DOWNLINK_HZ: u64 = 145_900_000;
+
 /// Standard SSB bandwidth (Hz) for amateur-radio satellites with
 /// linear transponders (AO-7 …). Single-sideband voice traffic
 /// occupies ~3 kHz; the catalog enrolls the wider ham-band
@@ -483,7 +495,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // individual SSB QSOs across the transponder.
         name: "AO-7 (OSCAR-7)",
         norad_id: AO_7_NORAD_ID,
-        downlink_hz: 145_950_000,
+        downlink_hz: AO_7_DOWNLINK_HZ,
         demod_mode: sdr_types::DemodMode::Lsb,
         bandwidth_hz: HAM_SSB_BANDWIDTH_HZ,
         imaging_protocol: None,
@@ -497,7 +509,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // the local PD scanner.
         name: "SO-50 (SaudiSat-1C)",
         norad_id: SO_50_NORAD_ID,
-        downlink_hz: 436_795_000,
+        downlink_hz: SO_50_DOWNLINK_HZ,
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: HAM_VOICE_NFM_BANDWIDTH_HZ,
         imaging_protocol: None,
@@ -514,7 +526,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // chase a chain bug. Per #649 caveat.
         name: "PO-101 (Diwata-2)",
         norad_id: PO_101_NORAD_ID,
-        downlink_hz: 145_900_000,
+        downlink_hz: PO_101_DOWNLINK_HZ,
         demod_mode: sdr_types::DemodMode::Nfm,
         bandwidth_hz: HAM_VOICE_NFM_BANDWIDTH_HZ,
         imaging_protocol: None,
@@ -754,10 +766,14 @@ mod tests {
         assert_eq!(ao_7.demod_mode, sdr_types::DemodMode::Lsb);
         assert_eq!(ao_7.bandwidth_hz, HAM_SSB_BANDWIDTH_HZ);
         assert_eq!(ao_7.imaging_protocol, None);
-        // Downlink in the 2 m amateur band (144-148 MHz). Pin the
-        // band rather than the exact freq so a future drag-tune
-        // helper that recentres the entry can't accidentally land
-        // outside the legal allocation without a test failure.
+        // Pin the exact downlink so a typo / band-edit can't shift
+        // the catalog away from the AMSAT-published frequency
+        // without a CR-able diff. Per CR round 1.
+        assert_eq!(ao_7.downlink_hz, AO_7_DOWNLINK_HZ);
+        // Belt-and-braces: also check the band membership so a
+        // future drag-tune helper that recentres entries can't
+        // land outside the legal 2 m amateur allocation
+        // (144-148 MHz) without a test failure.
         assert!(
             (144_000_000..=148_000_000).contains(&ao_7.downlink_hz),
             "AO-7 downlink {} Hz should be in the 2m amateur band",
@@ -778,7 +794,9 @@ mod tests {
         assert_eq!(so_50.demod_mode, sdr_types::DemodMode::Nfm);
         assert_eq!(so_50.bandwidth_hz, HAM_VOICE_NFM_BANDWIDTH_HZ);
         assert_eq!(so_50.imaging_protocol, None);
-        // Downlink in the 70 cm amateur band (420-450 MHz).
+        // Pin the exact downlink. Per CR round 1.
+        assert_eq!(so_50.downlink_hz, SO_50_DOWNLINK_HZ);
+        // Belt-and-braces 70 cm amateur band (420-450 MHz) check.
         assert!(
             (420_000_000..=450_000_000).contains(&so_50.downlink_hz),
             "SO-50 downlink {} Hz should be in the 70cm amateur band",
@@ -798,6 +816,9 @@ mod tests {
         assert_eq!(po_101.demod_mode, sdr_types::DemodMode::Nfm);
         assert_eq!(po_101.bandwidth_hz, HAM_VOICE_NFM_BANDWIDTH_HZ);
         assert_eq!(po_101.imaging_protocol, None);
+        // Pin the exact downlink. Per CR round 1.
+        assert_eq!(po_101.downlink_hz, PO_101_DOWNLINK_HZ);
+        // Belt-and-braces 2 m amateur band (144-148 MHz) check.
         assert!(
             (144_000_000..=148_000_000).contains(&po_101.downlink_hz),
             "PO-101 downlink {} Hz should be in the 2m amateur band",
@@ -813,18 +834,30 @@ mod tests {
         // copy-paste from a stale guide reintroducing dead birds
         // that would only ever produce empty pass sessions.
         // Per #649. Sources: AMSAT operational satellite list.
+        //
+        // NORAD IDs hoisted to named test-only constants per CR
+        // round 1 — keeps the assertion loop self-documenting and
+        // matches the constant-first style used elsewhere in this
+        // module (`NOAA_15_DECOMMISSIONED_NORAD_ID`, etc.).
+        const AO_91_DECOMMISSIONED_NORAD_ID: u32 = 43_017;
+        const AO_92_DECOMMISSIONED_NORAD_ID: u32 = 43_137;
+        const LILACSAT_2_DECOMMISSIONED_NORAD_ID: u32 = 40_908;
         for &(norad_id, name, reason) in &[
             (
-                43_017_u32,
+                AO_91_DECOMMISSIONED_NORAD_ID,
                 "AO-91 (FOX-1B)",
                 "battery failed, end-of-mission March 2024",
             ),
             (
-                43_137,
+                AO_92_DECOMMISSIONED_NORAD_ID,
                 "AO-92 (FOX-1D)",
                 "reentered atmosphere November 2022",
             ),
-            (40_908, "LilacSat-2", "decommissioned 2024"),
+            (
+                LILACSAT_2_DECOMMISSIONED_NORAD_ID,
+                "LilacSat-2",
+                "decommissioned 2024",
+            ),
         ] {
             assert!(
                 !KNOWN_SATELLITES.iter().any(|s| s.norad_id == norad_id),
