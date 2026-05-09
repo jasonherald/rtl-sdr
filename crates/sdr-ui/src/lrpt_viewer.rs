@@ -106,14 +106,31 @@ pub struct CompositeRecipe {
 ///    passes where the visible channels are dark but thermal
 ///    still discriminates land/sea/cloud.
 ///
-/// APID values are the AVHRR slots Meteor-M N2-2 transmits on:
-/// 64 = ch1, 65 = ch2, 66 = ch3, 68 = ch4 (ch4 thermal is the
-/// commonly-active IR slot when operating in the standard
-/// "three visible plus one IR" mode). If a future Meteor variant
-/// ships a different APID assignment we'll add new recipes
-/// alongside these rather than mutate the existing values —
-/// composites that worked once must keep working as the catalog
-/// grows.
+/// APID values are the AVHRR slots: 64 = ch1, 65 = ch2, 66 = ch3,
+/// 68 = ch4 (thermal IR).
+///
+/// **Per-satellite, per-season availability.** Roscosmos schedules
+/// each Meteor-M bird's broadcast set independently and rotates
+/// IR availability with the season. As of May 2026:
+///
+/// - **METEOR-M2 4** transmits the standard set 64/65/68
+///   (visible/visible/IR) — all three composites have full coverage.
+/// - **METEOR-M2 3** is in summer mode broadcasting 64/65/66 (three
+///   visible channels, no IR) — only Natural colour (123) covers
+///   this set; the IR-based composites are silently unavailable
+///   (`save_composite` returns `CompositeUnavailable` and the
+///   recipe is skipped at LOS).
+///
+/// `sdr_sat::KnownSatellite::expected_lrpt_apids` carries each
+/// satellite's current expected set, and the auto-record LOS path
+/// emits a warning if the live transmission diverges from it (e.g.,
+/// Roscosmos flips M2-3 back to standard mode and we start receiving
+/// APID 68 again). Per #645.
+///
+/// If a future Meteor variant ships a different APID assignment
+/// we'll add new recipes alongside these rather than mutate the
+/// existing values — composites that worked once must keep working
+/// as the catalog grows.
 pub const COMPOSITE_CATALOG: &[CompositeRecipe] = &[
     CompositeRecipe {
         name: "Natural colour (123)",

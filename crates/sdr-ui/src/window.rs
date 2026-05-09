@@ -11764,6 +11764,35 @@ fn connect_satellites_panel(
                 // many passes produce no LRPT). Per silent-pass
                 // diagnosis 2026-05-08.
                 let pass_decoded_nothing = snapshots.is_empty();
+                // Diagnostic: warn if the satellite delivered some
+                // APIDs but not the full per-satellite expected set.
+                // Catches schedule changes (e.g. Roscosmos flipping
+                // M2-3 between summer-mode c1/c2/c3 and standard
+                // c1/c2/c4) as a single log line instead of the user
+                // wondering why some composite recipes silently
+                // produced nothing. Silent passes are skipped — they're
+                // a different failure mode handled by
+                // `pass_decoded_nothing` above. Per #645.
+                if !pass_decoded_nothing
+                    && let Some((norad_id, _aos)) = exported_lrpt_pass
+                    && let Some(sat) = sdr_sat::KNOWN_SATELLITES
+                        .iter()
+                        .find(|s| s.norad_id == norad_id)
+                {
+                    let received_apids: Vec<u16> =
+                        snapshots.iter().map(|(apid, _)| *apid).collect();
+                    let missing = sat.missing_lrpt_apids(&received_apids);
+                    if !missing.is_empty() {
+                        tracing::warn!(
+                            "auto-record LOS: {} delivered APIDs {:?} but expected {:?}; \
+                             missing {:?} — Roscosmos schedule may have changed (see #645)",
+                            sat.name,
+                            received_apids,
+                            sat.expected_lrpt_apids.unwrap_or(&[]),
+                            missing,
+                        );
+                    }
+                }
                 glib::spawn_future_local(async move {
                     let dir_for_msg = dir.clone();
                     // Tuple return: (toast message, saved-at-least-one).
