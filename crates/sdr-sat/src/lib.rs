@@ -154,6 +154,24 @@ pub const PO_101_DOWNLINK_HZ: u64 = 145_900_000;
 /// passband by drag/click in the spectrum.
 pub const HAM_SSB_BANDWIDTH_HZ: u32 = 3_000;
 
+/// 2 m amateur band (Hz, inclusive). Same physical allocation as
+/// `SSTV_VHF_2M_BAND_HZ` but expressed under the ham-radio name
+/// because the catalog tests for AO-7 / PO-101 membership-check
+/// against the *amateur allocation*, not the SSTV-format-band
+/// (those happen to coincide at 2 m today; the names stay
+/// independent so a future schedule shift on either side doesn't
+/// silently couple them). Per CR round 2 on PR #656.
+pub const HAM_VHF_2M_BAND_HZ: (u64, u64) = (144_000_000, 148_000_000);
+
+/// 70 cm amateur band (Hz, inclusive). Wider than
+/// `SSTV_UHF_70CM_BAND_HZ` (430-440 MHz, the SSTV-format
+/// allocation slice) — the full ham 70 cm band runs 420-450 MHz
+/// in IARU Region 2. SO-50 at 436.795 MHz lives in both, but the
+/// catalog test uses the broader ham allocation so a future ham
+/// satellite at e.g. 425 MHz wouldn't fail on a too-narrow SSTV
+/// range. Per CR round 2 on PR #656.
+pub const HAM_UHF_70CM_BAND_HZ: (u64, u64) = (420_000_000, 450_000_000);
+
 /// Common downlink for METEOR-M2 series LRPT (Hz). Both M2-3 and
 /// M2-4 transmit on this channel. Centralized here so the catalog
 /// rows + the CR-noted bandwidth assertion test agree on one value.
@@ -775,7 +793,7 @@ mod tests {
         // land outside the legal 2 m amateur allocation
         // (144-148 MHz) without a test failure.
         assert!(
-            (144_000_000..=148_000_000).contains(&ao_7.downlink_hz),
+            (HAM_VHF_2M_BAND_HZ.0..=HAM_VHF_2M_BAND_HZ.1).contains(&ao_7.downlink_hz),
             "AO-7 downlink {} Hz should be in the 2m amateur band",
             ao_7.downlink_hz,
         );
@@ -798,7 +816,7 @@ mod tests {
         assert_eq!(so_50.downlink_hz, SO_50_DOWNLINK_HZ);
         // Belt-and-braces 70 cm amateur band (420-450 MHz) check.
         assert!(
-            (420_000_000..=450_000_000).contains(&so_50.downlink_hz),
+            (HAM_UHF_70CM_BAND_HZ.0..=HAM_UHF_70CM_BAND_HZ.1).contains(&so_50.downlink_hz),
             "SO-50 downlink {} Hz should be in the 70cm amateur band",
             so_50.downlink_hz,
         );
@@ -820,7 +838,7 @@ mod tests {
         assert_eq!(po_101.downlink_hz, PO_101_DOWNLINK_HZ);
         // Belt-and-braces 2 m amateur band (144-148 MHz) check.
         assert!(
-            (144_000_000..=148_000_000).contains(&po_101.downlink_hz),
+            (HAM_VHF_2M_BAND_HZ.0..=HAM_VHF_2M_BAND_HZ.1).contains(&po_101.downlink_hz),
             "PO-101 downlink {} Hz should be in the 2m amateur band",
             po_101.downlink_hz,
         );
