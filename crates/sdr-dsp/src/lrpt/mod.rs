@@ -25,6 +25,7 @@
 //!   `original/meteor_demod/demod.c::demod_oqpsk`.
 
 pub mod costas;
+pub mod meteor_agc;
 pub mod meteor_pll;
 pub mod mm_timing;
 pub mod rrc_filter;
@@ -32,6 +33,7 @@ pub mod slicer;
 pub mod timing;
 
 pub use costas::Costas;
+pub use meteor_agc::MeteorAgc;
 pub use meteor_pll::MeteorPll;
 pub use mm_timing::MmTiming;
 pub use rrc_filter::RrcFilter;
@@ -93,6 +95,15 @@ const OQPSK_PLL_BW: f32 = 2.0 * core::f32::consts::PI * DBDEXTER_PLL_BW_HZ / SYM
 /// exactly `π`.
 const MM_SYM_FREQ: f32 = 2.0 * core::f32::consts::PI * SYMBOL_RATE_HZ / SAMPLE_RATE_HZ;
 
+/// Reciprocal of the AGC target magnitude. The OQPSK chain's PLL +
+/// timing loops are calibrated for dbdexter's |sample| ≈ 190
+/// post-AGC scale, but [`slice_soft`] is calibrated for unit-
+/// magnitude input (rails at ±0.707 → ±90 after the ×127 scaling).
+/// Multiplying the assembled symbol by this constant just before
+/// the slicer brings it back to unit magnitude without disturbing
+/// the loop scales upstream.
+const OQPSK_SLICER_DESCALE: f32 = 1.0 / meteor_agc::TARGET_MAG;
+
 /// Modulation modes supported by [`LrptDemod`]. The catalog layer
 /// (`sdr-sat`) carries its own equivalent enum — the controller is
 /// the seam that maps from one to the other.
@@ -124,6 +135,12 @@ enum DemodInner {
         gardner: Gardner,
     },
     Oqpsk {
+        /// AGC stage between the RRC filter and the carrier-
+        /// recovery PLL. dbdexter's PLL is calibrated for
+        /// |sample| = 190 post-AGC; without this the lock
+        /// detector mis-fires (see [`MeteorAgc`]'s module
+        /// docs for the full chain of consequences).
+        agc: MeteorAgc,
         pll: MeteorPll,
         timing: MmTiming,
         /// In-phase sample stashed between the I-tick and the
@@ -188,13 +205,29 @@ impl LrptDemod {
     }
 
     fn build_oqpsk_inner() -> Result<DemodInner, DspError> {
+        let agc = MeteorAgc::new();
         let pll = MeteorPll::new(OQPSK_PLL_BW, true, None)?;
         let timing = MmTiming::new(MM_SYM_FREQ, DBDEXTER_SYM_BW)?;
         Ok(DemodInner::Oqpsk {
+            agc,
             pll,
             timing,
             pending_i: 0.0,
         })
+    }
+
+    /// Whether the OQPSK carrier-recovery PLL has ever locked since
+    /// construction. `None` for the QPSK mode (the SDR++-style
+    /// Costas loop in that path doesn't expose a lock detector).
+    /// Useful for diagnostics and for the `oqpsk_zero_iq_*`
+    /// regression tests that pin the AGC + lock-detector
+    /// interaction. Per CR round 2 on PR #663.
+    #[must_use]
+    pub fn oqpsk_locked_once(&self) -> Option<bool> {
+        match &self.inner {
+            DemodInner::Qpsk { .. } => None,
+            DemodInner::Oqpsk { pll, .. } => Some(pll.locked_once()),
+        }
     }
 
     /// Push one complex baseband sample. Returns up to one soft-
@@ -207,10 +240,17 @@ impl LrptDemod {
                 gardner.process(derotated).map(slice_soft)
             }
             DemodInner::Oqpsk {
+                agc,
                 pll,
                 timing,
                 pending_i,
             } => {
+                // AGC normalizes magnitude to dbdexter's
+                // expected ~190 rail amplitude before the PLL —
+                // without this the lock detector and tanh LUT
+                // are calibrated to the wrong scale. Per CR
+                // round 2 on PR #663.
+                let scaled = agc.process(filtered);
                 // Advance the carrier NCO on every input sample,
                 // not only on timing ticks. dbdexter's polyphase
                 // pipeline (interp_factor=5) skips the PLL on
@@ -223,7 +263,7 @@ impl LrptDemod {
                 // PLL frozen for that sample, and the next
                 // mix_i / mix_q would run at the wrong phase.
                 // Per CR round 1 on PR #663.
-                let mixed = pll.mix(filtered);
+                let mixed = pll.mix(scaled);
                 match timing.advance_timeslot_dual() {
                     1 => {
                         // I-tick: stash the in-phase rail. The
@@ -237,10 +277,15 @@ impl LrptDemod {
                         // Q-tick: reassemble the I/Q pair,
                         // retime the symbol clock, update the
                         // carrier estimate, emit the soft symbol.
+                        // The retime + update_estimate calls run
+                        // on the AGC-scale symbol (dbdexter's
+                        // calibration); the slicer gets a
+                        // descaled copy (unit magnitude, what
+                        // [`slice_soft`] expects).
                         let symbol = Complex::new(*pending_i, mixed.im);
                         timing.retime(symbol);
                         pll.update_estimate(*pending_i, mixed.im);
-                        Some(slice_soft(symbol))
+                        Some(slice_soft(symbol * OQPSK_SLICER_DESCALE))
                     }
                     _ => None,
                 }
@@ -327,6 +372,34 @@ mod tests {
         // chain's inner constructors is finite + positive, so
         // construction should never fail.
         assert!(LrptDemod::new_with_mode(LrptMode::Oqpsk).is_ok());
+    }
+
+    #[test]
+    fn oqpsk_zero_iq_never_acquires_lock() {
+        // Regression for CR round 2 on PR #663. Without the AGC
+        // stage and dbdexter's amplitude calibration, the
+        // MeteorPll lock detector's |error| EMA decays from 1000
+        // toward 0 with pole 0.001 and crosses the lock threshold
+        // (85) after ~2700 update_estimate() calls — purely from
+        // time elapsed — declaring lock on silence and disabling
+        // the free-run frequency sweep before the carrier is
+        // found. With the AGC in place, zero-IQ silence drives
+        // the gain to saturation and any post-AGC noise produces
+        // non-zero phase error; the EMA stays high and
+        // `locked_once` stays false.
+        let mut demod = LrptDemod::new_with_mode(LrptMode::Oqpsk).unwrap();
+        // 100k samples is well past the ~5400-sample point
+        // (= 2700 update_estimate calls × 2 input samples per
+        // call) at which the bug would have triggered.
+        for _ in 0..100_000 {
+            demod.process(Complex::default());
+        }
+        assert_eq!(
+            demod.oqpsk_locked_once(),
+            Some(false),
+            "zero-IQ silence must not trigger the OQPSK lock detector — \
+             AGC + lock-detector interaction has regressed",
+        );
     }
 
     #[test]

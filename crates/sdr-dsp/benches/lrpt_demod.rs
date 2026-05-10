@@ -43,7 +43,12 @@ fn bench_demod_qpsk(c: &mut Criterion) {
 
     c.bench_function("lrpt_demod_qpsk_1s_144ksps", |b| {
         b.iter(|| {
-            let mut demod = LrptDemod::new().expect("LrptDemod::new");
+            // Explicit-mode constructor so a future change to
+            // `LrptDemod::new`'s default can't silently flip
+            // this bench to the OQPSK pipeline. Per CR round 2
+            // on PR #663.
+            let mut demod = LrptDemod::new_with_mode(LrptMode::Qpsk)
+                .expect("LrptDemod::new_with_mode");
             let mut emitted = 0_u32;
             for s in &buf {
                 if demod.process(black_box(*s)).is_some() {

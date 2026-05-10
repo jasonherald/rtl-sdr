@@ -67,6 +67,17 @@ const LOCK_THRESHOLD_HIGH: f32 = 105.0;
 /// the user perceives at the start of a Meteor pass.
 const FREE_RUN_STEP: f32 = 1e-6;
 
+/// Minimum signal-magnitude EMA required before the lock detector
+/// is allowed to declare lock. Belt-and-suspenders complement to
+/// the AGC stage upstream: if the input is literally zero IQ the
+/// AGC's output is also zero (any gain × 0 = 0), so the
+/// `compute_error` metric returns 0 each call, and the |error|
+/// EMA decays from 1000 toward 0 — silently crossing
+/// [`LOCK_THRESHOLD_LOW`] purely from time elapsed. Gating lock on
+/// signal-magnitude EMA above this floor (≈ a quarter of the AGC
+/// target) closes that loophole. Per CR round 2 on PR #663.
+const LOCK_SIG_FLOOR: f32 = 47.5;
+
 /// Critically-damped 2nd-order loop alpha/beta from a normalized
 /// loop bandwidth. Same formula as
 /// [`crate::loops::PhaseControlLoop::critically_damped`], duplicated
@@ -95,6 +106,10 @@ pub struct MeteorPll {
     /// unlocked and the free-run sweep takes over until the EMA
     /// settles.
     err_ema: f32,
+    /// Exponential moving average of input signal magnitude.
+    /// Compared against [`LOCK_SIG_FLOOR`] to gate lock — see
+    /// that constant's docs for the failure mode this prevents.
+    sig_ema: f32,
     locked: bool,
     locked_once: bool,
     fmax: f32,
@@ -174,6 +189,7 @@ impl MeteorPll {
             alpha,
             beta,
             err_ema: 1000.0,
+            sig_ema: 0.0,
             locked: false,
             locked_once: false,
             fmax,
@@ -226,6 +242,11 @@ impl MeteorPll {
     /// [`Self::mix`] output.
     pub fn update_estimate(&mut self, i: f32, q: f32) {
         let error = self.compute_error(i, q);
+        // Track signal magnitude so the lock detector can refuse
+        // to declare lock on near-zero input. Same EMA pole as
+        // err_ema so the two settle on comparable timescales.
+        let mag = (i * i + q * q).sqrt();
+        self.sig_ema = self.sig_ema * (1.0 - ERR_POLE) + mag * ERR_POLE;
         self.apply_loop_update(error);
     }
 
@@ -283,12 +304,19 @@ impl MeteorPll {
         self.freq += self.beta * error;
 
         // Lock detector — exponential moving average of |error|
-        // with hysteresis at the dbdexter thresholds.
+        // with hysteresis at the dbdexter thresholds, plus a
+        // signal-magnitude floor so a literal-zero input can't
+        // trigger lock just by letting the |error| EMA decay
+        // (the EMA starts at 1000 and decays toward 0 with pole
+        // 0.001; without the floor it crosses LOW after ~2700
+        // updates regardless of signal). Per CR round 2 on
+        // PR #663.
         self.err_ema = self.err_ema * (1.0 - ERR_POLE) + error.abs() * ERR_POLE;
-        if self.err_ema < LOCK_THRESHOLD_LOW && !self.locked {
+        let has_signal = self.sig_ema >= LOCK_SIG_FLOOR;
+        if self.err_ema < LOCK_THRESHOLD_LOW && has_signal && !self.locked {
             self.locked = true;
             self.locked_once = true;
-        } else if self.err_ema > LOCK_THRESHOLD_HIGH && self.locked {
+        } else if (self.err_ema > LOCK_THRESHOLD_HIGH || !has_signal) && self.locked {
             self.locked = false;
         }
 
@@ -444,16 +472,31 @@ mod tests {
     #[test]
     fn locks_onto_clean_qpsk_constellation() {
         // Drive the PLL with synthetic clean QPSK at zero offset.
-        // After a few thousand symbols the lock detector should
-        // trip.
-        let mut pll = MeteorPll::new(TEST_BW, false, None).unwrap();
+        // Two production-realistic inputs:
+        //
+        // 1. Constellation pre-scaled to dbdexter's post-AGC
+        //    magnitude (190/√2 ≈ 134.35 per rail) so the signal-
+        //    magnitude lock gate sees enough power. In
+        //    production the upstream [`MeteorAgc`] applies this
+        //    scaling automatically; the unit test bypasses AGC.
+        // 2. The realistic loop bandwidth (`PROD_BW`) — wider
+        //    `TEST_BW = 0.01` overshoots wildly when paired with
+        //    AGC-scale errors and the loop oscillates instead of
+        //    locking. The production OQPSK PLL bandwidth was
+        //    derived to be stable at this input scale; honour it.
+        const RAIL: f32 = 134.35;
+        const PROD_BW: f32 = 8.726_646e-5; // 2π × 1 Hz / 72_000 Hz, matches OQPSK_PLL_BW
+        let mut pll = MeteorPll::new(PROD_BW, false, None).unwrap();
         let symbols = [
-            Complex::new(0.707, 0.707),
-            Complex::new(-0.707, 0.707),
-            Complex::new(0.707, -0.707),
-            Complex::new(-0.707, -0.707),
+            Complex::new(RAIL, RAIL),
+            Complex::new(-RAIL, RAIL),
+            Complex::new(RAIL, -RAIL),
+            Complex::new(-RAIL, -RAIL),
         ];
-        for n in 0..20_000 {
+        // The narrow loop takes longer to converge — pump enough
+        // samples that both the |error| EMA and the signal
+        // magnitude EMA settle into the lock window.
+        for n in 0..200_000 {
             let s = symbols[n % 4];
             let mixed = pll.mix(s);
             pll.update_estimate(mixed.re, mixed.im);
