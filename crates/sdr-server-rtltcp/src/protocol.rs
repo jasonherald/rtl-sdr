@@ -52,13 +52,24 @@ pub enum TunerTypeCode {
 impl From<TunerType> for TunerTypeCode {
     fn from(t: TunerType) -> Self {
         match t {
-            TunerType::Unknown => TunerTypeCode::Unknown,
             TunerType::E4000 => TunerTypeCode::E4000,
             TunerType::Fc0012 => TunerTypeCode::Fc0012,
             TunerType::Fc0013 => TunerTypeCode::Fc0013,
             TunerType::Fc2580 => TunerTypeCode::Fc2580,
             TunerType::R820T => TunerTypeCode::R820t,
             TunerType::R828D => TunerTypeCode::R828d,
+            // `TunerType::Unknown` plus any future variants the
+            // upstream adds (the enum is `#[non_exhaustive]` as of
+            // librtlsdr-rs 0.3) all map to the wire's `Unknown = 0`
+            // code. That's what `enum rtlsdr_tuner` in upstream
+            // `rtl-sdr.h` reserves for "type we don't have a code
+            // for", so old `rtl_tcp` clients see the right
+            // "unrecognised tuner" semantics rather than a
+            // misclassified known type. The `Unknown` arm and the
+            // catch-all are intentionally collapsed to one branch —
+            // explicit-then-wildcard would have identical bodies and
+            // trip `clippy::match_same_arms`.
+            TunerType::Unknown | _ => TunerTypeCode::Unknown,
         }
     }
 }

@@ -141,7 +141,7 @@ sdr-pipeline = { path = "crates/sdr-pipeline" }
 # pulled from crates.io. Async-runtime integrations are opt-in via the
 # per-runtime cargo features (currently unused by this app — the source
 # thread uses the sync iterator).
-librtlsdr-rs = "0.2"
+librtlsdr-rs = "0.3"
 sdr-source-rtlsdr = { path = "crates/sdr-source-rtlsdr" }
 sdr-source-network = { path = "crates/sdr-source-network" }
 sdr-server-rtltcp = { path = "crates/sdr-server-rtltcp" }
