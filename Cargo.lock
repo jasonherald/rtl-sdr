@@ -1996,9 +1996,9 @@ dependencies = [
 
 [[package]]
 name = "librtlsdr-rs"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc2cb5fc8ac4f4b61f2eee6525c787e0f8f2440fcd3506ad1410eb045fa2e6b9"
+checksum = "7ea2d5048767c6bd1c23affaee9b5d457acb52075fefdfd60f552ae72a522880"
 dependencies = [
  "rusb",
  "thiserror 2.0.18",
