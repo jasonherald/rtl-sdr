@@ -104,7 +104,6 @@ members = [
     "crates/sdr-source-rtlsdr",
     "crates/sdr-source-network",
     "crates/sdr-server-rtltcp",
-    "crates/sdr-rtltcp-discovery",
     "crates/sdr-scanner",
     "crates/sdr-source-file",
     "crates/sdr-sink-audio",
@@ -145,7 +144,11 @@ librtlsdr-rs = "0.3"
 sdr-source-rtlsdr = { path = "crates/sdr-source-rtlsdr" }
 sdr-source-network = { path = "crates/sdr-source-network" }
 sdr-server-rtltcp = { path = "crates/sdr-server-rtltcp" }
-sdr-rtltcp-discovery = { path = "crates/sdr-rtltcp-discovery" }
+# sdr-rtltcp-discovery was spun out into its own repo + published to
+# crates.io (https://github.com/jasonherald/sdr-rtltcp-discovery) — it's
+# a generic `_rtl_tcp._tcp.local.` mDNS browser/responder with no
+# rtl-sdr-specific coupling, so other rtl_tcp tooling can reuse it.
+sdr-rtltcp-discovery = "0.1"
 sdr-scanner = { path = "crates/sdr-scanner" }
 sdr-source-file = { path = "crates/sdr-source-file" }
 sdr-sink-audio = { path = "crates/sdr-sink-audio" }
