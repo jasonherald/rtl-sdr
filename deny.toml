@@ -36,6 +36,11 @@ allow = [
     "Zlib",
     "0BSD",
     "BSL-1.0",
+    # `LGPL-2.0-only` is `sdr-acars` — the spun-out acarsdec port, whose
+    # upstream license is the GNU Library GPL v2 with no "or later" grant.
+    # Linkable into this GPL-2.0-or-later app: LGPL→GPL is a permitted
+    # one-way upgrade per the LGPL's own terms.
+    "LGPL-2.0-only",
     "LGPL-2.0-or-later",
     "LGPL-2.1-or-later",
     "LGPL-3.0-or-later",
