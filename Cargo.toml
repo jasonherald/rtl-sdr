@@ -97,7 +97,6 @@ workspace = true
 resolver = "3"
 members = [
     ".",
-    "crates/sdr-acars",
     "crates/sdr-types",
     "crates/sdr-dsp",
     "crates/sdr-pipeline",
@@ -157,7 +156,12 @@ sdr-radio = { path = "crates/sdr-radio" }
 sdr-config = { path = "crates/sdr-config" }
 sdr-radioreference = { path = "crates/sdr-radioreference" }
 sdr-sat = { path = "crates/sdr-sat" }
-sdr-acars = { path = "crates/sdr-acars" }
+# sdr-acars was spun out into its own repo + published to crates.io
+# (https://github.com/jasonherald/sdr-acars) — a faithful Rust port of
+# acarsdec (LGPL-2.0-only). `default-features = false` keeps the `cli`
+# feature (and its clap / hound / tracing-subscriber deps) out of the
+# app's tree — this workspace uses the decoder library, not the CLI.
+sdr-acars = { version = "0.1", default-features = false }
 sdr-lrpt = { path = "crates/sdr-lrpt" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }
@@ -272,21 +276,16 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 # Zero-copy type casting
 bytemuck = { version = "1", features = ["derive"] }
 
-# Stack-allocated bounded vectors. Used by sdr-acars for fixed-size
-# ACARS frame buffers (max payload 220 bytes per ARINC 618) without
-# heap churn on the per-block decode path.
+# Stack-allocated bounded vectors. Used in the ACARS message path
+# (sdr-core / sdr-ffi / sdr-ui) for fixed-size fields — aircraft reg,
+# flight id, message no — without per-message heap churn.
 arrayvec = "0.7"
 
-# Complex-number arithmetic for sdr-acars MSK demodulation.
-# The `bytemuck` feature derives `Pod` + `Zeroable` on `Complex32`, enabling
-# zero-copy casts from `sdr_types::Complex` (same repr(C) f32 layout) in the
-# `acars_decode_tap` hot path.
+# Complex-number arithmetic. The `bytemuck` feature derives `Pod` +
+# `Zeroable` on `Complex32`, enabling zero-copy casts from
+# `sdr_types::Complex` (same repr(C) f32 layout) in `sdr-core`'s
+# `acars_decode_tap` before handing IQ to the `sdr-acars` channelizer.
 num-complex = { version = "0.4", features = ["bytemuck"] }
-
-# Command-line argument parsing for the sdr-acars-cli binary
-# (Task 9 of the ACARS DSP crate plan). Derive macros keep the
-# argument struct declarative and self-documenting.
-clap = { version = "4", features = ["derive"] }
 
 # GPU compute (epic #452 phase 2+). Used by sdr-dsp for the wgpu-backed
 # FFT engine behind the `FftEngine` trait. We target the default wgpu
