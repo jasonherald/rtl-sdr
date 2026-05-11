@@ -3286,6 +3286,8 @@ dependencies = [
 [[package]]
 name = "sdr-rtltcp-discovery"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c78e3e904dff81c1dd0d8eef03d6499a3b86b9f597381523b66e299a8816732"
 dependencies = [
  "libc",
  "mdns-sd",
