@@ -124,6 +124,16 @@ pub const IQ_CORRECTION_DEFAULT_RATE: f64 = 0.000_01;
 /// It is a plain LMS loop: no divisions, no trig, one complex multiply-add
 /// per sample, and it converges from a cold start on any signal that is not
 /// itself conjugate-symmetric (i.e. anything but a pure real baseband).
+///
+/// # Input scale
+///
+/// Like the SDR++ original, the step size is proportional to sample power
+/// (`y²·rate`), so the loop is tuned for IQ normalised to roughly ±1 —
+/// which is what [`crate::convert`] produces from 8-bit samples and what
+/// `IqFrontend` feeds it. Grossly over-scaled input (|x| ≫ 1) would
+/// overflow the `f32` estimate; rather than silently emit NaN forever,
+/// `process` re-arms the estimate to zero whenever it stops being finite,
+/// so the corrector recovers on the next in-contract block.
 pub struct IqCorrector {
     correction: Complex,
     rate: f32,
@@ -191,7 +201,13 @@ impl IqCorrector {
             c += (out * out) * self.rate;
             *y = out;
         }
-        self.correction = c;
+        // Self-heal: an out-of-contract block (see "Input scale") can blow
+        // the estimate up to inf/NaN; never carry that into the next block.
+        self.correction = if c.re.is_finite() && c.im.is_finite() {
+            c
+        } else {
+            Complex::default()
+        };
         Ok(input.len())
     }
 }
@@ -276,13 +292,45 @@ mod tests {
         assert!(out2[0].re.abs() < 1e-6, "after reset, output should be ~0");
     }
 
+    // ---- IqCorrector test fixture parameters -------------------------------
+    /// Length of the synthesized tone buffer; the tone is periodic in this
+    /// length, so repeated passes over it form one continuous signal.
+    const IQ_TEST_LEN: usize = 65_536;
+    /// Tone frequency as a fraction of the sample rate (fs / 8).
+    const IQ_TEST_TONE_DIV: usize = 8;
+    /// Number of trailing samples measured by the DFT.
+    const IQ_TEST_TAIL_LEN: usize = 8_192;
+    /// DFT bin of the tone within a `IQ_TEST_TAIL_LEN`-sample window: a tone
+    /// at fs/8 completes `TAIL_LEN / 8` cycles per window. Its image is at
+    /// the negative of this bin.
+    #[allow(clippy::cast_possible_wrap)] // 1024 — cannot wrap
+    const IQ_TEST_TAIL_TONE_BIN: i64 = (IQ_TEST_TAIL_LEN / IQ_TEST_TONE_DIV) as i64;
+    /// Injected I/Q gain error (10 %) and phase error (0.1 rad).
+    const IQ_TEST_GAIN_ERR: f32 = 0.10;
+    const IQ_TEST_PHASE_ERR: f32 = 0.10;
+    /// LMS time constant is 1/(2·rate) = 50 k samples; five passes over
+    /// 64 k samples ≈ 6.5 time constants.
+    const IQ_TEST_PASSES: usize = 5;
+    /// Required image-rejection improvement once converged.
+    const IQ_TEST_MIN_IMPROVEMENT_DB: f32 = 20.0;
+    /// Buffer sizes for the short passthrough / reset fixtures.
+    const IQ_TEST_SHORT_LEN: usize = 4_096;
+    const IQ_TEST_RESET_LEN: usize = 16_384;
+    /// Sample-equality tolerance for the untouched-passthrough check.
+    const IQ_TEST_PASSTHROUGH_TOL: f32 = 1e-3;
+    /// Out-of-contract amplitude (the corrector expects |x| ≲ 1).
+    const IQ_TEST_OVERSCALE_AMPLITUDE: f32 = 400.0;
+    const IQ_TEST_OVERSCALE_LEN: usize = 64;
+
     /// Synthesize a complex tone with gain + phase imbalance between I and Q
-    /// (the classic image-producing receiver defect).
+    /// (the classic image-producing receiver defect). The tone completes
+    /// `n / tone_div` cycles over `n` samples.
     #[allow(clippy::cast_precision_loss)]
-    fn imbalanced_tone(n: usize, bin: usize, gain_err: f32, phase_err: f32) -> Vec<Complex> {
+    fn imbalanced_tone(n: usize, tone_div: usize, gain_err: f32, phase_err: f32) -> Vec<Complex> {
+        let cycles = (n / tone_div) as f32;
         (0..n)
             .map(|i| {
-                let theta = 2.0 * std::f32::consts::PI * bin as f32 * i as f32 / n as f32;
+                let theta = 2.0 * std::f32::consts::PI * cycles * i as f32 / n as f32;
                 Complex::new((1.0 + gain_err) * theta.cos(), (theta + phase_err).sin())
             })
             .collect()
@@ -299,6 +347,12 @@ mod tests {
             im += s.re * a.sin() + s.im * a.cos();
         }
         (re * re + im * im) / (n * n)
+    }
+
+    /// Image-to-tone power ratio over the last `IQ_TEST_TAIL_LEN` samples.
+    fn image_ratio(x: &[Complex]) -> f32 {
+        let tail = &x[x.len() - IQ_TEST_TAIL_LEN..];
+        bin_power(tail, -IQ_TEST_TAIL_TONE_BIN) / bin_power(tail, IQ_TEST_TAIL_TONE_BIN)
     }
 
     /// Rates that pass the f64 range check but whose f32 coefficient
@@ -326,54 +380,81 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_wrap)]
     fn iq_corrector_improves_image_rejection() {
-        // 64 k samples of a tone at +fs/8 with 10 % gain and 0.1 rad phase error.
-        const N: usize = 65_536;
-        const BIN: usize = N / 8;
-        let input = imbalanced_tone(N, BIN, 0.10, 0.10);
-        let tail = &input[N - 8192..];
-        let before = bin_power(tail, -(BIN as i64 / 8)) / bin_power(tail, BIN as i64 / 8);
+        let input = imbalanced_tone(
+            IQ_TEST_LEN,
+            IQ_TEST_TONE_DIV,
+            IQ_TEST_GAIN_ERR,
+            IQ_TEST_PHASE_ERR,
+        );
+        let before = image_ratio(&input);
 
-        // LMS time constant is 1/(2·rate) = 50 k samples; run ~6 time
-        // constants (the tone is periodic in N, so repeated passes are
-        // a continuous signal).
         let mut corr = IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).unwrap();
-        let mut output = vec![Complex::default(); N];
-        for _ in 0..5 {
+        let mut output = vec![Complex::default(); IQ_TEST_LEN];
+        for _ in 0..IQ_TEST_PASSES {
             let n = corr.process(&input, &mut output).unwrap();
-            assert_eq!(n, N);
+            assert_eq!(n, IQ_TEST_LEN);
         }
-        let tail = &output[N - 8192..];
-        let after = bin_power(tail, -(BIN as i64 / 8)) / bin_power(tail, BIN as i64 / 8);
+        let after = image_ratio(&output);
 
         let improvement_db = 10.0 * (before / after).log10();
         assert!(
-            improvement_db > 20.0,
-            "image rejection should improve by > 20 dB once converged, got {improvement_db:.1} dB (before {before:e}, after {after:e})"
+            improvement_db > IQ_TEST_MIN_IMPROVEMENT_DB,
+            "image rejection should improve by > {IQ_TEST_MIN_IMPROVEMENT_DB} dB once converged, got {improvement_db:.1} dB (before {before:e}, after {after:e})"
         );
     }
 
     #[test]
     fn iq_corrector_passes_balanced_signal_unchanged() {
-        let input = imbalanced_tone(4096, 512, 0.0, 0.0);
+        let input = imbalanced_tone(IQ_TEST_SHORT_LEN, IQ_TEST_TONE_DIV, 0.0, 0.0);
         let mut corr = IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).unwrap();
-        let mut output = vec![Complex::default(); 4096];
+        let mut output = vec![Complex::default(); IQ_TEST_SHORT_LEN];
         corr.process(&input, &mut output).unwrap();
         for (a, b) in input.iter().zip(&output) {
-            assert!((a.re - b.re).abs() < 1e-3 && (a.im - b.im).abs() < 1e-3);
+            assert!(
+                (a.re - b.re).abs() < IQ_TEST_PASSTHROUGH_TOL
+                    && (a.im - b.im).abs() < IQ_TEST_PASSTHROUGH_TOL
+            );
         }
     }
 
     #[test]
     fn iq_corrector_reset_clears_estimate() {
-        let input = imbalanced_tone(16_384, 2048, 0.2, 0.0);
+        let input = imbalanced_tone(IQ_TEST_RESET_LEN, IQ_TEST_TONE_DIV, 0.2, 0.0);
         let mut corr = IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).unwrap();
         let mut output = vec![Complex::default(); input.len()];
         corr.process(&input, &mut output).unwrap();
         assert!(corr.correction().amplitude() > 0.0);
         corr.reset();
         assert!(corr.correction().amplitude() < f32::EPSILON);
+    }
+
+    /// Input far outside the documented ±1 scale must not poison the
+    /// estimate permanently: the state is re-armed and the corrector keeps
+    /// working on the next in-contract block.
+    #[test]
+    fn iq_corrector_recovers_from_overscaled_input() {
+        let mut corr = IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).unwrap();
+        let blast = vec![Complex::new(IQ_TEST_OVERSCALE_AMPLITUDE, 0.0); IQ_TEST_OVERSCALE_LEN];
+        let mut out = vec![Complex::default(); IQ_TEST_OVERSCALE_LEN];
+        corr.process(&blast, &mut out).unwrap();
+        assert!(
+            corr.correction().re.is_finite() && corr.correction().im.is_finite(),
+            "estimate must be finite after an over-scaled block, got {:?}",
+            corr.correction()
+        );
+
+        let input = imbalanced_tone(IQ_TEST_SHORT_LEN, IQ_TEST_TONE_DIV, 0.0, 0.0);
+        let mut output = vec![Complex::default(); IQ_TEST_SHORT_LEN];
+        corr.process(&input, &mut output).unwrap();
+        assert!(output.iter().all(|s| s.re.is_finite() && s.im.is_finite()));
+        for (a, b) in input.iter().zip(&output) {
+            assert!(
+                (a.re - b.re).abs() < IQ_TEST_PASSTHROUGH_TOL
+                    && (a.im - b.im).abs() < IQ_TEST_PASSTHROUGH_TOL,
+                "corrector must resume clean passthrough after recovery"
+            );
+        }
     }
 
     #[test]
