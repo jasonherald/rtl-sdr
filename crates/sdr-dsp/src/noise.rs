@@ -659,6 +659,39 @@ impl FmIfNoiseReduction {
         self.ready.clear();
     }
 
+    /// End of stream: process the partially filled block (zero-padded),
+    /// keeping only its real samples, and hand out everything still
+    /// queued. After this every sample ever passed to `process` has been
+    /// emitted exactly once. Returns the number of samples written;
+    /// calling it again emits nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::BufferTooSmall` if `output` cannot hold all
+    /// pending samples (at most `2 * fft_size`).
+    pub fn flush(&mut self, output: &mut [Complex]) -> Result<usize, DspError> {
+        if self.overlap_count > 0 {
+            let valid = self.overlap_count;
+            self.overlap_buf[valid..].fill(Complex::default());
+            let mut block = std::mem::take(&mut self.block_out);
+            self.process_block(&mut block);
+            self.ready.extend(block[..valid].iter().copied());
+            self.block_out = block;
+            self.overlap_count = 0;
+        }
+        let pending = self.ready.len();
+        if output.len() < pending {
+            return Err(DspError::BufferTooSmall {
+                need: pending,
+                got: output.len(),
+            });
+        }
+        for (dst, src) in output[..pending].iter_mut().zip(self.ready.drain(..)) {
+            *dst = src;
+        }
+        Ok(pending)
+    }
+
     /// Process complex samples through FFT-based noise reduction.
     ///
     /// Input is accumulated into FFT-size blocks; each completed block is
@@ -666,7 +699,8 @@ impl FmIfNoiseReduction {
     /// to `output`. The returned count may be smaller than `input.len()`
     /// (up to two blocks of latency) but the output stream is always the
     /// processed signal, in order, with every sample emitted exactly once,
-    /// independent of how the input is chunked.
+    /// independent of how the input is chunked. Call [`Self::flush`] at
+    /// end of stream to emit the final partial block.
     ///
     /// # Errors
     ///
@@ -1673,6 +1707,48 @@ mod tests {
                 "sample {i} differs between whole-buffer and 300-sample chunking: {:?} vs {:?}",
                 whole[i],
                 odd[i]
+            );
+        }
+    }
+
+    /// #773 (CR) — at end of stream, `flush` must emit the buffered partial
+    /// block so every input sample comes out exactly once, in order.
+    #[test]
+    fn fm_if_nr_flush_emits_every_buffered_sample() {
+        let input = fmif_test_signal(256 * 4 + 100);
+        let mut nr = FmIfNoiseReduction::new().unwrap();
+        let mut out = Vec::new();
+        for c in input.chunks(300) {
+            let mut buf = vec![Complex::default(); c.len()];
+            let n = nr.process(c, &mut buf).unwrap();
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert!(
+            out.len() < input.len(),
+            "some samples should still be buffered"
+        );
+        let mut tail = vec![Complex::default(); 2 * 256];
+        let n = nr.flush(&mut tail).unwrap();
+        out.extend_from_slice(&tail[..n]);
+        assert_eq!(
+            out.len(),
+            input.len(),
+            "flush must account for every input sample"
+        );
+        // Flushing twice emits nothing more.
+        assert_eq!(nr.flush(&mut tail).unwrap(), 0);
+        // The whole-buffer run (plus flush) must produce the same sequence.
+        let mut whole = FmIfNoiseReduction::new().unwrap();
+        let mut wbuf = vec![Complex::default(); input.len()];
+        let wn = whole.process(&input, &mut wbuf).unwrap();
+        let mut wout = wbuf[..wn].to_vec();
+        let wf = whole.flush(&mut tail).unwrap();
+        wout.extend_from_slice(&tail[..wf]);
+        assert_eq!(wout.len(), out.len());
+        for i in 0..out.len() {
+            assert!(
+                (wout[i].re - out[i].re).abs() < 1e-4 && (wout[i].im - out[i].im).abs() < 1e-4,
+                "sample {i} differs"
             );
         }
     }

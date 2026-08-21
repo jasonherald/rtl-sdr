@@ -354,6 +354,8 @@ mod tests {
         // and produce a large, measurable L/R ratio after decode.
         let left_amp: f32 = 0.4;
         let right_amp: f32 = 0.1;
+        // Pilot injection level relative to full-scale programme (≈10 %).
+        let pilot_amp: f32 = 0.1;
 
         // Phase accumulation over 20_000 samples (80 ms at
         // 250 kHz). Generous settling time for the stereo
@@ -375,7 +377,7 @@ mod tests {
                 // relationship the old decoder happened to decode.)
                 let mono = left + right;
                 let diff = left - right;
-                let pilot = 0.1 * (2.0 * PI * pilot_freq_hz * t).sin();
+                let pilot = pilot_amp * (2.0 * PI * pilot_freq_hz * t).sin();
                 let subcarrier = diff * (2.0 * PI * subcarrier_freq_hz * t).sin();
                 let mpx = mono + pilot + subcarrier;
                 phase += phase_scale * mpx;

@@ -217,6 +217,11 @@ impl IfChain {
 
     /// Enable or disable FM IF noise reduction.
     pub fn set_fm_if_nr_enabled(&mut self, enabled: bool) {
+        if self.fm_if_nr_enabled != enabled {
+            // The block-based NR holds partial input and queued output;
+            // never let a pre-toggle remainder leak into the new session.
+            self.fm_if_nr.reset();
+        }
         self.fm_if_nr_enabled = enabled;
     }
 
@@ -376,6 +381,45 @@ mod tests {
         assert_eq!(count, 100);
         assert_eq!(output[0].re, 1.0);
         assert_eq!(output[0].im, 2.0);
+    }
+
+    /// #773 (CR) — toggling FM IF NR off and on must not replay samples
+    /// buffered before the disable: the re-enabled chain behaves like a
+    /// fresh one.
+    #[test]
+    fn fm_if_nr_toggle_resets_buffered_state() {
+        let signal: Vec<Complex> = (0..512)
+            .map(|i| {
+                let theta = 2.0 * core::f32::consts::PI * 37.0 * i as f32 / 256.0;
+                Complex::new(theta.cos(), theta.sin())
+            })
+            .collect();
+
+        let mut toggled = IfChain::new().unwrap();
+        toggled.set_fm_if_nr_enabled(true);
+        let mut scratch = vec![Complex::default(); 300];
+        toggled.process(&signal[..300], &mut scratch).unwrap(); // 256 queued, 44 buffered
+        toggled.set_fm_if_nr_enabled(false);
+        toggled.set_fm_if_nr_enabled(true);
+        let mut out_toggled = vec![Complex::default(); 512];
+        let n_toggled = toggled.process(&signal, &mut out_toggled).unwrap();
+
+        let mut fresh = IfChain::new().unwrap();
+        fresh.set_fm_if_nr_enabled(true);
+        let mut out_fresh = vec![Complex::default(); 512];
+        let n_fresh = fresh.process(&signal, &mut out_fresh).unwrap();
+
+        assert_eq!(
+            n_toggled, n_fresh,
+            "stale buffered samples leaked through the toggle"
+        );
+        for i in 0..n_fresh {
+            assert!(
+                (out_toggled[i].re - out_fresh[i].re).abs() < 1e-4
+                    && (out_toggled[i].im - out_fresh[i].im).abs() < 1e-4,
+                "sample {i} differs after toggle"
+            );
+        }
     }
 
     #[test]
