@@ -37,6 +37,21 @@ pub const R82XX_MIN_TUNER_FREQ_HZ: f64 = 24_000_000.0;
 /// Direct-sampling mode value meaning "off — normal tuner path".
 const DIRECT_SAMPLING_OFF: i32 = 0;
 
+/// Direct-sampling mode: ADC fed from the I input (tuner bypassed).
+const DIRECT_SAMPLING_I: i32 = 1;
+
+/// Direct-sampling mode: ADC fed from the Q input (tuner bypassed).
+const DIRECT_SAMPLING_Q: i32 = 2;
+
+/// Raw bytes per IQ pair on the USB wire (one unsigned 8-bit I, one Q).
+const IQ_PAIR_BYTES: usize = 2;
+
+/// Ring-slot state: free for the USB reader to fill.
+const RING_SLOT_EMPTY: u8 = 0;
+
+/// Ring-slot state: holds a completed transfer awaiting the DSP reader.
+const RING_SLOT_FULL: u8 = 1;
+
 /// Hz → MHz divisor for user-facing frequency text.
 const HERTZ_PER_MHZ: f64 = 1_000_000.0;
 
@@ -92,9 +107,10 @@ pub fn classify_read(
         }
     };
     match result {
-        Ok(n) if n >= 2 => {
+        Ok(n) if n >= IQ_PAIR_BYTES => {
             budget.consecutive_soft_failures = 0;
-            ReadOutcome::Data(n & !1)
+            // Trim a trailing odd byte so the slot holds whole IQ pairs.
+            ReadOutcome::Data(n - n % IQ_PAIR_BYTES)
         }
         Ok(_) => soft(budget, "zero-length USB transfer"),
         Err(librtlsdr_rs::RtlSdrError::Usb(rusb::Error::Timeout)) => {
@@ -194,7 +210,7 @@ impl UsbRingBuffer {
                 data: Mutex::new(vec![0u8; slot_size]),
                 len: AtomicUsize::new(0),
                 consumed: AtomicUsize::new(0),
-                state: AtomicU8::new(0),
+                state: AtomicU8::new(RING_SLOT_EMPTY),
             })
             .collect();
         Self {
@@ -292,7 +308,7 @@ fn run_reader_thread(
         let idx = ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slot_count;
         let slot = &ring_writer.slots[idx];
 
-        while slot.state.load(Ordering::Acquire) != 0 {
+        while slot.state.load(Ordering::Acquire) != RING_SLOT_EMPTY {
             if !cancel.load(Ordering::Acquire) {
                 tracing::debug!("USB reader thread stopping (ring-full wait)");
                 return;
@@ -349,7 +365,7 @@ fn run_reader_thread(
 
         drop(data);
         slot.len.store(n, Ordering::Relaxed);
-        slot.state.store(1, Ordering::Release);
+        slot.state.store(RING_SLOT_FULL, Ordering::Release);
         ring_writer.write_idx.fetch_add(1, Ordering::Relaxed);
     }
     tracing::debug!("USB reader thread stopped");
@@ -555,11 +571,11 @@ impl RtlSdrSource {
     /// Ports the conversion from SDR++ `asyncHandler`:
     /// `re = (buf[i*2] - 127.4) / 128.0; im = (buf[i*2+1] - 127.4) / 128.0`
     pub fn convert_samples(raw: &[u8], output: &mut [Complex]) -> usize {
-        let sample_count = raw.len() / 2;
+        let sample_count = raw.len() / IQ_PAIR_BYTES;
         let count = sample_count.min(output.len());
         for i in 0..count {
-            let re = (f32::from(raw[i * 2]) - IQ_OFFSET) / IQ_SCALE;
-            let im = (f32::from(raw[i * 2 + 1]) - IQ_OFFSET) / IQ_SCALE;
+            let re = (f32::from(raw[i * IQ_PAIR_BYTES]) - IQ_OFFSET) / IQ_SCALE;
+            let im = (f32::from(raw[i * IQ_PAIR_BYTES + 1]) - IQ_OFFSET) / IQ_SCALE;
             output[i] = Complex::new(re, im);
         }
         count
@@ -693,9 +709,14 @@ impl Source for RtlSdrSource {
         // ("AGC should default to off").
         // Gain mode follows the last dispatch when there was one
         // (pre-start dispatch or a previous open); manual otherwise.
+        let initial_gain_manual = self.last_gain_manual.unwrap_or(true);
         device
-            .set_tuner_gain_mode(self.last_gain_manual.unwrap_or(true))
+            .set_tuner_gain_mode(initial_gain_manual)
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+        // Record the effective value so a later direct-sampling → off
+        // transition can restore it even when nothing was dispatched
+        // before the first `start()`.
+        self.last_gain_manual = Some(initial_gain_manual);
         // Replay both states: the RTL2832 keeps digital AGC across
         // handles, so a previous session leaving it on must be undone.
         if let Err(e) = device.set_agc_mode(self.rtl_agc_enabled) {
@@ -716,6 +737,10 @@ impl Source for RtlSdrSource {
                 error = %e,
                 "RtlSdrSource::start: post-open set_tuner_gain default failed (non-fatal)"
             );
+        } else {
+            // Same reasoning as `last_gain_manual` above: remember the
+            // gain the tuner was actually programmed with.
+            self.last_tuner_gain_tenths_db = Some(initial_gain_tenths_db);
         }
 
         // Set running BEFORE spawning so the reader thread sees it immediately.
@@ -802,7 +827,7 @@ impl Source for RtlSdrSource {
         let idx = ring.read_idx.load(Ordering::Relaxed) % ring.slot_count;
         let slot = &ring.slots[idx];
 
-        if slot.state.load(Ordering::Acquire) != 1 {
+        if slot.state.load(Ordering::Acquire) != RING_SLOT_FULL {
             return Ok(0); // No data available yet
         }
 
@@ -823,11 +848,11 @@ impl Source for RtlSdrSource {
         };
 
         // Each IQ pair = 2 raw bytes. Advance the consumed offset.
-        let new_consumed = consumed + count * 2;
+        let new_consumed = consumed + count * IQ_PAIR_BYTES;
         if new_consumed >= len {
             // Slot fully drained — release back to the writer.
             slot.consumed.store(0, Ordering::Relaxed);
-            slot.state.store(0, Ordering::Release);
+            slot.state.store(RING_SLOT_EMPTY, Ordering::Release);
             ring.read_idx.fetch_add(1, Ordering::Relaxed);
         } else {
             // Partial consumption — leave the slot owned by the
@@ -993,9 +1018,10 @@ impl Source for RtlSdrSource {
         // forwarding to the driver, which would either silently
         // misbehave or surface a confusing low-level error. Per
         // `CodeRabbit` round 1 on PR #559.
-        if !(0..=2).contains(&mode) {
+        if !(DIRECT_SAMPLING_OFF..=DIRECT_SAMPLING_Q).contains(&mode) {
             return Err(SourceError::TuneFailed(format!(
-                "invalid direct sampling mode: {mode} (expected 0..=2)"
+                "invalid direct sampling mode: {mode} (expected \
+                 {DIRECT_SAMPLING_OFF}=off, {DIRECT_SAMPLING_I}=I, {DIRECT_SAMPLING_Q}=Q)"
             )));
         }
         let was_off = self.direct_sampling_mode == DIRECT_SAMPLING_OFF;
@@ -1097,11 +1123,13 @@ mod tests {
     #[test]
     fn set_direct_sampling_is_remembered_without_open_device() {
         let mut source = RtlSdrSource::new(0);
-        source.set_direct_sampling(2).expect("valid mode");
-        assert_eq!(source.direct_sampling_mode, 2);
-        assert!(source.set_direct_sampling(3).is_err());
+        source
+            .set_direct_sampling(DIRECT_SAMPLING_Q)
+            .expect("valid mode");
+        assert_eq!(source.direct_sampling_mode, DIRECT_SAMPLING_Q);
+        assert!(source.set_direct_sampling(DIRECT_SAMPLING_Q + 1).is_err());
         assert_eq!(
-            source.direct_sampling_mode, 2,
+            source.direct_sampling_mode, DIRECT_SAMPLING_Q,
             "invalid mode must not overwrite"
         );
     }
