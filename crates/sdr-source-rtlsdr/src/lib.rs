@@ -689,10 +689,14 @@ impl Source for RtlSdrSource {
         device
             .set_tuner_gain_mode(self.last_gain_manual.unwrap_or(true))
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
-        if self.rtl_agc_enabled
-            && let Err(e) = device.set_agc_mode(true)
-        {
-            tracing::warn!("RTL AGC enable on open failed: {e}");
+        // Replay both states: the RTL2832 keeps digital AGC across
+        // handles, so a previous session leaving it on must be undone.
+        if let Err(e) = device.set_agc_mode(self.rtl_agc_enabled) {
+            tracing::warn!(
+                enabled = self.rtl_agc_enabled,
+                error = %e,
+                "RTL AGC restore on open failed"
+            );
         }
         if let Err(e) = device.set_tuner_gain(initial_gain_tenths_db) {
             // Non-fatal: the gain-mode write above already put
