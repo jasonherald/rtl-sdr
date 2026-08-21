@@ -29,7 +29,9 @@ impl DcBlocker {
     ///
     /// # Errors
     ///
-    /// Returns `DspError::InvalidParameter` if `rate` is not finite or not in (0, 1).
+    /// Returns `DspError::InvalidParameter` if `rate` is not finite, not in
+    /// (0, 1), or no longer strictly inside (0, 1) after conversion to the
+    /// `f32` the loop runs with (underflow to `0.0` or rounding up to `1.0`).
     #[allow(clippy::cast_possible_truncation)]
     pub fn new(rate: f64) -> Result<Self, DspError> {
         if !rate.is_finite() || rate <= 0.0 || rate >= 1.0 {
@@ -133,13 +135,13 @@ impl IqCorrector {
                 "IQ correction rate must be in (0, 1), got {rate}"
             )));
         }
-        // Validate the value the loop will actually use: a rate that is
-        // positive in f64 but underflows to 0.0 in f32 would build a
-        // corrector that never adapts.
+        // Validate the value the loop will actually use: a rate that is in
+        // (0, 1) in f64 can underflow to 0.0 (never adapts) or round up to
+        // 1.0 (unstable) in f32.
         let rate_f32 = rate as f32;
-        if rate_f32 <= 0.0 {
+        if rate_f32 <= 0.0 || rate_f32 >= 1.0 {
             return Err(DspError::InvalidParameter(format!(
-                "IQ correction rate {rate} underflows to zero in f32"
+                "IQ correction rate {rate} is not strictly inside (0, 1) as f32 ({rate_f32})"
             )));
         }
         Ok(Self {
@@ -301,6 +303,8 @@ mod tests {
         // corrector that never adapts.
         assert!(IqCorrector::new(f64::MIN_POSITIVE).is_err());
         assert!(IqCorrector::new(1e-50).is_err());
+        // Below 1.0 in f64 but rounds to exactly 1.0 in f32.
+        assert!(IqCorrector::new(1.0 - 1e-12).is_err());
     }
 
     #[test]
