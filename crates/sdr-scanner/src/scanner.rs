@@ -194,10 +194,13 @@ impl Scanner {
         if enabled {
             self.start_rotation()
         } else {
-            // Session-scoped state clears on disable so re-enabling
-            // starts fresh rather than carrying stale lockouts or
-            // mid-cycle rotation cursors into the next session.
-            self.locked_out.clear();
+            // Rotation state clears on disable so re-enabling starts
+            // fresh rather than carrying mid-cycle cursors. Lockouts
+            // are NOT cleared: they are scoped to the app session (the
+            // panel promises "skip for the rest of this session"), and
+            // the UI flips the master switch off on `EmptyRotation`, so
+            // clearing here threw away every lockout the moment the
+            // user locked out the last unlocked channel. Per #757.
             self.next_channel_idx = 0;
             self.hops_since_priority_sweep = 0;
             self.priority_sweep_visited = None;
@@ -321,7 +324,13 @@ impl Scanner {
                 if let Some(visited) = self.priority_sweep_visited.as_mut() {
                     visited.insert(key);
                 }
-                self.advance_cursor_past(idx);
+                // Deliberately leave `next_channel_idx` alone: a sweep is
+                // an interruption of the normal rotation, which must
+                // resume where it left off. Advancing the shared cursor
+                // past the priority channel permanently starved every
+                // normal channel between the interruption point and the
+                // priority channel's successor. The visited set already
+                // prevents re-picking within one sweep. Per #756.
                 return Some(idx);
             }
             // Sweep exhausted — no more unvisited + unlocked priorities.
@@ -543,7 +552,11 @@ impl Scanner {
                 ]
             }
             Some(Phase::AdvanceFromDwell | Phase::AdvanceFromHang) => {
-                self.hops_since_priority_sweep += 1;
+                // The hop counter is owned by `pick_next_channel` (only
+                // normal-rotation picks count). A second increment here
+                // made sweeps fire after ~3 hops instead of
+                // `PRIORITY_CHECK_INTERVAL` and flip-flopped priority-only
+                // lists between sweep and fallback. Per #756.
                 self.advance_rotation()
             }
             None | Some(_) => Vec::new(),
@@ -743,6 +756,107 @@ mod tests {
             samples_consumed: samples,
             sample_rate_hz: NonZeroU32::new(RATE).expect("RATE > 0"),
         }
+    }
+
+    /// Run one dwell-timeout hop (settle, then dwell expiry) and return the
+    /// frequency the scanner retuned to next, if any.
+    fn hop_on_dwell_timeout(s: &mut Scanner) -> Option<u64> {
+        s.handle_event(tick(TICK_PAST_SETTLE));
+        let cmds = s.handle_event(tick(TICK_PAST_DWELL));
+        cmds.iter().find_map(|c| match c {
+            ScannerCommand::Retune { freq_hz, .. } => Some(*freq_hz),
+            _ => None,
+        })
+    }
+
+    /// #756 — the priority sweep must arm after exactly
+    /// `PRIORITY_CHECK_INTERVAL` normal hops, not after ~half that
+    /// (the hop counter used to be incremented twice per hop).
+    #[test]
+    fn priority_sweep_arms_after_exactly_the_check_interval() {
+        let mut s = Scanner::new();
+        let mut channels: Vec<ScannerChannel> = (0..8)
+            .map(|i: u64| ch(&format!("N{i}"), 146_000_000 + i * 25_000, 0))
+            .collect();
+        channels.push(ch("P", 155_000_000, 1));
+        s.handle_event(ScannerEvent::ChannelsChanged(channels));
+        s.handle_event(ScannerEvent::SetEnabled(true)); // retunes to N0 (hop 1)
+
+        let mut visited = vec![146_000_000];
+        for _ in 0..12 {
+            if let Some(f) = hop_on_dwell_timeout(&mut s) {
+                visited.push(f);
+            }
+        }
+        let first_priority = visited
+            .iter()
+            .position(|f| *f == 155_000_000)
+            .expect("priority channel must be visited");
+        assert_eq!(
+            first_priority, PRIORITY_CHECK_INTERVAL as usize,
+            "priority channel should be the hop right after {PRIORITY_CHECK_INTERVAL} normal hops, visited order: {visited:?}"
+        );
+        // The sweep is an interruption: normal rotation resumes at the
+        // next unvisited normal channel, not past the priority channel.
+        assert_eq!(
+            visited[first_priority + 1],
+            146_000_000 + 5 * 25_000,
+            "rotation must resume at N5 after the sweep, visited order: {visited:?}"
+        );
+    }
+
+    /// #756 (second symptom) — on a priority-only list the fallback path
+    /// must not keep arming sweeps (sweep↔fallback flip-flop).
+    #[test]
+    fn priority_only_list_does_not_oscillate_between_sweep_and_fallback() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("P1", 155_000_000, 1),
+            ch("P2", 155_025_000, 1),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        for _ in 0..10 {
+            hop_on_dwell_timeout(&mut s);
+            assert_eq!(
+                s.hops_since_priority_sweep, 0,
+                "fallback hops on a priority-only list must not count toward a sweep"
+            );
+        }
+    }
+
+    /// #757 — lockouts are scoped to the app session, not to one
+    /// enable/disable cycle: the UI turns the master switch off on
+    /// `EmptyRotation`, and a user who just locked out the last noisy
+    /// channel must not get them all back on the next enable.
+    #[test]
+    fn lockouts_survive_disable_and_reenable() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        let key_a = ChannelKey {
+            name: "A".to_string(),
+            frequency_hz: 146_520_000,
+        };
+        s.handle_event(ScannerEvent::LockoutChannel(key_a.clone()));
+        s.handle_event(ScannerEvent::SetEnabled(false));
+        assert!(
+            s.locked_out.contains(&key_a),
+            "lockout must survive disable"
+        );
+        let cmds = s.handle_event(ScannerEvent::SetEnabled(true));
+        assert!(
+            matches!(
+                cmds[0],
+                ScannerCommand::Retune {
+                    freq_hz: 162_550_000,
+                    ..
+                }
+            ),
+            "re-enable must skip the locked-out channel, got {cmds:?}"
+        );
     }
 
     #[test]
@@ -1109,8 +1223,11 @@ mod tests {
         assert!(s.hops_since_priority_sweep > 0);
 
         s.handle_event(ScannerEvent::SetEnabled(false));
-        // Session state should be fully clear after disable.
-        assert!(s.locked_out.is_empty(), "locked_out not cleared on disable");
+        // Rotation state clears after disable; lockouts persist (#757).
+        assert!(
+            s.locked_out.contains(&key_a),
+            "lockouts must persist across disable"
+        );
         assert_eq!(s.next_channel_idx, 0);
         assert_eq!(s.hops_since_priority_sweep, 0);
         assert!(
