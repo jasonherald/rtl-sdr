@@ -1008,9 +1008,6 @@ impl Source for RtlSdrSource {
         device
             .set_direct_sampling(mode)
             .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
-        // Only persist a mode the device actually accepted, so a later
-        // `start()` / `tune()` never replays a rejected setting.
-        self.direct_sampling_mode = mode;
         // Leaving direct sampling re-runs the tuner init array
         // (librtlsdr `set_direct_sampling(0)` → `tuner.init()`),
         // which overwrites the LNA/mixer/VGA gain registers the
@@ -1028,6 +1025,11 @@ impl Source for RtlSdrSource {
                     .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
             }
         }
+        // Persist only after the device accepted the mode AND the gain
+        // restoration completed, so a later `start()` / `tune()` never
+        // replays a rejected setting and a failed restoration stays
+        // retryable (`was_off` is still false on the next mode-0 call).
+        self.direct_sampling_mode = mode;
         Ok(())
     }
 
