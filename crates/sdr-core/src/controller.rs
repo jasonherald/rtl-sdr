@@ -2864,6 +2864,17 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     ScannerMutexReason::RecordingStoppedForScanner,
                 ));
             }
+            // Without a gating squelch there is no carrier detection,
+            // so the scanner can only hop on dwell timeouts and never
+            // stop on activity. Tell the user instead of looking
+            // broken. Per #755.
+            if enabled && !state.radio.if_chain().squelch_active() {
+                let _ = dsp_tx.send(DspToUi::Error(
+                    "Scanner: enable manual or auto squelch so it can detect activity; \
+                     without it the scanner will only cycle through channels."
+                        .to_string(),
+                ));
+            }
             // Scanner ↔ transcription mutex was REMOVED — the two
             // are designed to coexist (issue #517).
             let cmds = state
@@ -3862,6 +3873,17 @@ fn reset_imaging_decoders(state: &mut DspState) {
     state.sstv_pass_stats = SstvPassStats::default();
 }
 
+/// Whether the scanner should treat the squelch as "carrier present".
+///
+/// `IfChain::squelch_open()` reports `true` whenever the squelch is not
+/// gating at all (manual off and auto off), because nothing is muting.
+/// Handing that to the scanner as an `Open` edge latched it in
+/// `Listening` on the first channel forever (#755): only a squelch that is
+/// actually gating can signal activity.
+fn scanner_carrier_present(gating: bool, open: bool) -> bool {
+    gating && open
+}
+
 /// Rebuild the IQ frontend with the current sample rate, preserving user settings.
 fn rebuild_frontend(state: &mut DspState) -> Result<(), String> {
     let mut new_frontend = IqFrontend::new(
@@ -4214,9 +4236,22 @@ fn process_iq_block(
                         // logic below — toggling transcription must not perturb
                         // scanner edge detection. Per CodeRabbit round 1 on PR
                         // #558.
+                        // Raw gate state: `true` whenever nothing is muting,
+                        // including "no squelch configured". The
+                        // transcription edge tracker below consumes this
+                        // as-is (an ungated open squelch must still emit
+                        // `SquelchOpened` after `EnableTranscription`).
                         let now_open = state.radio.if_chain().squelch_open();
-                        if now_open != state.squelch_was_open {
-                            let scanner_edge = if now_open {
+                        // Scanner view: only a *gating* squelch can signal a
+                        // carrier (#755). Kept separate from `now_open` so
+                        // the two consumers don't share one meaning. Per
+                        // CodeRabbit round 1 on PR #783.
+                        let scanner_open = scanner_carrier_present(
+                            state.radio.if_chain().squelch_active(),
+                            now_open,
+                        );
+                        if scanner_open != state.squelch_was_open {
+                            let scanner_edge = if scanner_open {
                                 sdr_scanner::SquelchState::Open
                             } else {
                                 sdr_scanner::SquelchState::Closed
@@ -4224,7 +4259,7 @@ fn process_iq_block(
                             let scan_cmds = state
                                 .scanner
                                 .handle_event(sdr_scanner::ScannerEvent::SquelchEdge(scanner_edge));
-                            state.squelch_was_open = now_open;
+                            state.squelch_was_open = scanner_open;
                             apply_scanner_commands(state, dsp_tx, scan_cmds);
                         }
 
@@ -5363,6 +5398,47 @@ mod tests {
         handle_command(&mut state, &dsp_tx, UiToDsp::SetIqCorrection(true));
         rebuild_frontend(&mut state).unwrap();
         assert!(state.frontend.iq_correction());
+    }
+
+    /// #755 — a squelch that is not gating (manual off, auto off) reports
+    /// "open" permanently; that must never be presented to the scanner as
+    /// a carrier, or it latches in Listening on the first channel.
+    #[test]
+    fn scanner_carrier_requires_a_gating_squelch() {
+        assert!(!scanner_carrier_present(false, true));
+        assert!(!scanner_carrier_present(false, false));
+        assert!(scanner_carrier_present(true, true));
+        assert!(!scanner_carrier_present(true, false));
+    }
+
+    /// #755 — enabling the scanner without any squelch gating is a
+    /// configuration the user needs to hear about.
+    #[test]
+    fn enabling_scanner_without_squelch_warns() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetSquelchEnabled(false));
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetAutoSquelch(false));
+        let _ = drain(&dsp_rx);
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetScannerEnabled(true));
+        let events = drain(&dsp_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::Error(m) if m.to_lowercase().contains("squelch"))),
+            "expected a squelch warning, got {events:?}"
+        );
+
+        // With squelch gating there is no warning.
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetScannerEnabled(false));
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetSquelchEnabled(true));
+        let _ = drain(&dsp_rx);
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetScannerEnabled(true));
+        let events = drain(&dsp_rx);
+        assert!(
+            !events.iter().any(|e| matches!(e, DspToUi::Error(_))),
+            "unexpected error: {events:?}"
+        );
     }
 
     /// #692 (CR round 1) — every path that replaces the frontend must
