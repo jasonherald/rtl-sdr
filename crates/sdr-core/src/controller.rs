@@ -3566,6 +3566,25 @@ fn open_source(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(
         source.tune(state.center_freq).map_err(|e| e.to_string())?;
     }
 
+    // Direct sampling must reach the source BEFORE `start()`, not in
+    // the post-start replay below: `RtlSdrSource::start()` performs the
+    // first `set_center_freq`, and an HF frequency is only tunable once
+    // the RTL2832 is in direct-sampling mode (the R820T can't go below
+    // ~24 MHz). The source is freshly constructed on every Play, so the
+    // mode the user picked while stopped never reached it otherwise —
+    // `start()` failed on the tune and the replay was never reached.
+    // With no device open yet the source just records the mode and
+    // programs it ahead of its first tune.
+    if state.source_type == SourceType::RtlSdr
+        && let Err(e) = source.set_direct_sampling(state.direct_sampling_mode)
+    {
+        tracing::warn!(
+            error = %e,
+            mode = state.direct_sampling_mode,
+            "pre-start direct-sampling dispatch failed"
+        );
+    }
+
     source.start().map_err(|e| e.to_string())?;
 
     // Re-apply persisted RTL-SDR settings to the freshly-opened
