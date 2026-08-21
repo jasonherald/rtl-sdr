@@ -93,6 +93,89 @@ impl DcBlocker {
     }
 }
 
+/// Default adaptation rate for [`IqCorrector`] — the value SDR++'s source
+/// modules pass to `dsp::correction::IQCorrector::init` (`0.00001`).
+/// Small enough that the estimate integrates over ~10⁵ samples (tens of
+/// milliseconds at typical SDR rates) instead of chasing the modulation.
+pub const IQ_CORRECTION_DEFAULT_RATE: f64 = 0.000_01;
+
+/// Adaptive IQ-imbalance corrector.
+///
+/// Ports SDR++ `dsp::correction::IQCorrector` (Moseley–Slump blind
+/// compensation). A receiver with mismatched I/Q gain or phase produces an
+/// image of every signal mirrored about DC; the corrector tracks a single
+/// complex coefficient `c` that minimises the correlation between the
+/// output and its own conjugate:
+///
+/// ```text
+/// y[n] = x[n] − conj(x[n]) · c
+/// c   += y[n]² · rate
+/// ```
+///
+/// It is a plain LMS loop: no divisions, no trig, one complex multiply-add
+/// per sample, and it converges from a cold start on any signal that is not
+/// itself conjugate-symmetric (i.e. anything but a pure real baseband).
+pub struct IqCorrector {
+    correction: Complex,
+    rate: f32,
+}
+
+impl IqCorrector {
+    /// Create a corrector with the given adaptation rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::InvalidParameter` if `rate` is not finite or not in (0, 1).
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn new(rate: f64) -> Result<Self, DspError> {
+        if !rate.is_finite() || rate <= 0.0 || rate >= 1.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "IQ correction rate must be in (0, 1), got {rate}"
+            )));
+        }
+        Ok(Self {
+            correction: Complex::default(),
+            rate: rate as f32,
+        })
+    }
+
+    /// Current imbalance estimate (zero = no correction applied).
+    pub fn correction(&self) -> Complex {
+        self.correction
+    }
+
+    /// Forget the imbalance estimate (e.g. on retune / source restart).
+    pub fn reset(&mut self) {
+        self.correction = Complex::default();
+    }
+
+    /// Process complex samples, cancelling the I/Q image.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DspError::BufferTooSmall` if `output.len() < input.len()`.
+    pub fn process(
+        &mut self,
+        input: &[Complex],
+        output: &mut [Complex],
+    ) -> Result<usize, DspError> {
+        if output.len() < input.len() {
+            return Err(DspError::BufferTooSmall {
+                need: input.len(),
+                got: output.len(),
+            });
+        }
+        let mut c = self.correction;
+        for (x, y) in input.iter().zip(output.iter_mut()) {
+            let out = *x - x.conj() * c;
+            c += (out * out) * self.rate;
+            *y = out;
+        }
+        self.correction = c;
+        Ok(input.len())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -171,5 +254,101 @@ mod tests {
         let mut out2 = vec![Complex::default(); 10];
         dc.process(&zeros, &mut out2).unwrap();
         assert!(out2[0].re.abs() < 1e-6, "after reset, output should be ~0");
+    }
+
+    /// Synthesize a complex tone with gain + phase imbalance between I and Q
+    /// (the classic image-producing receiver defect).
+    #[allow(clippy::cast_precision_loss)]
+    fn imbalanced_tone(n: usize, bin: usize, gain_err: f32, phase_err: f32) -> Vec<Complex> {
+        (0..n)
+            .map(|i| {
+                let theta = 2.0 * std::f32::consts::PI * bin as f32 * i as f32 / n as f32;
+                Complex::new((1.0 + gain_err) * theta.cos(), (theta + phase_err).sin())
+            })
+            .collect()
+    }
+
+    /// Power at DFT bin `k` over `x` (k may be negative for the image).
+    #[allow(clippy::cast_precision_loss)]
+    fn bin_power(x: &[Complex], k: i64) -> f32 {
+        let n = x.len() as f32;
+        let (mut re, mut im) = (0.0_f32, 0.0_f32);
+        for (i, s) in x.iter().enumerate() {
+            let a = -2.0 * std::f32::consts::PI * k as f32 * i as f32 / n;
+            re += s.re * a.cos() - s.im * a.sin();
+            im += s.re * a.sin() + s.im * a.cos();
+        }
+        (re * re + im * im) / (n * n)
+    }
+
+    #[test]
+    fn iq_corrector_rejects_invalid_rate() {
+        assert!(IqCorrector::new(0.0).is_err());
+        assert!(IqCorrector::new(-1e-5).is_err());
+        assert!(IqCorrector::new(f64::NAN).is_err());
+        assert!(IqCorrector::new(1.5).is_err());
+        assert!(IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).is_ok());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn iq_corrector_improves_image_rejection() {
+        // 64 k samples of a tone at +fs/8 with 10 % gain and 0.1 rad phase error.
+        const N: usize = 65_536;
+        const BIN: usize = N / 8;
+        let input = imbalanced_tone(N, BIN, 0.10, 0.10);
+        let tail = &input[N - 8192..];
+        let before = bin_power(tail, -(BIN as i64 / 8)) / bin_power(tail, BIN as i64 / 8);
+
+        // LMS time constant is 1/(2·rate) = 50 k samples; run ~6 time
+        // constants (the tone is periodic in N, so repeated passes are
+        // a continuous signal).
+        let mut corr = IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).unwrap();
+        let mut output = vec![Complex::default(); N];
+        for _ in 0..5 {
+            let n = corr.process(&input, &mut output).unwrap();
+            assert_eq!(n, N);
+        }
+        let tail = &output[N - 8192..];
+        let after = bin_power(tail, -(BIN as i64 / 8)) / bin_power(tail, BIN as i64 / 8);
+
+        let improvement_db = 10.0 * (before / after).log10();
+        assert!(
+            improvement_db > 20.0,
+            "image rejection should improve by > 20 dB once converged, got {improvement_db:.1} dB (before {before:e}, after {after:e})"
+        );
+    }
+
+    #[test]
+    fn iq_corrector_passes_balanced_signal_unchanged() {
+        let input = imbalanced_tone(4096, 512, 0.0, 0.0);
+        let mut corr = IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).unwrap();
+        let mut output = vec![Complex::default(); 4096];
+        corr.process(&input, &mut output).unwrap();
+        for (a, b) in input.iter().zip(&output) {
+            assert!((a.re - b.re).abs() < 1e-3 && (a.im - b.im).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn iq_corrector_reset_clears_estimate() {
+        let input = imbalanced_tone(16_384, 2048, 0.2, 0.0);
+        let mut corr = IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).unwrap();
+        let mut output = vec![Complex::default(); input.len()];
+        corr.process(&input, &mut output).unwrap();
+        assert!(corr.correction().amplitude() > 0.0);
+        corr.reset();
+        assert!(corr.correction().amplitude() < f32::EPSILON);
+    }
+
+    #[test]
+    fn iq_corrector_buffer_too_small() {
+        let mut corr = IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).unwrap();
+        let input = vec![Complex::default(); 8];
+        let mut output = vec![Complex::default(); 4];
+        assert!(matches!(
+            corr.process(&input, &mut output),
+            Err(DspError::BufferTooSmall { .. })
+        ));
     }
 }

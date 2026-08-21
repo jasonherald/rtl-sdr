@@ -347,6 +347,8 @@ struct DspState {
 
     // Persisted frontend settings (restored after rebuild)
     dc_blocking: bool,
+    /// IQ-imbalance correction engaged (independent of `dc_blocking`; #692).
+    iq_correction: bool,
     invert_iq: bool,
     window_fn: FftWindow,
     fft_rate: f64,
@@ -737,6 +739,7 @@ impl DspState {
             configured_sample_rate: DEFAULT_SAMPLE_RATE,
             volume: 1.0,
             dc_blocking: true,
+            iq_correction: false,
             invert_iq: false,
             window_fn: FftWindow::Nuttall,
             fft_rate: DEFAULT_FFT_RATE,
@@ -1493,6 +1496,18 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             tracing::info!(target: "tune", requested_hz = freq, "DSP_APPLY_REQUEST");
             on_tune_change(state);
             state.center_freq = freq;
+            // A centre-frequency tune is a fresh start for the VFO: the
+            // UI already zeroes its overlay offset on every tune path
+            // (`set_center_frequency`), but the engine kept demodulating
+            // at `center + old_offset`. Reset here and echo so the
+            // header / status bar / overlay all agree. Per #764.
+            if state.vfo_offset != 0.0 {
+                state.vfo_offset = 0.0;
+                if let Some(vfo) = &mut state.vfo {
+                    vfo.set_offset(0.0);
+                }
+                let _ = dsp_tx.send(DspToUi::VfoOffsetChanged(0.0));
+            }
             if let Some(source) = &mut state.source
                 && let Err(e) = source.tune(freq)
             {
@@ -1543,6 +1558,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                     state.frontend.effective_sample_rate(),
                 ));
                 let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
+                // The bandwidth was just reset to the new mode's default;
+                // echo it so the Radio-panel row, status bar and spectrum
+                // VFO width track the engine instead of keeping the old
+                // mode's value whenever it happens to fall inside the new
+                // range. Same echo `SetBandwidth` already emits. Per #697.
+                let _ = dsp_tx.send(DspToUi::BandwidthChanged(state.bandwidth));
 
                 // Notify the UI of the mode transition (edge detection — only
                 // when the mode actually changed so idempotent refreshes do not
@@ -1841,13 +1862,14 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetIqCorrection(enabled) => {
-            // IQ correction removes DC offset from the IQ signal.
-            // Route to the DC blocker which serves the same purpose.
-            tracing::debug!(enabled, "set IQ correction (via DC blocker)");
-            state.dc_blocking = enabled;
-            if let Err(e) = state.frontend.set_dc_blocking(enabled) {
-                tracing::warn!("set IQ correction failed: {e}");
-            }
+            // Adaptive I/Q-imbalance (image) correction — its own
+            // pipeline stage, NOT the DC blocker. The two used to share
+            // `state.dc_blocking`, so the startup replay of this switch
+            // (default off) silently disabled DC blocking (default on)
+            // on every launch. Per #692.
+            tracing::debug!(enabled, "set IQ correction");
+            state.iq_correction = enabled;
+            state.frontend.set_iq_correction(enabled);
         }
 
         UiToDsp::SetWindowFunction(window) => {
@@ -3856,6 +3878,7 @@ fn rebuild_frontend(state: &mut DspState) -> Result<(), String> {
     .map_err(|e| format!("frontend rebuild: {e}"))?;
 
     new_frontend.set_invert_iq(state.invert_iq);
+    new_frontend.set_iq_correction(state.iq_correction);
     new_frontend.set_fft_rate(state.fft_rate);
     new_frontend.set_fft_enabled(state.fft_enabled);
     state.frontend = new_frontend;
@@ -5290,6 +5313,101 @@ mod tests {
         assert_eq!(state.tuner_gain_tenths_db, 0);
         assert!(state.tuner_gain_index.is_none());
         assert_eq!(state.ppm_correction, 0);
+    }
+
+    /// Drain every pending `DspToUi` event from `rx`.
+    fn drain(rx: &mpsc::Receiver<DspToUi>) -> Vec<DspToUi> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// #692 — the IQ-correction switch must not share state with DC blocking.
+    #[test]
+    fn set_iq_correction_does_not_alias_dc_blocking() {
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetDcBlocking(true));
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetIqCorrection(false));
+        assert!(
+            state.dc_blocking,
+            "IQ correction off must leave DC blocking on"
+        );
+        assert!(!state.iq_correction);
+        assert!(!state.frontend.iq_correction());
+
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetIqCorrection(true));
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetDcBlocking(false));
+        assert!(
+            state.iq_correction,
+            "DC blocking off must leave IQ correction on"
+        );
+        assert!(state.frontend.iq_correction());
+        assert!(!state.dc_blocking);
+    }
+
+    /// #692 — a frontend rebuild (sample-rate change) must carry the IQ-correction setting.
+    #[test]
+    fn rebuild_frontend_preserves_iq_correction() {
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetIqCorrection(true));
+        rebuild_frontend(&mut state).unwrap();
+        assert!(state.frontend.iq_correction());
+    }
+
+    /// #697 — a mode switch resets the bandwidth to the mode default and
+    /// must tell the UI so row / overlay / status bar agree with the engine.
+    #[test]
+    fn set_demod_mode_emits_bandwidth_changed_with_mode_default() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        rebuild_vfo(&mut state).unwrap();
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetBandwidth(12_000.0));
+        let _ = drain(&dsp_rx);
+
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetDemodMode(sdr_types::DemodMode::Am),
+        );
+        let expected = state.radio.demod_config().default_bandwidth;
+        assert!((state.bandwidth - expected).abs() < f64::EPSILON);
+        let events = drain(&dsp_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::BandwidthChanged(bw) if (bw - expected).abs() < f64::EPSILON)),
+            "expected BandwidthChanged({expected}), got {events:?}"
+        );
+    }
+
+    /// #764 — tuning to a new centre frequency is a fresh start: the VFO
+    /// offset must reset to 0 in the engine (the UI overlay already does)
+    /// and the reset must be echoed so every readout agrees.
+    #[test]
+    fn tune_resets_vfo_offset_and_echoes_it() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        rebuild_vfo(&mut state).unwrap();
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetVfoOffset(50_000.0));
+        assert!((state.vfo_offset - 50_000.0).abs() < f64::EPSILON);
+        let _ = drain(&dsp_rx);
+
+        handle_command(&mut state, &dsp_tx, UiToDsp::Tune(101_000_000.0));
+        assert!(
+            state.vfo_offset.abs() < f64::EPSILON,
+            "Tune must reset the engine VFO offset"
+        );
+        let events = drain(&dsp_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::VfoOffsetChanged(o) if o.abs() < f64::EPSILON)),
+            "expected VfoOffsetChanged(0.0), got {events:?}"
+        );
     }
 
     #[test]
