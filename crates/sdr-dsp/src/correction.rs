@@ -139,7 +139,7 @@ pub const IQ_CORRECTION_MAX_UPDATE_POWER: f32 = 16.0;
 /// Like the SDR++ original, the step size is proportional to sample power
 /// (`y²·rate`), so the loop is tuned for IQ normalised to roughly ±1 —
 /// which is what [`crate::convert`] produces from 8-bit samples and what
-/// `IqFrontend` feeds it. Grossly over-scaled input (|x| ≫ 1) would
+/// `IqFrontend` feeds it. Grossly over-scaled input (|x| ≫ 1) 
 /// would overflow the `f32` estimate within a few samples. Because float
 /// sources (`FileSource`, `NetworkSource::Float32`) hand samples through
 /// unscaled, `process` therefore only trains on samples whose output
