@@ -130,6 +130,13 @@ const RAW_BUF_SIZE: usize = 262_144;
 /// ~1.0 s buffer, plenty of headroom for DSP bursts.
 const RING_SLOTS: usize = 16;
 
+/// How long the USB reader sleeps between checks while the ring is
+/// full (DSP behind). Bounded sleep rather than `yield_now()`: a yield
+/// returns immediately when nothing else is runnable, so the reader
+/// would spin a core and starve the very DSP thread it is waiting on.
+/// 100 µs is well under one USB bulk transfer (~65 ms at 2 MSPS).
+const RING_FULL_BACKOFF: Duration = Duration::from_micros(100);
+
 /// RTL-SDR USB sample rates (Hz).
 pub const SAMPLE_RATES: &[f64] = &[
     250_000.0,
@@ -277,7 +284,7 @@ fn run_reader_thread(
     let mut retry_budget = ReadRetryBudget::default();
 
     while cancel.load(Ordering::Acquire) {
-        // Find an empty slot; yield briefly if the ring is full
+        // Find an empty slot; back off briefly if the ring is full
         // (DSP can't keep up). Checking cancel here bounds
         // worst-case shutdown latency to one in-flight USB read
         // (~65 ms typical, up to one read timeout on stalled
@@ -290,7 +297,7 @@ fn run_reader_thread(
                 tracing::debug!("USB reader thread stopping (ring-full wait)");
                 return;
             }
-            std::thread::yield_now();
+            std::thread::sleep(RING_FULL_BACKOFF);
         }
 
         let Ok(mut data) = slot.data.lock() else {
