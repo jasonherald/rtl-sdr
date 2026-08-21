@@ -1668,6 +1668,30 @@ mod tests {
         );
     }
 
+    // ---- FM-IF-NR streaming fixture parameters (#773) ----
+    /// Default block size of `FmIfNoiseReduction::new()`.
+    const FMIF_FFT: usize = FM_IF_NR_FFT_SIZE;
+    /// Tone bin (cycles per block) and noise amplitude of the fixture.
+    const FMIF_TONE_BIN: f32 = 37.0;
+    const FMIF_NOISE_AMPLITUDE: f32 = 0.3;
+    /// Whole-stream length for the chunking / small-chunk tests, in blocks.
+    const FMIF_STREAM_BLOCKS: usize = 12;
+    /// A chunk size that is not a multiple of the block (exposes the old
+    /// double-emission) and one smaller than a block (exposes the old
+    /// passthrough latch).
+    const FMIF_ODD_CHUNK: usize = 300;
+    const FMIF_SMALL_CHUNK: usize = 100;
+    /// Partial remainder appended for the flush test.
+    const FMIF_FLUSH_TAIL: usize = 100;
+    /// `flush` emits at most two blocks.
+    const FMIF_FLUSH_CAPACITY: usize = 2 * FMIF_FFT;
+    /// Sample-equality tolerance between two runs.
+    const FMIF_SAMPLE_TOL: f32 = 1e-4;
+
+    fn fmif_close(a: Complex, b: Complex) -> bool {
+        (a.re - b.re).abs() < FMIF_SAMPLE_TOL && (a.im - b.im).abs() < FMIF_SAMPLE_TOL
+    }
+
     /// Tone + deterministic noise for FM-IF-NR streaming tests.
     fn fmif_test_signal(len: usize) -> Vec<Complex> {
         let mut seed: u32 = 0x1234_5678;
@@ -1675,8 +1699,12 @@ mod tests {
             .map(|i| {
                 seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 let noise = (seed >> 8) as f32 / 16_777_216.0 - 0.5;
-                let theta = 2.0 * core::f32::consts::PI * 37.0 * i as f32 / 256.0;
-                Complex::new(theta.cos() + 0.3 * noise, theta.sin() + 0.3 * noise)
+                let theta =
+                    2.0 * core::f32::consts::PI * FMIF_TONE_BIN * i as f32 / FMIF_FFT as f32;
+                Complex::new(
+                    theta.cos() + FMIF_NOISE_AMPLITUDE * noise,
+                    theta.sin() + FMIF_NOISE_AMPLITUDE * noise,
+                )
             })
             .collect()
     }
@@ -1696,15 +1724,18 @@ mod tests {
     /// of how the input is chunked (no duplicated or reordered tails).
     #[test]
     fn fm_if_nr_output_is_chunking_independent() {
-        let input = fmif_test_signal(256 * 12);
+        let input = fmif_test_signal(FMIF_FFT * FMIF_STREAM_BLOCKS);
         let whole = run_fmif_chunked(&input, input.len());
-        let odd = run_fmif_chunked(&input, 300);
+        let odd = run_fmif_chunked(&input, FMIF_ODD_CHUNK);
         let n = whole.len().min(odd.len());
-        assert!(n >= 256 * 10, "too little output to compare: {n}");
+        assert!(
+            n >= FMIF_FFT * (FMIF_STREAM_BLOCKS - 2),
+            "too little output to compare: {n}"
+        );
         for i in 0..n {
             assert!(
-                (whole[i].re - odd[i].re).abs() < 1e-4 && (whole[i].im - odd[i].im).abs() < 1e-4,
-                "sample {i} differs between whole-buffer and 300-sample chunking: {:?} vs {:?}",
+                fmif_close(whole[i], odd[i]),
+                "sample {i} differs between whole-buffer and {FMIF_ODD_CHUNK}-sample chunking: {:?} vs {:?}",
                 whole[i],
                 odd[i]
             );
@@ -1715,10 +1746,10 @@ mod tests {
     /// block so every input sample comes out exactly once, in order.
     #[test]
     fn fm_if_nr_flush_emits_every_buffered_sample() {
-        let input = fmif_test_signal(256 * 4 + 100);
+        let input = fmif_test_signal(FMIF_FFT * 4 + FMIF_FLUSH_TAIL);
         let mut nr = FmIfNoiseReduction::new().unwrap();
         let mut out = Vec::new();
-        for c in input.chunks(300) {
+        for c in input.chunks(FMIF_ODD_CHUNK) {
             let mut buf = vec![Complex::default(); c.len()];
             let n = nr.process(c, &mut buf).unwrap();
             out.extend_from_slice(&buf[..n]);
@@ -1727,7 +1758,7 @@ mod tests {
             out.len() < input.len(),
             "some samples should still be buffered"
         );
-        let mut tail = vec![Complex::default(); 2 * 256];
+        let mut tail = vec![Complex::default(); FMIF_FLUSH_CAPACITY];
         let n = nr.flush(&mut tail).unwrap();
         out.extend_from_slice(&tail[..n]);
         assert_eq!(
@@ -1746,10 +1777,7 @@ mod tests {
         wout.extend_from_slice(&tail[..wf]);
         assert_eq!(wout.len(), out.len());
         for i in 0..out.len() {
-            assert!(
-                (wout[i].re - out[i].re).abs() < 1e-4 && (wout[i].im - out[i].im).abs() < 1e-4,
-                "sample {i} differs"
-            );
+            assert!(fmif_close(wout[i], out[i]), "sample {i} differs");
         }
     }
 
@@ -1757,11 +1785,11 @@ mod tests {
     /// processed (not latch into raw passthrough forever).
     #[test]
     fn fm_if_nr_small_chunks_keep_processing() {
-        let input = fmif_test_signal(256 * 12);
-        let out = run_fmif_chunked(&input, 100);
+        let input = fmif_test_signal(FMIF_FFT * FMIF_STREAM_BLOCKS);
+        let out = run_fmif_chunked(&input, FMIF_SMALL_CHUNK);
         // Allow up to two blocks of latency, but everything else must come out…
         assert!(
-            out.len() + 2 * 256 >= input.len(),
+            out.len() + FMIF_FLUSH_CAPACITY >= input.len(),
             "emitted only {} of {}",
             out.len(),
             input.len()
@@ -1770,8 +1798,8 @@ mod tests {
         let differs = out
             .iter()
             .zip(&input)
-            .skip(256 * 2)
-            .filter(|(o, i)| (o.re - i.re).abs() > 1e-3 || (o.im - i.im).abs() > 1e-3)
+            .skip(2 * FMIF_FFT)
+            .filter(|(o, i)| !fmif_close(**o, **i))
             .count();
         assert!(
             differs > out.len() / 2,
