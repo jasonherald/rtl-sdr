@@ -108,6 +108,15 @@ impl DcBlocker {
 /// milliseconds at typical SDR rates) instead of chasing the modulation.
 pub const IQ_CORRECTION_DEFAULT_RATE: f64 = 0.000_01;
 
+/// Largest per-sample output power (|y|²) for which the LMS estimate is
+/// updated. The SDR++ loop is tuned for IQ normalised to ±1 (|y|² ≤ 2 for
+/// a full-scale sample); anything an order of magnitude above that is
+/// out-of-contract input (float sources pass samples through unscaled),
+/// and adapting on it would drive the `f32` estimate to infinity within a
+/// few samples. Such samples are still corrected with the current
+/// estimate; they just do not train it.
+pub const IQ_CORRECTION_MAX_UPDATE_POWER: f32 = 16.0;
+
 /// Adaptive IQ-imbalance corrector.
 ///
 /// Ports SDR++ `dsp::correction::IQCorrector` (Moseley–Slump blind
@@ -131,9 +140,14 @@ pub const IQ_CORRECTION_DEFAULT_RATE: f64 = 0.000_01;
 /// (`y²·rate`), so the loop is tuned for IQ normalised to roughly ±1 —
 /// which is what [`crate::convert`] produces from 8-bit samples and what
 /// `IqFrontend` feeds it. Grossly over-scaled input (|x| ≫ 1) would
-/// overflow the `f32` estimate; rather than silently emit NaN forever,
-/// `process` re-arms the estimate to zero whenever it stops being finite,
-/// so the corrector recovers on the next in-contract block.
+/// would overflow the `f32` estimate within a few samples. Because float
+/// sources (`FileSource`, `NetworkSource::Float32`) hand samples through
+/// unscaled, `process` therefore only trains on samples whose output
+/// power is at most [`IQ_CORRECTION_MAX_UPDATE_POWER`] — over-scaled
+/// samples are still corrected with the current estimate, so the output
+/// stays finite — and additionally re-arms the estimate to zero if it ever
+/// stops being finite. For in-contract input the update is identical to
+/// the SDR++ original.
 pub struct IqCorrector {
     correction: Complex,
     rate: f32,
@@ -198,7 +212,10 @@ impl IqCorrector {
         let mut c = self.correction;
         for (x, y) in input.iter().zip(output.iter_mut()) {
             let out = *x - x.conj() * c;
-            c += (out * out) * self.rate;
+            let power = out.re * out.re + out.im * out.im;
+            if power <= IQ_CORRECTION_MAX_UPDATE_POWER {
+                c += (out * out) * self.rate;
+            }
             *y = out;
         }
         // Self-heal: an out-of-contract block (see "Input scale") can blow
@@ -438,6 +455,13 @@ mod tests {
         let blast = vec![Complex::new(IQ_TEST_OVERSCALE_AMPLITUDE, 0.0); IQ_TEST_OVERSCALE_LEN];
         let mut out = vec![Complex::default(); IQ_TEST_OVERSCALE_LEN];
         corr.process(&blast, &mut out).unwrap();
+        // Float sources (FileSource, NetworkSource::Float32) pass samples
+        // through unscaled, so the output must stay finite *during* the
+        // over-scaled block too, not just after it.
+        assert!(
+            out.iter().all(|s| s.re.is_finite() && s.im.is_finite()),
+            "output must stay finite during an over-scaled block"
+        );
         assert!(
             corr.correction().re.is_finite() && corr.correction().im.is_finite(),
             "estimate must be finite after an over-scaled block, got {:?}",
