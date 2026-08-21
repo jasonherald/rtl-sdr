@@ -7,7 +7,7 @@
 //! - FFT computation for waterfall display (with sample accumulation)
 //! - Fan-out to multiple VFO consumers
 
-use sdr_dsp::correction::DcBlocker;
+use sdr_dsp::correction::{DcBlocker, IQ_CORRECTION_DEFAULT_RATE, IqCorrector};
 use sdr_dsp::fft::{self, FftEngine, RustFftEngine};
 use sdr_dsp::multirate::PowerDecimator;
 use sdr_dsp::window;
@@ -69,6 +69,8 @@ pub struct IqFrontend {
     // Pre-processing
     decimator: Option<PowerDecimator>,
     dc_blocker: Option<DcBlocker>,
+    /// Adaptive I/Q-imbalance corrector (Step 5); `None` when disabled.
+    iq_corrector: Option<IqCorrector>,
     invert_iq: bool,
 
     // FFT
@@ -173,6 +175,7 @@ impl IqFrontend {
             effective_sample_rate,
             decimator,
             dc_blocker,
+            iq_corrector: None,
             invert_iq: false,
             fft_size,
             fft_engine,
@@ -268,6 +271,25 @@ impl IqFrontend {
     /// Enable or disable IQ inversion correction.
     pub fn set_invert_iq(&mut self, invert: bool) {
         self.invert_iq = invert;
+    }
+
+    /// Enable or disable adaptive IQ-imbalance correction (image
+    /// cancellation). Independent of DC blocking — they fix different
+    /// receiver defects and live in different pipeline stages.
+    pub fn set_iq_correction(&mut self, enabled: bool) {
+        self.iq_corrector = if enabled {
+            // Default rate is validated at compile time to be in (0, 1);
+            // `new` cannot fail for it, so a failure here is a bug.
+            IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).ok()
+        } else {
+            None
+        };
+    }
+
+    /// Whether the IQ-imbalance corrector stage is engaged.
+    #[must_use]
+    pub fn iq_correction(&self) -> bool {
+        self.iq_corrector.is_some()
     }
 
     /// Enable or disable DC blocking.
@@ -440,6 +462,15 @@ impl IqFrontend {
             self.dc_scratch.resize(processed, Complex::default());
             self.dc_scratch.copy_from_slice(&output[..processed]);
             dc.process(&self.dc_scratch, &mut output[..processed])?;
+        }
+
+        // Step 5: IQ-imbalance correction — demod path only. Runs after
+        // DC blocking so the LMS estimate is not biased by a DC offset
+        // (a DC term is its own conjugate and would pull `c` off).
+        if let Some(iq) = &mut self.iq_corrector {
+            self.dc_scratch.resize(processed, Complex::default());
+            self.dc_scratch.copy_from_slice(&output[..processed]);
+            iq.process(&self.dc_scratch, &mut output[..processed])?;
         }
 
         Ok((processed, fft_ready))
@@ -684,6 +715,55 @@ mod tests {
 
         fe.process(&input, &mut output, &mut fft_out).unwrap();
         assert!((output[0].im - (-2.0)).abs() < 1e-6, "im should be negated");
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn iq_correction_stage_is_off_by_default_and_toggles() {
+        let mut fe = IqFrontend::new(
+            TEST_SAMPLE_RATE,
+            1,
+            TEST_FFT_SIZE,
+            FftWindow::Rectangular,
+            false,
+        )
+        .unwrap();
+        assert!(!fe.iq_correction());
+        fe.set_iq_correction(true);
+        assert!(fe.iq_correction());
+
+        // With the stage engaged, a gain-imbalanced tone is pulled toward
+        // balance: the corrector must actually touch the samples.
+        let n = 8192;
+        let input: Vec<Complex> = (0..n)
+            .map(|i| {
+                let theta = 2.0 * std::f32::consts::PI * (i as f32) / 16.0;
+                Complex::new(1.3 * theta.cos(), theta.sin())
+            })
+            .collect();
+        let mut output = vec![Complex::default(); n];
+        let mut fft_out = vec![0.0_f32; TEST_FFT_SIZE];
+        for _ in 0..8 {
+            fe.process(&input, &mut output, &mut fft_out).unwrap();
+        }
+        let changed = input
+            .iter()
+            .zip(&output)
+            .any(|(a, b)| (a.re - b.re).abs() > 1e-3 || (a.im - b.im).abs() > 1e-3);
+        assert!(
+            changed,
+            "IQ correction stage must modify an imbalanced signal"
+        );
+
+        fe.set_iq_correction(false);
+        fe.process(&input, &mut output, &mut fft_out).unwrap();
+        assert!(
+            input
+                .iter()
+                .zip(&output)
+                .all(|(a, b)| (a.re - b.re).abs() < 1e-6 && (a.im - b.im).abs() < 1e-6),
+            "disabled stage must pass samples through untouched"
+        );
     }
 
     #[test]
