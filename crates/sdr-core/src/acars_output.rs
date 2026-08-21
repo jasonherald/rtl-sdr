@@ -602,7 +602,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested").join("subdir").join("acars.jsonl");
         let writer = JsonlWriter::open(&path).unwrap();
-        assert!(writer.path() == path);
+        assert_eq!(writer.path(), path);
         assert!(path.exists());
     }
 

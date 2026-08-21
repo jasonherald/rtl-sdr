@@ -8030,7 +8030,9 @@ fn connect_source_panel(
                 let msg = if idx == sidebar::source_panel::DIRECT_SAMPLING_DISABLED_IDX {
                     "Direct Sampling off — retune to VHF/UHF."
                 } else {
-                    "Direct Sampling on — retune to an HF frequency (< 28 MHz)."
+                    // No `<` here: `adw::Toast` titles are Pango markup and
+                    // "(< 28 MHz)" failed to parse (GTK-WARNING, blank toast).
+                    "Direct Sampling on — retune to an HF frequency (below 28 MHz)."
                 };
                 overlay.add_toast(adw::Toast::new(msg));
             }

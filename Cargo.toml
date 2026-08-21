@@ -174,8 +174,17 @@ ksni = { version = "0.3", default-features = false, features = ["async-io"] }
 smol = "2"
 
 # HTTP / XML (RadioReference)
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-quick-xml = "0.37"
+# `rustls-no-provider` + a direct `rustls` dep pinned to the pure-Rust
+# `ring` provider: reqwest 0.13's plain `rustls` feature defaults to
+# aws-lc-rs (C crypto built through cmake), which deny.toml's no-C-TLS
+# policy is meant to keep out. Server certificates are checked through
+# `rustls-platform-verifier` (the OS trust store — reqwest 0.13.4
+# removed the bundled `webpki-roots` option). Every crate that enables
+# `reqwest` must also list `rustls` so a standalone
+# `cargo test -p <crate>` still has a process-level CryptoProvider.
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+quick-xml = "0.41"
 
 # Secure credential storage. keyring 4 is a ground-up rewrite: a
 # `keyring-core` runtime plus pluggable backend "store" crates. The
@@ -257,7 +266,7 @@ rustfft = "6"
 rusb = "0.9"
 
 # Audio (PipeWire on Linux)
-pipewire = "0.9"
+pipewire = "0.10"
 
 # Audio (CoreAudio / AUHAL on macOS). Spec called for 0.12, but 0.14 is
 # the current maintained release; same surface, no breaking changes that
@@ -277,7 +286,7 @@ mdns-sd = "0.19"
 # for its first-class frame-format streaming API that
 # transparently handles chunk framing for our per-connection
 # codec wrapper.
-lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "frame"] }
 
 # Zero-copy type casting
 bytemuck = { version = "1", features = ["derive"] }
@@ -299,8 +308,8 @@ num-complex = { version = "0.4", features = ["bytemuck"] }
 # which is what the `RTL-SDR` project supports anyway. `pollster`
 # drives wgpu's async surface to completion on the sync `FftEngine::
 # forward` path without pulling in a full async runtime.
-wgpu = "29"
-pollster = "0.4"
+wgpu = "30"
+pollster = "1"
 
 # GTK4 / UI
 gtk4 = { version = "0.11", features = ["v4_10"] }
@@ -312,7 +321,7 @@ cairo-rs = { version = "0.22", features = ["png"] }
 # `cargo_bench_support` turns on. Keeping the pin workspace-wide so the
 # GPU-acceleration sub-tickets (#179-#182) pick up the same version as
 # the CPU baseline harness in sdr-dsp.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 # Temporary-directory helpers for tests. Used by sdr-ui's autostart module
 # tests to exercise the XDG .desktop writer against an isolated path

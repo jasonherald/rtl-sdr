@@ -120,6 +120,8 @@ pub fn download_model(
     let part = dir.join(format!("{filename}.part"));
     tracing::info!(?dest, model = ?model, "downloading Whisper model");
 
+    crate::ensure_tls_provider();
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_mins(2))
         .build()?;

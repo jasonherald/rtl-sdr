@@ -405,6 +405,9 @@ impl GpuFftEngine {
                     power_preference: opts.power_preference,
                     force_fallback_adapter: opts.force_fallback_adapter,
                     compatible_surface: None,
+                    // wgpu 30: opt-in limit bucketing (anti-fingerprinting
+                    // on web). Off — we want the adapter's real limits.
+                    apply_limit_buckets: false,
                 })
                 .await
                 .map_err(|e| DspError::GpuUnavailable(format!("request_adapter failed: {e}")))?
@@ -1011,27 +1014,39 @@ impl FftEngine for GpuFftEngine {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *slot = Some(res);
         });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| DspError::GpuUnavailable(format!("device poll failed: {e}")))?;
-        let map_result = self
-            .map_complete
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .ok_or_else(|| {
-                DspError::GpuUnavailable("map_async callback did not fire during poll".into())
+        // Steps 4b-5 run inside a closure so that `staging.unmap()`
+        // executes on *every* exit — a failed poll / map / range
+        // would otherwise leave the buffer in the mapped state and
+        // make the next `forward()`'s `map_async` fail. `unmap` on a
+        // buffer whose map never completed is a no-op cancel. Per
+        // `CodeRabbit` round 1 on PR #691.
+        let mut readback = || -> Result<(), DspError> {
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| DspError::GpuUnavailable(format!("device poll failed: {e}")))?;
+            let map_result = self
+                .map_complete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| {
+                    DspError::GpuUnavailable("map_async callback did not fire during poll".into())
+                })?;
+            map_result.map_err(|e| DspError::GpuUnavailable(format!("staging map failed: {e}")))?;
+
+            // 5. Copy mapped bytes into the caller's buffer.
+            // wgpu 30: `get_mapped_range` reports an out-of-range /
+            // unmapped slice as an error instead of panicking.
+            let data = slice.get_mapped_range().map_err(|e| {
+                DspError::GpuUnavailable(format!("staging mapped range failed: {e}"))
             })?;
-        map_result.map_err(|e| DspError::GpuUnavailable(format!("staging map failed: {e}")))?;
-
-        // 5. Copy mapped bytes into the caller's buffer.
-        let data = slice.get_mapped_range();
-        let as_complex: &[Complex] = bytemuck::cast_slice(&data);
-        buf.copy_from_slice(as_complex);
-        drop(data);
+            let as_complex: &[Complex] = bytemuck::cast_slice(&data);
+            buf.copy_from_slice(as_complex);
+            Ok(())
+        };
+        let result = readback();
         self.staging.unmap();
-
-        Ok(())
+        result
     }
 
     fn size(&self) -> usize {

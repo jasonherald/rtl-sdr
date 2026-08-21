@@ -216,7 +216,7 @@ impl Demodulator for WfmDemodulator {
             // actually put through the speakers.
             self.agc_mono_buf.resize(count, 0.0);
             for (i, s) in output[..count].iter().enumerate() {
-                self.agc_mono_buf[i] = (0.5 * (s.l * s.l + s.r * s.r)).sqrt();
+                self.agc_mono_buf[i] = f32::midpoint(s.l * s.l, s.r * s.r).sqrt();
             }
             self.agc_buf.resize(count, 0.0);
             self.audio_agc

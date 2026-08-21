@@ -273,7 +273,7 @@ mod tests {
         let encoded = ccsds_encode(&input_bits);
         let mut dec = ViterbiDecoder::new();
         let mut decoded: Vec<u8> = Vec::new();
-        for chunk in encoded.chunks_exact(2) {
+        for chunk in encoded.as_chunks::<2>().0 {
             if let Some(bit) = dec.step([chunk[0], chunk[1]]) {
                 decoded.push(bit);
             }
@@ -378,7 +378,7 @@ mod proptests {
             let encoded = ccsds_encode(&bits);
             let mut dec = ViterbiDecoder::new();
             let mut decoded: Vec<u8> = Vec::new();
-            for chunk in encoded.chunks_exact(2) {
+            for chunk in encoded.as_chunks::<2>().0 {
                 if let Some(bit) = dec.step([chunk[0], chunk[1]]) {
                     decoded.push(bit);
                 }
@@ -412,7 +412,7 @@ mod proptests {
             encoded[i] = -encoded[i];
             let mut dec = ViterbiDecoder::new();
             let mut decoded: Vec<u8> = Vec::new();
-            for chunk in encoded.chunks_exact(2) {
+            for chunk in encoded.as_chunks::<2>().0 {
                 if let Some(bit) = dec.step([chunk[0], chunk[1]]) {
                     decoded.push(bit);
                 }

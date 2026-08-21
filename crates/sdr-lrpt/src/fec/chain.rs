@@ -227,7 +227,7 @@ impl FecChain {
                         partial_count: 0,
                     };
                     let mut emitted: Option<Vec<u8>> = None;
-                    for pair_chunk in window.chunks_exact(2) {
+                    for pair_chunk in window.as_chunks::<2>().0 {
                         let pair = [pair_chunk[0], pair_chunk[1]];
                         let rotated = rotation.apply(pair);
                         if let Some(bit) = self.viterbi.step(rotated) {
@@ -641,7 +641,7 @@ mod tests {
         for (idx, rot) in Rotation::ALL.iter().enumerate() {
             let mut chain = FecChain::new();
             let mut decoded: Option<Vec<u8>> = None;
-            for pair_chunk in soft.chunks_exact(2) {
+            for pair_chunk in soft.as_chunks::<2>().0 {
                 let pair = [pair_chunk[0], pair_chunk[1]];
                 let rotated = forward_rotation(idx, pair);
                 if let Some(vcdu) = chain.push_symbol(rotated)

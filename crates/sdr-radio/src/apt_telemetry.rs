@@ -240,7 +240,7 @@ fn find_frame_start(line_avgs: &[u8]) -> (usize, f32) {
         }
     }
     // Map [-1, 1] correlation to [0, 1] for the quality metric.
-    let quality = (best.1 + 1.0) * 0.5;
+    let quality = f32::midpoint(best.1, 1.0);
     (best.0, quality.clamp(0.0, 1.0))
 }
 

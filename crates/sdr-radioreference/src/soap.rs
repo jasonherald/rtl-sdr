@@ -6,7 +6,8 @@ use std::io::Cursor;
 
 use quick_xml::Reader;
 use quick_xml::Writer;
-use quick_xml::events::{BytesDecl, BytesText, Event};
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::{BytesDecl, BytesRef, BytesText, Event};
 use reqwest::blocking::Client;
 
 use crate::types::{CountyInfo, RrCategory, RrFrequency, RrSubcategory, RrTag, ZipInfo};
@@ -203,9 +204,6 @@ pub fn send_request(client: &Client, envelope: &str) -> Result<String, SoapError
 /// Extracts the `<faultstring>` text from a SOAP fault response, if present.
 pub fn extract_soap_fault(xml: &str) -> Option<String> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
-
-    let mut inside_fault_string = false;
 
     loop {
         match reader.read_event() {
@@ -213,11 +211,16 @@ pub fn extract_soap_fault(xml: &str) -> Option<String> {
                 let name = e.name();
                 let local = local_name(name.as_ref());
                 if local == b"faultstring" {
-                    inside_fault_string = true;
+                    // `read_text_content` accumulates the split
+                    // Text / GeneralRef events up to `</faultstring>`.
+                    // An empty element yields `""`, which is treated
+                    // as "no fault text" like the pre-quick-xml-0.38
+                    // single-Text-event path did.
+                    return read_text_content(&mut reader)
+                        .ok()
+                        .filter(|t| !t.is_empty())
+                        .map(Cow::into_owned);
                 }
-            }
-            Ok(Event::Text(ref e)) if inside_fault_string => {
-                return e.unescape().ok().map(Cow::into_owned);
             }
             Ok(Event::Eof) | Err(_) => return None,
             _ => {}
@@ -315,13 +318,34 @@ fn local_name(full: &[u8]) -> &[u8] {
 
 /// Reads the text content of the current element (caller has just seen
 /// `Event::Start` for this element).
+///
+/// Since quick-xml 0.38 the reader no longer unescapes text itself:
+/// `Prince George&apos;s` arrives as `Text("Prince George")`,
+/// `GeneralRef("apos")`, `Text("s")`. This accumulates all of those
+/// fragments (resolving character references and the five
+/// predefined XML entities) until the element's `End` event, so
+/// callers see one contiguous string exactly as the old
+/// `BytesText::unescape` path produced.
+///
+/// Whitespace is trimmed from the *assembled* string, never per
+/// fragment: the reader's `trim_text(true)` would strip the spaces
+/// on both sides of an entity (`Fire &amp; EMS` → `Fire&EMS`), so
+/// no parser in this module enables it. Whitespace-only `Text`
+/// events between elements are simply ignored by the `Start` /
+/// `End`-driven parsers.
 fn read_text_content<'a>(reader: &mut Reader<&'a [u8]>) -> Result<Cow<'a, str>, SoapError> {
     let mut text = String::new();
     loop {
         match reader.read_event() {
             Ok(Event::Text(e)) => {
-                let unescaped = e.unescape()?;
-                text.push_str(&unescaped);
+                let decoded = e.xml10_content().map_err(quick_xml::Error::from)?;
+                text.push_str(&decoded);
+            }
+            Ok(Event::GeneralRef(e)) => text.push_str(&resolve_general_ref(&e)?),
+            // CDATA is literal — no entity resolution, no EOL rules.
+            Ok(Event::CData(e)) => {
+                let decoded = e.decode().map_err(quick_xml::Error::from)?;
+                text.push_str(&decoded);
             }
             Ok(Event::End(_)) => break,
             Ok(Event::Eof) => {
@@ -333,13 +357,27 @@ fn read_text_content<'a>(reader: &mut Reader<&'a [u8]>) -> Result<Cow<'a, str>, 
             _ => {}
         }
     }
-    Ok(Cow::Owned(text))
+    Ok(Cow::Owned(text.trim().to_owned()))
+}
+
+/// Resolves a `&...;` reference inside element text: numeric character
+/// references (`&#39;`, `&#x27;`) and the predefined XML entities
+/// (`amp`, `lt`, `gt`, `quot`, `apos`). `RadioReference` does not ship
+/// a DTD, so any other entity name is an error — matching what
+/// `BytesText::unescape` rejected before quick-xml 0.38.
+fn resolve_general_ref(r: &BytesRef<'_>) -> Result<Cow<'static, str>, SoapError> {
+    if let Some(c) = r.resolve_char_ref()? {
+        return Ok(Cow::Owned(c.to_string()));
+    }
+    let name = r.decode().map_err(quick_xml::Error::from)?;
+    resolve_predefined_entity(&name)
+        .map(Cow::Borrowed)
+        .ok_or_else(|| SoapError::Unexpected(format!("unknown entity reference: &{name};")))
 }
 
 /// Parses a `getZipcodeInfo` response and returns the extracted `ZipInfo`.
 pub fn parse_zip_info(xml: &str) -> Result<ZipInfo, SoapError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut county_id: Option<u32> = None;
     let mut state_id: Option<u32> = None;
@@ -411,7 +449,6 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
     use CountyParseState::{InCat, InCats, InSubcat, InSubcats, Top};
 
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut county_name: Option<String> = None;
     let mut state_id: Option<u32> = None;
@@ -423,7 +460,6 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
     let mut current_subcats: Vec<RrSubcategory> = Vec::new();
     let mut current_scid: u32 = 0;
     let mut current_sc_name = String::new();
-    let mut current_field = String::new();
 
     // Nesting: return > cats > item(cat) > subcats > item(subcat)
     loop {
@@ -433,10 +469,35 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                 let name_ref = name.as_ref();
                 let local = local_name(name_ref);
                 match (&state, local) {
-                    (Top, b"countyName" | b"stid")
-                    | (InCat, b"cid" | b"cName")
-                    | (InSubcat, b"scid" | b"scName") => {
-                        current_field = String::from_utf8_lossy(local).into_owned();
+                    // Leaf text fields are consumed through their
+                    // `End` right here so entity-split text (quick-xml
+                    // ≥ 0.38 emits `GeneralRef` events between `Text`
+                    // fragments) is reassembled before use.
+                    (Top, b"countyName") => {
+                        county_name = Some(read_text_content(&mut reader)?.into_owned());
+                    }
+                    (Top, b"stid") => {
+                        state_id = Some(
+                            read_text_content(&mut reader)?
+                                .parse()
+                                .map_err(|e| SoapError::Unexpected(format!("bad stid: {e}")))?,
+                        );
+                    }
+                    (InCat, b"cid") => {
+                        current_cat_id = read_text_content(&mut reader)?
+                            .parse()
+                            .map_err(|e| SoapError::Unexpected(format!("bad cid: {e}")))?;
+                    }
+                    (InCat, b"cName") => {
+                        current_cat_name = read_text_content(&mut reader)?.into_owned();
+                    }
+                    (InSubcat, b"scid") => {
+                        current_scid = read_text_content(&mut reader)?
+                            .parse()
+                            .map_err(|e| SoapError::Unexpected(format!("bad scid: {e}")))?;
+                    }
+                    (InSubcat, b"scName") => {
+                        current_sc_name = read_text_content(&mut reader)?.into_owned();
                     }
                     (Top, b"cats") => state = InCats,
                     (InCats, b"item") => {
@@ -452,44 +513,6 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                         current_sc_name.clear();
                     }
                     _ => {}
-                }
-            }
-            Ok(Event::Text(ref e)) => {
-                if let Ok(text) = e.unescape() {
-                    match current_field.as_str() {
-                        "countyName" => {
-                            county_name = Some(text.into_owned());
-                            current_field.clear();
-                        }
-                        "stid" if state == Top => {
-                            state_id =
-                                Some(text.parse().map_err(|e| {
-                                    SoapError::Unexpected(format!("bad stid: {e}"))
-                                })?);
-                            current_field.clear();
-                        }
-                        "cid" => {
-                            current_cat_id = text
-                                .parse()
-                                .map_err(|e| SoapError::Unexpected(format!("bad cid: {e}")))?;
-                            current_field.clear();
-                        }
-                        "cName" => {
-                            current_cat_name = text.into_owned();
-                            current_field.clear();
-                        }
-                        "scid" => {
-                            current_scid = text
-                                .parse()
-                                .map_err(|e| SoapError::Unexpected(format!("bad scid: {e}")))?;
-                            current_field.clear();
-                        }
-                        "scName" => {
-                            current_sc_name = text.into_owned();
-                            current_field.clear();
-                        }
-                        _ => {}
-                    }
                 }
             }
             Ok(Event::End(ref e)) => {
@@ -588,10 +611,9 @@ impl FreqBuilder {
 
         let hz = (freq_mhz * 1_000_000.0).round() as u64;
 
-        let tone = self.tone_val.and_then(|t| {
-            #[allow(clippy::float_cmp)]
-            if t == 0.0 { None } else { Some(t) }
-        });
+        // `RadioReference` encodes "no tone" as an exact 0.0 literal.
+        #[allow(clippy::float_cmp, reason = "0.0 is a sentinel, not a computed value")]
+        let tone = self.tone_val.filter(|&t| t != 0.0);
 
         Some(RrFrequency {
             id: fid,
@@ -676,7 +698,6 @@ impl FreqBuilder {
 /// `None`.
 pub fn parse_frequencies(xml: &str) -> Result<Vec<RrFrequency>, SoapError> {
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
 
     let mut frequencies: Vec<RrFrequency> = Vec::new();
     let mut state = FreqParseState::TopLevel;
@@ -902,5 +923,82 @@ mod tests {
         assert!(envelope.contains("tns:getZipcodeInfo"), "missing method");
         assert!(envelope.contains("authInfo"), "missing authInfo element");
         assert!(envelope.contains(API_VERSION), "missing version");
+    }
+    /// `getCountyInfo` response carrying every kind of `&...;` reference
+    /// the quick-xml ≥ 0.38 reader now surfaces as separate
+    /// `Event::GeneralRef` events between `Text` fragments.
+    const COUNTY_ENTITY_RESPONSE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+  <SOAP-ENV:Body>
+    <ns1:getCountyInfoResponse>
+      <return>
+        <countyName>Prince George&apos;s</countyName>
+        <stid>24</stid>
+        <cats>
+          <item>
+            <cid>7</cid>
+            <cName>Fire &amp; EMS &lt;all&gt;</cName>
+            <subcats>
+              <item>
+                <scid>42</scid>
+                <scName>Dispatch &#40;North&#x29; &quot;Ops&quot;</scName>
+              </item>
+            </subcats>
+          </item>
+        </cats>
+      </return>
+    </ns1:getCountyInfoResponse>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"#;
+
+    #[test]
+    fn county_info_reassembles_entity_split_text() {
+        let info = parse_county_info(COUNTY_ENTITY_RESPONSE_XML, 1234).expect("parses");
+        assert_eq!(info.county_id, 1234);
+        assert_eq!(info.county_name, "Prince George's");
+        assert_eq!(info.state_id, 24);
+        assert_eq!(info.categories.len(), 1);
+        let cat = &info.categories[0];
+        assert_eq!(cat.id, 7);
+        assert_eq!(cat.name, "Fire & EMS <all>");
+        assert_eq!(cat.subcategories.len(), 1);
+        assert_eq!(cat.subcategories[0].scid, 42);
+        assert_eq!(cat.subcategories[0].name, "Dispatch (North) \"Ops\"");
+    }
+
+    #[test]
+    fn cdata_text_is_preserved_verbatim() {
+        let xml = COUNTY_ENTITY_RESPONSE_XML.replace(
+            "Fire &amp; EMS &lt;all&gt;",
+            "<![CDATA[Fire & EMS <all> & more]]> plus &amp; text",
+        );
+        let info = parse_county_info(&xml, 1).expect("parses");
+        assert_eq!(
+            info.categories[0].name,
+            "Fire & EMS <all> & more plus & text"
+        );
+    }
+
+    #[test]
+    fn fault_string_with_entities_is_fully_decoded() {
+        let xml =
+            FAULT_RESPONSE_XML.replace("Invalid API key", "Invalid &quot;key&quot; &amp; user");
+        assert_eq!(
+            extract_soap_fault(&xml).as_deref(),
+            Some("Invalid \"key\" & user")
+        );
+    }
+
+    #[test]
+    fn empty_fault_string_is_treated_as_no_fault() {
+        let xml = FAULT_RESPONSE_XML.replace("Invalid API key", "");
+        assert!(extract_soap_fault(&xml).is_none());
+    }
+
+    #[test]
+    fn unknown_entity_is_an_error_not_silent_truncation() {
+        let xml = COUNTY_ENTITY_RESPONSE_XML.replace("&apos;", "&nbsp;");
+        let err = parse_county_info(&xml, 1).expect_err("undefined entity must fail");
+        assert!(err.to_string().contains("nbsp"), "{err}");
     }
 }

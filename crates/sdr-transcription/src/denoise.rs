@@ -589,7 +589,7 @@ mod tests {
         // Sibilance ramp: linear 1.0 → VOICE_W_SIB_END.
         assert!((voice_band_weight(VOICE_F_FORMANT_HI_HZ) - 1.0).abs() < WEIGHT_EQ_EPS);
         let midpoint = 0.5_f32.mul_add(VOICE_W_SIB_END - 1.0, 1.0);
-        let mid_freq = (VOICE_F_FORMANT_HI_HZ + VOICE_F_SIB_HI_HZ) * 0.5;
+        let mid_freq = f32::midpoint(VOICE_F_FORMANT_HI_HZ, VOICE_F_SIB_HI_HZ);
         assert!(
             (voice_band_weight(mid_freq) - midpoint).abs() < WEIGHT_EQ_EPS,
             "mid-ramp should be halfway between 1.0 and VOICE_W_SIB_END"

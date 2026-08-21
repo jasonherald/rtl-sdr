@@ -392,6 +392,7 @@ impl TleCache {
         if let Some(c) = self.client.get() {
             return Ok(c.clone());
         }
+        crate::ensure_tls_provider();
         let new_client = reqwest::blocking::Client::builder()
             .timeout(self.fetch_timeout)
             .user_agent(concat!("sdr-rs/", env!("CARGO_PKG_VERSION")))

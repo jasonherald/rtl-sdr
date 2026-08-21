@@ -5,9 +5,10 @@
 //! and the OQPSK pipeline (#662, dbdexter port). Establishes the
 //! perf floor for regression detection on either path.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use sdr_dsp::lrpt::{LrptDemod, LrptMode};
 use sdr_types::Complex;
+use std::hint::black_box;
 
 /// 1 second of input at the demod's 144 ksps working sample rate.
 const SAMPLES_1S: usize = 144_000;

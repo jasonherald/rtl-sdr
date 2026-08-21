@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 sdr-types.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 quick-xml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

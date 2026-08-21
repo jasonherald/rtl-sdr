@@ -598,7 +598,7 @@ impl AfChain {
                 // CTCSS / voice-squelch use case) L and R are
                 // identical, but averaging is cheap and safe for
                 // any stereo content.
-                self.ctcss_mono_buf.push(0.5 * (s.l + s.r));
+                self.ctcss_mono_buf.push(f32::midpoint(s.l, s.r));
             }
             if let Some(detector) = self.ctcss_detector.as_mut() {
                 let _ = detector.accept_samples(&self.ctcss_mono_buf);

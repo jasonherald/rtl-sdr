@@ -113,6 +113,7 @@ fn client() -> Result<reqwest::blocking::Client, PostalLookupError> {
     if let Some(c) = CLIENT.get() {
         return Ok(c.clone());
     }
+    crate::ensure_tls_provider();
     let new_client = reqwest::blocking::Client::builder()
         .timeout(DEFAULT_LOOKUP_TIMEOUT)
         .user_agent(concat!("sdr-rs/", env!("CARGO_PKG_VERSION")))
