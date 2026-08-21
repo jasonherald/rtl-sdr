@@ -133,9 +133,18 @@ impl IqCorrector {
                 "IQ correction rate must be in (0, 1), got {rate}"
             )));
         }
+        // Validate the value the loop will actually use: a rate that is
+        // positive in f64 but underflows to 0.0 in f32 would build a
+        // corrector that never adapts.
+        let rate_f32 = rate as f32;
+        if rate_f32 <= 0.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "IQ correction rate {rate} underflows to zero in f32"
+            )));
+        }
         Ok(Self {
             correction: Complex::default(),
-            rate: rate as f32,
+            rate: rate_f32,
         })
     }
 
@@ -288,6 +297,10 @@ mod tests {
         assert!(IqCorrector::new(f64::NAN).is_err());
         assert!(IqCorrector::new(1.5).is_err());
         assert!(IqCorrector::new(IQ_CORRECTION_DEFAULT_RATE).is_ok());
+        // Positive in f64 but underflows to 0.0 in f32 — would construct a
+        // corrector that never adapts.
+        assert!(IqCorrector::new(f64::MIN_POSITIVE).is_err());
+        assert!(IqCorrector::new(1e-50).is_err());
     }
 
     #[test]

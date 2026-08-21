@@ -1793,9 +1793,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 state.dc_blocking,
             ) {
                 Ok(mut new_frontend) => {
-                    new_frontend.set_invert_iq(state.invert_iq);
-                    new_frontend.set_fft_rate(state.fft_rate);
-                    new_frontend.set_fft_enabled(state.fft_enabled);
+                    apply_persisted_frontend_settings(state, &mut new_frontend);
                     state.frontend = new_frontend;
                     state.fft_buf = vec![0.0; size];
                 }
@@ -1883,9 +1881,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 state.dc_blocking,
             ) {
                 Ok(mut new_frontend) => {
-                    new_frontend.set_invert_iq(state.invert_iq);
-                    new_frontend.set_fft_rate(state.fft_rate);
-                    new_frontend.set_fft_enabled(state.fft_enabled);
+                    apply_persisted_frontend_settings(state, &mut new_frontend);
                     state.fft_buf = vec![0.0; new_frontend.fft_size()];
                     state.frontend = new_frontend;
                 }
@@ -3877,12 +3873,23 @@ fn rebuild_frontend(state: &mut DspState) -> Result<(), String> {
     )
     .map_err(|e| format!("frontend rebuild: {e}"))?;
 
-    new_frontend.set_invert_iq(state.invert_iq);
-    new_frontend.set_iq_correction(state.iq_correction);
-    new_frontend.set_fft_rate(state.fft_rate);
-    new_frontend.set_fft_enabled(state.fft_enabled);
+    apply_persisted_frontend_settings(state, &mut new_frontend);
     state.frontend = new_frontend;
     Ok(())
+}
+
+/// Copy every user setting that lives outside `IqFrontend::new`'s
+/// constructor arguments onto a freshly built frontend. The single place
+/// to extend when a new persisted frontend flag is added — `SetFftSize`,
+/// `SetWindowFunction` and `rebuild_frontend` all replace the frontend and
+/// previously each carried its own (drifting) copy of this list; the
+/// IQ-correction flag was missing from two of them. Per `CodeRabbit`
+/// round 1 on PR #781 / #692.
+fn apply_persisted_frontend_settings(state: &DspState, frontend: &mut IqFrontend) {
+    frontend.set_invert_iq(state.invert_iq);
+    frontend.set_iq_correction(state.iq_correction);
+    frontend.set_fft_rate(state.fft_rate);
+    frontend.set_fft_enabled(state.fft_enabled);
 }
 
 /// Build or rebuild the `RxVfo` from the current frontend and demod configuration.
@@ -5355,6 +5362,35 @@ mod tests {
         let mut state = DspState::new(dsp_tx.clone()).unwrap();
         handle_command(&mut state, &dsp_tx, UiToDsp::SetIqCorrection(true));
         rebuild_frontend(&mut state).unwrap();
+        assert!(state.frontend.iq_correction());
+    }
+
+    /// #692 (CR round 1) — every path that replaces the frontend must
+    /// carry the IQ-correction setting, not just `rebuild_frontend`.
+    #[test]
+    fn set_fft_size_preserves_iq_correction() {
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetIqCorrection(true));
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetFftSize(DEFAULT_FFT_SIZE * 2),
+        );
+        assert_eq!(state.frontend.fft_size(), DEFAULT_FFT_SIZE * 2);
+        assert!(state.frontend.iq_correction());
+    }
+
+    #[test]
+    fn set_window_function_preserves_iq_correction() {
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetIqCorrection(true));
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetWindowFunction(sdr_pipeline::iq_frontend::FftWindow::Blackman),
+        );
         assert!(state.frontend.iq_correction());
     }
 
