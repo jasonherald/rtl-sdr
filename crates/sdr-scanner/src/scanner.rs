@@ -837,7 +837,10 @@ mod tests {
         ]));
         s.handle_event(ScannerEvent::SetEnabled(true));
         for _ in 0..PRIORITY_ONLY_CYCLES {
-            hop_on_dwell_timeout(&mut s);
+            assert!(
+                hop_on_dwell_timeout(&mut s).is_some(),
+                "priority-only hop must retune"
+            );
             assert_eq!(
                 s.hops_since_priority_sweep, 0,
                 "fallback hops on a priority-only list must not count toward a sweep"
