@@ -23,6 +23,8 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::passes::{LAT_RANGE_DEG, LON_RANGE_DEG};
+
 /// Default timeout for the Zippopotam.us round trip. Generous enough
 /// that a sluggish coffee-shop link still resolves, short enough that
 /// a network outage doesn't block the worker thread for a minute.
@@ -151,14 +153,18 @@ fn parse_response(zip: &str, body: &str) -> Result<PostalLocation, PostalLookupE
     // `str::parse::<f64>` accepts "NaN", "inf" and any magnitude; a
     // poisoned coordinate would be persisted to config and fabricate
     // passes downstream (#717). Same check `elevation.rs` applies.
-    if !lat_deg.is_finite() || !(-90.0..=90.0).contains(&lat_deg) {
+    if !lat_deg.is_finite() || !LAT_RANGE_DEG.contains(&lat_deg) {
         return Err(PostalLookupError::Parse(format!(
-            "latitude {lat_deg} out of range [-90, 90]"
+            "latitude {lat_deg} out of range [{}, {}]",
+            LAT_RANGE_DEG.start(),
+            LAT_RANGE_DEG.end()
         )));
     }
-    if !lon_deg.is_finite() || !(-180.0..=180.0).contains(&lon_deg) {
+    if !lon_deg.is_finite() || !LON_RANGE_DEG.contains(&lon_deg) {
         return Err(PostalLookupError::Parse(format!(
-            "longitude {lon_deg} out of range [-180, 180]"
+            "longitude {lon_deg} out of range [{}, {}]",
+            LON_RANGE_DEG.start(),
+            LON_RANGE_DEG.end()
         )));
     }
     let place = first

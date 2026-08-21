@@ -45,6 +45,12 @@ const REFINE_PRECISION: Duration = Duration::seconds(1);
 /// satellite near horizon almost the whole window) can't loop forever.
 const MAX_REFINE_ITERATIONS: usize = 20;
 
+/// Inclusive WGS84 geodetic latitude range (degrees).
+pub(crate) const LAT_RANGE_DEG: std::ops::RangeInclusive<f64> = -90.0..=90.0;
+
+/// Inclusive WGS84 geodetic longitude range (degrees).
+pub(crate) const LON_RANGE_DEG: std::ops::RangeInclusive<f64> = -180.0..=180.0;
+
 /// A receiver site on the ground — what the satellite is overhead of.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroundStation {
@@ -86,13 +92,20 @@ impl GroundStation {
     /// Returns [`SatelliteError::InvalidStation`] describing the first bad field.
     pub fn validate(&self) -> Result<(), SatelliteError> {
         let bad = |message: String| SatelliteError::InvalidStation { message };
-        if !self.lat_deg.is_finite() || !(-90.0..=90.0).contains(&self.lat_deg) {
-            return Err(bad(format!("latitude {} out of [-90, 90]", self.lat_deg)));
-        }
-        if !self.lon_deg.is_finite() || !(-180.0..=180.0).contains(&self.lon_deg) {
+        if !self.lat_deg.is_finite() || !LAT_RANGE_DEG.contains(&self.lat_deg) {
             return Err(bad(format!(
-                "longitude {} out of [-180, 180]",
-                self.lon_deg
+                "latitude {} out of [{}, {}]",
+                self.lat_deg,
+                LAT_RANGE_DEG.start(),
+                LAT_RANGE_DEG.end()
+            )));
+        }
+        if !self.lon_deg.is_finite() || !LON_RANGE_DEG.contains(&self.lon_deg) {
+            return Err(bad(format!(
+                "longitude {} out of [{}, {}]",
+                self.lon_deg,
+                LON_RANGE_DEG.start(),
+                LON_RANGE_DEG.end()
             )));
         }
         if !self.alt_m.is_finite() {
