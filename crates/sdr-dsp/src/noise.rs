@@ -592,6 +592,13 @@ pub struct FmIfNoiseReduction {
     /// Input accumulation buffer.
     overlap_buf: Vec<Complex>,
     overlap_count: usize,
+    /// Processed samples not yet handed to a caller. Every input sample is
+    /// emitted exactly once, in order, from here — never as a raw tail copy
+    /// (which double-emitted and reordered the stream, #773). Latency is
+    /// bounded by two FFT blocks.
+    ready: std::collections::VecDeque<Complex>,
+    /// Scratch for one processed block before it is queued.
+    block_out: Vec<Complex>,
 }
 
 impl FmIfNoiseReduction {
@@ -641,18 +648,29 @@ impl FmIfNoiseReduction {
             window,
             overlap_buf: vec![Complex::default(); fft_size],
             overlap_count: 0,
+            ready: std::collections::VecDeque::with_capacity(2 * fft_size),
+            block_out: vec![Complex::default(); fft_size],
         })
+    }
+
+    /// Discard buffered input and queued output (e.g. on retune).
+    pub fn reset(&mut self) {
+        self.overlap_count = 0;
+        self.ready.clear();
     }
 
     /// Process complex samples through FFT-based noise reduction.
     ///
-    /// Processes complete FFT-size blocks. Remaining samples are buffered
-    /// internally for the next call.
+    /// Input is accumulated into FFT-size blocks; each completed block is
+    /// processed and queued, and as many queued samples as fit are written
+    /// to `output`. The returned count may be smaller than `input.len()`
+    /// (up to two blocks of latency) but the output stream is always the
+    /// processed signal, in order, with every sample emitted exactly once,
+    /// independent of how the input is chunked.
     ///
     /// # Errors
     ///
     /// Returns `DspError::BufferTooSmall` if `output.len() < input.len()`.
-    #[allow(clippy::cast_precision_loss)]
     pub fn process(
         &mut self,
         input: &[Complex],
@@ -666,40 +684,27 @@ impl FmIfNoiseReduction {
         }
 
         let mut in_pos = 0;
-        let mut out_pos = 0;
-
         while in_pos < input.len() {
-            // Fill the overlap buffer from input.
             let can_take = (self.fft_size - self.overlap_count).min(input.len() - in_pos);
             self.overlap_buf[self.overlap_count..self.overlap_count + can_take]
                 .copy_from_slice(&input[in_pos..in_pos + can_take]);
             self.overlap_count += can_take;
             in_pos += can_take;
 
-            // Process a complete block when we have enough samples.
             if self.overlap_count == self.fft_size {
-                if out_pos + self.fft_size <= output.len() {
-                    self.process_block(&mut output[out_pos..out_pos + self.fft_size]);
-                    out_pos += self.fft_size;
-                    self.overlap_count = 0;
-                } else {
-                    // Output too small for this block — keep it buffered for next call.
-                    break;
-                }
+                let mut block = std::mem::take(&mut self.block_out);
+                self.process_block(&mut block);
+                self.ready.extend(block.iter().copied());
+                self.block_out = block;
+                self.overlap_count = 0;
             }
         }
 
-        // Pass through unprocessed tail samples so output count matches input.
-        // These samples are buffered in overlap_buf for the next FFT block;
-        // copy the original input (not overlap_buf which may contain stale data
-        // from prior calls) to maintain correct signal flow.
-        if out_pos < input.len() {
-            let remaining = input.len() - out_pos;
-            output[out_pos..out_pos + remaining].copy_from_slice(&input[input.len() - remaining..]);
-            out_pos += remaining;
+        let emit = self.ready.len().min(output.len());
+        for (dst, src) in output[..emit].iter_mut().zip(self.ready.drain(..emit)) {
+            *dst = src;
         }
-
-        Ok(out_pos)
+        Ok(emit)
     }
 
     /// Process a single FFT-size block: window, FFT, single-peak select, IFFT.
@@ -1626,6 +1631,75 @@ mod tests {
         assert!(
             (squelch.noise_floor_db() - floor_before).abs() < f32::EPSILON,
             "rearm should leave noise_floor_db untouched when disabled"
+        );
+    }
+
+    /// Tone + deterministic noise for FM-IF-NR streaming tests.
+    fn fmif_test_signal(len: usize) -> Vec<Complex> {
+        let mut seed: u32 = 0x1234_5678;
+        (0..len)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 8) as f32 / 16_777_216.0 - 0.5;
+                let theta = 2.0 * core::f32::consts::PI * 37.0 * i as f32 / 256.0;
+                Complex::new(theta.cos() + 0.3 * noise, theta.sin() + 0.3 * noise)
+            })
+            .collect()
+    }
+
+    fn run_fmif_chunked(input: &[Complex], chunk: usize) -> Vec<Complex> {
+        let mut nr = FmIfNoiseReduction::new().unwrap();
+        let mut out = Vec::new();
+        for c in input.chunks(chunk) {
+            let mut buf = vec![Complex::default(); c.len()];
+            let n = nr.process(c, &mut buf).unwrap();
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    /// #773 — the output stream must be the same sample sequence regardless
+    /// of how the input is chunked (no duplicated or reordered tails).
+    #[test]
+    fn fm_if_nr_output_is_chunking_independent() {
+        let input = fmif_test_signal(256 * 12);
+        let whole = run_fmif_chunked(&input, input.len());
+        let odd = run_fmif_chunked(&input, 300);
+        let n = whole.len().min(odd.len());
+        assert!(n >= 256 * 10, "too little output to compare: {n}");
+        for i in 0..n {
+            assert!(
+                (whole[i].re - odd[i].re).abs() < 1e-4 && (whole[i].im - odd[i].im).abs() < 1e-4,
+                "sample {i} differs between whole-buffer and 300-sample chunking: {:?} vs {:?}",
+                whole[i],
+                odd[i]
+            );
+        }
+    }
+
+    /// #773 — input chunks smaller than the FFT block must still be
+    /// processed (not latch into raw passthrough forever).
+    #[test]
+    fn fm_if_nr_small_chunks_keep_processing() {
+        let input = fmif_test_signal(256 * 12);
+        let out = run_fmif_chunked(&input, 100);
+        // Allow up to two blocks of latency, but everything else must come out…
+        assert!(
+            out.len() + 2 * 256 >= input.len(),
+            "emitted only {} of {}",
+            out.len(),
+            input.len()
+        );
+        // …and it must be the processed (noise-reduced) stream, not a raw copy.
+        let differs = out
+            .iter()
+            .zip(&input)
+            .skip(256 * 2)
+            .filter(|(o, i)| (o.re - i.re).abs() > 1e-3 || (o.im - i.im).abs() > 1e-3)
+            .count();
+        assert!(
+            differs > out.len() / 2,
+            "output looks like raw passthrough (only {differs} samples differ)"
         );
     }
 }

@@ -164,10 +164,20 @@ impl FmStereoDecoder {
             self.pilot_pll.process(&pilot_complex, &mut pll_out)?;
 
             // Double the PLL phase: 19 kHz → 38 kHz subcarrier.
-            // cos(2θ) = cos²(θ) − sin²(θ), using the PLL phasor components.
+            //
+            // The PLL is fed the *real* pilot, so it locks with its phasor
+            // in quadrature to the pilot: for a pilot sin(ωt) the locked
+            // phase is θ = ωt − π/2. The FCC composite carries the
+            // difference signal on sin(2ωt) (the 38 kHz subcarrier crosses
+            // zero with positive slope together with the pilot), and
+            // sin(2ωt) = −sin(2θ) = −2·sin(θ)·cos(θ). Using cos(2θ) here —
+            // as the first port did — yields −cos(2ωt), which is in
+            // quadrature with the subcarrier and demodulates to dual
+            // mono (#772). An inverted discriminator flips the pilot and
+            // subcarrier together, so this sign is polarity-independent.
             let cos_t = pll_out[0].re;
             let sin_t = pll_out[0].im;
-            let subcarrier = cos_t * cos_t - sin_t * sin_t;
+            let subcarrier = -2.0 * sin_t * cos_t;
 
             // Delay-compensate composite for phase-aligned extraction.
             // Uses persistent write position for correct streaming across calls.
@@ -350,5 +360,40 @@ mod tests {
                 ref_output[i].l
             );
         }
+    }
+
+    /// Build an FCC-standard MPX composite: (L+R) + (L−R)·sin(2ωt) + 0.1·sin(ωt)
+    /// — the 38 kHz subcarrier crosses zero with positive slope together with
+    /// the 19 kHz pilot. Left-only programme, so L−R == L+R == the tone.
+    fn fcc_mpx_left_only(len: usize, tone_hz: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / TEST_SAMPLE_RATE as f32;
+                let l = (2.0 * PI * tone_hz * t).sin();
+                let pilot = 0.1 * (2.0 * PI * 19_000.0 * t).sin();
+                let sub = l * (2.0 * PI * 38_000.0 * t).sin();
+                l + sub + pilot
+            })
+            .collect()
+    }
+
+    /// #772 — a left-only broadcast must decode with real channel
+    /// separation, not as dual mono.
+    #[test]
+    fn stereo_decoder_separates_left_only_programme() {
+        let mut decoder = FmStereoDecoder::new(TEST_SAMPLE_RATE).unwrap();
+        let len = 250_000; // 1 s at 250 ksps — plenty for PLL + filters to settle
+        let input = fcc_mpx_left_only(len, 1_000.0);
+        let mut output = vec![Stereo::default(); len];
+        decoder.process(&input, &mut output).unwrap();
+
+        let tail = &output[len / 2..];
+        let l_energy: f32 = tail.iter().map(|s| s.l * s.l).sum();
+        let r_energy: f32 = tail.iter().map(|s| s.r * s.r).sum();
+        let separation_db = 10.0 * (l_energy / r_energy.max(1e-12)).log10();
+        assert!(
+            separation_db > 20.0,
+            "left-only programme must leak < -20 dB into R, got {separation_db:.1} dB (L {l_energy:.3}, R {r_energy:.3})"
+        );
     }
 }

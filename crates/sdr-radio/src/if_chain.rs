@@ -254,7 +254,7 @@ impl IfChain {
             return Ok(input.len());
         }
 
-        let n = input.len();
+        let mut n = input.len();
         self.buf_a.resize(n, Complex::default());
         self.buf_b.resize(n, Complex::default());
 
@@ -336,15 +336,17 @@ impl IfChain {
             current_is_a = !current_is_a;
         }
 
-        // Stage 4: FM IF noise reduction
+        // Stage 4: FM IF noise reduction. Block-based: it may hand back
+        // fewer samples than it was given (bounded latency), so the
+        // running count follows its return value. Per #773.
         if self.fm_if_nr_enabled {
-            if current_is_a {
+            n = if current_is_a {
                 self.fm_if_nr
-                    .process(&self.buf_a[..n], &mut self.buf_b[..n])?;
+                    .process(&self.buf_a[..n], &mut self.buf_b[..n])?
             } else {
                 self.fm_if_nr
-                    .process(&self.buf_b[..n], &mut self.buf_a[..n])?;
-            }
+                    .process(&self.buf_b[..n], &mut self.buf_a[..n])?
+            };
             current_is_a = !current_is_a;
         }
 

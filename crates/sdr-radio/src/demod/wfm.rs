@@ -367,11 +367,16 @@ mod tests {
                 let t = i as f32 / sample_rate;
                 let left = left_amp * (2.0 * PI * audio_freq_hz * t).sin();
                 let right = right_amp * (2.0 * PI * audio_freq_hz * t).sin();
-                // Broadcast MPX: mono sum + pilot + DSBSC(L-R).
+                // Broadcast MPX: mono sum + pilot + DSBSC(L-R), in the
+                // FCC phase convention — pilot and subcarrier both sin,
+                // so the 38 kHz subcarrier crosses zero with positive
+                // slope together with the pilot. (This fixture used
+                // cos/cos before #772, which is exactly the quadrature
+                // relationship the old decoder happened to decode.)
                 let mono = left + right;
                 let diff = left - right;
-                let pilot = 0.1 * (2.0 * PI * pilot_freq_hz * t).cos();
-                let subcarrier = diff * (2.0 * PI * subcarrier_freq_hz * t).cos();
+                let pilot = 0.1 * (2.0 * PI * pilot_freq_hz * t).sin();
+                let subcarrier = diff * (2.0 * PI * subcarrier_freq_hz * t).sin();
                 let mpx = mono + pilot + subcarrier;
                 phase += phase_scale * mpx;
                 Complex::new(phase.cos(), phase.sin())
