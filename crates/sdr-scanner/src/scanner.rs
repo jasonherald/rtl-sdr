@@ -861,6 +861,10 @@ mod tests {
             name: "A".to_string(),
             frequency_hz: 146_520_000,
         };
+        let key_b = ChannelKey {
+            name: "B".to_string(),
+            frequency_hz: 162_550_000,
+        };
         s.handle_event(ScannerEvent::LockoutChannel(key_a.clone()));
         s.handle_event(ScannerEvent::SetEnabled(false));
         assert!(
@@ -877,6 +881,31 @@ mod tests {
                 }
             ),
             "re-enable must skip the locked-out channel, got {cmds:?}"
+        );
+
+        // The #757 UI flow: locking out the last available channel empties
+        // the rotation, the UI flips the master switch off, the user flips
+        // it back on — both lockouts must still be in force.
+        let empty = s.handle_event(ScannerEvent::LockoutChannel(key_b.clone()));
+        assert!(
+            empty
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::EmptyRotation)),
+            "locking out the last channel must empty the rotation, got {empty:?}"
+        );
+        s.handle_event(ScannerEvent::SetEnabled(false));
+        let cmds = s.handle_event(ScannerEvent::SetEnabled(true));
+        assert!(
+            s.locked_out.contains(&key_a) && s.locked_out.contains(&key_b),
+            "both lockouts must survive the EmptyRotation → off → on cycle"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, ScannerCommand::EmptyRotation))
+                && !cmds
+                    .iter()
+                    .any(|c| matches!(c, ScannerCommand::Retune { .. })),
+            "re-enable must not retune to a locked-out channel, got {cmds:?}"
         );
     }
 
@@ -1223,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn disable_clears_session_state() {
+    fn disable_clears_rotation_state_but_preserves_lockouts() {
         // Re-enabling after a disable should start fresh — no
         // carried-over lockouts, cursors, or hop counter.
         let mut s = Scanner::new();
