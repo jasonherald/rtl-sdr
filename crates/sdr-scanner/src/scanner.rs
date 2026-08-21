@@ -769,28 +769,49 @@ mod tests {
         })
     }
 
+    // ---- priority-sweep fixture topology (#756) ----
+    /// Normal channels N0..N7 at 25 kHz spacing from this base, plus one
+    /// priority channel. More normal channels than the check interval so
+    /// the cursor-starvation symptom (N3..N7 never visited) is observable.
+    const SWEEP_NORMAL_CHANNELS: u64 = 8;
+    const SWEEP_NORMAL_BASE_HZ: u64 = 146_000_000;
+    const SWEEP_NORMAL_SPACING_HZ: u64 = 25_000;
+    const SWEEP_PRIORITY_HZ: u64 = 155_000_000;
+    /// Hops driven after enable: enough to pass the first sweep and
+    /// observe where rotation resumes.
+    const SWEEP_HOPS: usize = 12;
+    /// After `PRIORITY_CHECK_INTERVAL` normal hops (N0..N4) and the sweep,
+    /// rotation must resume at N5.
+    const SWEEP_EXPECTED_RESUME_IDX: u64 = PRIORITY_CHECK_INTERVAL as u64;
+    /// Hops driven on the priority-only list — several sweep intervals.
+    const PRIORITY_ONLY_CYCLES: usize = 10;
+
+    fn normal_channel_hz(i: u64) -> u64 {
+        SWEEP_NORMAL_BASE_HZ + i * SWEEP_NORMAL_SPACING_HZ
+    }
+
     /// #756 — the priority sweep must arm after exactly
     /// `PRIORITY_CHECK_INTERVAL` normal hops, not after ~half that
     /// (the hop counter used to be incremented twice per hop).
     #[test]
     fn priority_sweep_arms_after_exactly_the_check_interval() {
         let mut s = Scanner::new();
-        let mut channels: Vec<ScannerChannel> = (0..8)
-            .map(|i: u64| ch(&format!("N{i}"), 146_000_000 + i * 25_000, 0))
+        let mut channels: Vec<ScannerChannel> = (0..SWEEP_NORMAL_CHANNELS)
+            .map(|i| ch(&format!("N{i}"), normal_channel_hz(i), 0))
             .collect();
-        channels.push(ch("P", 155_000_000, 1));
+        channels.push(ch("P", SWEEP_PRIORITY_HZ, 1));
         s.handle_event(ScannerEvent::ChannelsChanged(channels));
         s.handle_event(ScannerEvent::SetEnabled(true)); // retunes to N0 (hop 1)
 
-        let mut visited = vec![146_000_000];
-        for _ in 0..12 {
+        let mut visited = vec![normal_channel_hz(0)];
+        for _ in 0..SWEEP_HOPS {
             if let Some(f) = hop_on_dwell_timeout(&mut s) {
                 visited.push(f);
             }
         }
         let first_priority = visited
             .iter()
-            .position(|f| *f == 155_000_000)
+            .position(|f| *f == SWEEP_PRIORITY_HZ)
             .expect("priority channel must be visited");
         assert_eq!(
             first_priority, PRIORITY_CHECK_INTERVAL as usize,
@@ -800,8 +821,8 @@ mod tests {
         // next unvisited normal channel, not past the priority channel.
         assert_eq!(
             visited[first_priority + 1],
-            146_000_000 + 5 * 25_000,
-            "rotation must resume at N5 after the sweep, visited order: {visited:?}"
+            normal_channel_hz(SWEEP_EXPECTED_RESUME_IDX),
+            "rotation must resume at N{SWEEP_EXPECTED_RESUME_IDX} after the sweep, visited order: {visited:?}"
         );
     }
 
@@ -811,11 +832,11 @@ mod tests {
     fn priority_only_list_does_not_oscillate_between_sweep_and_fallback() {
         let mut s = Scanner::new();
         s.handle_event(ScannerEvent::ChannelsChanged(vec![
-            ch("P1", 155_000_000, 1),
-            ch("P2", 155_025_000, 1),
+            ch("P1", SWEEP_PRIORITY_HZ, 1),
+            ch("P2", SWEEP_PRIORITY_HZ + SWEEP_NORMAL_SPACING_HZ, 1),
         ]));
         s.handle_event(ScannerEvent::SetEnabled(true));
-        for _ in 0..10 {
+        for _ in 0..PRIORITY_ONLY_CYCLES {
             hop_on_dwell_timeout(&mut s);
             assert_eq!(
                 s.hops_since_priority_sweep, 0,

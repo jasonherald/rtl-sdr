@@ -4236,12 +4236,22 @@ fn process_iq_block(
                         // logic below — toggling transcription must not perturb
                         // scanner edge detection. Per CodeRabbit round 1 on PR
                         // #558.
-                        let now_open = scanner_carrier_present(
+                        // Raw gate state: `true` whenever nothing is muting,
+                        // including "no squelch configured". The
+                        // transcription edge tracker below consumes this
+                        // as-is (an ungated open squelch must still emit
+                        // `SquelchOpened` after `EnableTranscription`).
+                        let now_open = state.radio.if_chain().squelch_open();
+                        // Scanner view: only a *gating* squelch can signal a
+                        // carrier (#755). Kept separate from `now_open` so
+                        // the two consumers don't share one meaning. Per
+                        // CodeRabbit round 1 on PR #783.
+                        let scanner_open = scanner_carrier_present(
                             state.radio.if_chain().squelch_active(),
-                            state.radio.if_chain().squelch_open(),
+                            now_open,
                         );
-                        if now_open != state.squelch_was_open {
-                            let scanner_edge = if now_open {
+                        if scanner_open != state.squelch_was_open {
+                            let scanner_edge = if scanner_open {
                                 sdr_scanner::SquelchState::Open
                             } else {
                                 sdr_scanner::SquelchState::Closed
@@ -4249,7 +4259,7 @@ fn process_iq_block(
                             let scan_cmds = state
                                 .scanner
                                 .handle_event(sdr_scanner::ScannerEvent::SquelchEdge(scanner_edge));
-                            state.squelch_was_open = now_open;
+                            state.squelch_was_open = scanner_open;
                             apply_scanner_commands(state, dsp_tx, scan_cmds);
                         }
 
