@@ -987,30 +987,34 @@ impl Source for RtlSdrSource {
                 "invalid direct sampling mode: {mode} (expected 0..=2)"
             )));
         }
-        // Remember even with no open device so the next `start()`
-        // programs it ahead of the first tune.
         let was_off = self.direct_sampling_mode == DIRECT_SAMPLING_OFF;
+        let Some(device) = &mut self.device else {
+            // Remember even with no open device so the next `start()`
+            // programs it ahead of the first tune.
+            self.direct_sampling_mode = mode;
+            return Ok(());
+        };
+        device
+            .set_direct_sampling(mode)
+            .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        // Only persist a mode the device actually accepted, so a later
+        // `start()` / `tune()` never replays a rejected setting.
         self.direct_sampling_mode = mode;
-        if let Some(device) = &mut self.device {
-            device
-                .set_direct_sampling(mode)
-                .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
-            // Leaving direct sampling re-runs the tuner init array
-            // (librtlsdr `set_direct_sampling(0)` → `tuner.init()`),
-            // which overwrites the LNA/mixer/VGA gain registers the
-            // user's gain mode / gain had programmed. Re-apply them
-            // so a 0 dB + LNA chain doesn't come back saturated (#741).
-            if mode == DIRECT_SAMPLING_OFF && !was_off {
-                if let Some(manual) = self.last_gain_manual {
-                    device
-                        .set_tuner_gain_mode(manual)
-                        .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
-                }
-                if let Some(gain) = self.last_tuner_gain_tenths_db {
-                    device
-                        .set_tuner_gain(gain)
-                        .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
-                }
+        // Leaving direct sampling re-runs the tuner init array
+        // (librtlsdr `set_direct_sampling(0)` → `tuner.init()`),
+        // which overwrites the LNA/mixer/VGA gain registers the
+        // user's gain mode / gain had programmed. Re-apply them
+        // so a 0 dB + LNA chain doesn't come back saturated (#741).
+        if mode == DIRECT_SAMPLING_OFF && !was_off {
+            if let Some(manual) = self.last_gain_manual {
+                device
+                    .set_tuner_gain_mode(manual)
+                    .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
+            }
+            if let Some(gain) = self.last_tuner_gain_tenths_db {
+                device
+                    .set_tuner_gain(gain)
+                    .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
             }
         }
         Ok(())
