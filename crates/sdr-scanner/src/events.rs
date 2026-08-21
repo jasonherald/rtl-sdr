@@ -41,8 +41,11 @@ pub enum ScannerEvent {
     /// Master scanner on/off toggle.
     SetEnabled(bool),
 
-    /// Session-scoped lockout — channel is skipped in rotation
-    /// until unlocked or scanner is disabled.
+    /// App-session-scoped lockout — the channel is skipped in rotation
+    /// until `UnlockChannel` (or the channel disappears from the list).
+    /// Disabling and re-enabling the scanner preserves lockouts; only
+    /// the rotation cursor / hop counter / sweep state reset on disable.
+    /// Per #757.
     LockoutChannel(ChannelKey),
     UnlockChannel(ChannelKey),
 }
