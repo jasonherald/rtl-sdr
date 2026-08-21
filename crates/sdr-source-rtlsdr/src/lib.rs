@@ -37,8 +37,88 @@ pub const R82XX_MIN_TUNER_FREQ_HZ: f64 = 24_000_000.0;
 /// Direct-sampling mode value meaning "off — normal tuner path".
 const DIRECT_SAMPLING_OFF: i32 = 0;
 
+/// Direct-sampling mode: ADC fed from the I input (tuner bypassed).
+const DIRECT_SAMPLING_I: i32 = 1;
+
+/// Direct-sampling mode: ADC fed from the Q input (tuner bypassed).
+const DIRECT_SAMPLING_Q: i32 = 2;
+
+/// Raw bytes per IQ pair on the USB wire (one unsigned 8-bit I, one Q).
+const IQ_PAIR_BYTES: usize = 2;
+
+/// Ring-slot state: free for the USB reader to fill.
+const RING_SLOT_EMPTY: u8 = 0;
+
+/// Ring-slot state: holds a completed transfer awaiting the DSP reader.
+const RING_SLOT_FULL: u8 = 1;
+
 /// Hz → MHz divisor for user-facing frequency text.
 const HERTZ_PER_MHZ: f64 = 1_000_000.0;
+
+/// How many consecutive "soft" bulk-read results (USB timeout or a
+/// zero-length transfer) the reader tolerates before declaring the
+/// device gone. One read is bounded by the driver's bulk timeout
+/// (≈ 5 s), so this is roughly a minute of silence — long enough to
+/// ride out host suspend/resume, bus contention from a second dongle
+/// or rtl_tcp server, and USB autosuspend blips (the PR #406 "bad state
+/// until reseat" case), short enough that a genuinely dead dongle is
+/// reported instead of a frozen waterfall. Per #740.
+pub const MAX_CONSECUTIVE_SOFT_READ_FAILURES: u32 = 12;
+
+/// Per-reader budget of consecutive soft read failures.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReadRetryBudget {
+    consecutive_soft_failures: u32,
+}
+
+/// What the reader loop should do with one bulk-read result.
+#[derive(Debug)]
+pub enum ReadOutcome {
+    /// `n` bytes of IQ data (always even — whole pairs) are in the buffer.
+    Data(usize),
+    /// Transient: nothing usable this time, read again.
+    Retry,
+    /// Give up and flag the ring; the message is logged.
+    Fatal(String),
+}
+
+/// Classify a bulk-read result. Pure so the retry policy is unit-testable
+/// without hardware.
+///
+/// * `Ok(n)` with `n >= 2`: data. Odd byte counts are trimmed to whole
+///   IQ pairs — a slot whose length is odd could never be fully drained
+///   by the pair-wise reader and stalled the ring forever.
+/// * `Ok(0)` / `Ok(1)` and USB timeouts: soft — retry up to
+///   [`MAX_CONSECUTIVE_SOFT_READ_FAILURES`] in a row.
+/// * Anything else (device lost, pipe/overflow, tuner errors): fatal.
+pub fn classify_read(
+    result: Result<usize, librtlsdr_rs::RtlSdrError>,
+    budget: &mut ReadRetryBudget,
+) -> ReadOutcome {
+    let soft = |budget: &mut ReadRetryBudget, what: &str| {
+        budget.consecutive_soft_failures += 1;
+        if budget.consecutive_soft_failures > MAX_CONSECUTIVE_SOFT_READ_FAILURES {
+            ReadOutcome::Fatal(format!(
+                "{what} for {} consecutive bulk reads — giving up",
+                budget.consecutive_soft_failures
+            ))
+        } else {
+            ReadOutcome::Retry
+        }
+    };
+    match result {
+        Ok(n) if n >= IQ_PAIR_BYTES => {
+            budget.consecutive_soft_failures = 0;
+            // Trim a trailing odd byte so the slot holds whole IQ pairs.
+            ReadOutcome::Data(n - n % IQ_PAIR_BYTES)
+        }
+        Ok(_) => soft(budget, "zero-length USB transfer"),
+        Err(librtlsdr_rs::RtlSdrError::Usb(rusb::Error::Timeout)) => {
+            soft(budget, "USB read timeout")
+        }
+        Err(e) => ReadOutcome::Fatal(format!("USB reader error: {e}")),
+    }
+}
 
 /// IQ sample conversion factor: `(sample - 127.4) / 128.0`
 ///
@@ -65,6 +145,13 @@ const RAW_BUF_SIZE: usize = 262_144;
 /// At 2 Msps, each slot is 131072 IQ pairs = ~65 ms. 16 slots =
 /// ~1.0 s buffer, plenty of headroom for DSP bursts.
 const RING_SLOTS: usize = 16;
+
+/// How long the USB reader sleeps between checks while the ring is
+/// full (DSP behind). Bounded sleep rather than `yield_now()`: a yield
+/// returns immediately when nothing else is runnable, so the reader
+/// would spin a core and starve the very DSP thread it is waiting on.
+/// 100 µs is well under one USB bulk transfer (~65 ms at 2 MSPS).
+const RING_FULL_BACKOFF: Duration = Duration::from_micros(100);
 
 /// RTL-SDR USB sample rates (Hz).
 pub const SAMPLE_RATES: &[f64] = &[
@@ -123,7 +210,7 @@ impl UsbRingBuffer {
                 data: Mutex::new(vec![0u8; slot_size]),
                 len: AtomicUsize::new(0),
                 consumed: AtomicUsize::new(0),
-                state: AtomicU8::new(0),
+                state: AtomicU8::new(RING_SLOT_EMPTY),
             })
             .collect();
         Self {
@@ -167,6 +254,15 @@ pub struct RtlSdrSource {
     /// 0 dB choice with the 29.7 dB default and saturated the
     /// front-end on LNA-equipped chains.
     last_tuner_gain_tenths_db: Option<i32>,
+    /// Most-recent tuner gain mode dispatched (`Some(true)` = manual).
+    /// Remembered so it can be re-applied after a direct-sampling
+    /// off-transition re-runs the tuner init array (#741) and so a
+    /// pre-start dispatch survives into `start()`.
+    last_gain_manual: Option<bool>,
+    /// RTL2832 digital AGC state dispatched by the controller. Replayed
+    /// on every open; previously silently dropped by the trait default
+    /// (#739).
+    rtl_agc_enabled: bool,
     /// Most-recent direct-sampling mode the controller dispatched
     /// (0 = off, 1 = I branch, 2 = Q branch). Remembered across
     /// stop/start so `start()` can program it *before* the first
@@ -179,14 +275,16 @@ pub struct RtlSdrSource {
 
 /// USB reader-thread main loop.
 ///
-/// Drives [`librtlsdr_rs::RtlSdrReader::iter_samples`] forever
-/// (until `cancel` flips false or the iterator yields an error),
-/// pushing each owned `Vec<u8>` into the lock-free SPSC ring for
-/// the DSP thread to consume. Pulled out of the closure inside
-/// `RtlSdrSource::start` so the start path stays under clippy's
-/// too-many-lines threshold.
+/// Issues one [`librtlsdr_rs::RtlSdrReader::read_sync`] per ring slot,
+/// straight into the slot's buffer (no per-transfer allocation or
+/// copy), until `cancel` flips false or [`classify_read`] reports a fatal
+/// result. Transient timeouts / empty transfers are retried within
+/// [`MAX_CONSECUTIVE_SOFT_READ_FAILURES`]; the old iterator fused on the
+/// first `Ok(0)` or `Err` and left the ring reporting "no data" forever
+/// (#740). Pulled out of the closure inside `RtlSdrSource::start` so the
+/// start path stays under clippy's too-many-lines threshold.
 fn run_reader_thread(
-    reader: librtlsdr_rs::RtlSdrReader,
+    reader: &librtlsdr_rs::RtlSdrReader,
     ring_writer: &Arc<UsbRingBuffer>,
     cancel: &Arc<AtomicBool>,
 ) {
@@ -199,36 +297,52 @@ fn run_reader_thread(
     let mut buffers_seen = 0u32;
     let mut bytes_total: u64 = 0;
     let mut last_stats_log = std::time::Instant::now();
+    let mut retry_budget = ReadRetryBudget::default();
 
-    // Drive `reader.iter_samples(RAW_BUF_SIZE)` — yields owned
-    // `Vec<u8>` per USB bulk transfer. One allocation per yield
-    // (~15/sec at 2 Msps × 256 KB), negligible at modern
-    // allocator speeds. A zero-alloc
-    // `iter_samples_into(&mut Vec<u8>)` variant is a future
-    // optimisation if the per-yield allocation ever shows up in
-    // profiles.
-    for chunk in reader.iter_samples(RAW_BUF_SIZE) {
-        if !cancel.load(Ordering::Acquire) {
-            break;
+    while cancel.load(Ordering::Acquire) {
+        // Find an empty slot; back off briefly if the ring is full
+        // (DSP can't keep up). Checking cancel here bounds
+        // worst-case shutdown latency to one in-flight USB read
+        // (~65 ms typical, up to one read timeout on stalled
+        // hardware).
+        let idx = ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slot_count;
+        let slot = &ring_writer.slots[idx];
+
+        while slot.state.load(Ordering::Acquire) != RING_SLOT_EMPTY {
+            if !cancel.load(Ordering::Acquire) {
+                tracing::debug!("USB reader thread stopping (ring-full wait)");
+                return;
+            }
+            std::thread::sleep(RING_FULL_BACKOFF);
         }
 
-        let buf = match chunk {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("USB reader error: {e}");
+        let Ok(mut data) = slot.data.lock() else {
+            tracing::error!("ring slot mutex poisoned");
+            ring_writer.error.store(true, Ordering::Release);
+            break;
+        };
+
+        // Read directly into the slot.
+        let n = match classify_read(
+            reader.read_sync(&mut data[..RAW_BUF_SIZE]),
+            &mut retry_budget,
+        ) {
+            ReadOutcome::Data(n) => n,
+            ReadOutcome::Retry => {
+                drop(data);
+                continue;
+            }
+            ReadOutcome::Fatal(msg) => {
+                tracing::warn!("{msg}");
                 ring_writer.error.store(true, Ordering::Release);
                 break;
             }
         };
-        if buf.is_empty() {
-            continue;
-        }
 
         buffers_seen = buffers_seen.saturating_add(1);
-        bytes_total = bytes_total.saturating_add(buf.len() as u64);
-
+        bytes_total = bytes_total.saturating_add(n as u64);
         if buffers_seen == 1 {
-            log_buffer_stats(&buf, "first USB buffer received");
+            log_buffer_stats(&data[..n], "first USB buffer received");
         }
         if last_stats_log.elapsed() >= Duration::from_secs(5) {
             let mb = bytes_total as f64 / 1_048_576.0;
@@ -245,37 +359,13 @@ fn run_reader_thread(
             // saturation / quiet-noise / real-signal shapes
             // that the previous "log only the first buffer"
             // approach missed.
-            log_buffer_stats(&buf, "periodic USB buffer stats");
+            log_buffer_stats(&data[..n], "periodic USB buffer stats");
             last_stats_log = std::time::Instant::now();
         }
 
-        // Find an empty slot; yield briefly if the ring is full
-        // (DSP can't keep up). The pre-iter-call cancel check
-        // above bounds worst-case shutdown latency to one
-        // in-flight USB read (~65 ms typical, up to one read
-        // timeout on stalled hardware).
-        let idx = ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slot_count;
-        let slot = &ring_writer.slots[idx];
-
-        while slot.state.load(Ordering::Acquire) != 0 {
-            if !cancel.load(Ordering::Acquire) {
-                tracing::debug!("USB reader thread stopping (ring-full wait)");
-                return;
-            }
-            std::thread::yield_now();
-        }
-
-        let Ok(mut data) = slot.data.lock() else {
-            tracing::error!("ring slot mutex poisoned");
-            ring_writer.error.store(true, Ordering::Release);
-            break;
-        };
-
-        let n = buf.len();
-        data[..n].copy_from_slice(&buf);
         drop(data);
         slot.len.store(n, Ordering::Relaxed);
-        slot.state.store(1, Ordering::Release);
+        slot.state.store(RING_SLOT_FULL, Ordering::Release);
         ring_writer.write_idx.fetch_add(1, Ordering::Relaxed);
     }
     tracing::debug!("USB reader thread stopped");
@@ -438,6 +528,8 @@ impl RtlSdrSource {
             ring: None,
             reader_thread: None,
             last_tuner_gain_tenths_db: None,
+            last_gain_manual: None,
+            rtl_agc_enabled: false,
             direct_sampling_mode: DIRECT_SAMPLING_OFF,
         }
     }
@@ -479,11 +571,11 @@ impl RtlSdrSource {
     /// Ports the conversion from SDR++ `asyncHandler`:
     /// `re = (buf[i*2] - 127.4) / 128.0; im = (buf[i*2+1] - 127.4) / 128.0`
     pub fn convert_samples(raw: &[u8], output: &mut [Complex]) -> usize {
-        let sample_count = raw.len() / 2;
+        let sample_count = raw.len() / IQ_PAIR_BYTES;
         let count = sample_count.min(output.len());
         for i in 0..count {
-            let re = (f32::from(raw[i * 2]) - IQ_OFFSET) / IQ_SCALE;
-            let im = (f32::from(raw[i * 2 + 1]) - IQ_OFFSET) / IQ_SCALE;
+            let re = (f32::from(raw[i * IQ_PAIR_BYTES]) - IQ_OFFSET) / IQ_SCALE;
+            let im = (f32::from(raw[i * IQ_PAIR_BYTES + 1]) - IQ_OFFSET) / IQ_SCALE;
             output[i] = Complex::new(re, im);
         }
         count
@@ -615,9 +707,25 @@ impl Source for RtlSdrSource {
         //
         // Per issue #407 + user feedback on PR #418 smoke test
         // ("AGC should default to off").
+        // Gain mode follows the last dispatch when there was one
+        // (pre-start dispatch or a previous open); manual otherwise.
+        let initial_gain_manual = self.last_gain_manual.unwrap_or(true);
         device
-            .set_tuner_gain_mode(true)
+            .set_tuner_gain_mode(initial_gain_manual)
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+        // Record the effective value so a later direct-sampling → off
+        // transition can restore it even when nothing was dispatched
+        // before the first `start()`.
+        self.last_gain_manual = Some(initial_gain_manual);
+        // Replay both states: the RTL2832 keeps digital AGC across
+        // handles, so a previous session leaving it on must be undone.
+        if let Err(e) = device.set_agc_mode(self.rtl_agc_enabled) {
+            tracing::warn!(
+                enabled = self.rtl_agc_enabled,
+                error = %e,
+                "RTL AGC restore on open failed"
+            );
+        }
         if let Err(e) = device.set_tuner_gain(initial_gain_tenths_db) {
             // Non-fatal: the gain-mode write above already put
             // the tuner in a valid manual state. If the
@@ -629,6 +737,10 @@ impl Source for RtlSdrSource {
                 error = %e,
                 "RtlSdrSource::start: post-open set_tuner_gain default failed (non-fatal)"
             );
+        } else {
+            // Same reasoning as `last_gain_manual` above: remember the
+            // gain the tuner was actually programmed with.
+            self.last_tuner_gain_tenths_db = Some(initial_gain_tenths_db);
         }
 
         // Set running BEFORE spawning so the reader thread sees it immediately.
@@ -650,7 +762,7 @@ impl Source for RtlSdrSource {
 
         let thread = std::thread::Builder::new()
             .name("usb-reader".into())
-            .spawn(move || run_reader_thread(reader, &ring_writer, &cancel))
+            .spawn(move || run_reader_thread(&reader, &ring_writer, &cancel))
             .map_err(|e| SourceError::OpenFailed(format!("failed to spawn USB reader: {e}")))?;
 
         self.ring = Some(ring);
@@ -715,7 +827,7 @@ impl Source for RtlSdrSource {
         let idx = ring.read_idx.load(Ordering::Relaxed) % ring.slot_count;
         let slot = &ring.slots[idx];
 
-        if slot.state.load(Ordering::Acquire) != 1 {
+        if slot.state.load(Ordering::Acquire) != RING_SLOT_FULL {
             return Ok(0); // No data available yet
         }
 
@@ -736,11 +848,11 @@ impl Source for RtlSdrSource {
         };
 
         // Each IQ pair = 2 raw bytes. Advance the consumed offset.
-        let new_consumed = consumed + count * 2;
+        let new_consumed = consumed + count * IQ_PAIR_BYTES;
         if new_consumed >= len {
             // Slot fully drained — release back to the writer.
             slot.consumed.store(0, Ordering::Relaxed);
-            slot.state.store(0, Ordering::Release);
+            slot.state.store(RING_SLOT_EMPTY, Ordering::Release);
             ring.read_idx.fetch_add(1, Ordering::Relaxed);
         } else {
             // Partial consumption — leave the slot owned by the
@@ -785,7 +897,7 @@ impl Source for RtlSdrSource {
         if let Some(device) = &mut self.device {
             device
                 .set_tuner_gain(gain_tenths)
-                .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+                .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
         }
         Ok(())
     }
@@ -801,12 +913,44 @@ impl Source for RtlSdrSource {
         // straightforward. Per #626 smoke test.
         let device_open = self.device.is_some();
         tracing::info!(manual, device_open, "RtlSdrSource::set_gain_mode dispatch");
+        self.last_gain_manual = Some(manual);
         if let Some(device) = &mut self.device {
             device
                 .set_tuner_gain_mode(manual)
-                .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+                .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
         }
         Ok(())
+    }
+
+    fn set_rtl_agc(&mut self, enabled: bool) -> Result<(), SourceError> {
+        // RTL2832 digital AGC (distinct from the tuner's LNA/mixer/VGA
+        // AGC). Remembered for replay on open; forwarded live. Was a
+        // trait-default no-op on the USB source while the UI, the
+        // controller replay and the FFI all dispatched it (#739).
+        let device_open = self.device.is_some();
+        tracing::info!(enabled, device_open, "RtlSdrSource::set_rtl_agc dispatch");
+        self.rtl_agc_enabled = enabled;
+        if let Some(device) = &self.device {
+            device
+                .set_agc_mode(enabled)
+                .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn set_gain_by_index(&mut self, index: u32) -> Result<(), SourceError> {
+        // Resolve the index against the tuner's gain table and route
+        // through `set_gain` so the value is remembered like any other
+        // gain dispatch. Was a trait-default no-op on the USB source
+        // (#739).
+        let table = self.gains();
+        let Some(&gain_tenths) = usize::try_from(index).ok().and_then(|i| table.get(i)) else {
+            return Err(SourceError::InvalidParameter(format!(
+                "gain index {index} out of range (table has {} entries)",
+                table.len()
+            )));
+        };
+        self.set_gain(gain_tenths)
     }
 
     fn gains(&self) -> &[i32] {
@@ -874,19 +1018,44 @@ impl Source for RtlSdrSource {
         // forwarding to the driver, which would either silently
         // misbehave or surface a confusing low-level error. Per
         // `CodeRabbit` round 1 on PR #559.
-        if !(0..=2).contains(&mode) {
+        if !(DIRECT_SAMPLING_OFF..=DIRECT_SAMPLING_Q).contains(&mode) {
             return Err(SourceError::TuneFailed(format!(
-                "invalid direct sampling mode: {mode} (expected 0..=2)"
+                "invalid direct sampling mode: {mode} (expected \
+                 {DIRECT_SAMPLING_OFF}=off, {DIRECT_SAMPLING_I}=I, {DIRECT_SAMPLING_Q}=Q)"
             )));
         }
-        // Remember even with no open device so the next `start()`
-        // programs it ahead of the first tune.
-        self.direct_sampling_mode = mode;
-        if let Some(device) = &mut self.device {
-            device
-                .set_direct_sampling(mode)
-                .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        let was_off = self.direct_sampling_mode == DIRECT_SAMPLING_OFF;
+        let Some(device) = &mut self.device else {
+            // Remember even with no open device so the next `start()`
+            // programs it ahead of the first tune.
+            self.direct_sampling_mode = mode;
+            return Ok(());
+        };
+        device
+            .set_direct_sampling(mode)
+            .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        // Leaving direct sampling re-runs the tuner init array
+        // (librtlsdr `set_direct_sampling(0)` → `tuner.init()`),
+        // which overwrites the LNA/mixer/VGA gain registers the
+        // user's gain mode / gain had programmed. Re-apply them
+        // so a 0 dB + LNA chain doesn't come back saturated (#741).
+        if mode == DIRECT_SAMPLING_OFF && !was_off {
+            if let Some(manual) = self.last_gain_manual {
+                device
+                    .set_tuner_gain_mode(manual)
+                    .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
+            }
+            if let Some(gain) = self.last_tuner_gain_tenths_db {
+                device
+                    .set_tuner_gain(gain)
+                    .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
+            }
         }
+        // Persist only after the device accepted the mode AND the gain
+        // restoration completed, so a later `start()` / `tune()` never
+        // replays a rejected setting and a failed restoration stays
+        // retryable (`was_off` is still false on the next mode-0 call).
+        self.direct_sampling_mode = mode;
         Ok(())
     }
 
@@ -954,13 +1123,116 @@ mod tests {
     #[test]
     fn set_direct_sampling_is_remembered_without_open_device() {
         let mut source = RtlSdrSource::new(0);
-        source.set_direct_sampling(2).expect("valid mode");
-        assert_eq!(source.direct_sampling_mode, 2);
-        assert!(source.set_direct_sampling(3).is_err());
+        source
+            .set_direct_sampling(DIRECT_SAMPLING_Q)
+            .expect("valid mode");
+        assert_eq!(source.direct_sampling_mode, DIRECT_SAMPLING_Q);
+        assert!(source.set_direct_sampling(DIRECT_SAMPLING_Q + 1).is_err());
         assert_eq!(
-            source.direct_sampling_mode, 2,
+            source.direct_sampling_mode, DIRECT_SAMPLING_Q,
             "invalid mode must not overwrite"
         );
+    }
+
+    /// #739 — RTL AGC and gain-by-index are real operations on the USB
+    /// dongle, not trait-default no-ops. Without a device they are
+    /// remembered / validated; with one they reach the hardware.
+    #[test]
+    fn set_rtl_agc_is_remembered_without_a_device() {
+        let mut source = RtlSdrSource::new(0);
+        assert!(!source.rtl_agc_enabled);
+        source.set_rtl_agc(true).expect("stored");
+        assert!(source.rtl_agc_enabled);
+    }
+
+    #[test]
+    fn set_gain_by_index_rejects_out_of_range() {
+        let mut source = RtlSdrSource::new(0);
+        // No device → no gain table → any index is out of range.
+        assert!(matches!(
+            source.set_gain_by_index(0),
+            Err(SourceError::InvalidParameter(_))
+        ));
+    }
+
+    #[test]
+    fn set_gain_mode_is_remembered_without_a_device() {
+        let mut source = RtlSdrSource::new(0);
+        assert_eq!(source.last_gain_manual, None);
+        source.set_gain_mode(false).expect("stored");
+        assert_eq!(source.last_gain_manual, Some(false));
+    }
+
+    /// #740 — the reader must tolerate a bounded run of timeouts /
+    /// zero-length transfers (host suspend, bus contention, USB
+    /// autosuspend) and only give up on real device loss.
+    #[test]
+    fn classify_read_tolerates_bounded_timeouts_and_empty_reads() {
+        let mut retries = ReadRetryBudget::default();
+        let timeout = || Err::<usize, _>(librtlsdr_rs::RtlSdrError::Usb(rusb::Error::Timeout));
+        for _ in 0..MAX_CONSECUTIVE_SOFT_READ_FAILURES {
+            assert!(matches!(
+                classify_read(timeout(), &mut retries),
+                ReadOutcome::Retry
+            ));
+        }
+        assert!(matches!(
+            classify_read(timeout(), &mut retries),
+            ReadOutcome::Fatal(_)
+        ));
+
+        let mut retries = ReadRetryBudget::default();
+        for _ in 0..MAX_CONSECUTIVE_SOFT_READ_FAILURES {
+            assert!(matches!(
+                classify_read(Ok(0), &mut retries),
+                ReadOutcome::Retry
+            ));
+        }
+        assert!(matches!(
+            classify_read(Ok(0), &mut retries),
+            ReadOutcome::Fatal(_)
+        ));
+    }
+
+    #[test]
+    fn classify_read_data_resets_the_retry_budget_and_masks_odd_lengths() {
+        let mut retries = ReadRetryBudget::default();
+        let timeout = || Err::<usize, _>(librtlsdr_rs::RtlSdrError::Usb(rusb::Error::Timeout));
+        for _ in 0..MAX_CONSECUTIVE_SOFT_READ_FAILURES {
+            classify_read(timeout(), &mut retries);
+        }
+        // A successful transfer clears the budget…
+        assert!(matches!(
+            classify_read(Ok(4096), &mut retries),
+            ReadOutcome::Data(4096)
+        ));
+        assert!(matches!(
+            classify_read(timeout(), &mut retries),
+            ReadOutcome::Retry
+        ));
+        // …and an odd byte count is trimmed to whole IQ pairs so the ring
+        // slot can always be fully drained.
+        assert!(matches!(
+            classify_read(Ok(4097), &mut retries),
+            ReadOutcome::Data(4096)
+        ));
+        // A lone odd byte is not data.
+        assert!(matches!(
+            classify_read(Ok(1), &mut retries),
+            ReadOutcome::Retry
+        ));
+    }
+
+    #[test]
+    fn classify_read_device_loss_is_fatal_immediately() {
+        let mut retries = ReadRetryBudget::default();
+        assert!(matches!(
+            classify_read(
+                Err(librtlsdr_rs::RtlSdrError::Usb(rusb::Error::NoDevice)),
+                &mut retries
+            ),
+            ReadOutcome::Fatal(_)
+        ));
     }
 
     #[test]
