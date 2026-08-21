@@ -67,6 +67,40 @@ impl GroundStation {
         }
     }
 
+    /// Validating constructor: coordinates must be finite, latitude in
+    /// [−90, 90], longitude in [−180, 180].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SatelliteError::InvalidStation`] otherwise.
+    pub fn try_new(lat_deg: f64, lon_deg: f64, alt_m: f64) -> Result<Self, SatelliteError> {
+        let station = Self::new(lat_deg, lon_deg, alt_m);
+        station.validate()?;
+        Ok(station)
+    }
+
+    /// Check the coordinates are finite and within WGS84 ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SatelliteError::InvalidStation`] describing the first bad field.
+    pub fn validate(&self) -> Result<(), SatelliteError> {
+        let bad = |message: String| SatelliteError::InvalidStation { message };
+        if !self.lat_deg.is_finite() || !(-90.0..=90.0).contains(&self.lat_deg) {
+            return Err(bad(format!("latitude {} out of [-90, 90]", self.lat_deg)));
+        }
+        if !self.lon_deg.is_finite() || !(-180.0..=180.0).contains(&self.lon_deg) {
+            return Err(bad(format!(
+                "longitude {} out of [-180, 180]",
+                self.lon_deg
+            )));
+        }
+        if !self.alt_m.is_finite() {
+            return Err(bad(format!("altitude {} is not finite", self.alt_m)));
+        }
+        Ok(())
+    }
+
     /// Station position in ECEF (km).
     #[must_use]
     pub fn ecef_km(&self) -> [f64; 3] {
@@ -136,12 +170,16 @@ pub struct Pass {
 ///
 /// # Errors
 ///
-/// Propagates [`SatelliteError`] from the underlying SGP4 propagator.
+/// Propagates [`SatelliteError`] from the underlying SGP4 propagator, and
+/// returns [`SatelliteError::InvalidStation`] for non-finite / out-of-range
+/// station coordinates (which would otherwise surface as a bogus 90°
+/// elevation, #717).
 pub fn track(
     station: &GroundStation,
     satellite: &Satellite,
     when: DateTime<Utc>,
 ) -> Result<Track, SatelliteError> {
+    station.validate()?;
     let sat_eci = satellite.propagate(when)?;
     let sat_ecef = eci_to_ecef(sat_eci.position_km, when);
     let station_ecef = station.ecef_km();
@@ -149,10 +187,19 @@ pub fn track(
     let enu = ecef_to_enu(relative_ecef, station.lat_deg, station.lon_deg);
 
     let range_km = norm(enu);
+    if !range_km.is_finite() {
+        return Err(SatelliteError::Propagation {
+            name: satellite.name().to_string(),
+            when,
+            message: "non-finite range from SGP4 state".to_string(),
+        });
+    }
     // Azimuth: 0 = North, 90 = East, range [0, 360).
     let az_rad = enu[0].atan2(enu[1]);
     let azimuth_deg = az_rad.to_degrees().rem_euclid(360.0);
-    // Elevation: positive above horizon.
+    // Elevation: positive above horizon. Zero range (satellite exactly
+    // at the station) is the only way to reach the 90° branch now that
+    // non-finite ranges are rejected above.
     let elevation_deg = if range_km > 0.0 {
         (enu[2] / range_km).asin().to_degrees()
     } else {
@@ -265,12 +312,12 @@ pub fn upcoming_passes(
         ) {
             // Rising edge: refine the boundary.
             (None, false, true) => {
-                let start = refine_crossing(station, satellite, t, next_t, min_elevation_deg);
+                let start = refine_crossing(station, satellite, t, next_t, min_elevation_deg, true);
                 pass_open = Some(start);
             }
             // Setting edge: refine, build the Pass, push.
             (Some(open_at), true, false) => {
-                let end = refine_crossing(station, satellite, t, next_t, min_elevation_deg);
+                let end = refine_crossing(station, satellite, t, next_t, min_elevation_deg, false);
                 if let Some(p) = build_pass(station, satellite, open_at, end) {
                     passes.push(p);
                 }
@@ -299,16 +346,21 @@ fn elevation_at(station: &GroundStation, satellite: &Satellite, when: DateTime<U
     track(station, satellite, when).map_or(f64::NEG_INFINITY, |t| t.elevation_deg)
 }
 
-/// Bisect between `lo` (below threshold) and `hi` (above threshold) to
-/// find the moment elevation crosses `threshold_deg`, to within
-/// [`REFINE_PRECISION`]. Returns `hi` if bisection bottoms out before
-/// the precision target.
+/// Bisect between `lo` and `hi` (one coarse step apart) to find the
+/// moment elevation crosses `threshold_deg`, to within
+/// [`REFINE_PRECISION`]. `rising` says which side is above the threshold:
+/// for an AOS edge `lo` is below and `hi` above; for an LOS edge it is the
+/// reverse. The search keeps the crossing bracketed either way — using
+/// the rising-edge rule on a setting edge collapsed every LOS to an
+/// endpoint of the 60 s bucket (#716). Returns `hi` if bisection bottoms
+/// out before the precision target.
 fn refine_crossing(
     station: &GroundStation,
     satellite: &Satellite,
     lo: DateTime<Utc>,
     hi: DateTime<Utc>,
     threshold_deg: f64,
+    rising: bool,
 ) -> DateTime<Utc> {
     let mut lo = lo;
     let mut hi = hi;
@@ -317,7 +369,10 @@ fn refine_crossing(
             return hi;
         }
         let mid = lo + (hi - lo) / 2;
-        if elevation_at(station, satellite, mid) >= threshold_deg {
+        let above = elevation_at(station, satellite, mid) >= threshold_deg;
+        // Rising: the crossing is before `mid` when `mid` is already above.
+        // Setting: the crossing is after `mid` while `mid` is still above.
+        if above == rising {
             hi = mid;
         } else {
             lo = mid;
@@ -413,6 +468,83 @@ mod tests {
 
     fn test_station() -> GroundStation {
         GroundStation::new(TEST_STATION_LAT, TEST_STATION_LON, TEST_STATION_ALT_M)
+    }
+
+    /// Tolerance on the refined boundary elevation: the bisection stops
+    /// at `REFINE_PRECISION` (1 s), during which a LEO bird moves well
+    /// under 0.1°, so both edges must sit within that of the threshold.
+    const BOUNDARY_EL_TOL_DEG: f64 = 0.1;
+
+    /// #716 — both AOS *and* LOS must be refined to the threshold crossing.
+    /// The bisection assumed a rising edge, so LOS collapsed to an end of
+    /// the 60 s coarse bucket (up to a minute early or late).
+    #[test]
+    fn pass_boundaries_sit_at_the_elevation_threshold() {
+        let sat = test_satellite();
+        let station = test_station();
+        let from = sat.epoch();
+        let to = from + chrono::Duration::hours(24);
+        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG);
+        assert!(!passes.is_empty(), "expected at least one pass in 24 h");
+        for p in &passes {
+            if p.end == to {
+                continue; // clamped, not refined
+            }
+            let el_start = track(&station, &sat, p.start).unwrap().elevation_deg;
+            let el_end = track(&station, &sat, p.end).unwrap().elevation_deg;
+            assert!(
+                (el_start - TEST_MIN_ELEVATION_DEG).abs() < BOUNDARY_EL_TOL_DEG,
+                "AOS not at threshold: el = {el_start:.3}"
+            );
+            assert!(
+                (el_end - TEST_MIN_ELEVATION_DEG).abs() < BOUNDARY_EL_TOL_DEG,
+                "LOS not at threshold: el = {el_end:.3} (pass {} → {})",
+                p.start,
+                p.end
+            );
+        }
+    }
+
+    /// #717 — a non-finite or out-of-range station must be an error, not
+    /// a fabricated 90°-elevation pass.
+    #[test]
+    fn track_rejects_invalid_station() {
+        let sat = test_satellite();
+        for station in [
+            GroundStation::new(f64::NAN, -74.0, 0.0),
+            GroundStation::new(40.0, f64::INFINITY, 0.0),
+            GroundStation::new(91.0, -74.0, 0.0),
+            GroundStation::new(40.0, 181.0, 0.0),
+            GroundStation::new(40.0, -74.0, f64::NAN),
+        ] {
+            assert!(
+                matches!(
+                    track(&station, &sat, sat.epoch()),
+                    Err(SatelliteError::InvalidStation { .. })
+                ),
+                "station {station:?} must be rejected"
+            );
+        }
+        assert!(
+            upcoming_passes(
+                &GroundStation::new(f64::NAN, f64::NAN, 0.0),
+                &sat,
+                sat.epoch(),
+                sat.epoch() + chrono::Duration::hours(24),
+                TEST_MIN_ELEVATION_DEG
+            )
+            .is_empty(),
+            "an invalid station must not produce passes"
+        );
+    }
+
+    #[test]
+    fn ground_station_try_new_validates() {
+        assert!(GroundStation::try_new(40.0, -74.0, 50.0).is_ok());
+        assert!(GroundStation::try_new(f64::NAN, -74.0, 50.0).is_err());
+        assert!(GroundStation::try_new(-90.5, 0.0, 0.0).is_err());
+        assert!(GroundStation::try_new(0.0, 180.5, 0.0).is_err());
+        assert!(GroundStation::try_new(0.0, 0.0, f64::INFINITY).is_err());
     }
 
     #[test]

@@ -148,6 +148,19 @@ fn parse_response(zip: &str, body: &str) -> Result<PostalLocation, PostalLookupE
         .and_then(serde_json::Value::as_str)
         .and_then(|s| s.parse::<f64>().ok())
         .ok_or_else(|| PostalLookupError::Parse("missing/non-numeric longitude".to_string()))?;
+    // `str::parse::<f64>` accepts "NaN", "inf" and any magnitude; a
+    // poisoned coordinate would be persisted to config and fabricate
+    // passes downstream (#717). Same check `elevation.rs` applies.
+    if !lat_deg.is_finite() || !(-90.0..=90.0).contains(&lat_deg) {
+        return Err(PostalLookupError::Parse(format!(
+            "latitude {lat_deg} out of range [-90, 90]"
+        )));
+    }
+    if !lon_deg.is_finite() || !(-180.0..=180.0).contains(&lon_deg) {
+        return Err(PostalLookupError::Parse(format!(
+            "longitude {lon_deg} out of range [-180, 180]"
+        )));
+    }
     let place = first
         .get("place name")
         .and_then(serde_json::Value::as_str)
@@ -223,6 +236,30 @@ mod tests {
         assert!((loc.lon_deg - -80.4184).abs() < 0.0001);
         assert_eq!(loc.place, "Christiansburg");
         assert_eq!(loc.region, "VA");
+    }
+
+    /// #717 — `str::parse::<f64>` accepts "NaN" / "inf" and any magnitude;
+    /// the lookup must hand back only finite, in-range coordinates (the
+    /// sibling elevation lookup already validates the same quantities).
+    #[test]
+    fn parse_response_rejects_non_finite_or_out_of_range_coordinates() {
+        for (lat, lon) in [
+            ("NaN", "-80.4184"),
+            ("37.1548", "inf"),
+            ("95.0", "-80.4184"),
+            ("37.1548", "-181.0"),
+        ] {
+            let body = format!(
+                r#"{{"places":[{{"place name":"X","state abbreviation":"VA","latitude":"{lat}","longitude":"{lon}"}}]}}"#
+            );
+            assert!(
+                matches!(
+                    parse_response("24060", &body),
+                    Err(PostalLookupError::Parse(_))
+                ),
+                "lat={lat} lon={lon} must be rejected"
+            );
+        }
     }
 
     #[test]

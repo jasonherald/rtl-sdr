@@ -36,6 +36,15 @@ pub enum SatelliteError {
         /// Stringified SGP4 propagation error.
         message: String,
     },
+    /// The ground station's coordinates are non-finite or outside the
+    /// WGS84 ranges (|lat| ≤ 90, |lon| ≤ 180). A NaN station used to
+    /// fall through `track()` as a 90° elevation, fabricating a permanent
+    /// overhead pass (#717).
+    #[error("invalid ground station: {message}")]
+    InvalidStation {
+        /// What was wrong.
+        message: String,
+    },
 }
 
 /// One satellite's parsed TLE plus the SGP4 propagator built from it.
