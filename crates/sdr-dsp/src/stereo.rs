@@ -33,6 +33,9 @@ const AUDIO_LPF_TRANSITION: f64 = 4_000.0;
 /// PLL bandwidth for pilot tracking.
 const PILOT_PLL_BANDWIDTH: f32 = 0.01;
 
+/// Double-angle identity scale: sin(2θ) = 2·sin(θ)·cos(θ).
+const SUBCARRIER_DOUBLE_ANGLE_SCALE: f32 = 2.0;
+
 /// FM stereo decoder — extracts L/R channels from FM composite baseband.
 ///
 /// Input: mono FM discriminator output (composite baseband at IF sample rate).
@@ -164,10 +167,20 @@ impl FmStereoDecoder {
             self.pilot_pll.process(&pilot_complex, &mut pll_out)?;
 
             // Double the PLL phase: 19 kHz → 38 kHz subcarrier.
-            // cos(2θ) = cos²(θ) − sin²(θ), using the PLL phasor components.
+            //
+            // The PLL is fed the *real* pilot, so it locks with its phasor
+            // in quadrature to the pilot: for a pilot sin(ωt) the locked
+            // phase is θ = ωt − π/2. The FCC composite carries the
+            // difference signal on sin(2ωt) (the 38 kHz subcarrier crosses
+            // zero with positive slope together with the pilot), and
+            // sin(2ωt) = −sin(2θ) = −2·sin(θ)·cos(θ). Using cos(2θ) here —
+            // as the first port did — yields −cos(2ωt), which is in
+            // quadrature with the subcarrier and demodulates to dual
+            // mono (#772). An inverted discriminator flips the pilot and
+            // subcarrier together, so this sign is polarity-independent.
             let cos_t = pll_out[0].re;
             let sin_t = pll_out[0].im;
-            let subcarrier = cos_t * cos_t - sin_t * sin_t;
+            let subcarrier = -SUBCARRIER_DOUBLE_ANGLE_SCALE * sin_t * cos_t;
 
             // Delay-compensate composite for phase-aligned extraction.
             // Uses persistent write position for correct streaming across calls.
@@ -350,5 +363,55 @@ mod tests {
                 ref_output[i].l
             );
         }
+    }
+
+    /// FCC broadcast-MPX fixture parameters.
+    const MPX_PILOT_HZ: f32 = 19_000.0;
+    const MPX_SUBCARRIER_HZ: f32 = 2.0 * MPX_PILOT_HZ;
+    /// Pilot injection level relative to full-scale programme (≈10 %).
+    const MPX_PILOT_AMPLITUDE: f32 = 0.1;
+    /// Programme tone used by the separation test.
+    const MPX_TEST_TONE_HZ: f32 = 1_000.0;
+    /// 1 s at 250 ksps — plenty for the pilot PLL + filters to settle;
+    /// the second half is measured.
+    const MPX_TEST_LEN: usize = 250_000;
+    /// Floor applied to the R energy so a perfect decode can't divide by zero.
+    const MPX_ENERGY_FLOOR: f32 = 1e-12;
+    /// Required L→R separation for a left-only programme.
+    const MPX_MIN_SEPARATION_DB: f32 = 20.0;
+
+    /// Build an FCC-standard MPX composite:
+    /// (L+R) + (L−R)·sin(2ωt) + `MPX_PILOT_AMPLITUDE`·sin(ωt) — the 38 kHz
+    /// subcarrier crosses zero with positive slope together with the 19 kHz
+    /// pilot. Left-only programme, so L−R == L+R == the tone.
+    fn fcc_mpx_left_only(len: usize, tone_hz: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let t = i as f32 / TEST_SAMPLE_RATE as f32;
+                let l = (2.0 * PI * tone_hz * t).sin();
+                let pilot = MPX_PILOT_AMPLITUDE * (2.0 * PI * MPX_PILOT_HZ * t).sin();
+                let sub = l * (2.0 * PI * MPX_SUBCARRIER_HZ * t).sin();
+                l + sub + pilot
+            })
+            .collect()
+    }
+
+    /// #772 — a left-only broadcast must decode with real channel
+    /// separation, not as dual mono.
+    #[test]
+    fn stereo_decoder_separates_left_only_programme() {
+        let mut decoder = FmStereoDecoder::new(TEST_SAMPLE_RATE).unwrap();
+        let input = fcc_mpx_left_only(MPX_TEST_LEN, MPX_TEST_TONE_HZ);
+        let mut output = vec![Stereo::default(); MPX_TEST_LEN];
+        decoder.process(&input, &mut output).unwrap();
+
+        let tail = &output[MPX_TEST_LEN / 2..];
+        let l_energy: f32 = tail.iter().map(|s| s.l * s.l).sum();
+        let r_energy: f32 = tail.iter().map(|s| s.r * s.r).sum();
+        let separation_db = 10.0 * (l_energy / r_energy.max(MPX_ENERGY_FLOOR)).log10();
+        assert!(
+            separation_db > MPX_MIN_SEPARATION_DB,
+            "left-only programme must leak < -{MPX_MIN_SEPARATION_DB} dB into R, got {separation_db:.1} dB (L {l_energy:.3}, R {r_energy:.3})"
+        );
     }
 }

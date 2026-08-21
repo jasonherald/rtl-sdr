@@ -217,12 +217,32 @@ impl IfChain {
 
     /// Enable or disable FM IF noise reduction.
     pub fn set_fm_if_nr_enabled(&mut self, enabled: bool) {
+        if self.fm_if_nr_enabled != enabled {
+            // The block-based NR holds partial input and queued output;
+            // never let a pre-toggle remainder leak into the new session.
+            self.fm_if_nr.reset();
+        }
         self.fm_if_nr_enabled = enabled;
     }
 
     /// Returns whether FM IF noise reduction is enabled.
     pub fn fm_if_nr_enabled(&self) -> bool {
         self.fm_if_nr_enabled
+    }
+
+    /// End of stream: emit any samples the block-based FM IF noise
+    /// reduction still holds (see `FmIfNoiseReduction::flush`). A no-op
+    /// returning 0 when the stage is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `DspError::BufferTooSmall` from the NR stage.
+    pub fn flush(&mut self, output: &mut [Complex]) -> Result<usize, DspError> {
+        if self.fm_if_nr_enabled {
+            self.fm_if_nr.flush(output)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Process complex IF samples through the enabled chain stages.
@@ -254,7 +274,7 @@ impl IfChain {
             return Ok(input.len());
         }
 
-        let n = input.len();
+        let mut n = input.len();
         self.buf_a.resize(n, Complex::default());
         self.buf_b.resize(n, Complex::default());
 
@@ -336,15 +356,17 @@ impl IfChain {
             current_is_a = !current_is_a;
         }
 
-        // Stage 4: FM IF noise reduction
+        // Stage 4: FM IF noise reduction. Block-based: it may hand back
+        // fewer samples than it was given (bounded latency), so the
+        // running count follows its return value. Per #773.
         if self.fm_if_nr_enabled {
-            if current_is_a {
+            n = if current_is_a {
                 self.fm_if_nr
-                    .process(&self.buf_a[..n], &mut self.buf_b[..n])?;
+                    .process(&self.buf_a[..n], &mut self.buf_b[..n])?
             } else {
                 self.fm_if_nr
-                    .process(&self.buf_b[..n], &mut self.buf_a[..n])?;
-            }
+                    .process(&self.buf_b[..n], &mut self.buf_a[..n])?
+            };
             current_is_a = !current_is_a;
         }
 
@@ -374,6 +396,91 @@ mod tests {
         assert_eq!(count, 100);
         assert_eq!(output[0].re, 1.0);
         assert_eq!(output[0].im, 2.0);
+    }
+
+    // ---- FM IF NR streaming fixture parameters (#773) ----
+    /// Matches `FmIfNoiseReduction`'s default block size.
+    const NR_FFT_SIZE: usize = 256;
+    /// Two full NR blocks.
+    const NR_SIGNAL_LEN: usize = 2 * NR_FFT_SIZE;
+    /// Tone bin (cycles per FFT block) — a clean single peak for the NR.
+    const NR_TONE_BIN: f32 = 37.0;
+    /// One block plus a partial remainder, so state is left buffered.
+    const NR_PARTIAL_CHUNK: usize = NR_FFT_SIZE + 44;
+    /// Sample-equality tolerance between two chains.
+    const NR_SAMPLE_TOL: f32 = 1e-4;
+
+    fn nr_test_tone(len: usize) -> Vec<Complex> {
+        (0..len)
+            .map(|i| {
+                let theta =
+                    2.0 * core::f32::consts::PI * NR_TONE_BIN * i as f32 / NR_FFT_SIZE as f32;
+                Complex::new(theta.cos(), theta.sin())
+            })
+            .collect()
+    }
+
+    /// #773 (CR) — toggling FM IF NR off and on must not replay samples
+    /// buffered before the disable: the re-enabled chain behaves like a
+    /// fresh one.
+    #[test]
+    fn fm_if_nr_toggle_resets_buffered_state() {
+        let signal = nr_test_tone(NR_SIGNAL_LEN);
+
+        let mut toggled = IfChain::new().unwrap();
+        toggled.set_fm_if_nr_enabled(true);
+        let mut scratch = vec![Complex::default(); NR_PARTIAL_CHUNK];
+        toggled
+            .process(&signal[..NR_PARTIAL_CHUNK], &mut scratch)
+            .unwrap();
+        toggled.set_fm_if_nr_enabled(false);
+        toggled.set_fm_if_nr_enabled(true);
+        let mut out_toggled = vec![Complex::default(); NR_SIGNAL_LEN];
+        let n_toggled = toggled.process(&signal, &mut out_toggled).unwrap();
+
+        let mut fresh = IfChain::new().unwrap();
+        fresh.set_fm_if_nr_enabled(true);
+        let mut out_fresh = vec![Complex::default(); NR_SIGNAL_LEN];
+        let n_fresh = fresh.process(&signal, &mut out_fresh).unwrap();
+
+        assert_eq!(
+            n_toggled, n_fresh,
+            "stale buffered samples leaked through the toggle"
+        );
+        for i in 0..n_fresh {
+            assert!(
+                (out_toggled[i].re - out_fresh[i].re).abs() < NR_SAMPLE_TOL
+                    && (out_toggled[i].im - out_fresh[i].im).abs() < NR_SAMPLE_TOL,
+                "sample {i} differs after toggle"
+            );
+        }
+    }
+
+    /// #773 (CR) — end of stream: `process` + `flush` must account for
+    /// every input sample when FM IF NR is enabled, and `flush` is a no-op
+    /// when it is not.
+    #[test]
+    fn fm_if_nr_flush_completes_the_stream() {
+        let signal = nr_test_tone(NR_PARTIAL_CHUNK);
+
+        let mut chain = IfChain::new().unwrap();
+        chain.set_fm_if_nr_enabled(true);
+        let mut out = vec![Complex::default(); NR_PARTIAL_CHUNK];
+        let n = chain.process(&signal, &mut out).unwrap();
+        assert!(
+            n < NR_PARTIAL_CHUNK,
+            "a partial block should still be buffered"
+        );
+        let mut tail = vec![Complex::default(); 2 * NR_FFT_SIZE];
+        let flushed = chain.flush(&mut tail).unwrap();
+        assert_eq!(n + flushed, NR_PARTIAL_CHUNK);
+
+        let mut plain = IfChain::new().unwrap();
+        assert_eq!(
+            plain.flush(&mut tail).unwrap(),
+            0,
+            "flush is a no-op with NR disabled"
+        );
     }
 
     #[test]
