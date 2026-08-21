@@ -1253,8 +1253,9 @@ mod tests {
 
     #[test]
     fn disable_clears_rotation_state_but_preserves_lockouts() {
-        // Re-enabling after a disable should start fresh — no
-        // carried-over lockouts, cursors, or hop counter.
+        // Disable resets only the rotation cursor, hop counter and
+        // priority-sweep state so re-enable starts the cycle fresh;
+        // lockouts persist for the whole app session (#757).
         let mut s = Scanner::new();
         let key_a = ChannelKey {
             name: "A".to_string(),
