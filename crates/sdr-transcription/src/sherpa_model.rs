@@ -282,6 +282,8 @@ pub fn download_silero_vad(
 
     tracing::info!(url = %SILERO_VAD_URL, ?part_path, "downloading silero VAD");
 
+    crate::ensure_tls_provider();
+
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_mins(SILERO_VAD_REQUEST_TIMEOUT_MINS))
@@ -486,6 +488,7 @@ pub fn download_sherpa_archive(
     // 30-second connection timeout (fail fast if the server is unreachable),
     // 60-minute total body timeout (256 MB at ~70 KB/s — slow but still
     // legitimate for users on rural broadband or hotel WiFi).
+    crate::ensure_tls_provider();
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_hours(SHERPA_ARCHIVE_REQUEST_TIMEOUT_HOURS))

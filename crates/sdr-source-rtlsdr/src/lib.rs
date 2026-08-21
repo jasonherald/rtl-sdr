@@ -37,6 +37,9 @@ pub const R82XX_MIN_TUNER_FREQ_HZ: f64 = 24_000_000.0;
 /// Direct-sampling mode value meaning "off — normal tuner path".
 const DIRECT_SAMPLING_OFF: i32 = 0;
 
+/// Hz → MHz divisor for user-facing frequency text.
+const HERTZ_PER_MHZ: f64 = 1_000_000.0;
+
 /// IQ sample conversion factor: `(sample - 127.4) / 128.0`
 ///
 /// Matches SDR++ `RTLSDRSourceModule::asyncHandler`.
@@ -463,8 +466,8 @@ impl RtlSdrSource {
                 "{:.3} MHz is below the {tuner:?} tuner's {:.0} MHz floor. \
                  For HF, set Direct Sampling to \"Q branch\" in the Source panel \
                  (driver: {driver_error})",
-                frequency_hz / 1e6,
-                R82XX_MIN_TUNER_FREQ_HZ / 1e6,
+                frequency_hz / HERTZ_PER_MHZ,
+                R82XX_MIN_TUNER_FREQ_HZ / HERTZ_PER_MHZ,
             )
         } else {
             driver_error.to_string()

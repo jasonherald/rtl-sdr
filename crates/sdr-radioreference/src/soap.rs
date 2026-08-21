@@ -342,6 +342,11 @@ fn read_text_content<'a>(reader: &mut Reader<&'a [u8]>) -> Result<Cow<'a, str>, 
                 text.push_str(&decoded);
             }
             Ok(Event::GeneralRef(e)) => text.push_str(&resolve_general_ref(&e)?),
+            // CDATA is literal — no entity resolution, no EOL rules.
+            Ok(Event::CData(e)) => {
+                let decoded = e.decode().map_err(quick_xml::Error::from)?;
+                text.push_str(&decoded);
+            }
             Ok(Event::End(_)) => break,
             Ok(Event::Eof) => {
                 return Err(SoapError::Unexpected(
@@ -959,6 +964,19 @@ mod tests {
         assert_eq!(cat.subcategories.len(), 1);
         assert_eq!(cat.subcategories[0].scid, 42);
         assert_eq!(cat.subcategories[0].name, "Dispatch (North) \"Ops\"");
+    }
+
+    #[test]
+    fn cdata_text_is_preserved_verbatim() {
+        let xml = COUNTY_ENTITY_RESPONSE_XML.replace(
+            "Fire &amp; EMS &lt;all&gt;",
+            "<![CDATA[Fire & EMS <all> & more]]> plus &amp; text",
+        );
+        let info = parse_county_info(&xml, 1).expect("parses");
+        assert_eq!(
+            info.categories[0].name,
+            "Fire & EMS <all> & more plus & text"
+        );
     }
 
     #[test]

@@ -1133,3 +1133,29 @@ mod tests {
         );
     }
 }
+
+/// Install the pure-Rust `ring` `CryptoProvider` as the process-wide
+/// rustls default, idempotently.
+///
+/// reqwest 0.13's `rustls-no-provider` feature (see the workspace
+/// `Cargo.toml` comment) makes `Client::builder().build()` **panic**
+/// unless a provider was installed first — it calls
+/// `CryptoProvider::get_default()` rather than picking one from crate
+/// features. Call this immediately before every client construction;
+/// `install_default` returns `Err` when a provider is already set,
+/// which is exactly the "someone else got there first" case we want
+/// to ignore. Per `CodeRabbit` round 1 on PR #691.
+pub(crate) fn ensure_tls_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(test)]
+mod tls_provider_tests {
+    #[test]
+    fn blocking_client_builds_after_ensure_tls_provider() {
+        // Regression: without an installed provider reqwest panics here.
+        super::ensure_tls_provider();
+        super::ensure_tls_provider(); // idempotent
+        assert!(reqwest::blocking::Client::builder().build().is_ok());
+    }
+}
