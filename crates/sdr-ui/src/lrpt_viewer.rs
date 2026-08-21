@@ -1820,7 +1820,7 @@ impl LrptImageView {
             // `chunks_exact` views the flat tail buffer as
             // per-row slices without further allocation. Per
             // `CodeRabbit` round 17 on PR #543.
-            for (offset, row) in p.pixels.chunks_exact(IMAGE_WIDTH).enumerate() {
+            for (offset, row) in p.pixels.as_chunks::<IMAGE_WIDTH>().0.iter().enumerate() {
                 let outcome = renderer.push_line(p.apid, row);
                 if !outcome.consumed() {
                     // Transient failure — leave this row in the

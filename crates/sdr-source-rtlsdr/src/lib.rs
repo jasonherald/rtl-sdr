@@ -17,12 +17,25 @@
 //! uint8 IQ samples from the USB device to f32 Complex samples for
 //! the signal processing pipeline.
 
-use librtlsdr_rs::RtlSdrDevice;
+use librtlsdr_rs::{RtlSdrDevice, TunerType};
 use sdr_pipeline::source_manager::Source;
 use sdr_types::{Complex, SourceError};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Lowest frequency the R820T / R828D tuner PLL can reach through
+/// the normal tuner path. Below this the VCO (1770–3900 MHz) has
+/// no integer divider ≤ 64 that lands on the requested LO, and
+/// `librtlsdr-rs` returns `PllProgrammingFailed` rather than the C
+/// reference's "PLL not locked" warning + noise. HF reception below
+/// this floor needs the RTL2832's direct-sampling path (Q branch on
+/// RTL-SDR Blog v3+ dongles), which bypasses the tuner entirely.
+/// Matches the 24 MHz lower bound librtlsdr documents for R820T.
+pub const R82XX_MIN_TUNER_FREQ_HZ: f64 = 24_000_000.0;
+
+/// Direct-sampling mode value meaning "off — normal tuner path".
+const DIRECT_SAMPLING_OFF: i32 = 0;
 
 /// IQ sample conversion factor: `(sample - 127.4) / 128.0`
 ///
@@ -151,6 +164,14 @@ pub struct RtlSdrSource {
     /// 0 dB choice with the 29.7 dB default and saturated the
     /// front-end on LNA-equipped chains.
     last_tuner_gain_tenths_db: Option<i32>,
+    /// Most-recent direct-sampling mode the controller dispatched
+    /// (0 = off, 1 = I branch, 2 = Q branch). Remembered across
+    /// stop/start so `start()` can program it *before* the first
+    /// `set_center_freq` — the controller's post-`start()` replay
+    /// runs too late for HF: an R820T tune below
+    /// `R82XX_MIN_TUNER_FREQ_HZ` fails outright, so the replay was
+    /// never reached and Q-branch users could not Play below 24 MHz.
+    direct_sampling_mode: i32,
 }
 
 /// USB reader-thread main loop.
@@ -414,6 +435,39 @@ impl RtlSdrSource {
             ring: None,
             reader_thread: None,
             last_tuner_gain_tenths_db: None,
+            direct_sampling_mode: DIRECT_SAMPLING_OFF,
+        }
+    }
+
+    /// Build the user-facing `TuneFailed` message for a failed
+    /// `set_center_freq`.
+    ///
+    /// Pure so it is unit-testable without hardware. When the
+    /// request is below the R82xx tuner floor and direct sampling
+    /// is off, the raw driver error ("PLL programming failed … no
+    /// valid VCO divider") is replaced with an actionable hint
+    /// pointing at the Source panel's Direct Sampling combo.
+    /// Otherwise the driver text passes through unchanged.
+    fn tune_failure_message(
+        tuner: TunerType,
+        direct_sampling_mode: i32,
+        frequency_hz: f64,
+        driver_error: &str,
+    ) -> String {
+        let r82xx = matches!(tuner, TunerType::R820T | TunerType::R828D);
+        if r82xx
+            && direct_sampling_mode == DIRECT_SAMPLING_OFF
+            && frequency_hz < R82XX_MIN_TUNER_FREQ_HZ
+        {
+            format!(
+                "{:.3} MHz is below the {tuner:?} tuner's {:.0} MHz floor. \
+                 For HF, set Direct Sampling to \"Q branch\" in the Source panel \
+                 (driver: {driver_error})",
+                frequency_hz / 1e6,
+                R82XX_MIN_TUNER_FREQ_HZ / 1e6,
+            )
+        } else {
+            driver_error.to_string()
         }
     }
 
@@ -499,9 +553,29 @@ impl Source for RtlSdrSource {
             .set_sample_rate(self.sample_rate as u32)
             .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
 
-        device
-            .set_center_freq(self.frequency as u32)
-            .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        // Program direct sampling BEFORE the first tune, mirroring
+        // rtl_fm's call order. `rtlsdr_set_center_freq` branches on
+        // the direct-sampling flag, so an HF frequency with Q branch
+        // selected is only tunable once the mode is in place. The
+        // controller's post-`start()` replay still runs (harmless
+        // no-op re-write) but is too late to save this first tune.
+        if self.direct_sampling_mode != DIRECT_SAMPLING_OFF {
+            device
+                .set_direct_sampling(self.direct_sampling_mode)
+                .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+        }
+
+        let tuner = device.tuner_type();
+        let direct_sampling_mode = self.direct_sampling_mode;
+        let frequency_hz = self.frequency;
+        device.set_center_freq(self.frequency as u32).map_err(|e| {
+            SourceError::TuneFailed(Self::tune_failure_message(
+                tuner,
+                direct_sampling_mode,
+                frequency_hz,
+                &e.to_string(),
+            ))
+        })?;
 
         device
             .reset_buffer()
@@ -595,9 +669,16 @@ impl Source for RtlSdrSource {
     fn tune(&mut self, frequency_hz: f64) -> Result<(), SourceError> {
         self.frequency = frequency_hz;
         if let Some(device) = &mut self.device {
-            device
-                .set_center_freq(frequency_hz as u32)
-                .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+            let tuner = device.tuner_type();
+            let direct_sampling_mode = self.direct_sampling_mode;
+            device.set_center_freq(frequency_hz as u32).map_err(|e| {
+                SourceError::TuneFailed(Self::tune_failure_message(
+                    tuner,
+                    direct_sampling_mode,
+                    frequency_hz,
+                    &e.to_string(),
+                ))
+            })?;
         }
         Ok(())
     }
@@ -795,6 +876,9 @@ impl Source for RtlSdrSource {
                 "invalid direct sampling mode: {mode} (expected 0..=2)"
             )));
         }
+        // Remember even with no open device so the next `start()`
+        // programs it ahead of the first tune.
+        self.direct_sampling_mode = mode;
         if let Some(device) = &mut self.device {
             device
                 .set_direct_sampling(mode)
@@ -861,5 +945,55 @@ mod tests {
         let source = RtlSdrSource::new(0);
         assert_eq!(source.name(), "RTL-SDR");
         assert!((source.sample_rate() - 2_400_000.0).abs() < 1.0);
+        assert_eq!(source.direct_sampling_mode, DIRECT_SAMPLING_OFF);
+    }
+
+    #[test]
+    fn set_direct_sampling_is_remembered_without_open_device() {
+        let mut source = RtlSdrSource::new(0);
+        source.set_direct_sampling(2).expect("valid mode");
+        assert_eq!(source.direct_sampling_mode, 2);
+        assert!(source.set_direct_sampling(3).is_err());
+        assert_eq!(
+            source.direct_sampling_mode, 2,
+            "invalid mode must not overwrite"
+        );
+    }
+
+    #[test]
+    fn hf_tune_failure_on_r820t_hints_at_direct_sampling() {
+        let msg = RtlSdrSource::tune_failure_message(
+            TunerType::R820T,
+            DIRECT_SAMPLING_OFF,
+            4_800_000.0,
+            "R82xx: PLL programming failed for 6425000 Hz (no valid VCO divider)",
+        );
+        assert!(msg.contains("4.800 MHz"), "{msg}");
+        assert!(msg.contains("24 MHz floor"), "{msg}");
+        assert!(msg.contains("Direct Sampling"), "{msg}");
+        assert!(
+            msg.contains("no valid VCO divider"),
+            "driver detail kept: {msg}"
+        );
+    }
+
+    #[test]
+    fn tune_failure_passthrough_when_hint_does_not_apply() {
+        let raw = "some driver error";
+        // Already in direct sampling — tuner floor is irrelevant.
+        assert_eq!(
+            RtlSdrSource::tune_failure_message(TunerType::R820T, 2, 4_800_000.0, raw),
+            raw
+        );
+        // Above the floor — a different failure, don't mislead.
+        assert_eq!(
+            RtlSdrSource::tune_failure_message(TunerType::R820T, 0, 100_000_000.0, raw),
+            raw
+        );
+        // Non-R82xx tuner — floor constant doesn't apply.
+        assert_eq!(
+            RtlSdrSource::tune_failure_message(TunerType::E4000, 0, 4_800_000.0, raw),
+            raw
+        );
     }
 }

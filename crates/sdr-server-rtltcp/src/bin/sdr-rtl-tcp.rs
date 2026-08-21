@@ -408,16 +408,19 @@ fn parse_auth_key_hex(s: &str) -> Result<Vec<u8>, ParseError> {
         return Err(ParseError);
     }
     // With ASCII confirmed, the string is also a valid byte
-    // slice — `chunks_exact(2)` walks pairs without str-slicing
-    // boundary concerns. Per-char hex-digit validation keeps
+    // slice — `as_chunks::<2>()` walks pairs without str-slicing
+    // boundary concerns (the length check above guarantees an
+    // empty remainder). Per-char hex-digit validation keeps
     // the error surface narrow (same "bad input" signal for
     // "not hex" and "not ASCII").
     let bytes: Result<Vec<u8>, ParseError> = s
         .as_bytes()
-        .chunks_exact(HEX_CHARS_PER_BYTE)
-        .map(|pair| {
-            let hi = char::from(pair[0]).to_digit(16).ok_or(ParseError)?;
-            let lo = char::from(pair[1]).to_digit(16).ok_or(ParseError)?;
+        .as_chunks::<HEX_CHARS_PER_BYTE>()
+        .0
+        .iter()
+        .map(|&[hi, lo]| {
+            let hi = char::from(hi).to_digit(16).ok_or(ParseError)?;
+            let lo = char::from(lo).to_digit(16).ok_or(ParseError)?;
             // `to_digit(16)` only returns 0..=15, so `hi << 4 | lo`
             // fits in u8. The `as u8` is lossless here.
             #[allow(

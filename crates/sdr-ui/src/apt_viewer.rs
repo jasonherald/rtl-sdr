@@ -473,7 +473,7 @@ pub fn render_and_save_apt_png(
     let stride = usize::try_from(export_surface.stride())?;
     {
         let mut data = export_surface.data()?;
-        for (row, line) in pixels.chunks_exact(LINE_PIXELS).enumerate() {
+        for (row, line) in pixels.as_chunks::<LINE_PIXELS>().0.iter().enumerate() {
             let row_offset = row * stride;
             for (col, &g) in line.iter().enumerate() {
                 let p = row_offset + col * 4;

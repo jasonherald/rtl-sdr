@@ -405,6 +405,9 @@ impl GpuFftEngine {
                     power_preference: opts.power_preference,
                     force_fallback_adapter: opts.force_fallback_adapter,
                     compatible_surface: None,
+                    // wgpu 30: opt-in limit bucketing (anti-fingerprinting
+                    // on web). Off — we want the adapter's real limits.
+                    apply_limit_buckets: false,
                 })
                 .await
                 .map_err(|e| DspError::GpuUnavailable(format!("request_adapter failed: {e}")))?
@@ -1025,7 +1028,11 @@ impl FftEngine for GpuFftEngine {
         map_result.map_err(|e| DspError::GpuUnavailable(format!("staging map failed: {e}")))?;
 
         // 5. Copy mapped bytes into the caller's buffer.
-        let data = slice.get_mapped_range();
+        // wgpu 30: `get_mapped_range` reports an out-of-range / unmapped
+        // slice as an error instead of panicking.
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| DspError::GpuUnavailable(format!("staging mapped range failed: {e}")))?;
         let as_complex: &[Complex] = bytemuck::cast_slice(&data);
         buf.copy_from_slice(as_complex);
         drop(data);

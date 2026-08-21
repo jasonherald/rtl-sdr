@@ -336,9 +336,7 @@ impl RollingRms {
     }
 
     fn reset(&mut self) {
-        for v in &mut self.squares {
-            *v = 0.0;
-        }
+        self.squares.fill(0.0);
         self.head = 0;
         self.sum_sq = 0.0;
     }

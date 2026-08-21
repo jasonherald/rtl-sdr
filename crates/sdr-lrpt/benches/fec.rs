@@ -4,8 +4,9 @@
 //! derandomizer (1MB) on synthetic fixtures. Sets the per-stage
 //! perf floor for regression detection.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use sdr_lrpt::fec::{Derandomizer, RS_N, ReedSolomon, SyncCorrelator, ViterbiDecoder};
+use std::hint::black_box;
 
 /// Number of encoded bit pairs to drive through Viterbi per
 /// iteration. Slightly above one CADU's worth of soft input.
@@ -37,7 +38,7 @@ fn bench_viterbi(c: &mut Criterion) {
         b.iter(|| {
             let mut dec = ViterbiDecoder::new();
             let mut count = 0_u32;
-            for chunk in symbols.chunks_exact(2) {
+            for chunk in symbols.as_chunks::<2>().0 {
                 if dec.step([chunk[0], chunk[1]]).is_some() {
                     count += 1;
                 }

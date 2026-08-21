@@ -58,7 +58,7 @@ subtle.workspace = true
 # `Err(Unsupported)`. Scoped to `cfg(not(unix))` so the dep doesn't
 # affect the primary Linux/macOS builds.
 [target.'cfg(not(unix))'.dependencies]
-socket2 = "0.5"
+socket2 = "0.6"
 
 [lints]
 workspace = true

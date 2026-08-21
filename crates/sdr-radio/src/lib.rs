@@ -56,7 +56,10 @@ fn mean_abs_stereo(s: &[Stereo]) -> f32 {
     }
     #[allow(clippy::cast_precision_loss)]
     let inv_len = 1.0 / s.len() as f32;
-    s.iter().map(|t| (t.l.abs() + t.r.abs()) * 0.5).sum::<f32>() * inv_len
+    s.iter()
+        .map(|t| f32::midpoint(t.l.abs(), t.r.abs()))
+        .sum::<f32>()
+        * inv_len
 }
 
 /// Deemphasis mode for FM broadcast.

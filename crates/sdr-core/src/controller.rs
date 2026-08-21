@@ -867,7 +867,7 @@ fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_co
     state.apt_mono_buf.extend(
         state.audio_buf[..audio_count]
             .iter()
-            .map(|s| (s.l + s.r) * 0.5),
+            .map(|s| f32::midpoint(s.l, s.r)),
     );
 
     match decoder.process(&state.apt_mono_buf, &mut state.apt_lines_buf) {
@@ -999,7 +999,7 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
     state.sstv_mono_buf.extend(
         state.audio_buf[..audio_count]
             .iter()
-            .map(|s| (s.l + s.r) * 0.5),
+            .map(|s| f32::midpoint(s.l, s.r)),
     );
 
     // `SstvDecoder::process` returns a `Vec<SstvEvent>` — iterate and

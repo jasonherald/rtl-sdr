@@ -619,7 +619,7 @@ impl CtcssDetector {
         let mut pending = core::mem::take(&mut self.pending_samples);
 
         let mut last_decision = None;
-        for window in pending[..ready_len].chunks_exact(CTCSS_WINDOW_SAMPLES) {
+        for window in pending[..ready_len].as_chunks::<CTCSS_WINDOW_SAMPLES>().0 {
             last_decision = Some(self.process_window(window));
         }
 

@@ -56,6 +56,7 @@ whisper-rs = { workspace = true, optional = true }
 sherpa-onnx = { workspace = true, optional = true }
 earshot = { version = "1", optional = true }
 reqwest.workspace = true
+rustls.workspace = true
 rustfft.workspace = true
 sdr-types.workspace = true
 thiserror.workspace = true

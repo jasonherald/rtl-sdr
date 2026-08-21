@@ -152,7 +152,7 @@ pub fn auth_key_from_hex(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / HEX_CHARS_PER_BYTE);
-    for chunk in s.as_bytes().chunks_exact(HEX_CHARS_PER_BYTE) {
+    for chunk in s.as_bytes().as_chunks::<HEX_CHARS_PER_BYTE>().0 {
         let hi = char::from(chunk[0]).to_digit(16)?;
         let lo = char::from(chunk[1]).to_digit(16)?;
         // `hi` and `lo` are each 0..=15 (validated by `to_digit(16)`),
