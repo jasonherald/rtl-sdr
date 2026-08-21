@@ -29,9 +29,10 @@ impl DcBlocker {
     ///
     /// # Errors
     ///
-    /// Returns `DspError::InvalidParameter` if `rate` is not finite, not in
-    /// (0, 1), or no longer strictly inside (0, 1) after conversion to the
-    /// `f32` the loop runs with (underflow to `0.0` or rounding up to `1.0`).
+    /// Returns `DspError::InvalidParameter` if `rate` is not finite or not in
+    /// (0, 1), or if the `f32` pole coefficient `R = 1 - rate` the filter
+    /// actually runs with is no longer strictly inside (0, 1) (a rate that
+    /// vanishes in `f32` would leave `R == 1.0` and never reject DC).
     #[allow(clippy::cast_possible_truncation)]
     pub fn new(rate: f64) -> Result<Self, DspError> {
         if !rate.is_finite() || rate <= 0.0 || rate >= 1.0 {
@@ -39,8 +40,14 @@ impl DcBlocker {
                 "rate must be in (0, 1), got {rate}"
             )));
         }
+        let r = (1.0 - rate) as f32;
+        if r <= 0.0 || r >= 1.0 {
+            return Err(DspError::InvalidParameter(format!(
+                "rate {rate} leaves the f32 pole coefficient at {r}, outside (0, 1)"
+            )));
+        }
         Ok(Self {
-            r: (1.0 - rate) as f32,
+            r,
             last_in_re: 0.0,
             last_in_im: 0.0,
             last_out_re: 0.0,
@@ -127,7 +134,9 @@ impl IqCorrector {
     ///
     /// # Errors
     ///
-    /// Returns `DspError::InvalidParameter` if `rate` is not finite or not in (0, 1).
+    /// Returns `DspError::InvalidParameter` if `rate` is not finite, not in
+    /// (0, 1), or no longer strictly inside (0, 1) after conversion to the
+    /// `f32` the loop runs with (underflow to `0.0` or rounding up to `1.0`).
     #[allow(clippy::cast_possible_truncation)]
     pub fn new(rate: f64) -> Result<Self, DspError> {
         if !rate.is_finite() || rate <= 0.0 || rate >= 1.0 {
@@ -290,6 +299,15 @@ mod tests {
             im += s.re * a.sin() + s.im * a.cos();
         }
         (re * re + im * im) / (n * n)
+    }
+
+    /// Rates that pass the f64 range check but whose f32 coefficient
+    /// rounds to exactly 1.0 would build a blocker that never attenuates DC.
+    #[test]
+    fn dc_blocker_rejects_rate_that_vanishes_in_f32() {
+        assert!(DcBlocker::new(1e-50).is_err());
+        assert!(DcBlocker::new(f64::MIN_POSITIVE).is_err());
+        assert!(DcBlocker::new(1e-4).is_ok());
     }
 
     #[test]
