@@ -342,8 +342,11 @@ impl IqFrontend {
         self.dc_blocker = new_dc_blocker;
         // Discard any partially accumulated FFT data from the old rate
         self.fft_accum_count = 0;
-        // Recalculate FFT rate control for new effective sample rate
-        self.fft_skip_samples = calc_fft_skip_samples(new_effective_rate, self.fft_rate);
+        // The FFT accumulator is fed pre-decimation input (see `new`), so
+        // the skip budget stays on the RAW rate — deriving it from the
+        // effective rate ran the FFT `ratio×` too often after the
+        // controller's auto-decimation (#706).
+        self.fft_skip_samples = calc_fft_skip_samples(self.sample_rate, self.fft_rate);
         self.fft_skip_counter = 0;
         self.fft_accumulating = true;
         Ok(())
@@ -581,6 +584,29 @@ mod tests {
         // State should be unchanged after rejection
         assert_eq!(fe.decim_ratio(), 1);
         assert!((fe.effective_sample_rate() - TEST_SAMPLE_RATE).abs() < 1.0);
+    }
+
+    /// #706 — the FFT accumulator is fed *pre-decimation* input, so the
+    /// skip budget must always derive from the raw sample rate. Feeding
+    /// the post-decimation rate made the FFT run `ratio×` too often after
+    /// the controller's auto-decimation kicked in.
+    #[test]
+    fn set_decimation_keeps_fft_skip_budget_on_raw_rate() {
+        const AUTO_DECIM_RATIO: u32 = 8;
+        let mut fe = IqFrontend::new(
+            TEST_SAMPLE_RATE,
+            1,
+            TEST_FFT_SIZE,
+            FftWindow::Nuttall,
+            false,
+        )
+        .unwrap();
+        let raw_rate_budget = fe.fft_skip_samples;
+        fe.set_decimation(AUTO_DECIM_RATIO).unwrap();
+        assert_eq!(
+            fe.fft_skip_samples, raw_rate_budget,
+            "FFT skip budget must not shrink with decimation"
+        );
     }
 
     #[test]

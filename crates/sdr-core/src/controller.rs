@@ -2759,16 +2759,17 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 );
                 return;
             }
-            if let Some(source) = state.source.as_mut()
-                && let Err(e) = source.stop()
-            {
-                tracing::warn!(error = %e, "rtl_tcp source stop failed");
-                let _ = dsp_tx.send(DspToUi::Error(format!("Disconnect failed: {e}")));
-            }
-            // Drop the source outright so `rtl_tcp_connection_state`
-            // returns `None` (→ Disconnected) on the next poll,
-            // cascading into a UI row that reflects reality.
-            state.source = None;
+            // Same teardown as every other stop path: `cleanup()`
+            // stops the source AND the audio sink, finalizes WAV
+            // writers, emits `NetworkSinkStatus::Inactive`, disengages
+            // ACARS and flushes the imaging decoders. Dropping the
+            // source by hand skipped all of that, so the next Play
+            // hit `AlreadyRunning` on the sink and latched audio
+            // offline for the rest of the session (#693). `cleanup()`
+            // leaves `state.source = None`, so
+            // `rtl_tcp_connection_state` reports Disconnected on the
+            // next poll and the UI row reflects reality.
+            cleanup(state, dsp_tx);
             state.running = false;
             let _ = dsp_tx.send(DspToUi::SourceStopped);
         }
@@ -3365,6 +3366,62 @@ fn rebuild_rtl_tcp_source(
     state.source = Some(source);
 }
 
+/// Dispatch the persisted RTL-SDR settings that the driver programs
+/// during `start()` — they have to be on the source BEFORE that call.
+/// With no device open yet the source only records each value and
+/// replays it at open time, so every call here is best-effort and
+/// warn-logged.
+///
+/// - **Direct sampling**: `start()` performs the first
+///   `set_center_freq`, and an HF frequency is only tunable once the
+///   RTL2832 is in direct-sampling mode (the R820T can't go below
+///   ~24 MHz). Dispatching it afterwards meant `start()` failed on the
+///   tune and the replay was never reached.
+/// - **RTL AGC, tuner gain mode, tuner gain**: `start()` programs the
+///   tuner from its remembered values, falling back to first-time
+///   defaults (manual, 29.7 dB) when it has none. Replaying these only
+///   after `start()` forced those defaults onto the air for every Play
+///   and every satellite auto-record restart — a saturated burst for a
+///   0 dB + LNA chain, forced manual gain for AGC users (#703).
+///
+/// Order: direct sampling → RTL AGC → gain mode → gain, matching the
+/// driver's own open-time programming order.
+fn rtl_sdr_pre_start_settings(state: &DspState, source: &mut dyn Source) {
+    if let Err(e) = source.set_direct_sampling(state.direct_sampling_mode) {
+        tracing::warn!(
+            error = %e,
+            mode = state.direct_sampling_mode,
+            "pre-start direct-sampling dispatch failed"
+        );
+    }
+    if let Err(e) = source.set_rtl_agc(state.rtl_agc_enabled) {
+        tracing::warn!(
+            error = %e,
+            enabled = state.rtl_agc_enabled,
+            "pre-start RTL AGC dispatch failed"
+        );
+    }
+    // Gain mode before the manual value so a switch into manual mode
+    // lands at the persisted gain instead of the dongle's reset default.
+    if let Err(e) = source.set_gain_mode(!state.tuner_agc_auto) {
+        tracing::warn!(
+            error = %e,
+            agc_auto = state.tuner_agc_auto,
+            "pre-start tuner AGC mode dispatch failed"
+        );
+    }
+    // librtlsdr ignores the manual gain while AGC is on, so always
+    // dispatch — explicit-OFF AGC + persisted gain takes effect;
+    // AGC-on + persisted gain is a harmless write.
+    if let Err(e) = source.set_gain(state.tuner_gain_tenths_db) {
+        tracing::warn!(
+            error = %e,
+            gain_tenths = state.tuner_gain_tenths_db,
+            "pre-start tuner gain dispatch failed"
+        );
+    }
+}
+
 /// Re-apply the persisted RTL-SDR settings tracked on
 /// [`DspState`] to a freshly-opened source. Each setting is
 /// best-effort — we warn-log and toast on failure but never
@@ -3379,10 +3436,12 @@ fn rebuild_rtl_tcp_source(
 /// `state.source`.
 ///
 /// Replay order matches the rationale in the call site comment:
-/// PPM (clock baseline) → path-shaping toggles (direct-sampling,
-/// offset-tuning, RTL-AGC) → tuner gain mode + value (manual or
-/// AGC) → bias-T last (LNA power should follow the established
-/// signal path, not lead it).
+/// PPM (clock baseline) → offset-tuning → discrete gain index →
+/// bias-T last (LNA power should follow the established signal
+/// path, not lead it). Direct sampling, RTL AGC, tuner gain mode
+/// and gain are NOT replayed here: they are dispatched by
+/// [`rtl_sdr_pre_start_settings`] ahead of `start()`, which
+/// programs them itself (#703).
 ///
 /// Per issue #551.
 fn rtl_sdr_replay_persisted_settings(
@@ -3397,15 +3456,6 @@ fn rtl_sdr_replay_persisted_settings(
             "re-applying persisted PPM correction on source open failed"
         );
         let _ = dsp_tx.send(DspToUi::Error(format!("PPM correction failed: {e}")));
-    }
-
-    if let Err(e) = source.set_direct_sampling(state.direct_sampling_mode) {
-        tracing::warn!(
-            error = %e,
-            mode = state.direct_sampling_mode,
-            "re-applying persisted direct-sampling mode on source open failed"
-        );
-        let _ = dsp_tx.send(DspToUi::Error(format!("Direct sampling failed: {e}")));
     }
 
     // Only replay an *enabled* offset-tuning state. The
@@ -3431,40 +3481,6 @@ fn rtl_sdr_replay_persisted_settings(
             "re-applying persisted offset-tuning on source open failed"
         );
         let _ = dsp_tx.send(DspToUi::Error(format!("Offset tuning failed: {e}")));
-    }
-
-    if let Err(e) = source.set_rtl_agc(state.rtl_agc_enabled) {
-        tracing::warn!(
-            error = %e,
-            enabled = state.rtl_agc_enabled,
-            "re-applying persisted RTL AGC on source open failed"
-        );
-        let _ = dsp_tx.send(DspToUi::Error(format!("RTL AGC failed: {e}")));
-    }
-
-    // Tuner gain mode: `set_gain_mode(manual)` where
-    // `manual = !tuner_agc_auto`. Apply BEFORE the manual gain
-    // value so a switch into manual mode lands at the persisted
-    // value instead of the dongle's reset default.
-    if let Err(e) = source.set_gain_mode(!state.tuner_agc_auto) {
-        tracing::warn!(
-            error = %e,
-            agc_auto = state.tuner_agc_auto,
-            "re-applying persisted tuner AGC mode on source open failed"
-        );
-        let _ = dsp_tx.send(DspToUi::Error(format!("AGC failed: {e}")));
-    }
-
-    // Manual tuner gain. librtlsdr ignores this when AGC is on,
-    // so we always apply — explicit-OFF AGC + persisted gain
-    // takes effect; AGC-on + persisted gain is a harmless write.
-    if let Err(e) = source.set_gain(state.tuner_gain_tenths_db) {
-        tracing::warn!(
-            error = %e,
-            gain_tenths = state.tuner_gain_tenths_db,
-            "re-applying persisted tuner gain on source open failed"
-        );
-        let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
     }
 
     // Discrete gain index — only when the FFI/scanner side has
@@ -3595,23 +3611,11 @@ fn open_source(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(
         source.tune(state.center_freq).map_err(|e| e.to_string())?;
     }
 
-    // Direct sampling must reach the source BEFORE `start()`, not in
-    // the post-start replay below: `RtlSdrSource::start()` performs the
-    // first `set_center_freq`, and an HF frequency is only tunable once
-    // the RTL2832 is in direct-sampling mode (the R820T can't go below
-    // ~24 MHz). The source is freshly constructed on every Play, so the
-    // mode the user picked while stopped never reached it otherwise —
-    // `start()` failed on the tune and the replay was never reached.
-    // With no device open yet the source just records the mode and
-    // programs it ahead of its first tune.
-    if state.source_type == SourceType::RtlSdr
-        && let Err(e) = source.set_direct_sampling(state.direct_sampling_mode)
-    {
-        tracing::warn!(
-            error = %e,
-            mode = state.direct_sampling_mode,
-            "pre-start direct-sampling dispatch failed"
-        );
+    // Settings the driver programs during `start()` must reach the
+    // source BEFORE it, not in the post-start replay below — see
+    // `rtl_sdr_pre_start_settings` for why each one is there.
+    if state.source_type == SourceType::RtlSdr {
+        rtl_sdr_pre_start_settings(state, source.as_mut());
     }
 
     source.start().map_err(|e| e.to_string())?;
@@ -3971,10 +3975,17 @@ fn process_iq_block(
     dsp_tx: &mpsc::Sender<DspToUi>,
     fft_shared: &SharedFftBuffer,
 ) {
-    let Some(source) = &mut state.source else {
+    if state.source.is_none() {
+        // Reachable after `rebuild_rtl_tcp_source` fails `start()`.
+        // Tear the rest of the session down through `cleanup()` so the
+        // sink / recorders / ACARS lock don't outlive the source (#693).
         tracing::warn!("process_iq_block called without source");
+        cleanup(state, dsp_tx);
         state.running = false;
         let _ = dsp_tx.send(DspToUi::SourceStopped);
+        return;
+    }
+    let Some(source) = &mut state.source else {
         return;
     };
 
@@ -5364,6 +5375,144 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    /// #693 — `DisconnectRtlTcp` must tear the session down through
+    /// `cleanup()` like every other stop path, so the audio sink is
+    /// stopped (otherwise the next Play hits `AlreadyRunning` and audio
+    /// is latched offline for the rest of the session).
+    #[test]
+    fn disconnect_rtl_tcp_runs_cleanup() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        state.source_type = SourceType::RtlTcp;
+        state.audio_sink_type = AudioSinkType::Network;
+        let _ = drain(&dsp_rx);
+        handle_command(&mut state, &dsp_tx, UiToDsp::DisconnectRtlTcp);
+        let events = drain(&dsp_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive))),
+            "cleanup() emits NetworkSinkStatus::Inactive; got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, DspToUi::SourceStopped)),
+            "expected SourceStopped; got {events:?}"
+        );
+        assert!(!state.running);
+    }
+
+    /// #693 — the no-source guard in `process_iq_block` (reachable after a
+    /// failed `rtl_tcp` rebuild) must also go through `cleanup()`.
+    #[test]
+    fn process_iq_block_without_source_runs_cleanup() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        state.audio_sink_type = AudioSinkType::Network;
+        state.running = true;
+        state.source = None;
+        let fft_shared = SharedFftBuffer::new(state.frontend.fft_size());
+        let _ = drain(&dsp_rx);
+        process_iq_block(&mut state, &dsp_tx, &fft_shared);
+        let events = drain(&dsp_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive))),
+            "cleanup() emits NetworkSinkStatus::Inactive; got {events:?}"
+        );
+        assert!(!state.running);
+    }
+
+    /// Records the order of `Source` setter calls.
+    #[derive(Default)]
+    struct RecordingSource {
+        calls: Vec<String>,
+    }
+
+    impl Source for RecordingSource {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn start(&mut self) -> Result<(), sdr_types::SourceError> {
+            self.calls.push("start".into());
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<(), sdr_types::SourceError> {
+            Ok(())
+        }
+        fn tune(&mut self, _frequency_hz: f64) -> Result<(), sdr_types::SourceError> {
+            self.calls.push("tune".into());
+            Ok(())
+        }
+        fn sample_rates(&self) -> &[f64] {
+            &[2_400_000.0]
+        }
+        fn sample_rate(&self) -> f64 {
+            2_400_000.0
+        }
+        fn set_sample_rate(&mut self, _rate: f64) -> Result<(), sdr_types::SourceError> {
+            Ok(())
+        }
+        fn read_samples(
+            &mut self,
+            _output: &mut [Complex],
+        ) -> Result<usize, sdr_types::SourceError> {
+            Ok(0)
+        }
+        fn set_direct_sampling(&mut self, mode: i32) -> Result<(), sdr_types::SourceError> {
+            self.calls.push(format!("set_direct_sampling({mode})"));
+            Ok(())
+        }
+        fn set_rtl_agc(&mut self, enabled: bool) -> Result<(), sdr_types::SourceError> {
+            self.calls.push(format!("set_rtl_agc({enabled})"));
+            Ok(())
+        }
+        fn set_gain_mode(&mut self, manual: bool) -> Result<(), sdr_types::SourceError> {
+            self.calls.push(format!("set_gain_mode({manual})"));
+            Ok(())
+        }
+        fn set_gain(&mut self, gain_tenths: i32) -> Result<(), sdr_types::SourceError> {
+            self.calls.push(format!("set_gain({gain_tenths})"));
+            Ok(())
+        }
+    }
+
+    /// #703 — gain mode, gain and RTL AGC must reach the source BEFORE
+    /// `start()`, so the driver's open-time programming uses the user's
+    /// persisted values instead of its first-time defaults (29.7 dB manual),
+    /// which otherwise produces a saturated burst on every Play.
+    #[test]
+    fn rtl_sdr_pre_start_settings_dispatch_gain_before_start() {
+        const PERSISTED_GAIN_TENTHS_DB: i32 = 0;
+        const PERSISTED_DIRECT_SAMPLING: i32 = 2;
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx).unwrap();
+        state.tuner_agc_auto = false;
+        state.tuner_gain_tenths_db = PERSISTED_GAIN_TENTHS_DB;
+        state.rtl_agc_enabled = true;
+        state.direct_sampling_mode = PERSISTED_DIRECT_SAMPLING;
+
+        let mut source = RecordingSource::default();
+        rtl_sdr_pre_start_settings(&state, &mut source);
+        source.start().unwrap();
+
+        let start_at = source.calls.iter().position(|c| c == "start").unwrap();
+        let before: Vec<&str> = source.calls[..start_at]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            before,
+            [
+                "set_direct_sampling(2)",
+                "set_rtl_agc(true)",
+                "set_gain_mode(true)",
+                "set_gain(0)",
+            ],
+            "direct sampling, RTL AGC, gain mode and gain must precede start()"
+        );
     }
 
     /// #692 — the IQ-correction switch must not share state with DC blocking.
