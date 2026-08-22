@@ -436,16 +436,6 @@ impl RadioModule {
             .af_chain
             .process(&self.demod_buf[..demod_count], output)?;
 
-        // Stage 3.5: power-squelch hard mute. This used to be the IF
-        // chain zeroing IQ before the demod (SDR++ behaviour); it now
-        // happens after the demod so the imaging taps get real audio
-        // while the listener still hears exact silence — FM
-        // discriminators are amplitude-invariant, so the result at the
-        // speaker is identical (#734).
-        if self.if_chain.squelch_active() && !self.if_chain.squelch_open() {
-            output[..af_count].fill(Stereo::default());
-        }
-
         // Diagnostic dump preparation: snapshot the pre-envelope AF
         // amplitude before Stage 4 mutates `output`. The envelope can
         // mute audio during a closed squelch (deliberately), so a dump
@@ -474,6 +464,18 @@ impl RadioModule {
         } else {
             0.0
         };
+
+        // Stage 3.5: power-squelch hard mute. Runs AFTER the pre-envelope
+        // diagnostic snapshot above so a closed squelch is distinguishable
+        // from a dead demod in the STAGE_AMP dump. This used to be the IF
+        // chain zeroing IQ before the demod (SDR++ behaviour); it now
+        // happens after the demod so the imaging taps get real audio
+        // while the listener still hears exact silence — FM
+        // discriminators are amplitude-invariant, so the result at the
+        // speaker is identical (#734).
+        if self.if_chain.squelch_active() && !self.if_chain.squelch_open() {
+            output[..af_count].fill(Stereo::default());
+        }
 
         // Stage 4: Audio squelch envelope — only when the user
         // has actually enabled squelch (manual or auto). Running
