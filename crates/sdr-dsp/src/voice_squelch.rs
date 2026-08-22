@@ -716,10 +716,17 @@ impl VoiceSquelch {
     ///   `hang_samples_remaining` counter to
     ///   [`VOICE_SQUELCH_HANG_TIME_SAMPLES`] (500 ms by default).
     /// - Each "weak" block (detector reports closed) decrements
-    ///   the counter by `samples.len()`.
+    ///   the counter by the block's length.
     /// - The gate only actually transitions to closed when the
     ///   counter hits zero — i.e. after 500 ms of sustained
     ///   weakness with no intervening strong block.
+    ///
+    /// The detectors judge from a rolling RMS over the last
+    /// [`VOICE_SQUELCH_RMS_WINDOW_SAMPLES`] (100 ms), so a large
+    /// block is fed in windows of that size and the hang counter
+    /// is charged per window. Judging a 1 s block once by its last
+    /// 100 ms and charging the whole second drained the hang budget
+    /// in one look and muted whole seconds of speech (#777).
     ///
     /// Opening is immediate (first strong block after a closed
     /// state flips the gate open and resets the counter); only
@@ -740,8 +747,17 @@ impl VoiceSquelch {
             return true;
         }
 
+        for window in samples.chunks(VOICE_SQUELCH_RMS_WINDOW_SAMPLES) {
+            self.judge_window(window);
+        }
+        self.open
+    }
+
+    /// Run the detector over one window (at most the rolling-RMS
+    /// length) and apply the hang-time state machine to its verdict.
+    fn judge_window(&mut self, samples: &[f32]) {
         let strong = match self.mode {
-            VoiceSquelchMode::Off => unreachable!("handled above"),
+            VoiceSquelchMode::Off => return,
             VoiceSquelchMode::Syllabic { .. } => {
                 self.syllabic.as_mut().is_some_and(|d| d.process(samples))
             }
@@ -770,8 +786,6 @@ impl VoiceSquelch {
         // Weak verdict while already closed: stay closed. No
         // state change. (Hang counter is already at 0 in this
         // branch so nothing to decrement anyway.)
-
-        self.open
     }
 }
 
@@ -1119,6 +1133,43 @@ mod tests {
         assert!(
             vs.is_open(),
             "200 ms silence gap < 500 ms hang should NOT close the gate mid-word"
+        );
+    }
+
+    /// #777 — one large block must be judged per 100 ms window, not
+    /// by a single look at its last 100 ms charged for its full
+    /// length: 900 ms of speech followed by 100 ms of silence in a
+    /// single `accept_samples` call used to drain the whole 500 ms
+    /// hang budget and mute the block.
+    #[test]
+    fn hang_time_is_charged_per_window_not_per_block() {
+        let mut vs = VoiceSquelch::new(
+            VoiceSquelchMode::Syllabic {
+                threshold: VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+            },
+            VOICE_SQUELCH_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        vs.accept_samples(&syllable_modulated(1_000.0, 4.0, 1_000));
+        assert!(vs.is_open(), "gate should open on speech");
+
+        let mut block = syllable_modulated(1_000.0, 4.0, 900);
+        block.extend(std::iter::repeat_n(
+            0.0_f32,
+            VOICE_SQUELCH_RMS_WINDOW_SAMPLES,
+        ));
+        assert!(
+            vs.accept_samples(&block),
+            "100 ms of trailing silence in a 1 s block must not close a 500 ms hang"
+        );
+
+        // The same hang budget still closes on a single block that
+        // really is silent for longer than the hang time.
+        let silence =
+            vec![0.0_f32; VOICE_SQUELCH_HANG_TIME_SAMPLES + VOICE_SQUELCH_RMS_WINDOW_SAMPLES];
+        assert!(
+            !vs.accept_samples(&silence),
+            "600 ms of silence closes the gate"
         );
     }
 

@@ -444,17 +444,35 @@ pub fn low_pass_dc_removal_kaiser(
     let correction_main = omega_main / PI;
     let correction_dc = omega_dc / PI;
 
-    let taps = (0..count)
+    // Lowpass at the main cutoff, with a DC-band lowpass subtracted
+    // to create the notch at zero. Both share the same Kaiser window
+    // for shape consistency.
+    let (main_taps, dc_taps): (Vec<f64>, Vec<f64>) = (0..count)
         .map(|i| {
             let t = i as f64 - half + 0.5;
             let win = crate::window::kaiser(i as f64, count as f64, beta);
-            // Lowpass at the main cutoff, with DC-band lowpass
-            // subtracted to create the notch at zero. Both share
-            // the same Kaiser window for shape consistency.
-            let main = math::sinc(t * omega_main) * correction_main;
-            let dc = math::sinc(t * omega_dc) * correction_dc;
-            ((main - dc) * win) as f32
+            let main = math::sinc(t * omega_main) * correction_main * win;
+            let dc = math::sinc(t * omega_dc) * correction_dc * win;
+            (main, dc)
         })
+        .unzip();
+    // The window is sized for `transition_width`, which truncates the
+    // narrower DC lowpass (cutoff `transition_width / 2`) harder than
+    // the main one, so their DC gains differ and `main − dc` left a
+    // residual (0.025 @ 12.48 kHz, 0.06 @ 48 kHz — −24 dB against a
+    // −30 dB request). Scale the DC term so the two gains match and
+    // the notch actually nulls at every rate (#776).
+    let main_dc_gain: f64 = main_taps.iter().sum();
+    let dc_dc_gain: f64 = dc_taps.iter().sum();
+    let dc_scale = if dc_dc_gain.abs() > f64::EPSILON {
+        main_dc_gain / dc_dc_gain
+    } else {
+        1.0
+    };
+    let taps = main_taps
+        .iter()
+        .zip(&dc_taps)
+        .map(|(main, dc)| (main - dc * dc_scale) as f32)
         .collect();
 
     Ok(taps)
@@ -733,6 +751,46 @@ mod tests {
             dc_gain.abs() < dc_threshold,
             "DC gain should be ~0, got {dc_gain} (threshold {dc_threshold})"
         );
+    }
+
+    /// Magnitude of the FIR response at `freq_hz` by direct DFT.
+    #[allow(clippy::cast_precision_loss)]
+    fn magnitude_at(taps: &[f32], freq_hz: f64, fs: f64) -> f64 {
+        let w = core::f64::consts::TAU * freq_hz / fs;
+        let (re, im) = taps
+            .iter()
+            .enumerate()
+            .fold((0.0_f64, 0.0_f64), |(re, im), (n, &h)| {
+                let phase = w * n as f64;
+                (
+                    re + f64::from(h) * phase.cos(),
+                    im - f64::from(h) * phase.sin(),
+                )
+            });
+        re.hypot(im)
+    }
+
+    /// #776 — the inner DC lowpass was sized for `transition` but cut
+    /// at `transition/2`, so its DC gain fell short of the main lowpass
+    /// and the notch never nulled (residual 0.025 @ 12480, 0.061 @
+    /// 48 kHz, 0.068 @ 250 kHz). The null must hold at every rate the
+    /// APT path runs at, not just the 12480 fixture.
+    #[test]
+    fn test_low_pass_dc_removal_kaiser_nulls_dc_at_every_apt_rate() {
+        const DC_NULL_MAX: f32 = 1e-4;
+        for fs in [12_480.0, 48_000.0, 250_000.0] {
+            let taps = low_pass_dc_removal_kaiser(4_800.0, 1_000.0, 30.0, fs).unwrap();
+            let dc_gain: f32 = taps.iter().sum();
+            assert!(
+                dc_gain.abs() < DC_NULL_MAX,
+                "fs={fs}: DC gain should be ~0, got {dc_gain}"
+            );
+            let passband_gain = magnitude_at(&taps, 2_400.0, fs);
+            assert!(
+                (passband_gain - 1.0).abs() < 0.1,
+                "fs={fs}: passband gain at 2400 Hz should be ~1, got {passband_gain}"
+            );
+        }
     }
 
     #[test]

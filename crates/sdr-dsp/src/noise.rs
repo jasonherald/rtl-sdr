@@ -371,12 +371,27 @@ impl PowerSquelch {
             return Ok(0);
         }
 
-        // Compute mean amplitude (matching C++ volk_32fc_magnitude_32f + accumulate)
+        // Mean amplitude, as SDR++ measures it (`volk_32fc_magnitude_32f`
+        // + accumulate). The dB conversion deliberately differs: SDR++
+        // tests `10·log10(mean_amplitude) >= level`, which is neither
+        // amplitude nor power dB; this port uses the dBFS amplitude
+        // convention `20·log10(amplitude)` so the threshold the user
+        // sets matches the spectrum display. The default level and the
+        // panel range are calibrated to this scale (−100 dB default
+        // versus SDR++'s −50), so the two are not interchangeable (#775).
         let sum: f32 = input.iter().map(|s| s.amplitude()).sum();
         let mean_amplitude = sum / input.len() as f32;
 
-        // Convert to standard dB: 20*log10(amplitude) = 10*log10(power).
-        // This matches the standard dBFS convention used by most SDR tools.
+        // A non-finite sample (an overloaded or broken source) must not
+        // reach the noise-floor tracker: +inf would pin the floor at
+        // +inf for good and NaN drags it off during settling. Close the
+        // gate for this block and leave every estimate untouched (#775).
+        if !mean_amplitude.is_finite() {
+            self.last_measured_db = f32::NAN;
+            output[..input.len()].fill(Complex::default());
+            self.open = false;
+            return Ok(input.len());
+        }
         let measured_db = 20.0 * mean_amplitude.max(f32::MIN_POSITIVE).log10();
         self.last_measured_db = measured_db;
 
@@ -1517,6 +1532,44 @@ mod tests {
         assert!(
             floor > -70.0 && floor < -50.0,
             "noise floor should be near -60 dB, got {floor}"
+        );
+    }
+
+    /// #775 — a non-finite sample must not poison the noise-floor
+    /// tracker: `+inf` pinned `noise_floor_db` at `+inf` (absorbing,
+    /// gate closed on every frequency until restart) and NaN dragged
+    /// it to ≈ −757 dB during settling. Such a block closes the gate
+    /// and is otherwise ignored.
+    #[test]
+    fn test_auto_squelch_ignores_non_finite_blocks() {
+        let mut squelch = PowerSquelch::new(-100.0);
+        squelch.set_auto_squelch(true);
+        let noise = vec![Complex::new(NOISE_AMP, 0.0); TEST_BLOCK_LEN];
+        let mut output = vec![Complex::default(); TEST_BLOCK_LEN];
+        for _ in 0..AUTO_SETTLE_ITERS {
+            squelch.process(&noise, &mut output).unwrap();
+        }
+        let settled = squelch.noise_floor_db();
+
+        for bad in [f32::INFINITY, f32::NAN] {
+            let mut block = noise.clone();
+            block[TEST_BLOCK_LEN / 2] = Complex::new(bad, 0.0);
+            squelch.process(&block, &mut output).unwrap();
+            assert!(!squelch.is_open(), "a non-finite block closes the gate");
+            assert_eq!(
+                squelch.noise_floor_db(),
+                settled,
+                "noise floor must ignore a block containing {bad}"
+            );
+            assert!(output.iter().all(|s| s.re == 0.0 && s.im == 0.0));
+        }
+
+        // The tracker keeps working afterwards: a strong signal opens.
+        let signal = vec![Complex::new(STRONG_AMP, 0.0); TEST_BLOCK_LEN];
+        squelch.process(&signal, &mut output).unwrap();
+        assert!(
+            squelch.is_open(),
+            "should open on strong signal after a bad block"
         );
     }
 
