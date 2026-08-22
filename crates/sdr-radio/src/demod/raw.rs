@@ -35,8 +35,7 @@ impl RawDemodulator {
             default_snap_interval: 0.0,
             vfo_reference: VfoReference::Center,
             deemp_allowed: false,
-            post_proc_enabled: false,
-            default_deemp_tau: 0.0,
+            if_agc_allowed: false,
             fm_if_nr_allowed: false,
             nb_allowed: false,
             high_pass_allowed: false,
@@ -81,7 +80,7 @@ mod tests {
         let cfg = demod.config();
         assert!((cfg.if_sample_rate - 48_000.0).abs() < f64::EPSILON);
         assert!(cfg.bandwidth_locked);
-        assert!(!cfg.post_proc_enabled);
+        assert!(!cfg.if_agc_allowed);
     }
 
     #[test]

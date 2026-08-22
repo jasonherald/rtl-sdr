@@ -41,9 +41,9 @@
 //!     wedge 1 ↔ Channel 1 (visible)
 //!     wedge 2 ↔ Channel 2 (near-IR)
 //!     wedge 3 ↔ Channel 3A (shortwave IR, daytime)
-//!     wedge 4 ↔ Channel 3B (thermal IR, nighttime)
-//!     wedge 5 ↔ Channel 4 (thermal IR, sea-surface temp)
-//!     wedge 6 ↔ Channel 5 (thermal IR, cloud-top temp)
+//!     wedge 4 ↔ Channel 4 (thermal IR, sea-surface temp)
+//!     wedge 5 ↔ Channel 5 (thermal IR, cloud-top temp)
+//!     wedge 6 ↔ Channel 3B (thermal IR, nighttime)
 //!    ```
 //!
 //! Note: pixel-position numbers in the original ticket (909..954,
@@ -303,13 +303,17 @@ fn extract_wedges(line_avgs: &[u8], frame_offset: usize) -> [u8; WEDGES_PER_FRAM
 
 /// Channels are encoded by matching wedge 16's brightness against the
 /// calibration ramp's wedges 1–6, in this specific order.
+/// NOAA KLM User's Guide §4.2: wedge-16 channel IDs are 1 = Ch1,
+/// 2 = Ch2, 3 = `Ch3A`, 4 = Ch4, 5 = Ch5, 6 = `Ch3B`. An earlier table put
+/// 3B at wedge 4 and shifted 4/5 up, mislabelling every night pass
+/// (#735).
 const CHANNEL_ID_MAPPING: [AvhrrChannel; 6] = [
     AvhrrChannel::Ch1Visible,
     AvhrrChannel::Ch2NearIr,
     AvhrrChannel::Ch3aShortwaveIr,
-    AvhrrChannel::Ch3bThermalIr,
     AvhrrChannel::Ch4ThermalIr,
     AvhrrChannel::Ch5ThermalIr,
+    AvhrrChannel::Ch3bThermalIr,
 ];
 
 /// Map a wedge-16 brightness value to an AVHRR channel by finding which
@@ -582,7 +586,7 @@ mod tests {
         }
 
         assert_eq!(result.side_a.channel_id, Some(AvhrrChannel::Ch2NearIr));
-        assert_eq!(result.side_b.channel_id, Some(AvhrrChannel::Ch4ThermalIr));
+        assert_eq!(result.side_b.channel_id, Some(AvhrrChannel::Ch5ThermalIr));
 
         assert!(
             result.side_a.frame_sync_quality > TEST_GOOD_SYNC_QUALITY,
@@ -609,7 +613,7 @@ mod tests {
         );
         let result = decode_telemetry(&image).unwrap();
         assert_eq!(result.side_a.channel_id, Some(AvhrrChannel::Ch1Visible));
-        assert_eq!(result.side_b.channel_id, Some(AvhrrChannel::Ch5ThermalIr));
+        assert_eq!(result.side_b.channel_id, Some(AvhrrChannel::Ch3bThermalIr));
         assert!(result.side_a.frame_sync_quality > TEST_GOOD_SYNC_QUALITY);
     }
 
@@ -684,9 +688,9 @@ mod tests {
             (0, AvhrrChannel::Ch1Visible),
             (1, AvhrrChannel::Ch2NearIr),
             (2, AvhrrChannel::Ch3aShortwaveIr),
-            (3, AvhrrChannel::Ch3bThermalIr),
-            (4, AvhrrChannel::Ch4ThermalIr),
-            (5, AvhrrChannel::Ch5ThermalIr),
+            (3, AvhrrChannel::Ch4ThermalIr),
+            (4, AvhrrChannel::Ch5ThermalIr),
+            (5, AvhrrChannel::Ch3bThermalIr),
         ];
         for (ramp_idx, expected) in cases {
             let wedge16 = SPEC_GRAYSCALE_RAMP[ramp_idx];
@@ -776,5 +780,28 @@ mod tests {
         assert_eq!(TELEMETRY_B_END, 2080);
         assert_eq!(FRAME_LINES, 128);
         assert_eq!(WEDGES_PER_FRAME * LINES_PER_WEDGE, FRAME_LINES);
+    }
+
+    /// #735 — NOAA KLM wedge-16 channel IDs: 1 = Ch1, 2 = Ch2, 3 = `Ch3A`,
+    /// 4 = Ch4, 5 = Ch5, 6 = `Ch3B`. The old table had 4→3B, 5→4, 6→5,
+    /// mislabelling every night pass.
+    #[test]
+    fn wedge_channel_ids_follow_noaa_klm() {
+        let expected = [
+            AvhrrChannel::Ch1Visible,
+            AvhrrChannel::Ch2NearIr,
+            AvhrrChannel::Ch3aShortwaveIr,
+            AvhrrChannel::Ch4ThermalIr,
+            AvhrrChannel::Ch5ThermalIr,
+            AvhrrChannel::Ch3bThermalIr,
+        ];
+        for (wedge_idx, channel) in expected.iter().enumerate() {
+            assert_eq!(
+                classify_channel_wedge(SPEC_GRAYSCALE_RAMP[wedge_idx], SPEC_GRAYSCALE_RAMP),
+                Some(*channel),
+                "wedge {}",
+                wedge_idx + 1
+            );
+        }
     }
 }

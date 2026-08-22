@@ -115,6 +115,10 @@ fn envelope_coefficient(tau_seconds: f32, sample_rate_hz: f32) -> f32 {
 /// Attack/release asymmetry is deliberate: fast open (~2 ms) so
 /// keying-up leading edges aren't audibly faded, slow close
 /// (~5 ms) so tails of dropped words aren't clipped.
+/// Gain below which a closing release ramp is inaudible (−80 dB) and
+/// snaps to exact zero — see [`SquelchAudioEnvelope::settle_if_closed`].
+const SQUELCH_SETTLED_GAIN: f32 = 1e-4;
+
 pub struct SquelchAudioEnvelope {
     envelope_gain: f32,
     target: f32,
@@ -205,6 +209,22 @@ impl SquelchAudioEnvelope {
     pub fn reset_to_open(&mut self) {
         self.envelope_gain = 1.0;
         self.target = 1.0;
+    }
+
+    /// Once the release ramp has decayed below [`SQUELCH_SETTLED_GAIN`]
+    /// while the gate is closed, snap the gain to exactly zero and
+    /// report `true`; the caller can then hard-zero the block instead
+    /// of multiplying by a vanishing gain forever. The exponential
+    /// release never reaches zero on its own (#738).
+    pub fn settle_if_closed(&mut self) -> bool {
+        if self.target > 0.0 {
+            return false;
+        }
+        if self.envelope_gain <= SQUELCH_SETTLED_GAIN {
+            self.envelope_gain = 0.0;
+            return true;
+        }
+        false
     }
 
     /// Apply the envelope to a stereo audio buffer in place.
@@ -1887,5 +1907,41 @@ mod tests {
             differs > out.len() / 2,
             "output looks like raw passthrough (only {differs} samples differ)"
         );
+    }
+
+    /// #738 — the release ramp decays exponentially and never reaches
+    /// zero on its own; once it is inaudibly small the envelope snaps
+    /// to exactly zero so the listener gets true silence.
+    #[test]
+    fn squelch_audio_envelope_settles_to_exact_zero_after_release() {
+        const RATE: f32 = 48_000.0;
+        const BLOCK: usize = 480;
+        let mut env = SquelchAudioEnvelope::new(RATE).unwrap();
+        env.reset_to_open();
+        env.set_gate_open(false);
+        let mut buf = vec![sdr_types::Stereo { l: 1.0, r: 1.0 }; BLOCK];
+        env.process_stereo(&mut buf);
+        assert!(!env.settle_if_closed(), "still audibly ramping after 10 ms");
+        assert!(
+            buf[0].l > 0.5 && buf[BLOCK - 1].l < buf[0].l,
+            "release ramps down"
+        );
+        for _ in 0..100 {
+            let mut buf = vec![sdr_types::Stereo { l: 1.0, r: 1.0 }; BLOCK];
+            env.process_stereo(&mut buf);
+            if env.settle_if_closed() {
+                break;
+            }
+        }
+        assert!(env.settle_if_closed(), "must settle within 1 s");
+        let mut buf = vec![sdr_types::Stereo { l: 1.0, r: 1.0 }; BLOCK];
+        env.process_stereo(&mut buf);
+        assert!(
+            buf.iter().all(|s| s.l == 0.0 && s.r == 0.0),
+            "exact zero once settled"
+        );
+        // Reopening leaves the settled state.
+        env.set_gate_open(true);
+        assert!(!env.settle_if_closed());
     }
 }

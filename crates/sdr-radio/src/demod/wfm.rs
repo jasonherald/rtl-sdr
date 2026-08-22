@@ -1,7 +1,7 @@
 //! Wideband FM (broadcast) demodulator.
 
 use sdr_dsp::demod::BroadcastFmDemod;
-use sdr_dsp::filter::{DEEMPHASIS_TAU_EU, FirFilter};
+use sdr_dsp::filter::FirFilter;
 use sdr_dsp::loops::Agc;
 use sdr_dsp::stereo::FmStereoDecoder;
 use sdr_dsp::taps;
@@ -134,8 +134,7 @@ impl WfmDemodulator {
             default_snap_interval: WFM_SNAP_INTERVAL,
             vfo_reference: VfoReference::Center,
             deemp_allowed: true,
-            post_proc_enabled: true,
-            default_deemp_tau: DEEMPHASIS_TAU_EU,
+            if_agc_allowed: true,
             fm_if_nr_allowed: true,
             nb_allowed: false,
             high_pass_allowed: true,

@@ -1872,7 +1872,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // No failure path here — the IF chain's envelope
             // state is purely in-memory. Unlike hardware AGC,
             // we can't miss the source device.
-            state.radio.if_chain_mut().set_software_agc_enabled(enabled);
+            state.radio.set_software_agc_enabled(enabled);
         }
 
         UiToDsp::SetIqCorrection(enabled) => {

@@ -22,11 +22,13 @@
 //!    "demod" here just produces zero audio because there is
 //!    no listenable signal mid-pass — the imagery is the
 //!    artifact.
-//! 3. Squelch / NB / FM-IF-NR / deemphasis / high-pass /
-//!    voice-squelch are all disabled (`*_allowed: false`)
-//!    because none of them apply to a QPSK signal — applying
-//!    them would risk shaping the IQ before the LRPT tap reads
-//!    it (which would corrupt the carrier).
+//! 3. Squelch / NB / FM-IF-NR / software IF AGC / deemphasis /
+//!    high-pass / voice-squelch are all disabled (`*_allowed:
+//!    false`) because none of them mean anything for a QPSK
+//!    signal. Note they could not corrupt the decode either way:
+//!    the tap reads `radio_input` before `RadioModule::process`
+//!    runs any of them (point 2) — disabling them just avoids
+//!    pointless work and a misleading UI (#738).
 
 use sdr_types::{Complex, DspError, Stereo};
 
@@ -73,8 +75,7 @@ impl LrptDemodulator {
             default_snap_interval: 0.0,
             vfo_reference: VfoReference::Center,
             deemp_allowed: false,
-            post_proc_enabled: false,
-            default_deemp_tau: 0.0,
+            if_agc_allowed: false,
             fm_if_nr_allowed: false,
             nb_allowed: false,
             high_pass_allowed: false,
@@ -135,11 +136,13 @@ mod tests {
         assert!((cfg.if_sample_rate - 144_000.0).abs() < f64::EPSILON);
         assert!((cfg.af_sample_rate - cfg.if_sample_rate).abs() < f64::EPSILON);
         assert!(cfg.bandwidth_locked);
-        assert!(!cfg.post_proc_enabled);
+        assert!(!cfg.if_agc_allowed);
         // None of the voice-mode features apply to a QPSK signal —
         // make sure the config gates them off so a future "enable
-        // squelch on every demod" refactor can't accidentally
-        // shape the IQ before the LRPT tap reads it.
+        // squelch on every demod" refactor can't switch them on for
+        // a mode where they are meaningless. (They run after the
+        // LRPT tap has read `radio_input`, so the decode is safe
+        // regardless — see the module docs.)
         assert!(!cfg.fm_if_nr_allowed);
         assert!(!cfg.nb_allowed);
         assert!(!cfg.high_pass_allowed);

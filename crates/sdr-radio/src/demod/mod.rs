@@ -91,10 +91,10 @@ pub struct DemodConfig {
     pub vfo_reference: VfoReference,
     /// Whether deemphasis filtering is applicable to this mode.
     pub deemp_allowed: bool,
-    /// Whether post-processing (AF chain) is enabled by default.
-    pub post_proc_enabled: bool,
-    /// Default deemphasis time constant in seconds (0 = none).
-    pub default_deemp_tau: f64,
+    /// Whether the software IF AGC may run. Modes that hand the IQ (or
+    /// a symbol stream) through with its amplitude intact — Raw, LRPT,
+    /// CW — must not have it flattened by a 1e6-gain AGC (#738).
+    pub if_agc_allowed: bool,
     /// Whether FM IF noise reduction is applicable.
     pub fm_if_nr_allowed: bool,
     /// Whether noise blanker is applicable.

@@ -109,6 +109,9 @@ pub struct RadioModule {
     af_chain: AfChain,
     deemp_mode: DeemphasisMode,
     high_pass_enabled: bool,
+    /// The user's software-IF-AGC preference. Applied to the IF chain
+    /// only in modes whose config allows it (#738).
+    software_agc_enabled: bool,
     notch_enabled: bool,
     notch_frequency: f32,
     /// Persisted CTCSS squelch mode. Reapplied to the new AF chain
@@ -187,6 +190,7 @@ impl RadioModule {
             if_chain,
             af_chain,
             deemp_mode: DeemphasisMode::None,
+            software_agc_enabled: false,
             high_pass_enabled: false,
             notch_enabled: false,
             notch_frequency: sdr_dsp::filter::DEFAULT_NOTCH_FREQ_HZ,
@@ -239,6 +243,7 @@ impl RadioModule {
         let nb_allowed = new_demod.config().nb_allowed;
         let squelch_allowed = new_demod.config().squelch_allowed;
         let high_pass_allowed = new_demod.config().high_pass_allowed;
+        let if_agc_allowed = new_demod.config().if_agc_allowed;
 
         // Reconfigure AF chain for the new AF sample rate
         let new_af_chain = AfChain::new(af_rate, self.audio_sample_rate)
@@ -324,6 +329,11 @@ impl RadioModule {
         if !squelch_allowed {
             self.if_chain.set_squelch_enabled(false);
         }
+        // The software IF AGC follows the user's preference only in
+        // modes that allow it — Raw / LRPT / CW hand the IQ through
+        // with its amplitude intact (#738).
+        self.if_chain
+            .set_software_agc_enabled(self.software_agc_enabled && if_agc_allowed);
         // Reset the AF squelch envelope so stale gain state from
         // the previous mode's audio pipeline doesn't bleed into
         // the first block on the new mode. Envelope coefficients
@@ -465,18 +475,6 @@ impl RadioModule {
             0.0
         };
 
-        // Stage 3.5: power-squelch hard mute. Runs AFTER the pre-envelope
-        // diagnostic snapshot above so a closed squelch is distinguishable
-        // from a dead demod in the STAGE_AMP dump. This used to be the IF
-        // chain zeroing IQ before the demod (SDR++ behaviour); it now
-        // happens after the demod so the imaging taps get real audio
-        // while the listener still hears exact silence — FM
-        // discriminators are amplitude-invariant, so the result at the
-        // speaker is identical (#734).
-        if self.if_chain.squelch_active() && !self.if_chain.squelch_open() {
-            output[..af_count].fill(Stereo::default());
-        }
-
         // Stage 4: Audio squelch envelope — only when the user
         // has actually enabled squelch (manual or auto). Running
         // the envelope unconditionally would mute the first
@@ -497,6 +495,12 @@ impl RadioModule {
         // scaling IQ magnitude has zero effect on FM audio.
         // Applying the envelope to post-demod audio works for
         // all modulation types uniformly.
+        //
+        // Ordering with the hard mute (Stage 4.5): the envelope runs on
+        // the real demod output first so the close edge is a release
+        // ramp rather than a step — hard-zeroing before the envelope
+        // left it nothing to ramp, so only the open edge was ever
+        // smoothed (#738).
         if self.if_chain.squelch_active() {
             self.squelch_envelope
                 .set_gate_open(self.if_chain.squelch_open());
@@ -508,6 +512,22 @@ impl RadioModule {
             // open so the first block post-enable doesn't fade in
             // from silence.
             self.squelch_envelope.reset_to_open();
+        }
+
+        // Stage 4.5: power-squelch hard mute once the release has settled.
+        // Runs AFTER the pre-envelope diagnostic snapshot so a closed
+        // squelch is distinguishable from a dead demod in the STAGE_AMP
+        // dump. This used to be the IF chain zeroing IQ before the demod
+        // (SDR++ behaviour); it moved after the demod so the imaging taps
+        // get real audio (#734), and now after the envelope so the
+        // listener hears a ramped close edge followed by exact silence —
+        // FM discriminators are amplitude-invariant, so the result at the
+        // speaker is otherwise identical.
+        if self.if_chain.squelch_active()
+            && !self.if_chain.squelch_open()
+            && self.squelch_envelope.settle_if_closed()
+        {
+            output[..af_count].fill(Stereo::default());
         }
 
         // Diagnostic dump emission. Now that Stage 4 has run, we can
@@ -819,6 +839,15 @@ impl RadioModule {
     }
 
     /// Get a mutable reference to the IF chain for direct configuration.
+    /// Enable or disable the software IF AGC. The preference is kept
+    /// across mode switches and only applied in modes whose config
+    /// allows it — Raw / LRPT / CW hand the IQ through untouched (#738).
+    pub fn set_software_agc_enabled(&mut self, enabled: bool) {
+        self.software_agc_enabled = enabled;
+        let allowed = self.demod.config().if_agc_allowed;
+        self.if_chain.set_software_agc_enabled(enabled && allowed);
+    }
+
     pub fn if_chain_mut(&mut self) -> &mut IfChain {
         &mut self.if_chain
     }
@@ -1499,5 +1528,89 @@ mod tests {
                 threshold: VS_SYLLABIC_TUNED_THRESHOLD
             }
         );
+    }
+
+    /// #738 — the squelch close edge is ramped by the AF envelope on
+    /// real audio instead of being hard-zeroed first: the first closed
+    /// block still carries a decaying tail, and the speaker reaches
+    /// exact silence once the release has settled.
+    #[test]
+    fn squelch_close_edge_is_ramped_then_exactly_silent() {
+        const STRONG_AMPLITUDE: f32 = 0.5;
+        const WEAK_AMPLITUDE: f32 = 0.001;
+        const THRESHOLD_DB: f32 = -30.0;
+        const BLOCK: usize = 2_000;
+        const SETTLE_BLOCKS: usize = 50;
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        radio.set_squelch_enabled(true);
+        radio.set_squelch(THRESHOLD_DB);
+        let mut output = vec![Stereo::default(); radio.max_output_samples(BLOCK)];
+
+        let strong = fm_tone_iq(BLOCK, STRONG_AMPLITUDE);
+        for _ in 0..5 {
+            radio.process(&strong, &mut output).unwrap();
+        }
+        assert!(radio.if_chain().squelch_open(), "test premise: gate open");
+
+        let weak = fm_tone_iq(BLOCK, WEAK_AMPLITUDE);
+        let count = radio.process(&weak, &mut output).unwrap();
+        assert!(
+            !radio.if_chain().squelch_open(),
+            "test premise: gate closed"
+        );
+        assert!(
+            peak(&output[..count]) > 0.0,
+            "first closed block must carry the release ramp, not a hard step"
+        );
+        assert!(
+            output[0].l.abs() >= output[count - 1].l.abs(),
+            "the ramp decays across the block"
+        );
+
+        let mut silent = false;
+        for _ in 0..SETTLE_BLOCKS {
+            let count = radio.process(&weak, &mut output).unwrap();
+            if peak(&output[..count]) <= 0.0 {
+                silent = true;
+                break;
+            }
+        }
+        assert!(
+            silent,
+            "speaker must reach exact silence once the release settles"
+        );
+    }
+
+    /// #738 — the software IF AGC only runs in modes whose config
+    /// allows it; Raw / LRPT / CW keep their amplitude. The user's
+    /// preference is remembered and re-applied on a mode that allows it.
+    #[test]
+    fn software_if_agc_is_gated_by_the_demod_config() {
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        radio.set_software_agc_enabled(true);
+        assert!(radio.if_chain().software_agc_enabled());
+
+        radio.set_mode(DemodMode::Raw).unwrap();
+        assert!(!radio.demod_config().if_agc_allowed);
+        assert!(
+            !radio.if_chain().software_agc_enabled(),
+            "Raw passes IQ through untouched"
+        );
+        radio.set_software_agc_enabled(true);
+        assert!(
+            !radio.if_chain().software_agc_enabled(),
+            "cannot be enabled live on Raw"
+        );
+
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert!(
+            radio.if_chain().software_agc_enabled(),
+            "preference re-applied on NFM"
+        );
+        radio.set_software_agc_enabled(false);
+        radio.set_mode(DemodMode::Wfm).unwrap();
+        assert!(!radio.if_chain().software_agc_enabled());
     }
 }
