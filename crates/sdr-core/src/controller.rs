@@ -3712,15 +3712,14 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // signal); `acars_bank.is_some()` is too narrow because the
     // Start path intentionally invalidates the bank for the
     // lazy-rebuild window. CR round 5 on PR #584.
-    // Finalize recordings FIRST (Drop patches the WAV header sizes).
+    // Stop recordings FIRST (Drop patches the WAV header sizes) and tell
+    // the UI via `AudioRecordingStopped` / `IqRecordingStopped` so its
+    // recording-active flags clear — `SourceStopped` alone does not.
     // The ACARS disengage below refuses to change geometry while an IQ
     // writer is open (#695), and cleanup is the one path that must
     // always get through — the recording is ending anyway.
-    if state.audio_writer.take().is_some() {
-        tracing::info!("audio recording finalized on cleanup");
-    }
-    if state.iq_writer.take().is_some() {
-        tracing::info!("IQ recording finalized on cleanup");
+    if stop_any_recording(state, dsp_tx) {
+        tracing::info!("recording finalized on cleanup");
     }
 
     let mut acars_forced_off = false;
@@ -5856,6 +5855,12 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, DspToUi::AcarsEnabledChanged(Ok(false)))),
             "cleanup must ack the disengage, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::IqRecordingStopped)),
+            "cleanup must tell the UI the recording stopped, got {events:?}"
         );
         let _ = std::fs::remove_file(&path);
     }
