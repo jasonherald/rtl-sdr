@@ -919,10 +919,7 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
     while !shared.shutdown.load(Ordering::Relaxed) {
         set_state(&shared, ConnectionState::Connecting);
 
-        let attempt_result = attempt_connect(&host, port, &shared, &config);
-        // A failed attempt drops its stream; don't keep a dangling clone.
-        clear_pending_stream(&shared);
-        match attempt_result {
+        match attempt_connect(&host, port, &shared, &config) {
             Ok(HandshakeOutcome { stream, codec }) => {
                 attempt = 0;
                 // At this point handshake has completed successfully.
@@ -951,6 +948,10 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
                 // run_data_pump returned Ok — connection dropped transiently.
             }
             Err(e) => {
+                // A failed handshake drops its stream; remove its clone.
+                // Successful sessions keep it as the cancel handle until
+                // `run_data_pump` clears it at session end.
+                clear_pending_stream(&shared);
                 tracing::warn!(%e, host = %host, port, attempt, "rtl_tcp connect failed");
                 // Route each terminal error-kind to its
                 // dedicated `ConnectionState` variant so the UI
@@ -3924,6 +3925,76 @@ mod tests {
         assert!(
             elapsed < STOP_DEADLINE,
             "stop blocked for {elapsed:?} waiting on the pre-handshake read"
+        );
+    }
+
+    /// #745 (CR round 5 on PR #792) — `stop()` must not wait for a
+    /// command write blocked on a non-reading peer: the session cancel
+    /// handle shuts the socket without taking the sink lock. A sender
+    /// thread floods commands at a peer that completes the handshake and
+    /// then never reads; whether `write_all` actually blocks depends on
+    /// the loopback socket buffers, but `stop_manager` must return
+    /// promptly either way.
+    #[test]
+    fn stop_during_command_flood_returns_promptly() {
+        const FLOOD_SERVER_HOLD: Duration = Duration::from_secs(6);
+        const FLOOD_WARMUP: Duration = Duration::from_millis(300);
+        const STOP_DEADLINE: Duration = Duration::from_secs(1);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let header = DongleInfo {
+                    tuner: TunerTypeCode::R820t,
+                    gain_count: 29,
+                }
+                .to_bytes();
+                let _ = sock.write_all(&header);
+                // Never read: the client's sends back up.
+                thread::sleep(FLOOD_SERVER_HOLD);
+            }
+        });
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        src.start_manager().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && !matches!(src.connection_state(), ConnectionState::Connected { .. })
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            matches!(src.connection_state(), ConnectionState::Connected { .. }),
+            "test premise: connected"
+        );
+        let shared = Arc::clone(&src.shared);
+        let flooding = Arc::new(AtomicBool::new(true));
+        let flood_flag = Arc::clone(&flooding);
+        let flooder = thread::spawn(move || {
+            let mut hz = 100_000_000u32;
+            while flood_flag.load(Ordering::Relaxed) {
+                if let Ok(mut sink) = shared.command_sink.lock() {
+                    let Some(stream) = sink.as_mut() else { break };
+                    let cmd = Command {
+                        op: CommandOp::SetCenterFreq,
+                        param: hz,
+                    };
+                    if stream.write_all(&cmd.to_bytes()).is_err() {
+                        break;
+                    }
+                    hz = hz.wrapping_add(1);
+                }
+            }
+        });
+        thread::sleep(FLOOD_WARMUP);
+        let started = Instant::now();
+        src.stop_manager();
+        let elapsed = started.elapsed();
+        flooding.store(false, Ordering::Relaxed);
+        let _ = flooder.join();
+        drop(server_thread);
+        assert!(
+            elapsed < STOP_DEADLINE,
+            "stop blocked for {elapsed:?} behind a command write"
         );
     }
 
