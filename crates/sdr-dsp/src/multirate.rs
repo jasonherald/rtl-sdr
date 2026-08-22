@@ -825,8 +825,16 @@ mod tests {
     fn rational_resampler_reports_its_group_delay() -> Result<(), DspError> {
         const IN_RATE: f64 = 12_480.0;
         const OUT_RATE: f64 = 4_160.0;
-        /// `IN_RATE / OUT_RATE`: input samples per output sample.
-        const INPUT_SAMPLES_PER_OUTPUT: usize = 3;
+        /// `IN_RATE / OUT_RATE`: input samples per output sample, derived
+        /// from the rates and checked to be integral so a rate change
+        /// cannot leave the measurement with a stale factor.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        const INPUT_SAMPLES_PER_OUTPUT: usize = (IN_RATE / OUT_RATE) as usize;
+        #[allow(clippy::float_cmp, clippy::cast_precision_loss)]
+        const _: () = assert!(
+            OUT_RATE * INPUT_SAMPLES_PER_OUTPUT as f64 == IN_RATE,
+            "IN_RATE / OUT_RATE must be integral"
+        );
         const IMPULSE_AT: usize = 600;
         const LEN: usize = 3_000;
         let mut r = RationalResampler::new(IN_RATE, OUT_RATE)?;
