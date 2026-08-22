@@ -260,6 +260,11 @@ pub struct RtlTcpConfig {
     /// network hiccup but still fast enough that a yanked cable doesn't
     /// leave the UI frozen in Connected state until the kernel
     /// keepalive finally fires.
+    ///
+    /// **Applies to the raw pass-through (`Codec::None`) only.** A framed
+    /// codec (LZ4) cannot resume after a partial read, so those sessions
+    /// tear down for reconnect on the first timeout regardless of this
+    /// value (#743).
     pub max_consecutive_timeouts: u32,
 
     /// Timeout for each TCP `connect()` attempt. Default 10 s. Without
@@ -672,11 +677,6 @@ impl RtlTcpSource {
             CommandOp::SetGainByIndex => Some(u32::from((CommandOp::SetTunerGain as u8) - 1)),
             _ => None,
         };
-        if let Some(bit) = sibling_bit {
-            self.shared
-                .replay_mask
-                .fetch_and(!(1u32 << bit), Ordering::Relaxed);
-        }
         // IF gain is per stage (upper 16 bits of the param, 1-based);
         // one slot collapsed every stage into the last write (#745).
         if cmd.op == CommandOp::SetIfGain {
@@ -698,27 +698,39 @@ impl RtlTcpSource {
             }
             return;
         }
+        // `SetIfGain` returned above; its per-stage slots are not in
+        // this table, so the arm is `None` rather than a dead sentinel.
         let slot = match cmd.op {
-            CommandOp::SetCenterFreq => &self.shared.last_center_freq_hz,
-            CommandOp::SetSampleRate => &self.shared.last_sample_rate_hz,
-            CommandOp::SetGainMode => &self.shared.last_gain_mode,
-            CommandOp::SetTunerGain => &self.shared.last_tuner_gain,
-            CommandOp::SetFreqCorrection => &self.shared.last_ppm,
-            CommandOp::SetIfGain => unreachable_if_gain(),
-            CommandOp::SetTestMode => &self.shared.last_testmode,
-            CommandOp::SetAgcMode => &self.shared.last_agc_mode,
-            CommandOp::SetDirectSampling => &self.shared.last_direct_sampling,
-            CommandOp::SetOffsetTuning => &self.shared.last_offset_tuning,
-            CommandOp::SetRtlXtal => &self.shared.last_rtl_xtal,
-            CommandOp::SetTunerXtal => &self.shared.last_tuner_xtal,
-            CommandOp::SetGainByIndex => &self.shared.last_gain_by_index,
-            CommandOp::SetBiasTee => &self.shared.last_bias_tee,
+            CommandOp::SetCenterFreq => Some(&self.shared.last_center_freq_hz),
+            CommandOp::SetSampleRate => Some(&self.shared.last_sample_rate_hz),
+            CommandOp::SetGainMode => Some(&self.shared.last_gain_mode),
+            CommandOp::SetTunerGain => Some(&self.shared.last_tuner_gain),
+            CommandOp::SetFreqCorrection => Some(&self.shared.last_ppm),
+            CommandOp::SetIfGain => None,
+            CommandOp::SetTestMode => Some(&self.shared.last_testmode),
+            CommandOp::SetAgcMode => Some(&self.shared.last_agc_mode),
+            CommandOp::SetDirectSampling => Some(&self.shared.last_direct_sampling),
+            CommandOp::SetOffsetTuning => Some(&self.shared.last_offset_tuning),
+            CommandOp::SetRtlXtal => Some(&self.shared.last_rtl_xtal),
+            CommandOp::SetTunerXtal => Some(&self.shared.last_tuner_xtal),
+            CommandOp::SetGainByIndex => Some(&self.shared.last_gain_by_index),
+            CommandOp::SetBiasTee => Some(&self.shared.last_bias_tee),
+        };
+        let Some(slot) = slot else {
+            return;
         };
         slot.store(cmd.param, Ordering::Relaxed);
-        let bit = u32::from((cmd.op as u8) - 1);
-        self.shared
-            .replay_mask
-            .fetch_or(1u32 << bit, Ordering::Relaxed);
+        let own_bit = 1u32 << ((cmd.op as u8) - 1);
+        let sibling_clear = sibling_bit.map_or(u32::MAX, |bit| !(1u32 << bit));
+        // Single read-modify-write: clear the sibling and set our own bit
+        // together, so two concurrent gain setters can't interleave into
+        // "both bits set" (CR round 1 on PR #792).
+        let _ =
+            self.shared
+                .replay_mask
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mask| {
+                    Some((mask & sibling_clear) | own_bit)
+                });
     }
 
     /// Convenience typed setters — each one round-trips through
@@ -1101,8 +1113,27 @@ fn attempt_connect(
     let stream = connect_cancellable(addrs, config.connect_timeout, &shared.shutdown)?;
 
     // Let `stop_manager` cut the handshake reads short (#745).
-    if let Ok(mut pending) = shared.pending_stream.lock() {
-        *pending = stream.try_clone().ok();
+    match stream.try_clone() {
+        Ok(clone) => {
+            if let Ok(mut pending) = shared.pending_stream.lock() {
+                *pending = Some(clone);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%e, "rtl_tcp: could not clone the socket for stop(); a silent peer may delay stop by the read timeout");
+        }
+    }
+    // `stop_manager` sets `shutdown` and then takes `pending_stream`. If
+    // it ran between `connect_cancellable`'s last poll and the publish
+    // above, it found nothing to close and is already waiting in
+    // `join()` — so re-check here rather than walking into the handshake
+    // reads with a clone nobody will shut down.
+    if shared.shutdown.load(Ordering::Relaxed) {
+        clear_pending_stream(shared);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Err(SourceError::Io(std::io::Error::from(
+            std::io::ErrorKind::Interrupted,
+        )));
     }
 
     stream.set_read_timeout(Some(config.data_read_timeout))?;
@@ -1578,9 +1609,15 @@ fn replay_sticky_commands(shared: &Arc<SharedState>) {
         (CommandOp::SetGainByIndex, &shared.last_gain_by_index),
         (CommandOp::SetBiasTee, &shared.last_bias_tee),
     ];
-    // IF gain stages go where `SetIfGain` sat in the fixed table
-    // (after `SetFreqCorrection`), one command per recorded stage.
-    let (head, tail) = ops.split_at(5);
+    // IF gain stages go where `SetIfGain` sits in opcode order — before
+    // the first op with a higher opcode — one command per recorded
+    // stage. Derived from the table so a reorder cannot silently move
+    // the insertion point.
+    let if_gain_at = ops
+        .iter()
+        .position(|(op, _)| (*op as u8) > (CommandOp::SetIfGain as u8))
+        .unwrap_or(ops.len());
+    let (head, tail) = ops.split_at(if_gain_at);
     for (op, slot) in head
         .iter()
         .copied()
@@ -1628,12 +1665,6 @@ fn clear_pending_stream(shared: &SharedState) {
     if let Ok(mut pending) = shared.pending_stream.lock() {
         *pending = None;
     }
-}
-
-/// `record_command` handles `SetIfGain` before reaching the slot table.
-fn unreachable_if_gain() -> &'static AtomicU32 {
-    static NEVER: AtomicU32 = AtomicU32::new(0);
-    &NEVER
 }
 
 fn set_state(shared: &Arc<SharedState>, state: ConnectionState) {
