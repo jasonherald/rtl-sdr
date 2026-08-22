@@ -401,14 +401,19 @@ fn merge_defaults(mut loaded: Value, defaults: &Value) -> Value {
                     // Recursively merge nested objects
                     let merged = merge_defaults(existing.take(), default_val);
                     *existing = merged;
-                } else if default_val.is_object() {
-                    // A non-object where a subtree is expected would make
-                    // later `v["a"]["b"]` indexing panic — the default
-                    // subtree wins (#761).
-                    tracing::warn!(key, "config subtree has the wrong type, using defaults");
+                } else if !default_val.is_null()
+                    && std::mem::discriminant(&*existing) != std::mem::discriminant(default_val)
+                {
+                    // Any JSON-kind mismatch (a string where a number is
+                    // expected, a scalar where a subtree is, an object
+                    // where a scalar is) would make later typed reads or
+                    // `v["a"]["b"]` indexing misbehave — the default wins
+                    // (#761). A `null` default carries no type and never
+                    // overrides a real value.
+                    tracing::warn!(key, "config value has the wrong type, using the default");
                     *existing = default_val.clone();
                 }
-                // Otherwise the existing scalar value takes precedence
+                // Otherwise the existing value of the same kind takes precedence
             } else {
                 loaded_obj.insert(key.clone(), default_val.clone());
             }
@@ -590,7 +595,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "sdr-config-test-{name}-{}-{}",
             std::process::id(),
-            NEXT_TMP_ID.load(std::sync::atomic::Ordering::Relaxed)
+            NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -897,6 +902,19 @@ mod tests {
         let defaults = json!({"audio": {"volume": 0.5}});
         let merged = merge_defaults(loaded, &defaults);
         assert_eq!(merged["audio"]["volume"], 0.5);
+    }
+
+    /// #761 (CR round 4 on PR #794) — every kind mismatch is replaced, not
+    /// only scalar-where-object.
+    #[test]
+    fn scalar_kind_mismatches_are_replaced_by_the_default() {
+        let loaded = json!({"volume": "loud", "audio": {"x": 1}, "name": "keep", "opt": 3});
+        let defaults = json!({"volume": 0.5, "audio": 5, "name": "default", "opt": null});
+        let merged = merge_defaults(loaded, &defaults);
+        assert_eq!(merged["volume"], 0.5, "string where a number is expected");
+        assert_eq!(merged["audio"], 5, "object where a scalar is expected");
+        assert_eq!(merged["name"], "keep", "same kind: the loaded value wins");
+        assert_eq!(merged["opt"], 3, "a null default never overrides a value");
     }
 
     /// #761 — callers can tell an in-memory fallback apart so the UI can
