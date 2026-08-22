@@ -37,6 +37,10 @@
 
 use std::path::PathBuf;
 
+use gtk4::glib;
+use gtk4::prelude::*;
+use libadwaita as adw;
+
 /// Errors returned by the APT and LRPT image viewers' renderer
 /// and PNG-export paths. Constructed at the failing call site
 /// so the `Display` output identifies which step failed.
@@ -223,5 +227,67 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("width"));
         assert!(msg.contains("3000000000"));
+    }
+}
+
+/// Escape a toast title for `adw::Toast`, whose titles are Pango
+/// markup: an unescaped `<` or `&` in a DSP error or a file name made
+/// the toast blank with a GTK warning (#771).
+pub fn toast_title(text: &str) -> String {
+    glib::markup_escape_text(text).to_string()
+}
+
+/// A plain-text toast. Every toast built from runtime text goes through
+/// here so the escaping can't be forgotten at a call site.
+pub fn plain_toast(text: &str) -> adw::Toast {
+    adw::Toast::new(&toast_title(text))
+}
+
+/// Show `toast` on a viewer window whose content is an `adw::ToastOverlay`.
+///
+/// The overlay was installed with `adw::Window::set_content`, so it is
+/// `content()`; `gtk::Window::child()` returns libadwaita's internal
+/// wrapper and the downcast silently failed — no toast ever showed (#765).
+pub fn show_toast_in(window: &adw::Window, toast: adw::Toast) {
+    use adw::prelude::AdwWindowExt;
+    if let Some(overlay) = window
+        .content()
+        .and_then(|c| c.downcast::<adw::ToastOverlay>().ok())
+    {
+        overlay.add_toast(toast);
+    } else {
+        tracing::warn!("viewer toast dropped: window content is not a ToastOverlay");
+    }
+}
+
+#[cfg(test)]
+mod toast_title_tests {
+    use super::toast_title;
+
+    /// #771 — `adw::Toast` titles are Pango markup; an unescaped `<` or
+    /// `&` in a DSP error or a file name produced a blank toast and a
+    /// GTK warning.
+    #[test]
+    fn toast_title_escapes_markup() {
+        let title = toast_title("IQ record failed: <disk full> & more");
+        assert_eq!(title, "IQ record failed: &lt;disk full&gt; &amp; more");
+    }
+
+    /// The viewers' export toasts interpolate a file path — `&` in a
+    /// home-directory segment must survive as text.
+    #[test]
+    fn toast_title_escapes_a_path_with_an_ampersand() {
+        assert_eq!(
+            toast_title("Saved /home/r&d/sdr-recordings/apt.png"),
+            "Saved /home/r&amp;d/sdr-recordings/apt.png"
+        );
+    }
+
+    #[test]
+    fn toast_title_passes_plain_text_through() {
+        assert_eq!(
+            toast_title("Audio recording saved"),
+            "Audio recording saved"
+        );
     }
 }

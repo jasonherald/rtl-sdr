@@ -38,7 +38,7 @@ use libadwaita::prelude::*;
 use sdr_radio::sstv_image::{SstvImageHandle, SstvSnapshot};
 
 use crate::messages::UiToDsp;
-use crate::viewer::ViewerError;
+use crate::viewer::{ViewerError, plain_toast, show_toast_in};
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
@@ -644,12 +644,8 @@ pub fn open_sstv_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         let window_weak = window_for_export.downgrade();
         export_view.export_png_async(path, move |result| {
             let toast = match result {
-                Ok(()) => adw::Toast::builder()
-                    .title(format!("Saved {}", path_for_msg.display()))
-                    .build(),
-                Err(e) => adw::Toast::builder()
-                    .title(format!("PNG export failed: {e}"))
-                    .build(),
+                Ok(()) => plain_toast(&format!("Saved {}", path_for_msg.display())),
+                Err(e) => plain_toast(&format!("PNG export failed: {e}")),
             };
             if let Some(window) = window_weak.upgrade() {
                 show_toast_in(&window, toast);
@@ -693,22 +689,6 @@ fn default_export_path() -> PathBuf {
         suffix += 1;
     }
     path
-}
-
-/// Show `toast` inside the window's [`adw::ToastOverlay`], if present.
-fn show_toast_in(window: &adw::Window, toast: adw::Toast) {
-    // The overlay was installed with `adw::Window::set_content`, so it
-    // is `content()`; `gtk::Window::child()` returns libadwaita's internal
-    // wrapper and the downcast silently failed — no toast ever showed (#765).
-    use adw::prelude::AdwWindowExt;
-    if let Some(overlay) = window
-        .content()
-        .and_then(|c| c.downcast::<adw::ToastOverlay>().ok())
-    {
-        overlay.add_toast(toast);
-    } else {
-        tracing::warn!("viewer toast dropped: window content is not a ToastOverlay");
-    }
 }
 
 // ─── Live viewer action ──────────────────────────────────────────────────────

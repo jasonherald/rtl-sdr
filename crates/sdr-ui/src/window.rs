@@ -9,6 +9,8 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::ObjectSubclassIsExt;
+
+use crate::viewer::plain_toast;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_core::Engine;
@@ -14662,19 +14664,6 @@ fn recording_path(prefix: &str) -> std::path::PathBuf {
 /// `GApplication` can release naturally, removes the notification
 /// action whose closure captures window-owned widgets, shuts down
 /// the transcription engine, and destroys the window. Per #512.
-/// Escape a toast title for `adw::Toast`, whose titles are Pango
-/// markup: an unescaped `<` or `&` in a DSP error or a file name made
-/// the toast blank with a GTK warning (#771).
-fn toast_title(text: &str) -> String {
-    glib::markup_escape_text(text).to_string()
-}
-
-/// A plain-text toast. Every toast built from runtime text goes through
-/// here so the escaping can't be forgotten at a call site.
-fn plain_toast(text: &str) -> adw::Toast {
-    adw::Toast::new(&toast_title(text))
-}
-
 fn perform_real_quit(
     app: &adw::Application,
     state: &Rc<AppState>,
@@ -14705,28 +14694,6 @@ fn perform_real_quit(
     app.remove_action(crate::notify::TUNE_SATELLITE_ACTION);
     transcription_engine.borrow_mut().shutdown_nonblocking();
     window.destroy();
-}
-
-#[cfg(test)]
-mod toast_title_tests {
-    use super::toast_title;
-
-    /// #771 — `adw::Toast` titles are Pango markup; an unescaped `<` or
-    /// `&` in a DSP error or a file name produced a blank toast and a
-    /// GTK warning.
-    #[test]
-    fn toast_title_escapes_markup() {
-        let title = toast_title("IQ record failed: <disk full> & more");
-        assert_eq!(title, "IQ record failed: &lt;disk full&gt; &amp; more");
-    }
-
-    #[test]
-    fn toast_title_passes_plain_text_through() {
-        assert_eq!(
-            toast_title("Audio recording saved"),
-            "Audio recording saved"
-        );
-    }
 }
 
 #[cfg(test)]

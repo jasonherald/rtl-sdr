@@ -1012,6 +1012,46 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #762 (CR round 1 on PR #795) — a failed flush keeps the dirty flag
+    /// set so the next flush retries instead of skipping the save.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_flush_keeps_the_config_dirty() {
+        use std::os::unix::fs::PermissionsExt;
+        /// Directory mode with no write bit: the atomic temp-file
+        /// create must fail.
+        const READ_EXEC_ONLY: u32 = 0o500;
+        /// Restored afterwards so the temp dir can be removed.
+        const OWNER_FULL: u32 = 0o700;
+        if is_root() {
+            return; // root ignores directory permissions
+        }
+        let dir = temp_dir("flush-fails");
+        let path = dir.join("config.json");
+        let mgr = ConfigManager::load(&path, &json!({"volume": 0.5})).unwrap();
+        mgr.write(|c| c["volume"] = json!(0.9));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(READ_EXEC_ONLY)).unwrap();
+
+        let result = mgr.flush();
+        assert!(result.is_err(), "flush must report the failed save");
+        assert!(
+            mgr.modified.load(Ordering::Acquire),
+            "a failed flush must leave the config dirty for a retry"
+        );
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(OWNER_FULL)).unwrap();
+        mgr.flush().unwrap();
+        assert!(!mgr.modified.load(Ordering::Acquire));
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["volume"],
+            json!(0.9),
+            "the retry persists the change"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_merge_defaults() {
         let loaded = json!({"a": 1, "b": 2});
