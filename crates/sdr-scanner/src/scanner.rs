@@ -143,10 +143,13 @@ pub struct Scanner {
     /// Listening. Reset to `false` on every retune entry.
     squelch_open: bool,
     /// Sub-microsecond remainder of the last `SampleTick` conversion,
-    /// in sample·µs units (`< sample_rate_hz`), carried into the next
+    /// in sample·µs units (`< tick_carry_rate`), carried into the next
     /// tick so many tiny ticks measure the same duration as one large
     /// one (CR on PR #798).
     tick_carry: u64,
+    /// Sample rate the carry was produced at; a different rate
+    /// discards the carry (it is meaningless in other units).
+    tick_carry_rate: u32,
 }
 
 impl Default for Scanner {
@@ -161,6 +164,7 @@ impl Default for Scanner {
             priority_sweep_visited: None,
             squelch_open: false,
             tick_carry: 0,
+            tick_carry_rate: 0,
         }
     }
 }
@@ -765,17 +769,18 @@ impl Scanner {
     /// the conversion is exact over any sequence of ticks. (Rounding
     /// each tick up expired a 100 ms dwell after ~42 ms of one-sample
     /// ticks at 2.4 Msps.) The carry is in sample·µs units and is only
-    /// meaningful at one rate; a rate change discards it, which is at
-    /// most one microsecond.
+    /// meaningful at the rate that produced it; a rate change discards
+    /// it, which is at most one microsecond.
     fn tick_elapsed_us(&mut self, samples: u32, sample_rate_hz: NonZeroU32) -> u64 {
         let rate = u64::from(sample_rate_hz.get());
-        let carry = if self.tick_carry < rate {
+        let carry = if self.tick_carry_rate == sample_rate_hz.get() {
             self.tick_carry
         } else {
             0
         };
         let total = u64::from(samples) * US_PER_SEC + carry;
         self.tick_carry = total % rate;
+        self.tick_carry_rate = sample_rate_hz.get();
         total / rate
     }
 }
@@ -1801,5 +1806,22 @@ mod tests {
         // The last sample completes the dwell for both.
         assert!(has_retune(&one_shot.handle_event(tick_at(1, HIGH_RATE))));
         assert!(has_retune(&tiny.handle_event(tick_at(1, HIGH_RATE))));
+    }
+
+    /// CR round 3 on PR #798 — the carry is in sample·µs units of the
+    /// rate that produced it and must be discarded on a rate change:
+    /// 3 samples at 48 kHz leave a 0.5 µs carry, and one sample at
+    /// 30 kHz is 33.33 µs — 33 without the stale carry, 34 with it.
+    #[test]
+    fn tick_carry_is_discarded_on_a_sample_rate_change() {
+        let mut s = Scanner::new();
+        let rate_48k = NonZeroU32::new(48_000).expect("rate > 0");
+        let rate_30k = NonZeroU32::new(30_000).expect("rate > 0");
+        assert_eq!(s.tick_elapsed_us(3, rate_48k), 62);
+        assert_eq!(s.tick_carry, 24_000, "0.5 µs carry in sample·µs units");
+        assert_eq!(s.tick_elapsed_us(1, rate_30k), 33);
+        // Same rate: the carry is honoured (33.33 + 0.33 carry → 33, then 34).
+        assert_eq!(s.tick_elapsed_us(1, rate_30k), 33);
+        assert_eq!(s.tick_elapsed_us(1, rate_30k), 34);
     }
 }
