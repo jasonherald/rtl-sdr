@@ -40,6 +40,12 @@ use sdr_types::{Complex, DspError};
 use crate::lrpt_image::LrptImage;
 
 /// Driver that ties IQ in to per-channel scan lines out.
+/// Seconds of IQ without a channel growing before its held-back row
+/// group is released anyway. A group normally completes within ~1 s
+/// (14 packets); after the signal fades nothing will finish it, and the
+/// LOS snapshot is taken before any reset (#725).
+const STALE_GROUP_FLUSH_SECONDS: u64 = 2;
+
 pub struct LrptDecoder {
     demod: LrptDemod,
     pipeline: LrptPipeline,
@@ -56,6 +62,10 @@ pub struct LrptDecoder {
     /// (`channel.lines > watermark`) get pushed and the
     /// watermark advances.
     last_pushed_lines: HashMap<u16, usize>,
+    /// Per-APID line count at the last growth check.
+    seen_lines: HashMap<u16, usize>,
+    /// Per-APID IQ samples consumed since that channel last grew.
+    samples_since_growth: HashMap<u16, u64>,
 }
 
 impl LrptDecoder {
@@ -76,6 +86,8 @@ impl LrptDecoder {
             image,
             mode,
             last_pushed_lines: HashMap::new(),
+            seen_lines: HashMap::new(),
+            samples_since_growth: HashMap::new(),
         })
     }
 
@@ -97,7 +109,23 @@ impl LrptDecoder {
                 self.pipeline.push_symbol(soft);
             }
         }
+        self.note_growth(samples.len() as u64);
         self.harvest_new_lines();
+    }
+
+    /// Track, per channel, how much IQ has passed since its line count
+    /// last grew — the staleness clock for the held-back row group.
+    fn note_growth(&mut self, samples: u64) {
+        for (&apid, channel) in self.pipeline.assembler().channels() {
+            let seen = self.seen_lines.entry(apid).or_insert(0);
+            let since = self.samples_since_growth.entry(apid).or_insert(0);
+            if channel.lines > *seen {
+                *seen = channel.lines;
+                *since = 0;
+            } else {
+                *since = since.saturating_add(samples);
+            }
+        }
     }
 
     /// Walk the pipeline's assembler and push every line that's
@@ -128,13 +156,23 @@ impl LrptDecoder {
     /// next ~1 s. Pushing rows as soon as they exist handed the viewer
     /// (and the LOS export) 8-row bands holding only the MCUs decoded
     /// so far (#725). A group is therefore pushed only once the next
-    /// group has started — i.e. the last `MCU_SIDE` rows are held back
-    /// unless `include_in_progress` (the LOS flush).
+    /// group has started — i.e. the last `MCU_SIDE` rows are held back —
+    /// unless `include_in_progress` (an explicit flush) or the channel
+    /// has not grown for `STALE_GROUP_FLUSH_SECONDS` (signal gone; the
+    /// LOS snapshot must still see the last group).
     fn harvest(&mut self, include_in_progress: bool) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let stale_after = STALE_GROUP_FLUSH_SECONDS * sdr_dsp::lrpt::SAMPLE_RATE_HZ as u64;
         let assembler = self.pipeline.assembler();
         for (&apid, channel) in assembler.channels() {
             let already = self.last_pushed_lines.get(&apid).copied().unwrap_or(0);
-            let complete = if include_in_progress {
+            // Signal gone: nothing will finish this group, and the LOS
+            // snapshot is taken before any reset — release it.
+            let stale = self
+                .samples_since_growth
+                .get(&apid)
+                .is_some_and(|&since| since >= stale_after);
+            let complete = if include_in_progress || stale {
                 channel.lines
             } else {
                 channel.lines.saturating_sub(MCU_SIDE)
@@ -184,6 +222,8 @@ impl LrptDecoder {
         self.pipeline.reset();
         self.image.clear();
         self.last_pushed_lines.clear();
+        self.seen_lines.clear();
+        self.samples_since_growth.clear();
         Ok(())
     }
 }
@@ -306,5 +346,39 @@ mod tests {
                 .lines,
             2 * MCU_SIDE
         );
+    }
+
+    /// CR round 1 on PR #802 — the LOS snapshot is taken before any
+    /// reset, so a group that has stopped growing must be released on
+    /// its own: after `STALE_GROUP_FLUSH_SECONDS` of samples without
+    /// new lines on that channel, the harvest pushes it.
+    #[test]
+    fn stale_in_progress_group_is_released_after_the_flush_timeout() {
+        let image = LrptImage::new();
+        let mut decoder = LrptDecoder::new(image.clone(), LrptMode::Qpsk).unwrap();
+        let block = [[200_u8; MCU_SIDE]; MCU_SIDE];
+        decoder
+            .pipeline
+            .assembler_mut()
+            .place_mcu(APID_TEST, 0, 0, &block);
+        decoder.harvest_new_lines();
+        assert!(image.snapshot_channel(APID_TEST).is_none());
+
+        // Silence (zero IQ) for just under the timeout: still held.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let one_second = sdr_dsp::lrpt::SAMPLE_RATE_HZ as usize;
+        let silence = vec![Complex::default(); one_second];
+        for _ in 0..STALE_GROUP_FLUSH_SECONDS - 1 {
+            decoder.process(&silence);
+        }
+        assert!(
+            image.snapshot_channel(APID_TEST).is_none(),
+            "held until the timeout"
+        );
+        // Crossing the timeout releases the group.
+        decoder.process(&silence);
+        decoder.process(&silence);
+        let snap = image.snapshot_channel(APID_TEST).expect("released");
+        assert_eq!(snap.lines, MCU_SIDE);
     }
 }

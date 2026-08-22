@@ -255,8 +255,12 @@ impl LrptPipeline {
         let mut row_pkt = unwrapped - offset - anchor;
         // A channel first seen after the counter wrapped (relative to
         // the anchor) has no wrap of its own to count yet: resolve it
-        // onto the anchor's cycle.
-        if first_on_channel && row_pkt < 0 && row_pkt + SEQUENCE_COUNT_MODULUS >= 0 {
+        // onto the anchor's cycle. Only a wrap-sized deficit counts —
+        // a packet from just before the anchor (previous row group)
+        // is simply pre-anchor and is dropped below; treating it as
+        // post-wrap shifted that channel by a whole modulus for the
+        // rest of the pass (CR on PR #802).
+        if first_on_channel && row_pkt <= -WRAP_MIN_BACKWARD_DELTA {
             decoder.wraps += 1;
             row_pkt += SEQUENCE_COUNT_MODULUS;
         }
@@ -847,5 +851,31 @@ mod tests {
         p.consume_packet(&packet_with_mcu_id(66, pkt66, 0));
         let ch66 = p.assembler.channel(66).expect("placed");
         assert_eq!(ch66.lines, 2 * MCU_SIDE, "row 1 despite the wrapped count");
+    }
+
+    /// CR round 1 on PR #802 — a channel whose first packet sits just
+    /// *before* the anchor (previous row group) must be dropped at the
+    /// pre-anchor guard, not treated as post-wrap: the old condition
+    /// shifted it by a whole modulus (+381 rows) for the rest of the
+    /// pass and grew the channel buffer to thousands of blank lines.
+    #[test]
+    fn small_negative_first_sighting_is_dropped_not_wrapped() {
+        let mut p = LrptPipeline::new();
+        // APID 66 anchors at C − 28.
+        p.consume_packet(&packet_with_mcu_id(66, 1_028, 0));
+        assert_eq!(p.anchor, Some(1_000));
+        // APID 64's first packet belongs to the previous row group
+        // (row_pkt = −43).
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let previous_group = (1_000 - PACKETS_PER_ROW_GROUP) as u16;
+        p.consume_packet(&packet_with_mcu_id(64, previous_group, 0));
+        assert!(
+            p.assembler.channel(64).is_none(),
+            "dropped, not placed on row 380"
+        );
+        assert_eq!(p.decoders[&64].wraps, 0, "no phantom wrap");
+        // Its next packet, in the anchor's row group, lands on row 0.
+        p.consume_packet(&packet_with_mcu_id(64, 1_000, 0));
+        assert_eq!(p.assembler.channel(64).expect("placed").lines, MCU_SIDE);
     }
 }
