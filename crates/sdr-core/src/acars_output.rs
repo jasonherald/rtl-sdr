@@ -212,8 +212,14 @@ impl AcarsOutputs {
     /// explicit `Shutdown` message (or — as a fallback — drops
     /// `tx`, at which point the writer's `recv()` returns
     /// `Err(Disconnected)`). Either way the loop exits cleanly.
-    #[must_use]
-    pub fn new(dsp_tx: mpsc::Sender<crate::messages::DspToUi>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error if the writer thread cannot be spawned
+    /// (thread / FD exhaustion). The caller — `DspState::new` — turns
+    /// that into a `DspToUi::Error` instead of panicking the DSP
+    /// thread before its command loop (#701).
+    pub fn new(dsp_tx: mpsc::Sender<crate::messages::DspToUi>) -> std::io::Result<Self> {
         Self::with_capacity(ACARS_OUTPUT_CHANNEL_CAPACITY, dsp_tx)
     }
 
@@ -221,23 +227,25 @@ impl AcarsOutputs {
     /// capacity. Production calls go through `new`; tests use
     /// this directly via `with_capacity_for_test` to exercise
     /// the drop-on-full path with a cap they can saturate.
-    fn with_capacity(capacity: usize, dsp_tx: mpsc::Sender<crate::messages::DspToUi>) -> Self {
+    fn with_capacity(
+        capacity: usize,
+        dsp_tx: mpsc::Sender<crate::messages::DspToUi>,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(capacity);
         let config = Arc::new(RwLock::new(AcarsWriterConfig::default()));
 
         let writer_config = Arc::clone(&config);
         let writer_thread = std::thread::Builder::new()
             .name("sdr-acars-writer".into())
-            .spawn(move || run_writer_loop(rx, writer_config, dsp_tx))
-            .expect("failed to spawn ACARS writer thread");
+            .spawn(move || run_writer_loop(rx, writer_config, dsp_tx))?;
 
-        Self {
+        Ok(Self {
             tx,
             config,
             drop_count: Arc::new(AtomicU64::new(0)),
             last_drop_warn_at: Arc::new(Mutex::new(None)),
             writer_thread: Some(writer_thread),
-        }
+        })
     }
 
     /// Test-only constructor that builds the channel + config
@@ -309,7 +317,12 @@ impl AcarsOutputs {
     /// the current drop count so the message names how many
     /// were lost in this window.
     fn maybe_warn_full(&self) {
-        let mut last = self.last_drop_warn_at.lock().expect("warn lock poisoned");
+        // Recover from poison: a panic while holding this lock must
+        // not take the DSP thread down with it (#701).
+        let mut last = self
+            .last_drop_warn_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
         let elapsed = last.map_or(ACARS_OUTPUT_WARN_MIN_INTERVAL, |t| now.duration_since(t));
         if elapsed >= ACARS_OUTPUT_WARN_MIN_INTERVAL {
@@ -370,6 +383,8 @@ fn run_writer_loop(
     let mut udp: Option<(String, UdpFeeder)> = None;
     let mut jsonl_warn_at: Option<std::time::Instant> = None;
     let mut udp_warn_at: Option<std::time::Instant> = None;
+    let mut jsonl_backoff = OpenBackoff::default();
+    let mut udp_backoff = OpenBackoff::default();
 
     // `while let Ok(_)` is the disconnect-fallback path; the
     // inner `match` handles the explicit Shutdown sentinel
@@ -384,31 +399,41 @@ fn run_writer_loop(
                 // on path/addr change, so disabling JSONL or
                 // swapping the destination applies immediately
                 // even with no decoded traffic.
-                let (want_jsonl_path, want_udp_addr, _station_id) = {
-                    let cfg = config.read().expect("acars writer config poisoned");
-                    (
-                        cfg.jsonl_path.clone(),
-                        cfg.network_addr.clone(),
-                        cfg.station_id.clone(),
-                    )
-                };
-                ensure_jsonl(&mut jsonl, want_jsonl_path.as_deref(), &dsp_tx);
-                ensure_udp(&mut udp, want_udp_addr.as_deref(), &dsp_tx);
+                let (want_jsonl_path, want_udp_addr, _station_id) = snapshot_config(&config);
+                // An explicit config change is a user action: retry a
+                // previously failed open right away (#702).
+                jsonl_backoff.reset();
+                udp_backoff.reset();
+                ensure_jsonl(
+                    &mut jsonl,
+                    want_jsonl_path.as_deref(),
+                    &mut jsonl_backoff,
+                    &dsp_tx,
+                );
+                ensure_udp(
+                    &mut udp,
+                    want_udp_addr.as_deref(),
+                    &mut udp_backoff,
+                    &dsp_tx,
+                );
             }
             AcarsOutputMessage::Decoded(msg) => {
                 // Snapshot the config under a brief read lock so we
                 // don't hold it across blocking I/O.
-                let (want_jsonl_path, want_udp_addr, station_id) = {
-                    let cfg = config.read().expect("acars writer config poisoned");
-                    (
-                        cfg.jsonl_path.clone(),
-                        cfg.network_addr.clone(),
-                        cfg.station_id.clone(),
-                    )
-                };
+                let (want_jsonl_path, want_udp_addr, station_id) = snapshot_config(&config);
 
-                ensure_jsonl(&mut jsonl, want_jsonl_path.as_deref(), &dsp_tx);
-                ensure_udp(&mut udp, want_udp_addr.as_deref(), &dsp_tx);
+                ensure_jsonl(
+                    &mut jsonl,
+                    want_jsonl_path.as_deref(),
+                    &mut jsonl_backoff,
+                    &dsp_tx,
+                );
+                ensure_udp(
+                    &mut udp,
+                    want_udp_addr.as_deref(),
+                    &mut udp_backoff,
+                    &dsp_tx,
+                );
 
                 if let Some((_, w)) = jsonl.as_mut()
                     && let Err(e) = w.write(&msg, station_id.as_deref())
@@ -422,6 +447,53 @@ fn run_writer_loop(
                 }
             }
         }
+    }
+}
+
+/// Snapshot the writer config under a brief read lock so it is never
+/// held across blocking I/O. Recovers from poison: a panic elsewhere
+/// while holding the lock must not kill the writer thread (#701).
+fn snapshot_config(
+    config: &RwLock<AcarsWriterConfig>,
+) -> (Option<PathBuf>, Option<String>, Option<String>) {
+    let cfg = config
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (
+        cfg.jsonl_path.clone(),
+        cfg.network_addr.clone(),
+        cfg.station_id.clone(),
+    )
+}
+
+/// Retry gate for a failed output open (#702). With an unwritable
+/// path or an unresolvable feeder host, every decoded message used
+/// to redo `create_dir_all` + `open` (or DNS) plus a warn and a toast
+/// — several per second on a busy airband. After a failure the same
+/// target is not retried until [`ACARS_OUTPUT_WARN_MIN_INTERVAL`]
+/// elapses; a different target or [`OpenBackoff::reset`] (explicit
+/// config change) retries immediately.
+#[derive(Debug, Default)]
+struct OpenBackoff {
+    /// Target whose last open failed, with the failure time.
+    failed: Option<(String, std::time::Instant)>,
+}
+
+impl OpenBackoff {
+    /// `true` while `target` is still inside the backoff window.
+    fn should_skip(&self, target: &str) -> bool {
+        self.failed
+            .as_ref()
+            .is_some_and(|(key, at)| key == target && at.elapsed() < ACARS_OUTPUT_WARN_MIN_INTERVAL)
+    }
+
+    fn record_failure(&mut self, target: &str) {
+        self.failed = Some((target.to_string(), std::time::Instant::now()));
+    }
+
+    /// Forget the last failure so the next `ensure_*` retries.
+    fn reset(&mut self) {
+        self.failed = None;
     }
 }
 
@@ -445,6 +517,7 @@ fn emit_output_error(
 fn ensure_jsonl(
     slot: &mut Option<(PathBuf, JsonlWriter)>,
     want: Option<&Path>,
+    backoff: &mut OpenBackoff,
     dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
 ) {
     let needs_reopen = match (slot.as_ref(), want) {
@@ -457,11 +530,19 @@ fn ensure_jsonl(
     }
     *slot = None;
     if let Some(want) = want {
+        let key = want.to_string_lossy();
+        if backoff.should_skip(&key) {
+            return;
+        }
         match JsonlWriter::open(want) {
-            Ok(w) => *slot = Some((want.to_path_buf(), w)),
+            Ok(w) => {
+                backoff.reset();
+                *slot = Some((want.to_path_buf(), w));
+            }
             Err(e) => {
+                backoff.record_failure(&key);
                 let message = format!("acars jsonl open failed: {e}");
-                tracing::warn!("{message}");
+                tracing::warn!("{message} (retry in {ACARS_OUTPUT_WARN_MIN_INTERVAL:?})");
                 emit_output_error(dsp_tx, "jsonl", message);
             }
         }
@@ -474,6 +555,7 @@ fn ensure_jsonl(
 fn ensure_udp(
     slot: &mut Option<(String, UdpFeeder)>,
     want: Option<&str>,
+    backoff: &mut OpenBackoff,
     dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
 ) {
     let needs_reopen = match (slot.as_ref(), want) {
@@ -486,11 +568,18 @@ fn ensure_udp(
     }
     *slot = None;
     if let Some(want) = want {
+        if backoff.should_skip(want) {
+            return;
+        }
         match UdpFeeder::open(want) {
-            Ok(f) => *slot = Some((want.to_string(), f)),
+            Ok(f) => {
+                backoff.reset();
+                *slot = Some((want.to_string(), f));
+            }
             Err(e) => {
+                backoff.record_failure(want);
                 let message = format!("acars udp open failed: {e}");
-                tracing::warn!("{message}");
+                tracing::warn!("{message} (retry in {ACARS_OUTPUT_WARN_MIN_INTERVAL:?})");
                 emit_output_error(dsp_tx, "udp", message);
             }
         }
@@ -638,6 +727,123 @@ mod tests {
         // Unresolvable host.
         // Use .invalid TLD per RFC 6761 — guaranteed to never resolve.
         assert!(UdpFeeder::open("nonexistent.invalid:5550").is_err());
+    }
+
+    /// #701 — a poisoned warn-rate-limit mutex must not panic the DSP
+    /// thread; recover the guard and keep going.
+    #[test]
+    #[allow(clippy::panic)] // the panic is the poison injection
+    fn try_send_survives_poisoned_warn_lock() {
+        let outputs = AcarsOutputs::with_capacity_for_test(1);
+        let lock = Arc::clone(&outputs.last_drop_warn_at);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = lock.lock().unwrap();
+            panic!("poison the warn lock on purpose");
+        });
+        assert!(
+            poisoner.join().is_err(),
+            "test premise: the lock is poisoned"
+        );
+
+        assert!(outputs.try_send(make_msg(0)));
+        // Channel full → drop path → maybe_warn_full takes the poisoned lock.
+        assert!(!outputs.try_send(make_msg(0)));
+        assert_eq!(outputs.drop_count(), 1);
+    }
+
+    /// #701 — a poisoned writer config lock must not kill the writer
+    /// thread; it recovers the inner value and keeps serving messages.
+    #[test]
+    #[allow(clippy::panic)] // the panic is the poison injection
+    fn writer_thread_survives_poisoned_config_lock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("poisoned.jsonl");
+        let config = Arc::new(RwLock::new(AcarsWriterConfig {
+            jsonl_path: Some(path.clone()),
+            network_addr: None,
+            station_id: None,
+        }));
+        let poison = Arc::clone(&config);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = poison.write().unwrap();
+            panic!("poison the config lock on purpose");
+        });
+        assert!(
+            poisoner.join().is_err(),
+            "test premise: the lock is poisoned"
+        );
+
+        let (tx, rx) = mpsc::sync_channel::<AcarsOutputMessage>(8);
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<crate::messages::DspToUi>();
+        let worker = Arc::clone(&config);
+        let handle = std::thread::spawn(move || run_writer_loop(rx, worker, dsp_tx));
+        tx.send(AcarsOutputMessage::Decoded(make_msg(0))).unwrap();
+        tx.send(AcarsOutputMessage::Shutdown).unwrap();
+        handle
+            .join()
+            .expect("writer thread must survive a poisoned config lock");
+        let lines: Vec<_> = BufReader::new(File::open(&path).unwrap())
+            .lines()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the message after the poison is still written"
+        );
+    }
+
+    /// #702 — a failing open must not be retried (with a warn + toast)
+    /// on every message; it backs off until the interval elapses or the
+    /// target changes.
+    #[test]
+    fn ensure_jsonl_backs_off_after_a_failed_open() {
+        let dir = tempdir().unwrap();
+        // A path *under a regular file* can never be created.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad = blocker.join("out.jsonl");
+
+        let (dsp_tx, dsp_rx) = mpsc::channel::<crate::messages::DspToUi>();
+        let mut slot = None;
+        let mut backoff = OpenBackoff::default();
+        ensure_jsonl(&mut slot, Some(&bad), &mut backoff, &dsp_tx);
+        ensure_jsonl(&mut slot, Some(&bad), &mut backoff, &dsp_tx);
+        ensure_jsonl(&mut slot, Some(&bad), &mut backoff, &dsp_tx);
+        let toasts = dsp_rx.try_iter().count();
+        assert_eq!(
+            toasts, 1,
+            "one toast per backoff window, not one per message"
+        );
+        assert!(slot.is_none());
+
+        // A different target retries immediately.
+        let good = dir.path().join("ok.jsonl");
+        ensure_jsonl(&mut slot, Some(&good), &mut backoff, &dsp_tx);
+        assert!(slot.is_some(), "a new target is tried right away");
+        assert_eq!(dsp_rx.try_iter().count(), 0);
+    }
+
+    /// #702 — an explicit config change resets the backoff so the user's
+    /// action gets an immediate retry.
+    #[test]
+    fn open_backoff_reset_forces_a_retry() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let bad = blocker.join("out.jsonl");
+        let (dsp_tx, dsp_rx) = mpsc::channel::<crate::messages::DspToUi>();
+        let mut slot = None;
+        let mut backoff = OpenBackoff::default();
+        ensure_jsonl(&mut slot, Some(&bad), &mut backoff, &dsp_tx);
+        assert_eq!(dsp_rx.try_iter().count(), 1);
+        backoff.reset();
+        ensure_jsonl(&mut slot, Some(&bad), &mut backoff, &dsp_tx);
+        assert_eq!(
+            dsp_rx.try_iter().count(),
+            1,
+            "retry after reset surfaces again"
+        );
     }
 
     #[test]

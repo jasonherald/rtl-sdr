@@ -809,7 +809,8 @@ impl DspState {
             acars_init_failed: false,
             acars_stats_emitted_at: std::time::Instant::now(),
             acars_region: crate::acars_airband_lock::AcarsRegion::default(),
-            acars_outputs: AcarsOutputs::new(dsp_tx),
+            acars_outputs: AcarsOutputs::new(dsp_tx)
+                .map_err(|e| format!("ACARS output writer thread: {e}"))?,
             acars_last_user_jsonl_path: None,
             acars_last_user_network_addr: None,
         })
@@ -3863,6 +3864,15 @@ fn reset_imaging_decoders(state: &mut DspState) {
         tracing::warn!("LRPT decoder reset failed; dropping for re-init: {e}");
         state.lrpt_decoder = None;
     }
+    // Clear the shared LRPT canvas directly rather than relying on the
+    // decoder's reset to do it: `SetLrptModulation` and the reset-Err
+    // branch above leave `lrpt_decoder = None`, and a between-pass
+    // reset then left pass 1's pixels for pass 2 to composite over —
+    // the LOS PNG held both passes (#700). The handle itself survives
+    // (the viewer holds a clone); only its pixels are wiped.
+    if let Some(image) = state.lrpt_image.as_ref() {
+        image.clear();
+    }
     state.lrpt_init_failed = false;
 
     // SSTV decoder reset: drop and re-init on next tap call so
@@ -5950,6 +5960,33 @@ mod tests {
         assert!(recording_write_error_message("IQ", &disk_full).contains("write failed"));
     }
 
+    /// #700 — the shared LRPT canvas must be cleared between passes even
+    /// when no decoder is alive to do it as a side effect (e.g. after a
+    /// modulation change dropped it), or pass 2 composites onto pass 1.
+    #[test]
+    fn reset_imaging_decoders_clears_lrpt_image_without_a_decoder() {
+        const APID: u16 = 64;
+        const LINE_WIDTH: usize = 8;
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx).unwrap();
+        let image = sdr_radio::lrpt_image::LrptImage::new();
+        image.push_line(APID, &[0x80; LINE_WIDTH]);
+        assert!(
+            !image.channel_apids().is_empty(),
+            "test premise: a line landed"
+        );
+        state.lrpt_image = Some(image);
+        state.lrpt_decoder = None;
+
+        reset_imaging_decoders(&mut state);
+
+        let image = state.lrpt_image.as_ref().unwrap();
+        assert!(
+            image.channel_apids().is_empty(),
+            "stale pixels survived the between-pass reset"
+        );
+    }
+
     /// #692 — the IQ-correction switch must not share state with DC blocking.
     #[test]
     fn set_iq_correction_does_not_alias_dc_blocking() {
@@ -6226,7 +6263,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
         let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
-        let outputs = super::AcarsOutputs::new(acars_dsp_tx);
+        let outputs = super::AcarsOutputs::new(acars_dsp_tx).unwrap();
 
         super::acars_decode_tap(
             &mut bank,
@@ -6251,7 +6288,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<DspToUi>();
         let iq = vec![Complex::default(); 1024];
         let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
-        let outputs = super::AcarsOutputs::new(acars_dsp_tx);
+        let outputs = super::AcarsOutputs::new(acars_dsp_tx).unwrap();
 
         super::acars_decode_tap(
             &mut bank,
@@ -6275,7 +6312,7 @@ mod tests {
         let iq = vec![Complex::default(); 1024];
         let bad_channels: [f64; 6] = [0.0; 6]; // outside source bandwidth
         let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
-        let outputs = super::AcarsOutputs::new(acars_dsp_tx);
+        let outputs = super::AcarsOutputs::new(acars_dsp_tx).unwrap();
 
         super::acars_decode_tap(
             &mut bank,
