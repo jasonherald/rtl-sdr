@@ -562,7 +562,7 @@ struct DspState {
     /// from the post-`radio.process` audio path when the active
     /// demod mode is NFM (the only mode the APT 2400 Hz subcarrier
     /// rides through cleanly). Audio output rate is 48 kHz which
-    /// is well above the decoder's 4800 Hz Nyquist floor.
+    /// is well above the decoder's 10.6 kHz input-rate floor.
     ///
     /// `None` means "not yet built" — built once, kept across
     /// demod-mode toggles so re-entering NFM during a pass picks
@@ -827,7 +827,7 @@ impl DspState {
 /// `audio_count > 0` and the active demod is NFM.
 fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_count: usize) {
     // Lazy-init. Audio rate comes from `RadioModule::audio_sample_rate`
-    // (typically 48 kHz, well above the decoder's 4800 Hz floor).
+    // (typically 48 kHz, well above the decoder's 10.6 kHz floor).
     if state.apt_decoder.is_none() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let rate_hz = state.radio.audio_sample_rate() as u32;

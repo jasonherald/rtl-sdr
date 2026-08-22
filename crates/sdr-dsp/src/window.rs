@@ -171,16 +171,25 @@ pub fn kaiser_beta(atten_db: f64) -> f64 {
 /// `Δω` is the transition width in radians/sample.
 ///
 /// Returns an odd value (Type-I FIR has zero phase + symmetric taps).
-/// Capped at 1 to prevent zero-length windows when the formula gives
-/// pathological values (negative or zero atten input).
+/// Clamped to `[1, KAISER_LENGTH_MAX]`: negative / zero / NaN estimates
+/// (bad atten input) give 1, and a vanishing transition width — whose
+/// estimate overflows `usize` or is infinite — saturates instead of
+/// wrapping to a 1-tap design (#776). Callers compare against their
+/// own tap-count ceiling.
 #[must_use]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn kaiser_length(atten_db: f64, transition_rad: f64) -> usize {
+    /// Saturation point for the estimate; leaves headroom for the
+    /// odd-length adjustment below (and is itself odd).
+    const KAISER_LENGTH_MAX: usize = usize::MAX >> 1;
     let raw = ((atten_db - 8.0) / (2.285 * transition_rad)).ceil();
-    let mut n = if raw.is_finite() && raw > 0.0 {
-        raw as usize + 1
-    } else {
+    #[allow(clippy::cast_precision_loss)]
+    let mut n = if raw.is_nan() || raw <= 0.0 {
         1
+    } else if raw >= KAISER_LENGTH_MAX as f64 {
+        KAISER_LENGTH_MAX
+    } else {
+        raw as usize + 1
     };
     if n.is_multiple_of(2) {
         n += 1;
@@ -455,6 +464,17 @@ mod tests {
         assert_eq!(n_90 % 2, 1, "expected odd length, got {n_90}");
         assert!(n_30 < n_60);
         assert!(n_60 < n_90);
+    }
+
+    /// #776 — a vanishing transition width used to saturate the
+    /// `as usize` cast and then overflow on `+ 1` (debug panic,
+    /// release wrap to a 1-tap design). The estimate must saturate.
+    #[test]
+    fn test_kaiser_length_saturates_on_vanishing_transition() {
+        let n = kaiser_length(60.0, f64::MIN_POSITIVE);
+        assert_eq!(n % 2, 1, "expected odd length, got {n}");
+        assert!(n > 1_000_000, "expected a saturated huge length, got {n}");
+        assert_eq!(kaiser_length(60.0, 1e-300), n);
     }
 
     #[test]

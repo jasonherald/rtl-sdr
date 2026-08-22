@@ -807,6 +807,16 @@ const DC_BANDPASS_TRANSITION_HZ: f64 = 1_000.0;
 /// Stopband attenuation target for the input-rate DC-removing
 /// bandpass. 30 dB matches noaa-apt's `standard` profile.
 const DC_BANDPASS_ATTEN_DB: f64 = 30.0;
+/// Lowest input rate [`AptDecoder::new`] accepts (exclusive). The
+/// DC-removing bandpass needs its upper transition edge
+/// (`cutoff + transition/2` = 5300 Hz) below Nyquist, which is a
+/// stricter floor than the 2·`SUBCARRIER_HZ` sampling requirement.
+/// [`AptDecoder::new`] rejects rates at or below this with
+/// [`DspError::InvalidParameter`]; before #776 they slipped past the
+/// 4800 Hz guard and failed inside the tap designer.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub const MIN_INPUT_RATE_HZ: u32 =
+    (2.0 * (DC_BANDPASS_CUTOUT_HZ + DC_BANDPASS_TRANSITION_HZ / 2.0)) as u32;
 
 /// Maximum input audio samples processed through the resample → envelope
 /// stages in one pass. Keeps `resample_scratch`, `demod_scratch`, and
@@ -880,32 +890,29 @@ impl AptDecoder {
     /// Build a decoder for audio sampled at `input_rate_hz`.
     ///
     /// Typical value is 48000 (the output rate of the FM demodulator).
-    /// Must be **strictly greater than** `2 · SUBCARRIER_HZ` (4800 Hz)
-    /// — at exactly 4800 Hz the 2400 Hz APT subcarrier sits on Nyquist
-    /// where each sample lands at a phase-ambiguous point on the cosine,
-    /// and below that it's already aliased before this pipeline gets a
-    /// chance to look at it. Either case produces silent garbage, so
-    /// the boundary itself is rejected.
+    /// Must be **strictly greater than** [`MIN_INPUT_RATE_HZ`]
+    /// (10 600 Hz): the input-rate DC-removing bandpass places its
+    /// upper transition edge at 5300 Hz, which has to sit below
+    /// Nyquist. That floor already covers the `2 · SUBCARRIER_HZ`
+    /// (4800 Hz) sampling requirement for the 2400 Hz subcarrier.
     ///
     /// # Errors
     ///
     /// Returns [`DspError::InvalidParameter`] if `input_rate_hz` is at or
-    /// below the strict Nyquist floor for the APT subcarrier
-    /// (`> 2·SUBCARRIER_HZ`, i.e. above 4800 Hz). Propagates other
-    /// [`DspError`] values from the underlying resampler, envelope
-    /// detector, or tap designer.
+    /// below [`MIN_INPUT_RATE_HZ`]. Propagates other [`DspError`] values
+    /// from the underlying resampler, envelope detector, or tap designer.
     #[allow(clippy::cast_possible_truncation)]
     pub fn new(input_rate_hz: u32) -> Result<Self, DspError> {
-        // 2 · 2400 = 4800 Hz exactly — no rounding, just hard-code so the
-        // const-context-friendly comparison below stays trivially correct.
-        // Note `<=`: at exactly 2·f_c the subcarrier sits at Nyquist where
-        // each sample lands at a phase-ambiguous point on the cosine, so
-        // the boundary itself has to be rejected — not just rates below.
-        const NYQUIST_FLOOR_HZ: u32 = 4_800;
-        if input_rate_hz <= NYQUIST_FLOOR_HZ {
+        // The DC-removing bandpass below needs `cutoff + transition/2`
+        // (5300 Hz) strictly below Nyquist, which subsumes the
+        // 2·SUBCARRIER_HZ = 4800 Hz sampling floor. Rejecting here names
+        // the rate; letting the tap designer fail named filter
+        // internals and was cached as a session-long error (#776).
+        if input_rate_hz <= MIN_INPUT_RATE_HZ {
             return Err(DspError::InvalidParameter(format!(
-                "input_rate_hz ({input_rate_hz}) must be > 2·SUBCARRIER_HZ \
-                 ({NYQUIST_FLOOR_HZ}) to sample the 2400 Hz APT subcarrier safely",
+                "input_rate_hz ({input_rate_hz}) must be > {MIN_INPUT_RATE_HZ} Hz so the \
+                 DC-removing bandpass (cutoff {DC_BANDPASS_CUTOUT_HZ} Hz, transition \
+                 {DC_BANDPASS_TRANSITION_HZ} Hz) fits below Nyquist",
             )));
         }
         // Pre-size the resample / envelope scratch vectors for the
@@ -1545,6 +1552,33 @@ mod tests {
         );
         assert_eq!(SAMPLES_PER_SYNC_A_CYCLE, 12);
         assert_eq!(SAMPLES_PER_SYNC_B_CYCLE, 15);
+    }
+
+    /// #776 — the constructor guard only checked the `2·f_c` Nyquist
+    /// floor (4800 Hz) but the DC-removing bandpass it builds needs
+    /// `cutoff + transition/2` below Nyquist, i.e. a rate above
+    /// 10 600 Hz. 8 / 9.6 kHz audio passed the guard and died inside
+    /// the tap designer with an error naming filter internals.
+    #[test]
+    fn apt_decoder_rejects_rates_the_dc_bandpass_cannot_support() {
+        for rate in [8_000, 9_600, 10_600] {
+            let err = AptDecoder::new(rate).err().map(|e| e.to_string());
+            assert!(err.is_some(), "rate {rate} must be rejected");
+            let msg = err.unwrap_or_default();
+            assert!(
+                msg.contains("input_rate_hz") && msg.contains(&MIN_INPUT_RATE_HZ.to_string()),
+                "rate {rate}: error must name the input-rate floor, got: {msg}"
+            );
+        }
+        assert!(
+            AptDecoder::new(MIN_INPUT_RATE_HZ + 1).is_ok(),
+            "the floor is exclusive: {} Hz is accepted",
+            MIN_INPUT_RATE_HZ + 1
+        );
+        assert!(
+            AptDecoder::new(11_025).is_ok(),
+            "11 025 Hz clears the floor"
+        );
     }
 
     #[test]

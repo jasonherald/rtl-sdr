@@ -35,16 +35,16 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use sdr_dsp::apt::{AptDecoder, AptLine, LINE_PIXELS, READY_QUEUE_CAP};
+use sdr_dsp::apt::{AptDecoder, AptLine, LINE_PIXELS, MIN_INPUT_RATE_HZ, READY_QUEUE_CAP};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
         eprintln!(
             "usage: {} <input.wav> <output.png>\n\
-             input.wav: PCM 16-bit OR float WAV, sample rate >= 11025 Hz; \
+             input.wav: PCM 16-bit OR float WAV, sample rate > {} Hz; \
              multi-channel input is downmixed to mono",
-            args[0]
+            args[0], MIN_INPUT_RATE_HZ,
         );
         std::process::exit(2);
     }
@@ -60,15 +60,15 @@ fn main() {
     );
     // Reject specs the decoder can't ingest before we attempt to read
     // samples or build the decoder — both would otherwise panic.
-    // `AptDecoder::new` requires sample_rate ≥ 11025 Hz (the working
-    // intermediate rate); integer WAVs are read as `i16` below so any
+    // `AptDecoder::new` requires sample_rate > `MIN_INPUT_RATE_HZ`
+    // (10 600 Hz — the decoder's DC-removing bandpass must fit below
+    // Nyquist, #776); integer WAVs are read as `i16` below so any
     // bit-depth other than 16 trips `samples::<i16>().unwrap()`. Per
     // CR round 3 on PR #571.
-    const MIN_SAMPLE_RATE_HZ: u32 = 11_025;
-    if spec.sample_rate < MIN_SAMPLE_RATE_HZ {
+    if spec.sample_rate <= MIN_INPUT_RATE_HZ {
         eprintln!(
-            "unsupported sample rate: {} Hz (need >= {} Hz)",
-            spec.sample_rate, MIN_SAMPLE_RATE_HZ,
+            "unsupported sample rate: {} Hz (need > {} Hz)",
+            spec.sample_rate, MIN_INPUT_RATE_HZ,
         );
         std::process::exit(2);
     }

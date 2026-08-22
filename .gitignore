@@ -39,3 +39,7 @@ apps/macos/build/
 # Local LRPT/satellite test recordings (large IQ/.s binaries + reference
 # images). Preserved on disk for decode validation; never committed.
 /test-data/
+
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md

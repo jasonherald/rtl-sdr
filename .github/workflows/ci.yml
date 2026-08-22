@@ -120,3 +120,77 @@ jobs:
           cargo llvm-cov --package sdr-lrpt \
             --fail-under-lines 90 \
             --fail-under-regions 90
+
+  # Workspace coverage → Codacy (#796). Codacy is on trial as the
+  # SonarCloud replacement; this feeds its coverage dashboard. Runs
+  # the default (Whisper CPU) feature set — the transcription backend
+  # mutex means exactly one backend per build. This job executes
+  # workspace code (build scripts, tests) and therefore never sees the
+  # Codacy token: the report travels to a separate upload job as an
+  # artifact, so a compromised build script cannot reach the token
+  # (e.g. by appending `BASH_ENV=` to `$GITHUB_ENV`).
+  codacy-coverage:
+    name: Coverage report (Codacy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Untrusted PR code runs in this job; it needs no git credentials.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake \
+            libgtk-4-dev libadwaita-1-dev libusb-1.0-0-dev \
+            libpipewire-0.3-dev libclang-dev libdbus-1-dev
+      - name: Install cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov
+      - name: Workspace coverage (LCOV)
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lcov
+          path: lcov.info
+          retention-days: 7
+
+  # Upload-only job: no checkout, no workspace code — just the LCOV
+  # artifact and a pinned, checksum-verified reporter binary. Skips
+  # the upload when `CODACY_PROJECT_TOKEN` is not configured (forks,
+  # or before the secret exists) instead of failing the workflow.
+  codacy-upload:
+    name: Coverage upload (Codacy)
+    needs: codacy-coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Only a presence flag at job scope (a step's own `env` is not
+      # visible to its own `if`); the token itself is scoped to the
+      # upload step.
+      HAS_CODACY_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN != '' }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: lcov
+      # The official action is SHA-pinned only for its action.yml; it
+      # then bootstraps `get.sh` from the reporter repo's mutable
+      # `master` branch and hands the token to whatever that fetched.
+      # Fetch a pinned release of the reporter instead and verify it
+      # against a checksum recorded here before the token is exposed.
+      - name: Upload to Codacy
+        if: ${{ env.HAS_CODACY_TOKEN == 'true' }}
+        env:
+          CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+          REPORTER_VERSION: 14.1.3
+          REPORTER_SHA512: 73a6c93fc5db509fd0423d6e545759c3f61d8360ee12054e32a9277daab6add0da6c6639248f6ed6c0042366440293ebc0b6144325aef52c5d3d4b230d65eb17
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o codacy-coverage-reporter \
+            "https://github.com/codacy/codacy-coverage-reporter/releases/download/${REPORTER_VERSION}/codacy-coverage-reporter-linux"
+          echo "${REPORTER_SHA512}  codacy-coverage-reporter" | sha512sum -c -
+          chmod +x codacy-coverage-reporter
+          ./codacy-coverage-reporter report -r lcov.info
