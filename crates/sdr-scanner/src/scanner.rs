@@ -20,6 +20,13 @@ use crate::{PRIORITY_CHECK_INTERVAL, SETTLE_MS};
 /// multi-tier #365 work a one-constant change.
 const MIN_PRIORITY_TIER: u8 = 1;
 
+/// How much post-settle audio confirms a latched carrier as genuine.
+/// Covers the IQ ring drain after a retune (the settle window is
+/// `SETTLE_MS`; the ring can hold a little more at high rates) while
+/// staying far below any realistic hang time, so a real transmission
+/// that was already active at retune keeps its `hang_ms` (#759).
+const PROVISIONAL_CONFIRM_MS: u32 = 100;
+
 /// Internal phase carrying per-phase bookkeeping. The outer
 /// `ScannerState` surfaced to the UI is a flattened view of this.
 #[derive(Debug, Clone)]
@@ -27,20 +34,28 @@ enum Phase {
     Idle,
     Retuning {
         target_idx: usize,
-        /// `None` → seed on next `SampleTick`; `Some(n)` → n samples remaining.
-        samples_until_settled: Option<u64>,
+        /// `None` → seed on next `SampleTick`; `Some(n)` → n µs remaining.
+        us_until_settled: Option<u64>,
     },
     Dwelling {
         idx: usize,
-        samples_until_timeout: u64,
+        us_until_timeout: u64,
     },
     Listening {
         idx: usize,
+        /// `Some(µs)` while the Listening is provisional: it was
+        /// entered from the settle-window latch rather than a
+        /// post-settle edge, so the carrier may be the previous
+        /// channel's IQ still draining from the ring. A close during
+        /// that window resumes the dwell instead of hanging; once
+        /// [`PROVISIONAL_CONFIRM_MS`] of post-settle audio has passed
+        /// the carrier is confirmed and this becomes `None` (#759).
+        provisional_us: Option<u64>,
     },
     Hanging {
         idx: usize,
-        /// `None` → seed on next `SampleTick`; `Some(n)` → n samples remaining.
-        samples_until_timeout: Option<u64>,
+        /// `None` → seed on next `SampleTick`; `Some(n)` → n µs remaining.
+        us_until_timeout: Option<u64>,
     },
     /// Transition marker: advance rotation after a Dwelling timeout.
     /// Never stored in `self.phase`; used only inside `handle_sample_tick`.
@@ -127,6 +142,14 @@ pub struct Scanner {
     /// this at settle expiry to decide Dwelling vs direct
     /// Listening. Reset to `false` on every retune entry.
     squelch_open: bool,
+    /// Sub-microsecond remainder of the last `SampleTick` conversion,
+    /// in sample·µs units (`< tick_carry_rate`), carried into the next
+    /// tick so many tiny ticks measure the same duration as one large
+    /// one (CR on PR #798).
+    tick_carry: u64,
+    /// Sample rate the carry was produced at; a different rate
+    /// discards the carry (it is meaningless in other units).
+    tick_carry_rate: u32,
 }
 
 impl Default for Scanner {
@@ -140,6 +163,8 @@ impl Default for Scanner {
             hops_since_priority_sweep: 0,
             priority_sweep_visited: None,
             squelch_open: false,
+            tick_carry: 0,
+            tick_carry_rate: 0,
         }
     }
 }
@@ -209,6 +234,17 @@ impl Scanner {
     }
 
     fn handle_channels_changed(&mut self, channels: Vec<ScannerChannel>) -> Vec<ScannerCommand> {
+        let active = self.current_channel_key().cloned();
+        let previous_tune = active
+            .as_ref()
+            .and_then(|key| self.channels.iter().find(|c| &c.key == key))
+            .map(ScannerChannel::tune_config);
+        // Where normal rotation resumes, as a key so it survives a
+        // reorder (matters during a priority sweep, see below).
+        let cursor_key = self
+            .channels
+            .get(self.next_channel_idx)
+            .map(|c| c.key.clone());
         self.channels = channels;
         // Any stale lockout keys for channels that no longer exist
         // are harmless (the set is only consulted against the
@@ -219,16 +255,57 @@ impl Scanner {
         if !self.enabled {
             return Vec::new();
         }
-        // Currently-scanning mid-list-change: recover from wherever
-        // the phase left us by re-starting rotation. Also reset
-        // the rotation cursor + sweep state + hops counter so a
-        // list edit doesn't leave stale pointers or trigger an
-        // immediate priority sweep just because the pre-edit
-        // session had accumulated hops.
+
+        // Re-resolve the active channel by key. The UI pushes the
+        // whole list on every bookmark edit and on every default
+        // dwell/hang spin-row notify; restarting the rotation for
+        // each of those retuned to index 0 and muted mid-word (#758).
+        // Only the channel's own tune config (frequency, mode,
+        // bandwidth, CTCSS, voice squelch) warrants a retune — dwell /
+        // hang changes apply when those phases are next seeded.
+        if let (Some(key), Some(previous_tune)) = (active, previous_tune)
+            && !self.locked_out.contains(&key)
+            && let Some(new_idx) = self.channels.iter().position(|c| c.key == key)
+            && self.channels[new_idx].tune_config() == previous_tune
+        {
+            self.rebind_active_index(new_idx);
+            if let Some(visited) = self.priority_sweep_visited.as_mut() {
+                // A sweep is an interruption of the normal rotation,
+                // which must resume where it left off: re-resolve the
+                // old cursor by key rather than anchoring it past the
+                // priority channel (that starved every normal channel
+                // in between, #756).
+                visited.retain(|k| valid.contains(k));
+                self.next_channel_idx = cursor_key
+                    .and_then(|key| self.channels.iter().position(|c| c.key == key))
+                    .unwrap_or(0);
+            } else {
+                self.next_channel_idx = (new_idx + 1) % self.channels.len();
+            }
+            return Vec::new();
+        }
+
+        // The active channel is gone or its tune config changed:
+        // recover by re-starting rotation. Reset the cursor + sweep
+        // state + hops counter so a list edit doesn't leave stale
+        // pointers or trigger an immediate priority sweep just
+        // because the pre-edit session had accumulated hops.
         self.next_channel_idx = 0;
         self.hops_since_priority_sweep = 0;
         self.priority_sweep_visited = None;
         self.start_rotation()
+    }
+
+    /// Point the current phase at `idx` without changing anything
+    /// else about it (the channel list was re-ordered around it).
+    fn rebind_active_index(&mut self, idx: usize) {
+        match &mut self.phase {
+            Phase::Retuning { target_idx, .. } => *target_idx = idx,
+            Phase::Dwelling { idx: i, .. }
+            | Phase::Listening { idx: i, .. }
+            | Phase::Hanging { idx: i, .. } => *i = idx,
+            Phase::Idle | Phase::AdvanceFromDwell | Phase::AdvanceFromHang => {}
+        }
     }
 
     /// Begin or resume rotation from the current cursor. Emits
@@ -237,11 +314,14 @@ impl Scanner {
     /// exist, and transitions to Idle.
     fn start_rotation(&mut self) -> Vec<ScannerCommand> {
         let Some(idx) = self.pick_next_channel() else {
-            // No scannable channels available.
+            // No scannable channels available. An enabled scanner
+            // with nothing to scan keeps the sink gated (same as the
+            // `advance_rotation` empty branch, #759); disabling it
+            // releases the mute.
             self.phase = Phase::Idle;
             return vec![
                 ScannerCommand::EmptyRotation,
-                ScannerCommand::MuteAudio(false),
+                ScannerCommand::MuteAudio(true),
                 ScannerCommand::ActiveChannelChanged(None),
                 ScannerCommand::StateChanged(ScannerState::Idle),
             ];
@@ -272,7 +352,7 @@ impl Scanner {
         self.squelch_open = false;
         self.phase = Phase::Retuning {
             target_idx: idx,
-            samples_until_settled: None, // seeded on first SampleTick
+            us_until_settled: None, // seeded on first SampleTick
         };
         vec![
             ScannerCommand::Retune {
@@ -412,24 +492,53 @@ impl Scanner {
             }
             (Phase::Dwelling { idx, .. } | Phase::Hanging { idx, .. }, SquelchState::Open) => {
                 let idx = *idx;
-                self.phase = Phase::Listening { idx };
+                self.phase = Phase::Listening {
+                    idx,
+                    provisional_us: None,
+                };
                 vec![
                     ScannerCommand::MuteAudio(false),
                     ScannerCommand::StateChanged(ScannerState::Listening),
                 ]
             }
-            (Phase::Listening { idx }, SquelchState::Closed) => {
-                let idx = *idx;
-                self.phase = Phase::Hanging {
+            (
+                Phase::Listening {
                     idx,
-                    samples_until_timeout: None, // seed on first tick
-                };
-                vec![
-                    ScannerCommand::MuteAudio(true),
-                    ScannerCommand::StateChanged(ScannerState::Hanging),
-                ]
+                    provisional_us,
+                },
+                SquelchState::Closed,
+            ) => {
+                let (idx, provisional) = (*idx, provisional_us.is_some());
+                self.close_from_listening(idx, provisional)
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Squelch closed while Listening: hang, unless the Listening
+    /// was provisional — entered from the settle-window latch — in
+    /// which case the "carrier" was the previous channel's IQ still
+    /// draining from the ring and a full dwell resumes instead of
+    /// `hang_ms` of dead air (#759).
+    fn close_from_listening(&mut self, idx: usize, provisional: bool) -> Vec<ScannerCommand> {
+        if provisional {
+            self.phase = Phase::Dwelling {
+                idx,
+                us_until_timeout: ms_to_us(self.channels[idx].dwell_ms),
+            };
+            vec![
+                ScannerCommand::MuteAudio(true),
+                ScannerCommand::StateChanged(ScannerState::Dwelling),
+            ]
+        } else {
+            self.phase = Phase::Hanging {
+                idx,
+                us_until_timeout: None, // seed on first tick
+            };
+            vec![
+                ScannerCommand::MuteAudio(true),
+                ScannerCommand::StateChanged(ScannerState::Hanging),
+            ]
         }
     }
 
@@ -442,28 +551,38 @@ impl Scanner {
         samples_consumed: u32,
         sample_rate_hz: NonZeroU32,
     ) -> Vec<ScannerCommand> {
-        // `sample_rate_hz > 0` is now enforced at the event-type
-        // level via `NonZeroU32` — no runtime guard needed.
-        let sample_rate_hz = sample_rate_hz.get();
-        let samples = u64::from(samples_consumed);
+        // Countdowns are kept in microseconds and each tick is
+        // converted at the rate it was produced, so a mid-countdown
+        // sample-rate change neither drains a dwell in a few ms nor
+        // stretches a hang to tens of seconds (#759).
+        let elapsed_us = self.tick_elapsed_us(samples_consumed, sample_rate_hz);
         let next_phase: Option<Phase> = match &mut self.phase {
-            Phase::Idle | Phase::Listening { .. } => return Vec::new(),
+            Phase::Idle
+            | Phase::Listening {
+                provisional_us: None,
+                ..
+            } => return Vec::new(),
+            Phase::Listening {
+                provisional_us: Some(remaining),
+                ..
+            } => {
+                // Post-settle audio belongs to the new channel: once
+                // enough has passed the latched carrier is genuine.
+                *remaining = remaining.saturating_sub(elapsed_us);
+                if *remaining == 0
+                    && let Phase::Listening { provisional_us, .. } = &mut self.phase
+                {
+                    *provisional_us = None;
+                }
+                return Vec::new();
+            }
             Phase::Retuning {
                 target_idx,
-                samples_until_settled,
+                us_until_settled,
             } => {
-                let remaining = match samples_until_settled {
-                    None => {
-                        let seeded =
-                            ms_to_samples(SETTLE_MS, sample_rate_hz).saturating_sub(samples);
-                        *samples_until_settled = Some(seeded);
-                        seeded
-                    }
-                    Some(remaining) => {
-                        *remaining = remaining.saturating_sub(samples);
-                        *remaining
-                    }
-                };
+                let before = us_until_settled.unwrap_or_else(|| ms_to_us(SETTLE_MS));
+                let remaining = before.saturating_sub(elapsed_us);
+                *us_until_settled = Some(remaining);
                 if remaining == 0 {
                     let idx = *target_idx;
                     // Settle complete. If the channel's squelch was
@@ -473,13 +592,22 @@ impl Scanner {
                     // Listening rather than Dwelling — otherwise
                     // we'd sit silent waiting for a second edge
                     // that the squelch detector already fired.
+                    // The part of this block past the settle window is
+                    // post-settle audio: dwell already spent, or
+                    // confirmation of a latched carrier.
+                    let overshoot_us = elapsed_us.saturating_sub(before);
                     if self.squelch_open {
-                        Some(Phase::Listening { idx })
+                        Some(Phase::Listening {
+                            idx,
+                            provisional_us: ms_to_us(PROVISIONAL_CONFIRM_MS)
+                                .checked_sub(overshoot_us)
+                                .filter(|&remaining| remaining > 0),
+                        })
                     } else {
-                        let dwell_ms = self.channels[idx].dwell_ms;
+                        let dwell_us = ms_to_us(self.channels[idx].dwell_ms);
                         Some(Phase::Dwelling {
                             idx,
-                            samples_until_timeout: ms_to_samples(dwell_ms, sample_rate_hz),
+                            us_until_timeout: dwell_us.saturating_sub(overshoot_us),
                         })
                     }
                 } else {
@@ -487,11 +615,10 @@ impl Scanner {
                 }
             }
             Phase::Dwelling {
-                samples_until_timeout,
-                ..
+                us_until_timeout, ..
             } => {
-                *samples_until_timeout = samples_until_timeout.saturating_sub(samples);
-                if *samples_until_timeout == 0 {
+                *us_until_timeout = us_until_timeout.saturating_sub(elapsed_us);
+                if *us_until_timeout == 0 {
                     Some(Phase::AdvanceFromDwell)
                 } else {
                     None
@@ -499,20 +626,12 @@ impl Scanner {
             }
             Phase::Hanging {
                 idx,
-                samples_until_timeout,
+                us_until_timeout,
             } => {
-                let remaining = match samples_until_timeout {
-                    None => {
-                        let hang_ms = self.channels[*idx].hang_ms;
-                        let seeded = ms_to_samples(hang_ms, sample_rate_hz).saturating_sub(samples);
-                        *samples_until_timeout = Some(seeded);
-                        seeded
-                    }
-                    Some(remaining) => {
-                        *remaining = remaining.saturating_sub(samples);
-                        *remaining
-                    }
-                };
+                let before =
+                    us_until_timeout.unwrap_or_else(|| ms_to_us(self.channels[*idx].hang_ms));
+                let remaining = before.saturating_sub(elapsed_us);
+                *us_until_timeout = Some(remaining);
                 if remaining == 0 {
                     Some(Phase::AdvanceFromHang)
                 } else {
@@ -535,17 +654,35 @@ impl Scanner {
         match next_phase {
             Some(Phase::Dwelling {
                 idx,
-                samples_until_timeout,
+                us_until_timeout: 0,
+            }) => {
+                // The settle-expiry block overshot by a whole dwell
+                // with nothing opening: advance straight away.
+                self.phase = Phase::Dwelling {
+                    idx,
+                    us_until_timeout: 0,
+                };
+                self.advance_rotation()
+            }
+            Some(Phase::Dwelling {
+                idx,
+                us_until_timeout,
             }) => {
                 self.phase = Phase::Dwelling {
                     idx,
-                    samples_until_timeout,
+                    us_until_timeout,
                 };
                 vec![ScannerCommand::StateChanged(ScannerState::Dwelling)]
             }
-            Some(Phase::Listening { idx }) => {
+            Some(Phase::Listening {
+                idx,
+                provisional_us,
+            }) => {
                 // Persistent-open-carrier path from settle expiry.
-                self.phase = Phase::Listening { idx };
+                self.phase = Phase::Listening {
+                    idx,
+                    provisional_us,
+                };
                 vec![
                     ScannerCommand::MuteAudio(false),
                     ScannerCommand::StateChanged(ScannerState::Listening),
@@ -567,10 +704,15 @@ impl Scanner {
         if let Some(idx) = self.pick_next_channel() {
             self.enter_retuning(idx)
         } else {
+            // The radio is still tuned to the channel we are leaving
+            // (a lockout of the active channel lands here), so keep
+            // the sink gated — un-gating played the locked-out
+            // transmission while the UI showed no active channel
+            // (#759). Disabling the scanner releases the mute.
             self.phase = Phase::Idle;
             vec![
                 ScannerCommand::EmptyRotation,
-                ScannerCommand::MuteAudio(false),
+                ScannerCommand::MuteAudio(true),
                 ScannerCommand::ActiveChannelChanged(None),
                 ScannerCommand::StateChanged(ScannerState::Idle),
             ]
@@ -603,9 +745,9 @@ impl Scanner {
     fn current_channel_key(&self) -> Option<&ChannelKey> {
         match &self.phase {
             Phase::Retuning { target_idx, .. } => self.channels.get(*target_idx).map(|c| &c.key),
-            Phase::Dwelling { idx, .. } | Phase::Listening { idx } | Phase::Hanging { idx, .. } => {
-                self.channels.get(*idx).map(|c| &c.key)
-            }
+            Phase::Dwelling { idx, .. }
+            | Phase::Listening { idx, .. }
+            | Phase::Hanging { idx, .. } => self.channels.get(*idx).map(|c| &c.key),
             Phase::Idle | Phase::AdvanceFromDwell | Phase::AdvanceFromHang => None,
         }
     }
@@ -624,12 +766,34 @@ impl Scanner {
     }
 }
 
-/// Convert milliseconds to a sample count at the given sample rate,
-/// rounding up. Uses `div_ceil` so 30 ms at 48 000 Hz = 1440 samples
-/// (exact), 30 ms at 44 100 Hz = 1323 samples. Caller uses this to
-/// seed `samples_until_*`.
-fn ms_to_samples(ms: u32, sample_rate_hz: u32) -> u64 {
-    (u64::from(ms) * u64::from(sample_rate_hz)).div_ceil(1000)
+impl Scanner {
+    /// Duration of `samples` at `sample_rate_hz` in whole microseconds,
+    /// with the sub-microsecond remainder carried to the next call so
+    /// the conversion is exact over any sequence of ticks. (Rounding
+    /// each tick up expired a 100 ms dwell after ~42 ms of one-sample
+    /// ticks at 2.4 Msps.) The carry is in sample·µs units and is only
+    /// meaningful at the rate that produced it; a rate change discards
+    /// it, which is at most one microsecond.
+    fn tick_elapsed_us(&mut self, samples: u32, sample_rate_hz: NonZeroU32) -> u64 {
+        let rate = u64::from(sample_rate_hz.get());
+        let carry = if self.tick_carry_rate == sample_rate_hz.get() {
+            self.tick_carry
+        } else {
+            0
+        };
+        let total = u64::from(samples) * US_PER_SEC + carry;
+        self.tick_carry = total % rate;
+        self.tick_carry_rate = sample_rate_hz.get();
+        total / rate
+    }
+}
+
+const US_PER_MS: u64 = 1_000;
+const US_PER_SEC: u64 = 1_000_000;
+
+/// Milliseconds → microseconds for seeding `us_until_*`.
+fn ms_to_us(ms: u32) -> u64 {
+    u64::from(ms) * US_PER_MS
 }
 
 #[cfg(test)]
@@ -1129,18 +1293,20 @@ mod tests {
         s.handle_event(tick(TICK_PAST_SETTLE));
         s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
         assert_eq!(s.state(), ScannerState::Listening);
-        // User deletes channel B and adds C.
+        // User deletes channel A — the one being listened to — and
+        // adds C. (Edits that leave the active channel's tune config
+        // alone no longer restart the rotation, #758.)
         let commands = s.handle_event(ScannerEvent::ChannelsChanged(vec![
-            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
             ch("C", 28_400_000, 0),
         ]));
         // Scanner recovers by restarting rotation at cursor 0.
         assert_eq!(s.state(), ScannerState::Retuning);
-        // First retune after list change goes to A.
+        // First retune after list change goes to B.
         assert!(commands.iter().any(|c| matches!(
             c,
             ScannerCommand::Retune {
-                freq_hz: 146_520_000,
+                freq_hz: 162_550_000,
                 ..
             }
         )));
@@ -1288,5 +1454,399 @@ mod tests {
             s.priority_sweep_visited.is_none(),
             "priority sweep state not cleared on disable"
         );
+    }
+
+    // --- #758 / #759 (Aug 2026 deep review) ---
+
+    fn has_retune(cmds: &[ScannerCommand]) -> bool {
+        cmds.iter()
+            .any(|c| matches!(c, ScannerCommand::Retune { .. }))
+    }
+
+    fn tick_at(samples: u32, rate: u32) -> ScannerEvent {
+        ScannerEvent::SampleTick {
+            samples_consumed: samples,
+            sample_rate_hz: NonZeroU32::new(rate).expect("rate > 0"),
+        }
+    }
+
+    /// #758 — a list update that leaves the active channel's tune
+    /// config untouched (here: a default-hang nudge applied to every
+    /// channel plus a new channel) must not retune mid-transmission.
+    #[test]
+    fn channels_changed_keeps_listening_when_active_channel_is_unchanged() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(TICK_PAST_SETTLE));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        assert_eq!(s.state(), ScannerState::Listening);
+
+        let mut a = ch("A", 146_520_000, 0);
+        a.hang_ms = DEFAULT_HANG_MS + 100;
+        let mut b = ch("B", 162_550_000, 0);
+        b.hang_ms = DEFAULT_HANG_MS + 100;
+        let commands = s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("C", 28_400_000, 0),
+            a,
+            b,
+        ]));
+        assert_eq!(s.state(), ScannerState::Listening, "{commands:?}");
+        assert!(!has_retune(&commands), "{commands:?}");
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::MuteAudio(true))),
+            "{commands:?}"
+        );
+
+        // The active index was re-resolved: locking out A (now at
+        // index 1) still force-advances away from it.
+        let commands = s.handle_event(ScannerEvent::LockoutChannel(ChannelKey {
+            name: "A".to_string(),
+            frequency_hz: 146_520_000,
+        }));
+        assert_eq!(s.state(), ScannerState::Retuning);
+        assert!(has_retune(&commands));
+    }
+
+    /// #758 — a change to the active channel's own tune config
+    /// (bandwidth here) still retunes.
+    #[test]
+    fn channels_changed_retunes_when_active_channel_config_changes() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(TICK_PAST_SETTLE));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        assert_eq!(s.state(), ScannerState::Listening);
+
+        let mut a = ch("A", 146_520_000, 0);
+        a.bandwidth = 25_000.0;
+        let commands = s.handle_event(ScannerEvent::ChannelsChanged(vec![a]));
+        assert_eq!(s.state(), ScannerState::Retuning);
+        assert!(has_retune(&commands));
+    }
+
+    /// #759 — locking out the only channel while listening must not
+    /// un-gate the sink: the radio is still on that channel.
+    #[test]
+    fn lockout_into_empty_rotation_keeps_audio_muted() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![ch("A", 146_520_000, 0)]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(TICK_PAST_SETTLE));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        assert_eq!(s.state(), ScannerState::Listening);
+
+        let commands = s.handle_event(ScannerEvent::LockoutChannel(ChannelKey {
+            name: "A".to_string(),
+            frequency_hz: 146_520_000,
+        }));
+        assert_eq!(s.state(), ScannerState::Idle);
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::EmptyRotation))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::MuteAudio(true))),
+            "{commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::MuteAudio(false))),
+            "{commands:?}"
+        );
+    }
+
+    /// #759 — countdowns are wall-clock, not a sample count frozen at
+    /// the rate of the phase-entry tick: 50 ms of dwell at 250 ksps
+    /// plus 40 ms at 2.4 Msps is 90 ms, short of the 100 ms dwell.
+    #[test]
+    fn dwell_countdown_survives_a_sample_rate_change() {
+        const LOW_RATE: u32 = 250_000;
+        const HIGH_RATE: u32 = 2_400_000;
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        // Settle (30 ms) exactly, then dwell starts from a clean seed.
+        s.handle_event(tick_at(LOW_RATE * SETTLE_MS / 1000, LOW_RATE));
+        assert_eq!(s.state(), ScannerState::Dwelling);
+        s.handle_event(tick_at(LOW_RATE / 20, LOW_RATE)); // 50 ms
+        assert_eq!(s.state(), ScannerState::Dwelling);
+        let commands = s.handle_event(tick_at(HIGH_RATE / 25, HIGH_RATE)); // 40 ms
+        assert_eq!(s.state(), ScannerState::Dwelling, "{commands:?}");
+        let commands = s.handle_event(tick_at(HIGH_RATE / 50, HIGH_RATE)); // 20 ms → 110 ms
+        assert!(has_retune(&commands), "{commands:?}");
+    }
+
+    /// #759 — the part of the settle-expiry block that overshoots the
+    /// settle window counts toward the dwell: 2000 samples at 48 kHz
+    /// is 30 ms settle + 11.7 ms of dwell, so 4300 more samples
+    /// (89.6 ms) complete the 100 ms dwell.
+    #[test]
+    fn dwell_is_charged_for_the_settle_overshoot() {
+        // 89.6 ms at 48 kHz — completes the 100 ms dwell after the
+        // 11.7 ms of settle overshoot charged by TICK_SETTLE_COMPLETE.
+        const TICK_REMAINDER_OF_DWELL: u32 = 4300;
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(TICK_SETTLE_COMPLETE));
+        assert_eq!(s.state(), ScannerState::Dwelling);
+        let commands = s.handle_event(tick(TICK_REMAINDER_OF_DWELL));
+        assert!(has_retune(&commands), "{commands:?}");
+    }
+
+    /// #759 — a Listening entered from the settle-window latch is
+    /// provisional: if the carrier "closes" right after settle it was
+    /// the previous channel's IQ still draining from the ring, so the
+    /// scanner resumes the dwell instead of hanging for 2 s of dead air.
+    #[test]
+    fn latched_open_that_closes_after_settle_resumes_dwell() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(TICK_IN_SETTLE));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        s.handle_event(tick(TICK_SETTLE_COMPLETE));
+        assert_eq!(s.state(), ScannerState::Listening);
+
+        let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
+        assert_eq!(s.state(), ScannerState::Dwelling, "{commands:?}");
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, ScannerCommand::MuteAudio(true))),
+            "{commands:?}"
+        );
+        // A genuine carrier that opens during that dwell is a normal,
+        // non-provisional Listening: closing it hangs as usual.
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        assert_eq!(s.state(), ScannerState::Listening);
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
+        assert_eq!(s.state(), ScannerState::Hanging);
+    }
+
+    /// #759 — a settle-expiry block that overshoots the whole dwell
+    /// (a 64 K block at a low rate) advances immediately instead of
+    /// waiting a further full dwell.
+    #[test]
+    fn settle_block_overshooting_the_whole_dwell_advances_immediately() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        // 200 ms at 48 kHz: 30 ms settle + 100 ms dwell + 70 ms spare.
+        let commands = s.handle_event(tick(RATE / 5));
+        assert_eq!(s.state(), ScannerState::Retuning, "{commands:?}");
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            ScannerCommand::Retune {
+                freq_hz: 162_550_000,
+                ..
+            }
+        )));
+    }
+
+    /// #758 — a list update that moves the Retuning target to another
+    /// position rebinds the index: the settle expiry still reads that
+    /// channel's dwell and the next hop continues from it.
+    #[test]
+    fn channels_changed_rebinds_the_retuning_target_index() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        assert_eq!(s.state(), ScannerState::Retuning);
+
+        // A moves to index 2 with a long dwell override; no retune.
+        let mut a = ch("A", 146_520_000, 0);
+        a.dwell_ms = 1_000;
+        let commands = s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("C", 28_400_000, 0),
+            ch("B", 162_550_000, 0),
+            a,
+        ]));
+        assert_eq!(s.state(), ScannerState::Retuning);
+        assert!(!has_retune(&commands), "{commands:?}");
+
+        // Settle expires into A's dwell: the rebound index reads A's
+        // 1 s override, so the default 100 ms does not time out.
+        s.handle_event(tick(TICK_SETTLE_COMPLETE));
+        assert_eq!(s.state(), ScannerState::Dwelling);
+        let commands = s.handle_event(tick(TICK_PAST_DWELL));
+        assert_eq!(s.state(), ScannerState::Dwelling, "{commands:?}");
+        // And the rotation continues after A — wrapping to C.
+        let commands = s.handle_event(tick(RATE));
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                ScannerCommand::Retune {
+                    freq_hz: 28_400_000,
+                    ..
+                }
+            )),
+            "{commands:?}"
+        );
+    }
+
+    /// CR round 1 on PR #798 — a list push while the scanner sits on a
+    /// priority-sweep pick must not anchor the cursor past that
+    /// channel: normal rotation resumes where the sweep interrupted
+    /// it (#756), exactly as if no push had happened.
+    #[test]
+    fn channels_changed_during_a_priority_sweep_keeps_the_rotation_cursor() {
+        let mut s = Scanner::new();
+        let mut channels: Vec<ScannerChannel> = (0..SWEEP_NORMAL_CHANNELS)
+            .map(|i| ch(&format!("N{i}"), normal_channel_hz(i), 0))
+            .collect();
+        channels.push(ch("P", SWEEP_PRIORITY_HZ, 1));
+        s.handle_event(ScannerEvent::ChannelsChanged(channels.clone()));
+        s.handle_event(ScannerEvent::SetEnabled(true)); // N0
+
+        // Hop until the sweep picks P.
+        let mut hops = 0;
+        while hop_on_dwell_timeout(&mut s) != Some(SWEEP_PRIORITY_HZ) {
+            hops += 1;
+            assert!(hops < SWEEP_HOPS, "sweep never picked the priority channel");
+        }
+        assert!(
+            s.priority_sweep_visited.is_some(),
+            "sweep must be in progress"
+        );
+
+        // The UI re-pushes the same list (a default-hang nudge).
+        let commands = s.handle_event(ScannerEvent::ChannelsChanged(channels));
+        assert!(!has_retune(&commands), "{commands:?}");
+
+        assert_eq!(
+            hop_on_dwell_timeout(&mut s),
+            Some(normal_channel_hz(SWEEP_EXPECTED_RESUME_IDX)),
+            "rotation must resume at N{SWEEP_EXPECTED_RESUME_IDX} after the sweep"
+        );
+    }
+
+    /// CR round 1 on PR #798 — a latched carrier that is still open
+    /// after `PROVISIONAL_CONFIRM_MS` of post-settle audio is genuine:
+    /// when it finally closes the scanner hangs as usual instead of
+    /// dropping into a muted dwell mid-conversation.
+    #[test]
+    fn latched_open_confirmed_by_post_settle_audio_hangs_on_close() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(TICK_IN_SETTLE));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        s.handle_event(tick(TICK_SETTLE_COMPLETE));
+        assert_eq!(s.state(), ScannerState::Listening);
+
+        // PROVISIONAL_CONFIRM_MS of audio at 48 kHz, plus a little.
+        let confirm_samples = RATE * PROVISIONAL_CONFIRM_MS / 1000 + 1;
+        s.handle_event(tick(confirm_samples));
+        assert_eq!(s.state(), ScannerState::Listening);
+
+        let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
+        assert_eq!(s.state(), ScannerState::Hanging, "{commands:?}");
+    }
+
+    /// CR round 2 on PR #798 — tick durations must not be rounded up
+    /// per event: at 2.4 Msps a one-sample tick is 0.417 µs, and
+    /// ceiling each one to 1 µs expired a 100 ms dwell after ~42 ms of
+    /// audio. The same duration delivered as one tick or as
+    /// one-sample ticks must expire the dwell at the same point.
+    #[test]
+    fn countdown_is_exact_across_many_tiny_ticks() {
+        const HIGH_RATE: u32 = 2_400_000;
+        let dwell_samples = HIGH_RATE / 1000 * DEFAULT_DWELL_MS;
+        let settle_samples = HIGH_RATE / 1000 * SETTLE_MS;
+
+        let mut one_shot = Scanner::new();
+        let mut tiny = Scanner::new();
+        for s in [&mut one_shot, &mut tiny] {
+            s.handle_event(ScannerEvent::ChannelsChanged(vec![
+                ch("A", 146_520_000, 0),
+                ch("B", 162_550_000, 0),
+            ]));
+            s.handle_event(ScannerEvent::SetEnabled(true));
+            s.handle_event(tick_at(settle_samples, HIGH_RATE));
+            assert_eq!(s.state(), ScannerState::Dwelling);
+        }
+
+        // All but one sample of the dwell: neither may advance.
+        let commands = one_shot.handle_event(tick_at(dwell_samples - 1, HIGH_RATE));
+        assert!(!has_retune(&commands), "one-shot: {commands:?}");
+        for _ in 0..dwell_samples - 1 {
+            let commands = tiny.handle_event(tick_at(1, HIGH_RATE));
+            assert!(
+                !has_retune(&commands),
+                "tiny ticks advanced early: {commands:?}"
+            );
+        }
+        // The last sample completes the dwell for both.
+        assert!(has_retune(&one_shot.handle_event(tick_at(1, HIGH_RATE))));
+        assert!(has_retune(&tiny.handle_event(tick_at(1, HIGH_RATE))));
+    }
+
+    /// CR round 3 on PR #798 — the carry is in sample·µs units of the
+    /// rate that produced it and must be discarded on a rate change:
+    /// 3 samples at 48 kHz leave a 0.5 µs carry, and one sample at
+    /// 30 kHz is 33.33 µs — 33 without the stale carry, 34 with it.
+    #[test]
+    fn tick_carry_is_discarded_on_a_sample_rate_change() {
+        let mut s = Scanner::new();
+        let rate_48k = NonZeroU32::new(48_000).expect("rate > 0");
+        let rate_30k = NonZeroU32::new(30_000).expect("rate > 0");
+        assert_eq!(s.tick_elapsed_us(3, rate_48k), 62);
+        assert_eq!(s.tick_carry, 24_000, "0.5 µs carry in sample·µs units");
+        assert_eq!(s.tick_elapsed_us(1, rate_30k), 33);
+        // Same rate: the carry is honoured (33.33 + 0.33 carry → 33, then 34).
+        assert_eq!(s.tick_elapsed_us(1, rate_30k), 33);
+        assert_eq!(s.tick_elapsed_us(1, rate_30k), 34);
+    }
+
+    /// CR round 4 on PR #798 — the settle-expiry block's overshoot is
+    /// post-settle audio and counts toward confirming a latched
+    /// carrier: one 200 ms tick (30 ms settle + 170 ms, beyond the
+    /// 100 ms confirmation) makes the Listening genuine, so a close
+    /// hangs instead of resuming the dwell.
+    #[test]
+    fn settle_overshoot_counts_toward_provisional_confirmation() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(TICK_IN_SETTLE));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        s.handle_event(tick(RATE / 5)); // 200 ms
+        assert_eq!(s.state(), ScannerState::Listening);
+
+        let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
+        assert_eq!(s.state(), ScannerState::Hanging, "{commands:?}");
     }
 }
