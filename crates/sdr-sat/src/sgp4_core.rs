@@ -45,6 +45,54 @@ pub enum SatelliteError {
         /// What was wrong.
         message: String,
     },
+    /// The TLE's elements are older than [`TLE_MAX_AGE`] at the
+    /// requested time; propagating them would produce confident but
+    /// wrong predictions (#718).
+    #[error("TLE for {name} is {age_days} days old (limit {limit_days}); refresh the elements")]
+    TleExpired {
+        /// Satellite name for context.
+        name: String,
+        /// Element age at the requested time, whole days.
+        age_days: i64,
+        /// [`TLE_MAX_AGE`] in whole days.
+        limit_days: i64,
+    },
+}
+
+/// Element age past which predictions should be flagged to the user.
+/// SGP4 accuracy degrades roughly with the square of the age; two
+/// weeks is the usual "still fine for AOS/LOS to the minute" bound.
+pub const TLE_WARN_AGE: chrono::Duration = chrono::Duration::days(14);
+
+/// Element age at and beyond which propagation is refused: a month-old
+/// TLE for a LEO bird puts AOS tens of minutes off, which is worse than
+/// no prediction because auto-record then tunes and records noise
+/// (#718).
+pub const TLE_MAX_AGE: chrono::Duration = chrono::Duration::days(30);
+
+/// How trustworthy a TLE is at a given instant, by element age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TleFreshness {
+    /// Younger than [`TLE_WARN_AGE`] (or from the future — clock skew).
+    Fresh,
+    /// Between [`TLE_WARN_AGE`] and [`TLE_MAX_AGE`]: usable, flag it.
+    Stale,
+    /// At or beyond [`TLE_MAX_AGE`]: refuse to propagate.
+    Expired,
+}
+
+impl TleFreshness {
+    /// Classify an element age (`when - epoch`).
+    #[must_use]
+    pub fn for_age(age: chrono::Duration) -> Self {
+        if age >= TLE_MAX_AGE {
+            Self::Expired
+        } else if age >= TLE_WARN_AGE {
+            Self::Stale
+        } else {
+            Self::Fresh
+        }
+    }
 }
 
 /// One satellite's parsed TLE plus the SGP4 propagator built from it.
@@ -115,6 +163,36 @@ impl Satellite {
         self.epoch
     }
 
+    /// Age of the elements at `when` (negative if `when` precedes the
+    /// epoch).
+    #[must_use]
+    pub fn age_at(&self, when: DateTime<Utc>) -> chrono::Duration {
+        when - self.epoch
+    }
+
+    /// [`TleFreshness`] of the elements at `when`.
+    #[must_use]
+    pub fn freshness(&self, when: DateTime<Utc>) -> TleFreshness {
+        TleFreshness::for_age(self.age_at(when))
+    }
+
+    /// Error if the elements are [`TleFreshness::Expired`] at `when`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SatelliteError::TleExpired`].
+    pub fn check_not_expired(&self, when: DateTime<Utc>) -> Result<(), SatelliteError> {
+        let age = self.age_at(when);
+        if TleFreshness::for_age(age) == TleFreshness::Expired {
+            return Err(SatelliteError::TleExpired {
+                name: self.name.clone(),
+                age_days: age.num_days(),
+                limit_days: TLE_MAX_AGE.num_days(),
+            });
+        }
+        Ok(())
+    }
+
     /// Propagate the orbit to `when` and return the satellite's
     /// position + velocity in the **TEME** frame (treated as ECI for
     /// our purposes — the ~tens-of-arcseconds difference is negligible
@@ -154,10 +232,36 @@ impl Satellite {
                 when,
                 message: format!("{e}"),
             })?;
+        finite_state(&self.name, when, prediction.position, prediction.velocity)?;
         Ok(EciState {
             position_km: prediction.position,
             velocity_km_s: prediction.velocity,
             when,
+        })
+    }
+}
+
+/// Reject a non-finite SGP4 state. The propagator returns `Ok` with
+/// NaN/inf components for some decayed or corrupt element sets; left
+/// unchecked those became a NaN elevation and a NaN Doppler offset
+/// handed to the VFO (#719).
+fn finite_state(
+    name: &str,
+    when: DateTime<Utc>,
+    position_km: [f64; 3],
+    velocity_km_s: [f64; 3],
+) -> Result<(), SatelliteError> {
+    let finite = position_km
+        .iter()
+        .chain(&velocity_km_s)
+        .all(|v| v.is_finite());
+    if finite {
+        Ok(())
+    } else {
+        Err(SatelliteError::Propagation {
+            name: name.to_string(),
+            when,
+            message: "SGP4 returned a non-finite state".to_string(),
         })
     }
 }
@@ -437,6 +541,42 @@ mod tests {
             (enu[2] - 100.0).abs() < 1e-9,
             "up expected 100 km, got {}",
             enu[2],
+        );
+    }
+
+    /// #719 — `propagate` promises `Propagation` for non-physical
+    /// results; a NaN/inf state from the propagator must be rejected
+    /// rather than handed to the az/el/Doppler math.
+    #[test]
+    fn finite_state_rejects_nan_and_inf() {
+        let when = Utc::now();
+        assert!(finite_state("x", when, [1.0, 2.0, 3.0], [0.1, 0.2, 0.3]).is_ok());
+        let err = finite_state("x", when, [f64::NAN, 2.0, 3.0], [0.1, 0.2, 0.3]).unwrap_err();
+        assert!(matches!(err, SatelliteError::Propagation { .. }), "{err:?}");
+        let err = finite_state("x", when, [1.0, 2.0, 3.0], [0.1, f64::INFINITY, 0.3]).unwrap_err();
+        assert!(matches!(err, SatelliteError::Propagation { .. }), "{err:?}");
+    }
+
+    /// #718 — element age bands: fresh under 14 d, stale up to 30 d,
+    /// expired beyond.
+    #[test]
+    fn freshness_bands_follow_the_age_thresholds() {
+        let sat = Satellite::from_tle(TEST_TLE_NAME, TEST_TLE_LINE1, TEST_TLE_LINE2).unwrap();
+        let epoch = sat.epoch();
+        assert_eq!(
+            sat.freshness(epoch + chrono::Duration::days(1)),
+            TleFreshness::Fresh
+        );
+        assert_eq!(sat.freshness(epoch + TLE_WARN_AGE), TleFreshness::Stale);
+        assert_eq!(
+            sat.freshness(epoch + TLE_MAX_AGE - chrono::Duration::seconds(1)),
+            TleFreshness::Stale
+        );
+        assert_eq!(sat.freshness(epoch + TLE_MAX_AGE), TleFreshness::Expired);
+        // Elements from the "future" (clock skew) are simply fresh.
+        assert_eq!(
+            sat.freshness(epoch - chrono::Duration::days(3)),
+            TleFreshness::Fresh
         );
     }
 }

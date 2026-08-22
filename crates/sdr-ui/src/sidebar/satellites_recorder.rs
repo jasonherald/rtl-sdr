@@ -932,6 +932,7 @@ mod tests {
             max_el_time: start + ChronoDuration::seconds(duration_secs / 2),
             start_az_deg: 245.0,
             end_az_deg: 105.0,
+            tle_age: chrono::Duration::zero(),
         }
     }
 
@@ -1794,6 +1795,7 @@ mod tests {
             max_el_time: start + ChronoDuration::seconds(duration_secs / 2),
             start_az_deg: 245.0,
             end_az_deg: 105.0,
+            tle_age: chrono::Duration::zero(),
         }
     }
 

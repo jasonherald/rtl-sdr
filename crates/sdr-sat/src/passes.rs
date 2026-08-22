@@ -21,7 +21,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::sgp4_core::{
-    EARTH_ROTATION_RAD_PER_SEC, Satellite, SatelliteError, ecef_to_enu, eci_to_ecef,
+    EARTH_ROTATION_RAD_PER_SEC, Satellite, SatelliteError, TleFreshness, ecef_to_enu, eci_to_ecef,
     geodetic_to_ecef, gmst_rad,
 };
 
@@ -176,6 +176,17 @@ pub struct Pass {
     pub start_az_deg: f64,
     /// Azimuth at LOS (degrees clockwise from true north).
     pub end_az_deg: f64,
+    /// Age of the TLE elements at the start of the enumeration window
+    /// — how much to trust this prediction (#718).
+    pub tle_age: Duration,
+}
+
+impl Pass {
+    /// Trust band of the elements this pass was predicted from.
+    #[must_use]
+    pub fn tle_freshness(&self) -> TleFreshness {
+        TleFreshness::for_age(self.tle_age)
+    }
 }
 
 /// Compute the satellite's current az/el/range/Doppler relative to the
@@ -271,8 +282,11 @@ pub fn is_ascending(satellite: &Satellite, when: DateTime<Utc>) -> Result<bool, 
     /// inside any realistic SGP4 epoch budget.
     const DELTA: chrono::Duration = chrono::Duration::seconds(30);
 
+    let later = when
+        .checked_add_signed(DELTA)
+        .ok_or_else(|| time_out_of_range(satellite, when))?;
     let s0 = satellite.propagate(when)?;
-    let s1 = satellite.propagate(when + DELTA)?;
+    let s1 = satellite.propagate(later)?;
 
     // Geocentric latitude (in radians) from ECI position. The exact
     // ECEF/geodetic latitude differs by a fraction of a degree near
@@ -293,20 +307,33 @@ pub fn is_ascending(satellite: &Satellite, when: DateTime<Utc>) -> Result<bool, 
 /// their `start` is whatever moment the satellite first cleared
 /// `min_elevation_deg` *within* the window. Symmetrically, passes that
 /// haven't fully ended by `to` are returned with `end == to`.
+///
+/// # Errors
+///
+/// * [`SatelliteError::TleExpired`] — the elements are older than
+///   [`crate::sgp4_core::TLE_MAX_AGE`] at `from` (#718).
+/// * [`SatelliteError::Propagation`] — SGP4 failed or returned a
+///   non-finite state somewhere in the window. Earlier versions mapped
+///   that to "below the horizon", which fabricated a setting edge plus
+///   a phantom second pass when a decayed TLE failed mid-window, and
+///   made a window that failed entirely look like a quiet sky (#719).
+/// * [`SatelliteError::InvalidStation`] — `station` is out of range.
 pub fn upcoming_passes(
     station: &GroundStation,
     satellite: &Satellite,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     min_elevation_deg: f64,
-) -> Vec<Pass> {
+) -> Result<Vec<Pass>, SatelliteError> {
     if to <= from {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    satellite.check_not_expired(from)?;
+    let tle_age = satellite.age_at(from);
 
     let mut passes = Vec::new();
     let mut t = from;
-    let mut prev_el = elevation_at(station, satellite, t);
+    let mut prev_el = elevation_at(station, satellite, t)?;
     let mut pass_open: Option<DateTime<Utc>> = if prev_el >= min_elevation_deg {
         // Window starts mid-pass — clamp the start to the window edge.
         Some(from)
@@ -315,8 +342,10 @@ pub fn upcoming_passes(
     };
 
     while t < to {
-        let next_t = (t + COARSE_STEP).min(to);
-        let next_el = elevation_at(station, satellite, next_t);
+        // Saturate at `to` rather than panic at the edge of chrono's
+        // range (#720).
+        let next_t = t.checked_add_signed(COARSE_STEP).map_or(to, |n| n.min(to));
+        let next_el = elevation_at(station, satellite, next_t)?;
 
         match (
             pass_open,
@@ -325,15 +354,14 @@ pub fn upcoming_passes(
         ) {
             // Rising edge: refine the boundary.
             (None, false, true) => {
-                let start = refine_crossing(station, satellite, t, next_t, min_elevation_deg, true);
+                let start =
+                    refine_crossing(station, satellite, t, next_t, min_elevation_deg, true)?;
                 pass_open = Some(start);
             }
             // Setting edge: refine, build the Pass, push.
             (Some(open_at), true, false) => {
-                let end = refine_crossing(station, satellite, t, next_t, min_elevation_deg, false);
-                if let Some(p) = build_pass(station, satellite, open_at, end) {
-                    passes.push(p);
-                }
+                let end = refine_crossing(station, satellite, t, next_t, min_elevation_deg, false)?;
+                passes.push(build_pass(station, satellite, open_at, end, tle_age)?);
                 pass_open = None;
             }
             _ => {}
@@ -344,19 +372,29 @@ pub fn upcoming_passes(
     }
 
     // Pass still open at `to` — emit it with end clamped.
-    if let Some(open_at) = pass_open
-        && let Some(p) = build_pass(station, satellite, open_at, to)
-    {
-        passes.push(p);
+    if let Some(open_at) = pass_open {
+        passes.push(build_pass(station, satellite, open_at, to, tle_age)?);
     }
 
-    passes
+    Ok(passes)
 }
 
 // ─── Internals ────────────────────────────────────────────────────────
 
-fn elevation_at(station: &GroundStation, satellite: &Satellite, when: DateTime<Utc>) -> f64 {
-    track(station, satellite, when).map_or(f64::NEG_INFINITY, |t| t.elevation_deg)
+fn time_out_of_range(satellite: &Satellite, when: DateTime<Utc>) -> SatelliteError {
+    SatelliteError::Propagation {
+        name: satellite.name().to_string(),
+        when,
+        message: "time is at the edge of the representable range".to_string(),
+    }
+}
+
+fn elevation_at(
+    station: &GroundStation,
+    satellite: &Satellite,
+    when: DateTime<Utc>,
+) -> Result<f64, SatelliteError> {
+    track(station, satellite, when).map(|t| t.elevation_deg)
 }
 
 /// Bisect between `lo` and `hi` (one coarse step apart) to find the
@@ -374,15 +412,15 @@ fn refine_crossing(
     hi: DateTime<Utc>,
     threshold_deg: f64,
     rising: bool,
-) -> DateTime<Utc> {
+) -> Result<DateTime<Utc>, SatelliteError> {
     let mut lo = lo;
     let mut hi = hi;
     for _ in 0..MAX_REFINE_ITERATIONS {
         if hi - lo <= REFINE_PRECISION {
-            return hi;
+            return Ok(hi);
         }
         let mid = lo + (hi - lo) / 2;
-        let above = elevation_at(station, satellite, mid) >= threshold_deg;
+        let above = elevation_at(station, satellite, mid)? >= threshold_deg;
         // Rising: the crossing is before `mid` when `mid` is already above.
         // Setting: the crossing is after `mid` while `mid` is still above.
         if above == rising {
@@ -391,21 +429,22 @@ fn refine_crossing(
             lo = mid;
         }
     }
-    hi
+    Ok(hi)
 }
 
 /// Walk a fine grid between `start` and `end`, find the maximum
-/// elevation, and pull the AOS/LOS azimuths. Returns `None` only if
-/// SGP4 propagation fails at *both* AOS and LOS — `elevation_at`
-/// handles transient propagation failures gracefully so this is rare.
+/// elevation, and pull the AOS/LOS azimuths. Any propagation failure
+/// is the caller's error — there is no "graceful" value for a pass
+/// whose peak could not be computed (#719).
 fn build_pass(
     station: &GroundStation,
     satellite: &Satellite,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-) -> Option<Pass> {
-    let aos = track(station, satellite, start).ok()?;
-    let los = track(station, satellite, end).ok()?;
+    tle_age: Duration,
+) -> Result<Pass, SatelliteError> {
+    let aos = track(station, satellite, start)?;
+    let los = track(station, satellite, end)?;
 
     let mut max_el = aos.elevation_deg.max(los.elevation_deg);
     let mut max_t = if aos.elevation_deg >= los.elevation_deg {
@@ -413,17 +452,17 @@ fn build_pass(
     } else {
         end
     };
-    let mut t = start + FINE_STEP;
+    let mut t = start.checked_add_signed(FINE_STEP).unwrap_or(end);
     while t < end {
-        let el = elevation_at(station, satellite, t);
+        let el = elevation_at(station, satellite, t)?;
         if el > max_el {
             max_el = el;
             max_t = t;
         }
-        t += FINE_STEP;
+        t = t.checked_add_signed(FINE_STEP).unwrap_or(end);
     }
 
-    Some(Pass {
+    Ok(Pass {
         satellite: satellite.name().to_string(),
         start,
         end,
@@ -431,6 +470,7 @@ fn build_pass(
         max_el_time: max_t,
         start_az_deg: aos.azimuth_deg,
         end_az_deg: los.azimuth_deg,
+        tle_age,
     })
 }
 
@@ -497,7 +537,7 @@ mod tests {
         let station = test_station();
         let from = sat.epoch();
         let to = from + chrono::Duration::hours(24);
-        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG);
+        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG).unwrap();
         assert!(!passes.is_empty(), "expected at least one pass in 24 h");
         for p in &passes {
             if p.end == to {
@@ -539,15 +579,17 @@ mod tests {
             );
         }
         assert!(
-            upcoming_passes(
-                &GroundStation::new(f64::NAN, f64::NAN, 0.0),
-                &sat,
-                sat.epoch(),
-                sat.epoch() + chrono::Duration::hours(24),
-                TEST_MIN_ELEVATION_DEG
-            )
-            .is_empty(),
-            "an invalid station must not produce passes"
+            matches!(
+                upcoming_passes(
+                    &GroundStation::new(f64::NAN, f64::NAN, 0.0),
+                    &sat,
+                    sat.epoch(),
+                    sat.epoch() + chrono::Duration::hours(24),
+                    TEST_MIN_ELEVATION_DEG
+                ),
+                Err(SatelliteError::InvalidStation { .. })
+            ),
+            "an invalid station must be an error, not an empty pass list"
         );
     }
 
@@ -604,7 +646,7 @@ mod tests {
         let station = test_station();
         let from = sat.epoch();
         let to = from + Duration::days(1);
-        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG);
+        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG).unwrap();
         assert!(!passes.is_empty(), "expected ≥ 1 pass in 24 h");
         // Vanguard 1 has 10.82 orbits/day; ~1/3 of those will be
         // visible above 5° from a single mid-lat station, so 1–6
@@ -622,7 +664,7 @@ mod tests {
         let station = test_station();
         let from = sat.epoch();
         let to = from + Duration::days(1);
-        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG);
+        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG).unwrap();
         for p in &passes {
             // Time ordering.
             assert!(p.start < p.end, "pass {p:?}: start ≥ end");
@@ -661,7 +703,11 @@ mod tests {
         let sat = test_satellite();
         let station = test_station();
         let t = sat.epoch();
-        assert!(upcoming_passes(&station, &sat, t, t, TEST_MIN_ELEVATION_DEG).is_empty());
+        assert!(
+            upcoming_passes(&station, &sat, t, t, TEST_MIN_ELEVATION_DEG)
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             upcoming_passes(
                 &station,
@@ -670,6 +716,7 @@ mod tests {
                 t - Duration::seconds(1),
                 TEST_MIN_ELEVATION_DEG
             )
+            .unwrap()
             .is_empty()
         );
     }
@@ -718,5 +765,79 @@ mod tests {
             result.is_err(),
             "is_ascending at year ~0 should propagate an SGP4 error, got Ok({result:?})",
         );
+    }
+
+    // --- #718 / #719 / #720 (Aug 2026 deep review) ---
+
+    /// #719 — a window the propagator cannot cover is an error, not
+    /// an empty (quiet-sky) result and not a fabricated setting edge.
+    #[test]
+    fn upcoming_passes_reports_propagation_failure_instead_of_guessing() {
+        let sat = test_satellite();
+        let station = test_station();
+        let from = chrono::DateTime::<Utc>::MIN_UTC + Duration::seconds(60);
+        let to = from + Duration::hours(2);
+        let result = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG);
+        assert!(
+            matches!(result, Err(SatelliteError::Propagation { .. })),
+            "expected a propagation error, got {result:?}"
+        );
+    }
+
+    /// #718 — elements older than `TLE_MAX_AGE` at the start of the
+    /// window are refused rather than propagated into confident
+    /// nonsense.
+    #[test]
+    fn upcoming_passes_refuses_an_expired_tle() {
+        let sat = test_satellite();
+        let station = test_station();
+        let from = sat.epoch() + crate::sgp4_core::TLE_MAX_AGE + Duration::days(1);
+        let to = from + Duration::days(1);
+        let result = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG);
+        assert!(
+            matches!(result, Err(SatelliteError::TleExpired { .. })),
+            "expected TleExpired, got {result:?}"
+        );
+    }
+
+    /// #718 — every pass carries the element age at the window start
+    /// so the UI can flag stale-but-usable predictions.
+    #[test]
+    fn passes_carry_the_tle_age_at_window_start() {
+        let sat = test_satellite();
+        let station = test_station();
+        let from = sat.epoch() + crate::sgp4_core::TLE_WARN_AGE + Duration::days(2);
+        let to = from + Duration::days(1);
+        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG).unwrap();
+        assert!(!passes.is_empty(), "a day of NOAA passes expected");
+        for pass in &passes {
+            assert_eq!(
+                pass.tle_age,
+                crate::sgp4_core::TLE_WARN_AGE + Duration::days(2)
+            );
+            assert_eq!(pass.tle_freshness(), TleFreshness::Stale);
+        }
+    }
+
+    /// #720 — time arithmetic at the edge of chrono's range must not
+    /// panic: `is_ascending` samples `when + 30 s`.
+    #[test]
+    fn is_ascending_at_max_utc_returns_an_error_instead_of_panicking() {
+        let sat = test_satellite();
+        let result = is_ascending(&sat, chrono::DateTime::<Utc>::MAX_UTC);
+        assert!(result.is_err(), "got {result:?}");
+    }
+
+    /// #720 — the coarse scan's `t + COARSE_STEP` must not panic when
+    /// `to` is `MAX_UTC` (the TLE is expired there, so the expected
+    /// outcome is an error, never a panic).
+    #[test]
+    fn upcoming_passes_at_max_utc_does_not_panic() {
+        let sat = test_satellite();
+        let station = test_station();
+        let to = chrono::DateTime::<Utc>::MAX_UTC;
+        let from = to - Duration::hours(1);
+        let result = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG);
+        assert!(result.is_err(), "got {result:?}");
     }
 }

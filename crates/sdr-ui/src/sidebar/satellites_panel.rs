@@ -44,7 +44,8 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_config::ConfigManager;
 use sdr_sat::{
-    GroundStation, KNOWN_SATELLITES, Pass, Satellite, TleCache, TleCacheError, upcoming_passes,
+    GroundStation, KNOWN_SATELLITES, Pass, Satellite, TleCache, TleCacheError, TleFreshness,
+    upcoming_passes,
 };
 
 // ─── First-run defaults ────────────────────────────────────────────────
@@ -1090,9 +1091,16 @@ pub fn format_pass_subtitle(pass: &Pass) -> String {
         "max el {:.0}°  ·  AOS {:.0}° → LOS {:.0}°",
         pass.max_elevation_deg, pass.start_az_deg, pass.end_az_deg,
     );
-    match downlink_hz_for_pass(pass) {
+    let subtitle = match downlink_hz_for_pass(pass) {
         Some(hz) => format!("{quality}  ·  {}  ·  {geometry}", format_downlink_mhz(hz)),
         None => format!("{quality}  ·  {geometry}"),
+    };
+    // Stale elements still predict, but the user must see that the
+    // AOS may be minutes off and a refresh is due (#718).
+    if pass.tle_freshness() == TleFreshness::Fresh {
+        subtitle
+    } else {
+        format!("{subtitle}  ·  TLE {} d old", pass.tle_age.num_days())
     }
 }
 
@@ -1148,7 +1156,11 @@ pub fn enumerate_upcoming_passes(
     station: &GroundStation,
     from: DateTime<Utc>,
 ) -> Vec<Pass> {
-    let to = from + ChronoDuration::hours(PASS_LOOKAHEAD_HOURS);
+    // `checked_add_signed`: `+` panics at the edge of chrono's range
+    // (#720); a clamped window just yields no passes.
+    let to = from
+        .checked_add_signed(ChronoDuration::hours(PASS_LOOKAHEAD_HOURS))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
     let mut passes = Vec::new();
     for known in KNOWN_SATELLITES {
         // `cached_tle_for` (NOT `tle_for`) — this loop runs on the
@@ -1160,9 +1172,15 @@ pub fn enumerate_upcoming_passes(
         match cache.cached_tle_for(known.norad_id) {
             Ok((line1, line2)) => match Satellite::from_tle(known.name, &line1, &line2) {
                 Ok(sat) => {
-                    let mut found =
-                        upcoming_passes(station, &sat, from, to, MIN_PASS_ELEVATION_DEG);
-                    passes.append(&mut found);
+                    match upcoming_passes(station, &sat, from, to, MIN_PASS_ELEVATION_DEG) {
+                        Ok(mut found) => passes.append(&mut found),
+                        // Expired elements or a propagation failure:
+                        // no list entry rather than a confident wrong
+                        // one (#718, #719). The user sees it in the log
+                        // and in the refresh status; a refresh fixes
+                        // the common (stale) case.
+                        Err(e) => log_satellite_skip(known.name, &e.to_string()),
+                    }
                 }
                 Err(e) => log_satellite_skip(known.name, &e.to_string()),
             },
@@ -1373,6 +1391,7 @@ mod tests {
             max_el_time: start + ChronoDuration::minutes(6),
             start_az_deg: 245.0,
             end_az_deg: 105.0,
+            tle_age: chrono::Duration::zero(),
         }
     }
 
@@ -1395,6 +1414,25 @@ mod tests {
         let subtitle = format_pass_subtitle(&pass);
         assert!(subtitle.contains("winner"), "subtitle: {subtitle}");
         assert!(subtitle.contains("137.900 MHz"), "subtitle: {subtitle}");
+    }
+
+    /// #718 — a pass predicted from stale elements says so, so a
+    /// normal-looking list after three weeks offline is not mistaken
+    /// for a trustworthy one.
+    #[test]
+    fn format_pass_subtitle_flags_stale_tle_age() {
+        let mut pass = synthetic_pass(Utc::now(), 30);
+        pass.tle_age = sdr_sat::TLE_WARN_AGE + ChronoDuration::days(2);
+        let subtitle = format_pass_subtitle(&pass);
+        assert!(
+            subtitle.ends_with("TLE 16 d old"),
+            "stale elements must be flagged, got: {subtitle}"
+        );
+        pass.tle_age = ChronoDuration::days(3);
+        assert!(
+            !format_pass_subtitle(&pass).contains("TLE"),
+            "fresh elements are not flagged"
+        );
     }
 
     #[test]
@@ -1534,6 +1572,7 @@ mod tests {
             max_el_time: now + ChronoDuration::minutes(5),
             start_az_deg: 0.0,
             end_az_deg: 0.0,
+            tle_age: chrono::Duration::zero(),
         };
         assert_eq!(format_pass_title(&pass, now), "METEOR-M2 3 — starting now");
     }
@@ -1597,6 +1636,7 @@ mod tests {
             max_el_time: now + ChronoDuration::minutes(5),
             start_az_deg: 0.0,
             end_az_deg: 0.0,
+            tle_age: chrono::Duration::zero(),
         };
         assert_eq!(
             format_pass_title(&pass, now),
