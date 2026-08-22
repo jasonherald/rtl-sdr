@@ -440,10 +440,9 @@ impl SyllabicDetector {
         self.threshold = threshold;
     }
 
-    /// Feed a block of mono audio samples and return the gate
-    /// state at the END of the block. Caller gets one bool per
-    /// process call regardless of block size.
-    fn process(&mut self, samples: &[f32]) -> bool {
+    /// Feed mono audio into the envelope filter and the rolling
+    /// RMS trackers. No verdict — see [`Self::verdict`].
+    fn push(&mut self, samples: &[f32]) {
         for &x in samples {
             // Full-wave rectify for envelope extraction. Using
             // abs() rather than x² + sqrt because the BPF that
@@ -455,7 +454,10 @@ impl SyllabicDetector {
             self.envelope_rms.push(envelope);
             self.signal_rms.push(x);
         }
+    }
 
+    /// Gate verdict from the current rolling-RMS state.
+    fn verdict(&self) -> bool {
         let env = self.envelope_rms.rms();
         let sig = self.signal_rms.rms();
         // Pure-silence guard: if the whole signal is effectively
@@ -513,14 +515,19 @@ impl SnrDetector {
         self.threshold_db = threshold_db;
     }
 
-    fn process(&mut self, samples: &[f32]) -> bool {
+    /// Feed mono audio into the band filters and rolling RMS
+    /// trackers. No verdict — see [`Self::verdict`].
+    fn push(&mut self, samples: &[f32]) {
         for &x in samples {
             let in_band = self.in_band_bpf.process_sample(x);
             let out_band = self.out_of_band_bpf.process_sample(x);
             self.in_band_rms.push(in_band);
             self.out_of_band_rms.push(out_band);
         }
+    }
 
+    /// Gate verdict from the current rolling-RMS state.
+    fn verdict(&self) -> bool {
         let in_rms = self.in_band_rms.rms();
         let out_rms = self.out_of_band_rms.rms().max(SNR_OUT_OF_BAND_FLOOR);
         // Pure-silence guard: if the in-band is at or below the
@@ -556,6 +563,10 @@ pub struct VoiceSquelch {
     /// when the gate is closed OR when the mode is `Off` (which
     /// is always-open anyway).
     hang_samples_remaining: usize,
+    /// Samples fed since the last verdict; a verdict is taken every
+    /// [`VOICE_SQUELCH_RMS_WINDOW_SAMPLES`] samples of audio
+    /// regardless of how calls split the stream.
+    window_fill: usize,
 }
 
 impl VoiceSquelch {
@@ -621,6 +632,7 @@ impl VoiceSquelch {
             snr,
             open,
             hang_samples_remaining: 0,
+            window_fill: 0,
         })
     }
 
@@ -648,6 +660,7 @@ impl VoiceSquelch {
         }
         self.open = matches!(self.mode, VoiceSquelchMode::Off);
         self.hang_samples_remaining = 0;
+        self.window_fill = 0;
     }
 
     /// Swap the mode in place. Drops the previous detector (if
@@ -722,11 +735,16 @@ impl VoiceSquelch {
     ///   weakness with no intervening strong block.
     ///
     /// The detectors judge from a rolling RMS over the last
-    /// [`VOICE_SQUELCH_RMS_WINDOW_SAMPLES`] (100 ms), so a large
-    /// block is fed in windows of that size and the hang counter
-    /// is charged per window. Judging a 1 s block once by its last
-    /// 100 ms and charging the whole second drained the hang budget
-    /// in one look and muted whole seconds of speech (#777).
+    /// [`VOICE_SQUELCH_RMS_WINDOW_SAMPLES`] (100 ms), so a verdict is
+    /// taken — and the hang counter charged by one window — every
+    /// time that many samples of audio have accumulated, counted
+    /// across calls. Gate timing is therefore identical whether the
+    /// stream arrives in 7-sample, 10 ms or 1 s blocks; a verdict
+    /// can trail the audio by up to one window. Judging each call
+    /// once by its last 100 ms and charging its whole length drained
+    /// the hang budget in one look on large blocks (#777), and
+    /// judging every small block reloaded or bled it at a cadence
+    /// set by the callback size (CR on PR #797).
     ///
     /// Opening is immediate (first strong block after a closed
     /// state flips the gate open and resets the counter); only
@@ -747,21 +765,48 @@ impl VoiceSquelch {
             return true;
         }
 
-        for window in samples.chunks(VOICE_SQUELCH_RMS_WINDOW_SAMPLES) {
-            self.judge_window(window);
+        let mut rest = samples;
+        while !rest.is_empty() {
+            let take = (VOICE_SQUELCH_RMS_WINDOW_SAMPLES - self.window_fill).min(rest.len());
+            let (head, tail) = rest.split_at(take);
+            self.push(head);
+            self.window_fill += take;
+            if self.window_fill == VOICE_SQUELCH_RMS_WINDOW_SAMPLES {
+                self.window_fill = 0;
+                self.judge_window();
+            }
+            rest = tail;
         }
         self.open
     }
 
-    /// Run the detector over one window (at most the rolling-RMS
-    /// length) and apply the hang-time state machine to its verdict.
-    fn judge_window(&mut self, samples: &[f32]) {
+    /// Feed audio into whichever detector is active.
+    fn push(&mut self, samples: &[f32]) {
+        match self.mode {
+            VoiceSquelchMode::Off => {}
+            VoiceSquelchMode::Syllabic { .. } => {
+                if let Some(d) = &mut self.syllabic {
+                    d.push(samples);
+                }
+            }
+            VoiceSquelchMode::Snr { .. } => {
+                if let Some(d) = &mut self.snr {
+                    d.push(samples);
+                }
+            }
+        }
+    }
+
+    /// Take one window's verdict and apply the hang-time state
+    /// machine, charging the counter by one window on a weak verdict.
+    fn judge_window(&mut self) {
         let strong = match self.mode {
             VoiceSquelchMode::Off => return,
-            VoiceSquelchMode::Syllabic { .. } => {
-                self.syllabic.as_mut().is_some_and(|d| d.process(samples))
-            }
-            VoiceSquelchMode::Snr { .. } => self.snr.as_mut().is_some_and(|d| d.process(samples)),
+            VoiceSquelchMode::Syllabic { .. } => self
+                .syllabic
+                .as_ref()
+                .is_some_and(SyllabicDetector::verdict),
+            VoiceSquelchMode::Snr { .. } => self.snr.as_ref().is_some_and(SnrDetector::verdict),
         };
 
         if strong {
@@ -773,12 +818,14 @@ impl VoiceSquelch {
             self.hang_samples_remaining = VOICE_SQUELCH_HANG_TIME_SAMPLES;
         } else if self.open {
             // Weak verdict while the gate is open: bleed the
-            // hang counter down by this block's sample length.
+            // hang counter down by one window.
             // `saturating_sub` is important — the final block
             // before close might carry more samples than the
             // remaining budget, and we don't want an underflow
             // panic.
-            self.hang_samples_remaining = self.hang_samples_remaining.saturating_sub(samples.len());
+            self.hang_samples_remaining = self
+                .hang_samples_remaining
+                .saturating_sub(VOICE_SQUELCH_RMS_WINDOW_SAMPLES);
             if self.hang_samples_remaining == 0 {
                 self.open = false;
             }
@@ -1171,6 +1218,60 @@ mod tests {
             !vs.accept_samples(&silence),
             "600 ms of silence closes the gate"
         );
+    }
+
+    /// CR round 1 on PR #797 — the verdict cadence is fixed at one
+    /// per RMS window of audio regardless of how the audio is split
+    /// across calls: 7-sample, 10 ms, 10 007-sample and one-shot
+    /// deliveries of the same stream must agree with the 100 ms
+    /// delivery at every window boundary they land on.
+    #[test]
+    fn gate_state_is_independent_of_call_block_size() {
+        let mut stream = syllable_modulated(1_000.0, 4.0, 1_000);
+        stream.extend(std::iter::repeat_n(
+            0.0_f32,
+            (VOICE_SQUELCH_SAMPLE_RATE_HZ * 0.7) as usize,
+        ));
+        stream.extend(syllable_modulated(1_000.0, 4.0, 800));
+        stream.extend(std::iter::repeat_n(
+            0.0_f32,
+            (VOICE_SQUELCH_SAMPLE_RATE_HZ * 0.6) as usize,
+        ));
+        assert_eq!(stream.len() % VOICE_SQUELCH_RMS_WINDOW_SAMPLES, 0);
+
+        // Gate state after each call that ends exactly on a window
+        // boundary, keyed by the number of samples fed so far.
+        let observe = |block: usize| -> Vec<(usize, bool)> {
+            let mut vs = VoiceSquelch::new(
+                VoiceSquelchMode::Syllabic {
+                    threshold: VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+                },
+                VOICE_SQUELCH_SAMPLE_RATE_HZ,
+            )
+            .unwrap();
+            let mut fed = 0;
+            let mut states = Vec::new();
+            for chunk in stream.chunks(block) {
+                vs.accept_samples(chunk);
+                fed += chunk.len();
+                if fed % VOICE_SQUELCH_RMS_WINDOW_SAMPLES == 0 {
+                    states.push((fed, vs.is_open()));
+                }
+            }
+            states
+        };
+
+        let reference = observe(VOICE_SQUELCH_RMS_WINDOW_SAMPLES);
+        assert!(reference.iter().any(|&(_, o)| o), "{reference:?}");
+        assert!(reference.iter().any(|&(_, o)| !o), "{reference:?}");
+        for block in [7, 480, 10_007, stream.len()] {
+            let observed = observe(block);
+            assert!(!observed.is_empty(), "block size {block} observes nothing");
+            for (fed, open) in observed {
+                let expected = reference.iter().find(|(f, _)| *f == fed).map(|(_, o)| *o);
+                assert_eq!(Some(open), expected, "block size {block} at {fed} samples");
+            }
+        }
     }
 
     #[test]

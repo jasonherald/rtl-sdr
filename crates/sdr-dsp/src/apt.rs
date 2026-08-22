@@ -811,7 +811,9 @@ const DC_BANDPASS_ATTEN_DB: f64 = 30.0;
 /// DC-removing bandpass needs its upper transition edge
 /// (`cutoff + transition/2` = 5300 Hz) below Nyquist, which is a
 /// stricter floor than the 2·`SUBCARRIER_HZ` sampling requirement.
-/// Rates at or below this fail inside the tap designer (#776).
+/// [`AptDecoder::new`] rejects rates at or below this with
+/// [`DspError::InvalidParameter`]; before #776 they slipped past the
+/// 4800 Hz guard and failed inside the tap designer.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub const MIN_INPUT_RATE_HZ: u32 =
     (2.0 * (DC_BANDPASS_CUTOUT_HZ + DC_BANDPASS_TRANSITION_HZ / 2.0)) as u32;

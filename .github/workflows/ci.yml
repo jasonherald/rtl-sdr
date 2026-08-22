@@ -132,11 +132,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # Job-level so the upload step's `if` can see it (a step's own
-      # `env` is not visible to its own condition).
-      CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+      # Only a presence flag at job scope (a step's own `env` is not
+      # visible to its own `if`); the token itself is scoped to the
+      # upload step so build scripts and tests never see it.
+      HAS_CODACY_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN != '' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Untrusted PR code runs in this job; it needs no git credentials.
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: llvm-tools-preview
@@ -152,7 +156,7 @@ jobs:
       - name: Workspace coverage (LCOV)
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload to Codacy
-        if: ${{ env.CODACY_PROJECT_TOKEN != '' }}
+        if: ${{ env.HAS_CODACY_TOKEN == 'true' }}
         uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
         with:
           project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
