@@ -240,7 +240,10 @@ impl TleCache {
     pub fn cached_tle_for(&self, norad_id: u32) -> Result<(String, String), TleCacheError> {
         let path = self.cache_path(norad_id);
         let cached = read_file(&path)?.ok_or(TleCacheError::NotFound { norad_id })?;
-        if !has_any_tle_pair(&cached) {
+        // Same SGP4-backed validation as the refresh path: a pair the
+        // parser rejects is a miss here, not an `Ok` that
+        // `Satellite::from_tle` then refuses (CR on PR #799).
+        if !has_valid_tle_for(&cached, norad_id) {
             return Err(TleCacheError::NotFound { norad_id });
         }
         parse_tle_text(&cached, norad_id).ok_or(TleCacheError::NotFound { norad_id })
@@ -264,16 +267,7 @@ impl TleCache {
     /// * [`TleCacheError::Io`] — only if writing the freshly-fetched
     ///   body to disk failed; the in-memory body is still returned.
     pub fn force_refresh(&self, norad_id: u32) -> Result<String, TleCacheError> {
-        let text = self.fetch(norad_id).and_then(|text| {
-            if has_any_tle_pair(&text) {
-                Ok(text)
-            } else {
-                Err(TleCacheError::Fetch(
-                    "response body did not contain any valid TLE pair (captive portal? HTML error page?)"
-                        .to_string(),
-                ))
-            }
-        })?;
+        let text = self.fetch_validated(norad_id)?;
         let path = self.cache_path(norad_id);
         if let Err(e) = self.write_cache(&path, &text) {
             tracing::warn!(
@@ -301,10 +295,14 @@ impl TleCache {
         // TOCTOU race steals the file between mtime check and read,
         // or the cached content fails validation, fall through to
         // the refetch path so the cache self-heals.
+        // A cache file we cannot read (permissions, mid-read failure)
+        // is treated like a miss on this path: the network is the
+        // authority here, and an I/O error must neither block the
+        // fetch nor replace a real fetch error (#720).
         if !is_stale(&path, self.refresh_max_age)
-            && let Some(cached) = read_file(&path)?
+            && let Some(cached) = read_file_or_miss(&path, norad_id)
         {
-            if has_any_tle_pair(&cached) {
+            if has_valid_tle_for(&cached, norad_id) {
                 return Ok(cached);
             }
             tracing::warn!("ignoring corrupted fresh TLE cache for NORAD {norad_id}; refetching");
@@ -314,17 +312,7 @@ impl TleCache {
         // If the fetch (or validation) fails, fall back to whatever
         // stale copy still happens to exist *and validates*. If even
         // that's gone or corrupted, surface the original fetch error.
-        let fetch_result = self.fetch(norad_id).and_then(|text| {
-            if has_any_tle_pair(&text) {
-                Ok(text)
-            } else {
-                Err(TleCacheError::Fetch(
-                    "response body did not contain any valid TLE pair (captive portal? HTML error page?)"
-                        .to_string(),
-                ))
-            }
-        });
-        match fetch_result {
+        match self.fetch_validated(norad_id) {
             Ok(text) => {
                 // Best-effort cache write — a failed write (read-only
                 // fs, disk full, permissions) shouldn't throw away
@@ -337,8 +325,8 @@ impl TleCache {
                 Ok(text)
             }
             Err(fetch_err) => {
-                if let Some(cached) = read_file(&path)?
-                    && has_any_tle_pair(&cached)
+                if let Some(cached) = read_file_or_miss(&path, norad_id)
+                    && has_valid_tle_for(&cached, norad_id)
                 {
                     tracing::warn!(
                         "TLE fetch for NORAD {norad_id} failed ({fetch_err}); using stale cache",
@@ -355,6 +343,27 @@ impl TleCache {
     /// If [`TleCache::with_fetcher`] supplied an override, that closure
     /// runs instead — letting tests stay hermetic and users plug in
     /// custom HTTP stacks.
+    /// Fetch and require a TLE pair **for `norad_id`**. A structurally
+    /// valid body for a different satellite used to pass the id-agnostic
+    /// check, get written under `{id}.tle` with "last refreshed: now",
+    /// and then make the satellite vanish from the list for a day when
+    /// `cached_tle_for` found no matching pair (#720).
+    fn fetch_validated(&self, norad_id: u32) -> Result<String, TleCacheError> {
+        let text = self.fetch(norad_id)?;
+        if has_valid_tle_for(&text, norad_id) {
+            Ok(text)
+        } else if has_any_tle_pair(&text) {
+            Err(TleCacheError::Fetch(format!(
+                "response body did not contain a TLE pair for NORAD {norad_id}"
+            )))
+        } else {
+            Err(TleCacheError::Fetch(
+                "response body did not contain any valid TLE pair (captive portal? HTML error page?)"
+                    .to_string(),
+            ))
+        }
+    }
+
     fn fetch(&self, norad_id: u32) -> Result<String, TleCacheError> {
         if let Some(override_fetcher) = &self.fetcher {
             return override_fetcher(norad_id);
@@ -471,6 +480,20 @@ fn read_file(path: &Path) -> Result<Option<String>, TleCacheError> {
     }
 }
 
+/// [`read_file`] for the refresh path: any read error is logged and
+/// treated as a miss so it cannot block or mask the network path.
+fn read_file_or_miss(path: &Path, norad_id: u32) -> Option<String> {
+    match read_file(path) {
+        Ok(cached) => cached,
+        Err(e) => {
+            tracing::warn!(
+                "TLE cache for NORAD {norad_id} is unreadable ({e}); treating as a miss"
+            );
+            None
+        }
+    }
+}
+
 fn is_stale(path: &Path, max_age: StdDuration) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return true; // missing = stale
@@ -526,6 +549,17 @@ pub(crate) fn has_any_tle_pair(text: &str) -> bool {
     let lines = tle_lines(text);
     let last = lines.len().saturating_sub(1);
     (0..last).any(|i| pair_matches(lines[i], lines[i + 1], None))
+}
+
+/// Does `text` hold a pair for `norad_id` that the SGP4 parser accepts?
+/// The structural check in [`parse_tle_text`] only looks at prefixes and
+/// catalog numbers; a body with the right id but a bad checksum or a
+/// malformed orbital field passed it, got cached, and was then refused
+/// by `Satellite::from_tle` until the file aged out (CR on PR #799).
+fn has_valid_tle_for(text: &str, norad_id: u32) -> bool {
+    parse_tle_text(text, norad_id).is_some_and(|(line1, line2)| {
+        crate::sgp4_core::Satellite::from_tle("validation", &line1, &line2).is_ok()
+    })
 }
 
 /// Collect the non-empty, right-trimmed lines of `text` into a `Vec`.
@@ -588,7 +622,32 @@ const TLE_NORAD_END: usize = 7;
 /// error page that landed in the cache by accident.)
 fn norad_id_from_tle_line(line: &str) -> Option<u32> {
     let field = line.get(TLE_NORAD_START..TLE_NORAD_END)?;
-    field.trim().parse::<u32>().ok()
+    let field = field.trim();
+    if let Ok(id) = field.parse::<u32>() {
+        return Some(id);
+    }
+    alpha5_to_norad_id(field)
+}
+
+/// Decode an Alpha-5 catalog number (`A0000`–`Z9999`): the first
+/// character is a letter standing in for the ten-thousands, `A` = 10
+/// through `Z` = 34 with `I` and `O` skipped, followed by four digits.
+/// Celestrak mandates it for ids ≥ 100 000; plain digits never parse
+/// those, so every such satellite used to be "not a valid TLE" and
+/// refetched on every call (#720).
+fn alpha5_to_norad_id(field: &str) -> Option<u32> {
+    const ALPHA5_LETTERS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const ALPHA5_FIRST_VALUE: u32 = 10;
+    const ALPHA5_DIGITS: usize = 4;
+    let (letter, digits) = field.split_at_checked(1)?;
+    let letter = letter.as_bytes().first()?;
+    let index = ALPHA5_LETTERS.iter().position(|l| l == letter)?;
+    if digits.len() != ALPHA5_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let low = digits.parse::<u32>().ok()?;
+    let index = u32::try_from(index).ok()?;
+    Some((index + ALPHA5_FIRST_VALUE) * 10_000 + low)
 }
 
 #[cfg(test)]
@@ -603,11 +662,11 @@ VANGUARD 1
 1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753
 2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667
 ISS (ZARYA)
-1 25544U 98067A   20194.88670927  .00002728  00000-0  61021-4 0  9994
-2 25544  51.6442 211.4001 0001234  92.7501 270.5089 15.49538275234276
+1 25544U 98067A   20194.88670927  .00002728  00000-0  61021-4 0  9996
+2 25544  51.6442 211.4001 0001234  92.7501 270.5089 15.49538275234275
 NOAA 19
-1 33591U 09005A   24001.50000000  .00000050  00000-0  50000-4 0  9994
-2 33591  99.0000 100.0000 0010000  90.0000 270.0000 14.10000000123456
+1 33591U 09005A   24001.50000000  .00000050  00000-0  50000-4 0  9991
+2 33591  99.0000 100.0000 0010000  90.0000 270.0000 14.10000000123452
 ";
 
     /// Same three TLEs but in 2-line format (no name line) — Celestrak
@@ -616,8 +675,8 @@ NOAA 19
     const SAMPLE_TLE_2LINE: &str = "\
 1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753
 2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667
-1 25544U 98067A   20194.88670927  .00002728  00000-0  61021-4 0  9994
-2 25544  51.6442 211.4001 0001234  92.7501 270.5089 15.49538275234276
+1 25544U 98067A   20194.88670927  .00002728  00000-0  61021-4 0  9996
+2 25544  51.6442 211.4001 0001234  92.7501 270.5089 15.49538275234275
 ";
 
     #[test]
@@ -688,7 +747,7 @@ NOAA 19
         // (line1, garbage_line2) pair that would misfire downstream.
         let bad_pair_then_good = "\
 NAME ONE
-1 11111U 99001A   24000.00000000  .00000000  00000-0  10000-3 0  9990
+1 11111U 99001A   24000.00000000  .00000000  00000-0  10000-3 0  9994
 NEXT NAME LINE NOT A TLE
 1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753
 2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667
@@ -714,7 +773,7 @@ NEXT NAME LINE NOT A TLE
         let mismatched_pair = "\
 VANGUARD 1
 1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753
-2 25544  51.6442 211.4001 0001234  92.7501 270.5089 15.49538275234276
+2 25544  51.6442 211.4001 0001234  92.7501 270.5089 15.49538275234275
 ";
         assert!(parse_tle_text(mismatched_pair, 5).is_none());
         assert!(parse_tle_text(mismatched_pair, 25_544).is_none());
@@ -733,7 +792,7 @@ VANGUARD 1
         // line 2 of NORAD 11111 and then run off the end.
         let bad_swallows_next = "\
 SOMETHING
-1 11111U 99001A   24000.00000000  .00000000  00000-0  10000-3 0  9990
+1 11111U 99001A   24000.00000000  .00000000  00000-0  10000-3 0  9994
 1 00005U 58002B   00179.78495062  .00000023  00000-0  28098-4 0  4753
 2 00005  34.2682 348.7242 1859667 331.7664  19.3264 10.82419157413667
 ";
@@ -913,15 +972,16 @@ SOMETHING
     #[test]
     fn cache_returns_not_found_when_norad_id_missing_from_fresh_file() {
         // Per-NORAD cache file at id 99999 that contains a different
-        // satellite's entries — should surface as NotFound, not as
-        // a successful match.
+        // satellite's entries is corrupt for that id: the refresh path
+        // must not serve it, and must refetch. Offline, the fetch
+        // error is what surfaces — never a successful match (#720).
         let dir = unique_temp_dir("missing-id");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("99999.tle");
         std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
-        let cache = TleCache::with_dir(dir);
+        let cache = TleCache::with_dir(dir).with_fetcher(always_fail_fetcher());
         let err = cache.tle_for(99_999).unwrap_err();
-        assert!(matches!(err, TleCacheError::NotFound { norad_id: 99_999 }));
+        assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
     }
 
     #[test]
@@ -1153,5 +1213,128 @@ SOMETHING
         let counter = NEXT_TEST_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
         std::env::temp_dir().join(format!("sdr-sat-test-{tag}-{pid}-{nanos}-{counter}"))
+    }
+
+    // --- #720 (Aug 2026 deep review) ---
+
+    /// Celestrak's Alpha-5 encoding for catalog numbers ≥ 100 000: the
+    /// first column is a letter (I and O excluded) worth
+    /// `(index + 10) · 10 000`.
+    #[test]
+    fn norad_id_parses_alpha5_catalog_numbers() {
+        assert_eq!(
+            norad_id_from_tle_line("1 A0000U 24001A   24001.5"),
+            Some(100_000)
+        );
+        assert_eq!(norad_id_from_tle_line("2 B1234  99.0"), Some(111_234));
+        assert_eq!(norad_id_from_tle_line("1 Z9999U"), Some(339_999));
+        assert_eq!(norad_id_from_tle_line("1 I0000U"), None, "I is excluded");
+        assert_eq!(norad_id_from_tle_line("1 O0000U"), None, "O is excluded");
+        assert_eq!(
+            norad_id_from_tle_line("1 a0000U"),
+            None,
+            "lower case is not Alpha-5"
+        );
+        assert_eq!(norad_id_from_tle_line("1 25544U"), Some(25_544));
+    }
+
+    /// An unreadable cache file (permissions) must not abort the fetch
+    /// path, and when offline the fetch error — not the read error —
+    /// is what the caller sees.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_cache_file_neither_blocks_fetch_nor_masks_fetch_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata("/proc/self").is_ok_and(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.uid() == 0
+        }) {
+            return; // root ignores file permissions
+        }
+        let dir = unique_temp_dir("unreadable-cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("5.tle");
+        std::fs::write(&path, SAMPLE_TLE_3LINE).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let online =
+            TleCache::with_dir(dir.clone()).with_fetcher(|_| Ok(SAMPLE_TLE_3LINE.to_string()));
+        let text = online.tle_text(5).unwrap();
+        assert_eq!(text, SAMPLE_TLE_3LINE);
+
+        // The successful refresh rewrote the file readable; make it
+        // unreadable again for the offline half.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let offline = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
+        let err = offline.tle_text(5).unwrap_err();
+        assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body that is valid TLE text but for a different satellite is
+    /// a fetch failure: nothing is written under `{id}.tle` and the
+    /// "last refreshed" clock does not move.
+    #[test]
+    fn refresh_rejects_a_body_for_a_different_satellite() {
+        let dir = unique_temp_dir("wrong-sat-body");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache =
+            TleCache::with_dir(dir.clone()).with_fetcher(|_| Ok(SAMPLE_TLE_3LINE.to_string()));
+        let err = cache.force_refresh(99_999).unwrap_err();
+        assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+        assert!(!dir.join("99999.tle").exists(), "nothing may be cached");
+        let err = cache.tle_text(99_999).unwrap_err();
+        assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+        assert!(!dir.join("99999.tle").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CR round 1 on PR #799 — a pair with the right id but fields the
+    /// SGP4 parser rejects is a fetch failure and is never cached;
+    /// otherwise `Satellite::from_tle` would refuse it from the cache
+    /// and the satellite would vanish until the file aged out.
+    #[test]
+    fn refresh_rejects_a_pair_the_sgp4_parser_cannot_parse() {
+        const MALFORMED: &str = "\
+1 99999U 09005A   24001.50000000  .00000050  00000-0  50000-4 0  9994
+2 99999  XX.0000 100.0000 0010000  90.0000 270.0000 14.10000000123456
+";
+        let dir = unique_temp_dir("malformed-pair");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = TleCache::with_dir(dir.clone()).with_fetcher(|_| Ok(MALFORMED.to_string()));
+        let err = cache.force_refresh(99_999).unwrap_err();
+        assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+        assert!(!dir.join("99999.tle").exists(), "nothing may be cached");
+
+        // A malformed body already on disk is corrupt for the refresh
+        // path too: the fetch error surfaces, not the bad lines.
+        std::fs::write(dir.join("99999.tle"), MALFORMED).unwrap();
+        let offline = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
+        let err = offline.tle_text(99_999).unwrap_err();
+        assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CR round 2 on PR #799 — the cache-only path applies the same
+    /// SGP4-backed validation: a malformed pair for the requested id is
+    /// `NotFound`, not an `Ok` that `Satellite::from_tle` then rejects.
+    #[test]
+    fn cached_tle_for_rejects_a_malformed_requested_pair() {
+        const MALFORMED: &str = "\
+1 99999U 09005A   24001.50000000  .00000050  00000-0  50000-4 0  9994
+2 99999  XX.0000 100.0000 0010000  90.0000 270.0000 14.10000000123456
+";
+        let dir = unique_temp_dir("cached-malformed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("99999.tle"), MALFORMED).unwrap();
+        let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
+        let err = cache.cached_tle_for(99_999).unwrap_err();
+        assert!(
+            matches!(err, TleCacheError::NotFound { norad_id: 99_999 }),
+            "got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

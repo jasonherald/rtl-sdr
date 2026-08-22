@@ -514,6 +514,7 @@ mod tests {
         // exclude the marginal grazes that don't actually have
         // useful Doppler curve geometry.
         let pass = sdr_sat::upcoming_passes(station, sat, from, to, 5.0)
+            .expect("pass enumeration succeeds near the TLE epoch")
             .into_iter()
             .next()
             .expect("a NOAA 19 pass should fall within 48 h of epoch");
