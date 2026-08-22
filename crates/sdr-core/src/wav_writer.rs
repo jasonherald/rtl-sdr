@@ -4,7 +4,7 @@
 //! with placeholder sizes, then patched on [`Drop`] to finalize the file.
 
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, ErrorKind, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use sdr_types::{Complex, Stereo};
@@ -50,17 +50,23 @@ pub const MAX_WAV_DATA_BYTES: u64 =
 /// - IQ recording: 2-channel (I, Q) at the source sample rate.
 ///
 /// The file is finalized automatically when dropped.
-pub struct WavWriter {
-    writer: BufWriter<File>,
-    /// Bytes of sample data written so far (`u64` so the accounting can
-    /// never wrap; the WAV cap is enforced by [`Self::check_capacity`]).
+///
+/// Generic over the sink so tests can inject write failures; production
+/// code only ever uses the default `File` sink via [`WavWriter::new`].
+pub struct WavWriter<W: Write + Seek = File> {
+    writer: BufWriter<W>,
+    /// Bytes of sample data the sink has *accepted* so far (`u64` so the
+    /// accounting can never wrap; the WAV cap is enforced by
+    /// [`Self::check_capacity`]). Advanced per accepted chunk, so a write
+    /// that fails part-way still leaves the header describing exactly the
+    /// payload on disk (#694).
     bytes_written: u64,
     /// Data-chunk byte cap — [`MAX_WAV_DATA_BYTES`] outside tests.
     max_data_bytes: u64,
     finalized: bool,
 }
 
-impl WavWriter {
+impl WavWriter<File> {
     /// Create a new WAV writer at `path`.
     ///
     /// Writes the 44-byte WAV header with placeholder sizes. The sizes are
@@ -70,9 +76,18 @@ impl WavWriter {
     ///
     /// Returns an I/O error if the file cannot be created or the header write fails.
     pub fn new(path: &Path, sample_rate: u32, channels: u16) -> std::io::Result<Self> {
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
+        Self::with_sink(BufWriter::new(File::create(path)?), sample_rate, channels)
+    }
+}
 
+impl<W: Write + Seek> WavWriter<W> {
+    /// Create a writer over an arbitrary buffered sink (tests inject a
+    /// failing sink here; production goes through [`WavWriter::new`]).
+    fn with_sink(
+        mut writer: BufWriter<W>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> std::io::Result<Self> {
         // RIFF header
         writer.write_all(b"RIFF")?;
         writer.write_all(&0u32.to_le_bytes())?; // placeholder: file size - 8
@@ -131,6 +146,30 @@ impl WavWriter {
         Ok(())
     }
 
+    /// Write `bytes` to the sink, advancing `bytes_written` by every chunk
+    /// the sink accepts. Unlike `write_all`, a failure part-way leaves the
+    /// accounting equal to what was actually accepted, so `finalize` never
+    /// advertises less data than the file holds (#694).
+    fn write_accounted(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            match self.writer.write(bytes) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::WriteZero,
+                        "WAV sink accepted no bytes",
+                    ));
+                }
+                Ok(n) => {
+                    self.bytes_written += n as u64;
+                    bytes = &bytes[n..];
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Write a slice of stereo audio samples (L, R interleaved as f32 pairs).
     ///
     /// On little-endian targets, uses `bytemuck::cast_slice` for a single bulk
@@ -139,25 +178,24 @@ impl WavWriter {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the write fails, or
+    /// Returns an I/O error if the write fails (the accounting then covers
+    /// exactly the bytes the sink accepted), or
     /// [`std::io::ErrorKind::StorageFull`] (with nothing written) if the
     /// slice would push the data chunk past [`MAX_WAV_DATA_BYTES`].
     pub fn write_stereo(&mut self, samples: &[Stereo]) -> std::io::Result<()> {
-        let bytes = samples.len() as u64 * u64::from(FRAME_BYTES);
-        self.check_capacity(bytes)?;
+        self.check_capacity(samples.len() as u64 * u64::from(FRAME_BYTES))?;
         #[cfg(target_endian = "little")]
         {
-            self.writer.write_all(bytemuck::cast_slice(samples))?;
+            self.write_accounted(bytemuck::cast_slice(samples))
         }
         #[cfg(not(target_endian = "little"))]
         {
             for s in samples {
-                self.writer.write_all(&s.l.to_le_bytes())?;
-                self.writer.write_all(&s.r.to_le_bytes())?;
+                self.write_accounted(&s.l.to_le_bytes())?;
+                self.write_accounted(&s.r.to_le_bytes())?;
             }
+            Ok(())
         }
-        self.bytes_written += bytes;
-        Ok(())
     }
 
     /// Write a slice of IQ samples (I, Q interleaved as f32 pairs).
@@ -168,25 +206,24 @@ impl WavWriter {
     ///
     /// # Errors
     ///
-    /// Returns an I/O error if the write fails, or
+    /// Returns an I/O error if the write fails (the accounting then covers
+    /// exactly the bytes the sink accepted), or
     /// [`std::io::ErrorKind::StorageFull`] (with nothing written) if the
     /// slice would push the data chunk past [`MAX_WAV_DATA_BYTES`].
     pub fn write_iq(&mut self, samples: &[Complex]) -> std::io::Result<()> {
-        let bytes = samples.len() as u64 * u64::from(FRAME_BYTES);
-        self.check_capacity(bytes)?;
+        self.check_capacity(samples.len() as u64 * u64::from(FRAME_BYTES))?;
         #[cfg(target_endian = "little")]
         {
-            self.writer.write_all(bytemuck::cast_slice(samples))?;
+            self.write_accounted(bytemuck::cast_slice(samples))
         }
         #[cfg(not(target_endian = "little"))]
         {
             for s in samples {
-                self.writer.write_all(&s.re.to_le_bytes())?;
-                self.writer.write_all(&s.im.to_le_bytes())?;
+                self.write_accounted(&s.re.to_le_bytes())?;
+                self.write_accounted(&s.im.to_le_bytes())?;
             }
+            Ok(())
         }
-        self.bytes_written += bytes;
-        Ok(())
     }
 
     /// Finalize the WAV file by patching the RIFF and data chunk sizes.
@@ -207,8 +244,10 @@ impl WavWriter {
 
         // `check_capacity` guarantees `bytes_written <= MAX_WAV_DATA_BYTES`, so
         // both header fields fit; the conversion is checked anyway rather
-        // than trusted (#694).
-        let data_size = u32::try_from(self.bytes_written).map_err(|_| {
+        // than trusted (#694). A write that failed mid-frame may have left a
+        // partial frame on disk — the header only advertises whole frames.
+        let whole_frames = self.bytes_written / u64::from(FRAME_BYTES) * u64::from(FRAME_BYTES);
+        let data_size = u32::try_from(whole_frames).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "WAV data chunk exceeds the u32 header field",
@@ -229,7 +268,7 @@ impl WavWriter {
     }
 }
 
-impl Drop for WavWriter {
+impl<W: Write + Seek> Drop for WavWriter<W> {
     fn drop(&mut self) {
         if let Err(e) = self.finalize() {
             tracing::warn!("WAV finalize failed: {e}");
@@ -359,6 +398,119 @@ mod tests {
         );
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Sink that accepts up to `accept_limit` appended bytes in total,
+    /// then fails every further append — models a disk that fills
+    /// mid-buffer. Overwrites inside the existing content (the header
+    /// patches `finalize` performs) need no space and always succeed.
+    struct FailingSink {
+        buf: std::io::Cursor<Vec<u8>>,
+        accept_limit: usize,
+        accepted: usize,
+    }
+
+    impl FailingSink {
+        fn new(accept_limit: usize) -> Self {
+            Self {
+                buf: std::io::Cursor::new(Vec::new()),
+                accept_limit,
+                accepted: 0,
+            }
+        }
+    }
+
+    impl Write for FailingSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let pos = usize::try_from(self.buf.position()).unwrap();
+            let len = self.buf.get_ref().len();
+            if pos < len {
+                // Overwrite of existing bytes (header patch): no budget.
+                let n = data.len().min(len - pos);
+                self.buf.write_all(&data[..n])?;
+                return Ok(n);
+            }
+            let room = self.accept_limit.saturating_sub(self.accepted);
+            if room == 0 {
+                return Err(std::io::Error::other("injected disk failure"));
+            }
+            let n = data.len().min(room);
+            self.buf.write_all(&data[..n])?;
+            self.accepted += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.buf.flush()
+        }
+    }
+
+    impl Seek for FailingSink {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.buf.seek(pos)
+        }
+    }
+
+    /// Header-only sink budget: the 44-byte header must always land.
+    const HEADER_ONLY: usize = WAV_HEADER_SIZE as usize;
+    /// Tiny `BufWriter` so sample writes reach the sink immediately.
+    const UNBUFFERED: usize = 1;
+
+    fn read_data_size(writer: &WavWriter<FailingSink>) -> u32 {
+        let bytes = writer.writer.get_ref().buf.get_ref();
+        u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]])
+    }
+
+    /// #694 (CR round 3) — a sink that fails after accepting a prefix of
+    /// the buffer must leave the accounting (and so the finalized header)
+    /// equal to what it accepted, rounded down to whole frames.
+    #[test]
+    fn partial_stereo_write_is_accounted_before_finalize() {
+        const ACCEPT_FRAMES: u64 = 2;
+        let limit =
+            HEADER_ONLY + usize::try_from(ACCEPT_FRAMES * u64::from(FRAME_BYTES)).unwrap() + 3;
+        let mut writer = WavWriter::with_sink(
+            BufWriter::with_capacity(UNBUFFERED, FailingSink::new(limit)),
+            48_000,
+            2,
+        )
+        .unwrap();
+        let five = vec![Stereo { l: 0.5, r: -0.5 }; 5];
+        assert!(writer.write_stereo(&five).is_err());
+        assert_eq!(
+            writer.bytes_written(),
+            ACCEPT_FRAMES * u64::from(FRAME_BYTES) + 3,
+            "accounting must cover exactly the accepted bytes"
+        );
+        writer.finalize().unwrap();
+        assert_eq!(
+            u64::from(read_data_size(&writer)),
+            ACCEPT_FRAMES * u64::from(FRAME_BYTES),
+            "header advertises the whole frames actually on disk"
+        );
+    }
+
+    /// #694 (CR round 3) — same contract for the IQ path.
+    #[test]
+    fn partial_iq_write_is_accounted_before_finalize() {
+        const ACCEPT_FRAMES: u64 = 3;
+        let limit = HEADER_ONLY + usize::try_from(ACCEPT_FRAMES * u64::from(FRAME_BYTES)).unwrap();
+        let mut writer = WavWriter::with_sink(
+            BufWriter::with_capacity(UNBUFFERED, FailingSink::new(limit)),
+            2_400_000,
+            2,
+        )
+        .unwrap();
+        let eight = vec![Complex::new(1.0, 0.0); 8];
+        assert!(writer.write_iq(&eight).is_err());
+        assert_eq!(
+            writer.bytes_written(),
+            ACCEPT_FRAMES * u64::from(FRAME_BYTES)
+        );
+        writer.finalize().unwrap();
+        assert_eq!(
+            u64::from(read_data_size(&writer)),
+            ACCEPT_FRAMES * u64::from(FRAME_BYTES)
+        );
     }
 
     /// #694 — the default cap must keep both `u32` header fields in range.
