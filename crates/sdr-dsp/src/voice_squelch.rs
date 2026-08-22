@@ -566,8 +566,9 @@ impl VoiceSquelch {
     ///
     /// Returns [`DspError::InvalidParameter`] if `sample_rate_hz`
     /// differs from [`VOICE_SQUELCH_SAMPLE_RATE_HZ`] by more than
-    /// [`SAMPLE_RATE_MATCH_EPSILON_HZ`], or if the mode carries a
-    /// non-finite threshold.
+    /// [`SAMPLE_RATE_MATCH_EPSILON_HZ`], or if the mode fails
+    /// [`VoiceSquelchMode::validate`]: a `Syllabic` threshold must be
+    /// finite and strictly positive, an `Snr` threshold finite.
     pub fn new(mode: VoiceSquelchMode, sample_rate_hz: f32) -> Result<Self, DspError> {
         if !sample_rate_hz.is_finite() {
             return Err(DspError::InvalidParameter(format!(
