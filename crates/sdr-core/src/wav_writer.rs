@@ -44,6 +44,35 @@ pub const MAX_WAV_DATA_BYTES: u64 =
     (u32::MAX as u64 - (WAV_HEADER_SIZE - RIFF_HEADER_PREFIX) as u64) / FRAME_BYTES as u64
         * FRAME_BYTES as u64;
 
+/// Marker error carried inside the [`ErrorKind::StorageFull`] I/O error
+/// the writer returns when the WAV structural limit is reached, so callers
+/// can tell it apart from a genuinely full filesystem (which surfaces as a
+/// bare `StorageFull` from the OS). See [`is_wav_limit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WavLimitReached;
+
+impl std::fmt::Display for WavLimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WAV data chunk limit reached (4 GiB); start a new recording")
+    }
+}
+
+impl std::error::Error for WavLimitReached {}
+
+/// Build the I/O error the writer returns at the WAV limit.
+#[must_use]
+pub fn wav_limit_error() -> std::io::Error {
+    std::io::Error::new(ErrorKind::StorageFull, WavLimitReached)
+}
+
+/// `true` when `err` is the writer's WAV-limit error (not a full disk).
+#[must_use]
+pub fn is_wav_limit(err: &std::io::Error) -> bool {
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<WavLimitReached>())
+        .is_some()
+}
+
 /// Writes demodulated stereo audio or raw IQ samples to a WAV file.
 ///
 /// - Audio recording: 2-channel (L, R) at 48 kHz.
@@ -138,10 +167,7 @@ impl<W: Write + Seek> WavWriter<W> {
     /// written by `finalize` never describes bytes that are not on disk.
     fn check_capacity(&self, bytes: u64) -> std::io::Result<()> {
         if self.bytes_written.saturating_add(bytes) > self.max_data_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::StorageFull,
-                "WAV data chunk limit reached (4 GiB); start a new recording",
-            ));
+            return Err(wav_limit_error());
         }
         Ok(())
     }
@@ -386,6 +412,11 @@ mod tests {
             assert!(writer.is_full(), "less than one frame left counts as full");
             let err = writer.write_stereo(&one).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+            assert!(is_wav_limit(&err), "the WAV limit must be identifiable");
+            assert!(
+                !is_wav_limit(&std::io::Error::from(std::io::ErrorKind::StorageFull)),
+                "a bare StorageFull is a full filesystem, not the WAV limit"
+            );
             assert_eq!(writer.bytes_written(), EXPECTED_DATA_BYTES);
         }
 

@@ -2193,16 +2193,25 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // The Start path intentionally invalidates the bank
             // for the lazy-rebuild window — bank can be None
             // while ACARS is still engaged. CR round 5 on PR #584.
-            let acars_outcome =
-                if state.acars_pre_lock.is_some() && source_type != SourceType::RtlSdr {
-                    tracing::info!(
-                        ?source_type,
-                        "ACARS auto-disabling: source type changing to non-RTL-SDR"
-                    );
-                    handle_set_acars_enabled(state, false, dsp_tx)
-                } else {
-                    AcarsHandlerOutcome::Normal
-                };
+            // While an IQ recording is open on a live source, leave the
+            // disengage to `cleanup()` below: it stops the recording first
+            // and then performs the forced ACARS teardown, whereas the
+            // user-path disengage would be refused by the recording mutex
+            // (#695) and emit a misleading failure for a switch that is
+            // about to succeed.
+            let defer_to_cleanup = state.iq_writer.is_some() && state.running;
+            let acars_outcome = if state.acars_pre_lock.is_some()
+                && source_type != SourceType::RtlSdr
+                && !defer_to_cleanup
+            {
+                tracing::info!(
+                    ?source_type,
+                    "ACARS auto-disabling: source type changing to non-RTL-SDR"
+                );
+                handle_set_acars_enabled(state, false, dsp_tx)
+            } else {
+                AcarsHandlerOutcome::Normal
+            };
             let was_running = state.running;
             if was_running {
                 cleanup(state, dsp_tx);
@@ -4754,7 +4763,9 @@ enum AcarsHandlerOutcome {
 /// (#694) is an expected end-of-file condition, not a fault, so it gets
 /// its own wording.
 fn recording_write_error_message(kind: &str, err: &std::io::Error) -> String {
-    if err.kind() == std::io::ErrorKind::StorageFull {
+    // A full filesystem also arrives as `StorageFull`; only the writer's
+    // typed marker means the WAV structural limit.
+    if crate::wav_writer::is_wav_limit(err) {
         format!("{kind} recording stopped: WAV 4 GiB limit reached")
     } else {
         format!("{kind} recording write failed")
@@ -5884,6 +5895,59 @@ mod tests {
             "a failed rebuild must not clamp the stored offset"
         );
         assert!(state.vfo.is_some(), "the previous VFO must survive");
+    }
+
+    /// #695 (CR round 5) — switching source type while IQ-recording with
+    /// ACARS engaged must not trip the recording mutex: `cleanup()` stops
+    /// the recording first and then performs the forced ACARS teardown.
+    #[test]
+    fn source_type_switch_while_iq_recording_defers_acars_teardown_to_cleanup() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let path = temp_wav("acars-source-switch");
+        state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+        state.acars_pre_lock = Some(test_pre_lock_snapshot());
+        state.running = true;
+        let _ = drain(&dsp_rx);
+
+        // File source with an empty path: the restart after cleanup fails
+        // fast and without hardware.
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetSourceType(SourceType::File),
+        );
+
+        let events = drain(&dsp_rx);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                DspToUi::AcarsEnabledChanged(Err(
+                    crate::acars_airband_lock::AcarsEnableError::IqRecordingActive
+                ))
+            )),
+            "source switch must not report a recording-mutex failure, got {events:?}"
+        );
+        assert!(state.acars_pre_lock.is_none(), "ACARS torn down by cleanup");
+        assert!(state.iq_writer.is_none(), "recording stopped by cleanup");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::IqRecordingStopped)),
+            "expected IqRecordingStopped, got {events:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #694 (CR round 5) — only the WAV structural limit gets the
+    /// "4 GiB limit" wording; a full filesystem is a plain write failure.
+    #[test]
+    fn recording_write_error_message_distinguishes_wav_limit_from_disk_full() {
+        let wav_limit = crate::wav_writer::wav_limit_error();
+        assert!(recording_write_error_message("IQ", &wav_limit).contains("4 GiB"));
+        let disk_full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        assert!(!recording_write_error_message("IQ", &disk_full).contains("4 GiB"));
+        assert!(recording_write_error_message("IQ", &disk_full).contains("write failed"));
     }
 
     /// #692 — the IQ-correction switch must not share state with DC blocking.
