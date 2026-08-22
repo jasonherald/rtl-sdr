@@ -307,6 +307,12 @@ pub enum AcarsEnableError {
     #[error("VFO rebuild failed: {0}")]
     VfoRebuildFailed(String),
 
+    /// An IQ recording is in progress. Engaging ACARS forces the
+    /// source to the airband rate, which would silently desync the
+    /// recording's header sample rate from its data (#695).
+    #[error("stop the IQ recording before enabling ACARS (it changes the sample rate)")]
+    IqRecordingActive,
+
     /// Scanner is currently running. The scanner mutates source
     /// rate / center / decimation directly via
     /// `apply_scanner_commands`, bypassing the `UiToDsp` dispatcher

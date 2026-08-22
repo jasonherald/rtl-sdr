@@ -1657,11 +1657,15 @@ mod tests {
     }
 
     #[test]
-    fn iq_recording_start_stop_round_trip() {
-        // Same shape as the audio recording round-trip test —
-        // verifies the controller opened + finalized the WAV
-        // file, not just that `send_command` returned OK. Per
-        // CodeRabbit round 2 on PR #345.
+    fn iq_recording_without_source_is_rejected() {
+        // #695 — the IQ WAV header bakes in the source sample rate,
+        // which is only authoritative while a source is open. A
+        // headless handle has no source, so the controller must
+        // refuse to open a writer (the FFI call itself still returns
+        // Ok: `send_command` is asynchronous and the rejection
+        // surfaces as an error event). Verify no file is created.
+        // Previously (PR #345) this round-trip expected a finalized
+        // header on disk.
         let h = make_handle();
         let tmp = unique_temp_wav("sdr-ffi-iq-test");
         let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
@@ -1674,13 +1678,10 @@ mod tests {
             SdrCoreError::Ok.as_int()
         );
         std::thread::sleep(std::time::Duration::from_millis(RECORDING_FLUSH_WAIT_MS));
-        let metadata =
-            std::fs::metadata(&tmp).expect("IQ recording should create a WAV file before cleanup");
         assert!(
-            metadata.len() >= WAV_HEADER_BYTES,
-            "IQ recording should finalize at least a WAV header"
+            std::fs::metadata(&tmp).is_err(),
+            "IQ recording must not open a WAV file while no source is running"
         );
-        std::fs::remove_file(&tmp).unwrap();
         destroy(h);
     }
 
