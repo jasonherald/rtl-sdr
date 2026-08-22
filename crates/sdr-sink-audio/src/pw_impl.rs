@@ -91,7 +91,7 @@ pub fn list_audio_sinks() -> Vec<AudioDevice> {
 const ENUMERATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long a timed-out enumeration worker gets to honour the quit
-/// message before its join is handed to a detached reaper.
+/// message before it is left to exit on its own.
 const ENUMERATE_QUIT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Why a PipeWire sink enumeration produced no list.
@@ -113,11 +113,29 @@ enum EnumerateError {
     /// The worker died without reporting (panicked).
     #[error("the enumeration worker exited without a result")]
     WorkerDied,
+    /// An earlier worker is still unresolved; nothing new was spawned.
+    #[error("a previous PipeWire enumeration is still in flight")]
+    Busy,
 }
 
 impl EnumerateError {
     fn setup(stage: &'static str) -> impl FnOnce(pipewire::Error) -> Self {
         move |source| Self::Setup { stage, source }
+    }
+}
+
+/// Set while an enumeration worker is alive. A worker that is wedged
+/// inside a blocking PipeWire setup call outlives its caller's timeout;
+/// while it does, further refreshes must not stack more workers on top
+/// of it (CR round 2 on PR #795).
+static ENUMERATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Clears `ENUMERATE_IN_FLIGHT` when the worker exits, panic included.
+struct InFlightGuard;
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        ENUMERATE_IN_FLIGHT.store(false, Ordering::Release);
     }
 }
 
@@ -128,15 +146,27 @@ impl EnumerateError {
 /// panel build) waits at most `ENUMERATE_TIMEOUT`: a wedged or absent
 /// daemon must not freeze startup, and "Default" alone is a usable answer
 /// (#771). On timeout the worker's main loop is told to quit and the
-/// thread is joined — through a detached reaper if it is still stuck
-/// inside a blocking setup call — so repeated refreshes cannot
-/// accumulate live PipeWire loops.
+/// thread is joined. A worker still stuck inside a blocking setup call
+/// (where the quit message cannot reach it) is left to exit on its own;
+/// it holds `ENUMERATE_IN_FLIGHT` until then, so the process never has
+/// more than one enumeration worker — a later refresh returns `Busy`.
 fn enumerate_sinks_bounded() -> Result<Vec<AudioDevice>, EnumerateError> {
+    if ENUMERATE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(EnumerateError::Busy);
+    }
+    let guard = InFlightGuard;
+
     let (tx, rx) = std::sync::mpsc::channel();
     let (quit_tx, quit_rx) = pipewire::channel::channel::<Quit>();
     let worker = std::thread::Builder::new()
         .name("pw-enumerate".to_string())
         .spawn(move || {
+            // The flag now belongs to the worker: it clears when this
+            // thread exits, however late that is.
+            let _guard = guard;
             let _ = tx.send(enumerate_sinks(quit_rx));
         })
         .map_err(EnumerateError::Spawn)?;
@@ -155,14 +185,7 @@ fn enumerate_sinks_bounded() -> Result<Vec<AudioDevice>, EnumerateError> {
             if rx.recv_timeout(ENUMERATE_QUIT_GRACE).is_ok() {
                 let _ = worker.join();
             } else {
-                // Still blocked before the loop ran (e.g. in `connect`);
-                // reap it off the caller's thread once it returns.
-                tracing::debug!("pw-enumerate worker ignored quit; reaping detached");
-                let _ = std::thread::Builder::new()
-                    .name("pw-enumerate-reaper".to_string())
-                    .spawn(move || {
-                        let _ = worker.join();
-                    });
+                tracing::debug!("pw-enumerate worker ignored quit; left to exit on its own");
             }
             Err(EnumerateError::TimedOut(ENUMERATE_TIMEOUT))
         }
@@ -628,5 +651,23 @@ mod tests {
     fn test_stop_before_start_returns_not_running() {
         let mut sink = AudioSink::new();
         assert!(matches!(sink.stop(), Err(SinkError::NotRunning)));
+    }
+
+    /// CR round 2 on PR #795 — while one enumeration worker is still
+    /// unresolved (wedged daemon), another refresh must not spawn a
+    /// second one; the caller gets `Busy` and the flag stays set for the
+    /// worker that owns it.
+    #[test]
+    fn enumeration_is_skipped_while_a_worker_is_in_flight() {
+        assert!(
+            ENUMERATE_IN_FLIGHT
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "no other test may hold the in-flight flag"
+        );
+        let result = enumerate_sinks_bounded();
+        assert!(matches!(result, Err(EnumerateError::Busy)), "{result:?}");
+        assert!(ENUMERATE_IN_FLIGHT.load(Ordering::Acquire));
+        ENUMERATE_IN_FLIGHT.store(false, Ordering::Release);
     }
 }
