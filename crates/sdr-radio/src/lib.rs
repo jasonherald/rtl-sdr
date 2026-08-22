@@ -163,7 +163,11 @@ impl RadioModule {
     pub fn new(audio_sample_rate: f64) -> Result<Self, RadioError> {
         let mode = DemodMode::Wfm;
         let demod = create_demodulator(mode)?;
-        let if_chain = IfChain::new()?;
+        let mut if_chain = IfChain::new()?;
+        // The power squelch only tracks the gate here; the exact-zero
+        // mute is applied post-demod in `process` so the imaging taps
+        // can read ungated audio via `pre_gate_audio` (#734).
+        if_chain.set_squelch_mutes_iq(false);
         let af_chain = AfChain::new(demod.config().af_sample_rate, audio_sample_rate)?;
         // Audio-path envelope for smoothing squelch open / close
         // transitions. Runs at the final `audio_sample_rate`
@@ -421,10 +425,23 @@ impl RadioModule {
         self.demod_buf.resize(demod_input, Stereo::default());
         let demod_count = self.demod.process(demod_src, &mut self.demod_buf)?;
 
-        // Stage 3: AF chain (deemphasis + resampling)
+        // Stage 3: AF chain (deemphasis + resampling). It snapshots the
+        // block before its own CTCSS / voice-squelch mute; with the
+        // power-squelch mute moved here (below) that snapshot is fully
+        // ungated — see `pre_gate_audio` (#734).
         let af_count = self
             .af_chain
             .process(&self.demod_buf[..demod_count], output)?;
+
+        // Stage 3.5: power-squelch hard mute. This used to be the IF
+        // chain zeroing IQ before the demod (SDR++ behaviour); it now
+        // happens after the demod so the imaging taps get real audio
+        // while the listener still hears exact silence — FM
+        // discriminators are amplitude-invariant, so the result at the
+        // speaker is identical (#734).
+        if self.if_chain.squelch_active() && !self.if_chain.squelch_open() {
+            output[..af_count].fill(Stereo::default());
+        }
 
         // Diagnostic dump preparation: snapshot the pre-envelope AF
         // amplitude before Stage 4 mutates `output`. The envelope can
@@ -761,6 +778,15 @@ impl RadioModule {
         self.demod.set_stereo(enabled);
     }
 
+    /// Audio of the last [`Self::process`] call *before* any speaker
+    /// gate (power squelch, CTCSS, voice squelch) was applied — for
+    /// decoders such as APT / SSTV whose subcarriers have no speech
+    /// cadence and would otherwise be zeroed by the gates (#734). Same
+    /// length as that call's return value.
+    pub fn pre_gate_audio(&self) -> &[Stereo] {
+        self.af_chain.ungated_output()
+    }
+
     /// Get the current demodulation mode.
     pub fn current_mode(&self) -> DemodMode {
         self.mode
@@ -977,6 +1003,102 @@ mod tests {
             .map(|s| s.l.abs().max(s.r.abs()))
             .fold(0.0_f32, f32::max);
         assert!(peak < 0.01, "squelch should mute output, peak = {peak}");
+    }
+
+    /// FM-modulated audio tone at the NFM IF rate (50 kHz), for the
+    /// pre-gate tests: the demod output is a clean tone the gates would
+    /// otherwise hide.
+    fn fm_tone_iq(count: usize, amplitude: f32) -> Vec<Complex> {
+        const IF_RATE_HZ: f32 = 50_000.0;
+        const TONE_HZ: f32 = 1_000.0;
+        const DEVIATION_HZ: f32 = 3_000.0;
+        let mut phase = 0.0_f32;
+        (0..count)
+            .map(|i| {
+                let t = i as f32 / IF_RATE_HZ;
+                let inst_freq = DEVIATION_HZ * (2.0 * PI * TONE_HZ * t).sin();
+                phase += 2.0 * PI * inst_freq / IF_RATE_HZ;
+                Complex::new(amplitude * phase.cos(), amplitude * phase.sin())
+            })
+            .collect()
+    }
+
+    fn peak(s: &[Stereo]) -> f32 {
+        s.iter()
+            .map(|v| v.l.abs().max(v.r.abs()))
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// #734 — the speaker stays hard-muted while the power squelch is
+    /// closed, but `pre_gate_audio()` must still carry the demodulated
+    /// signal for the APT / SSTV taps.
+    #[test]
+    fn pre_gate_audio_survives_a_closed_power_squelch() {
+        const WEAK_AMPLITUDE: f32 = 0.001;
+        const HIGH_THRESHOLD_DB: f32 = 10.0;
+        const BLOCK: usize = 2_000;
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        radio.set_squelch_enabled(true);
+        radio.set_squelch(HIGH_THRESHOLD_DB);
+
+        let input = fm_tone_iq(BLOCK, WEAK_AMPLITUDE);
+        let mut output = vec![Stereo::default(); radio.max_output_samples(BLOCK)];
+        let count = radio.process(&input, &mut output).unwrap();
+        assert!(count > 0);
+        assert!(
+            !radio.if_chain().squelch_open(),
+            "test premise: gate closed"
+        );
+        // `peak` is non-negative, so `<= 0.0` means exactly zero.
+        assert!(
+            peak(&output[..count]) <= 0.0,
+            "speaker output is hard-muted"
+        );
+
+        let pre_gate = radio.pre_gate_audio();
+        assert_eq!(pre_gate.len(), count);
+        assert!(
+            peak(pre_gate) > 0.0,
+            "pre-gate audio keeps the demodulated tone"
+        );
+    }
+
+    /// #734 — same contract for a closed voice squelch (APT / SSTV tones
+    /// have no speech cadence, so Syllabic / Snr stay closed on them).
+    #[test]
+    fn pre_gate_audio_survives_a_closed_voice_squelch() {
+        use sdr_dsp::voice_squelch::VoiceSquelchMode;
+        // Two seconds at the 50 kHz IF rate: long enough for the
+        // Syllabic envelope filter's start-up transient to decay so the
+        // steady tone reads as "no cadence".
+        const BLOCK: usize = 100_000;
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        // A steady tone has no speech cadence, so Syllabic stays closed.
+        radio
+            .set_voice_squelch_mode(VoiceSquelchMode::Syllabic {
+                threshold: sdr_dsp::voice_squelch::VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+            })
+            .unwrap();
+
+        let input = fm_tone_iq(BLOCK, 1.0);
+        let mut output = vec![Stereo::default(); radio.max_output_samples(BLOCK)];
+        let count = radio.process(&input, &mut output).unwrap();
+        assert!(count > 0);
+        assert!(
+            !radio.voice_squelch_open(),
+            "test premise: voice gate closed"
+        );
+        // `peak` is non-negative, so `<= 0.0` means exactly zero.
+        assert!(
+            peak(&output[..count]) <= 0.0,
+            "speaker output is hard-muted"
+        );
+        assert!(
+            peak(radio.pre_gate_audio()) > 0.0,
+            "pre-gate audio keeps the tone"
+        );
     }
 
     #[test]

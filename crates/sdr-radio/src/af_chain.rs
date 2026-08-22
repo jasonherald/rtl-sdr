@@ -132,6 +132,10 @@ pub struct AfChain {
     /// Mono downmix scratch buffer fed to the detector. Reused
     /// across calls to avoid per-block allocation on the hot path.
     ctcss_mono_buf: Vec<f32>,
+    /// Copy of the last processed block taken *before* the CTCSS /
+    /// voice-squelch zeroing, for consumers that must see the audio
+    /// regardless of the speaker gates (APT / SSTV decoders, #734).
+    ungated_buf: Vec<Stereo>,
     /// Voice-activity squelch (syllabic or SNR). Runs on the
     /// same post-deemph mono downmix as the CTCSS detector and
     /// contributes a second AF-level gate. Unlike CTCSS the
@@ -204,6 +208,7 @@ impl AfChain {
             ctcss_threshold: CTCSS_DEFAULT_THRESHOLD,
             ctcss_detector: None,
             ctcss_mono_buf: Vec::new(),
+            ungated_buf: Vec::new(),
             voice_squelch,
             deemp_buf_l: Vec::new(),
             deemp_out_l: Vec::new(),
@@ -679,6 +684,10 @@ impl AfChain {
                 .as_ref()
                 .is_some_and(|d| !d.is_sustained());
         let voice_closed = self.voice_squelch.mode().is_active() && !self.voice_squelch.is_open();
+        // Keep the ungated block for the imaging taps before muting
+        // the speaker path (#734).
+        self.ungated_buf.clear();
+        self.ungated_buf.extend_from_slice(&output[..resamp_count]);
         if ctcss_closed || voice_closed {
             for s in &mut output[..resamp_count] {
                 *s = Stereo::new(0.0, 0.0);
@@ -686,6 +695,13 @@ impl AfChain {
         }
 
         Ok(resamp_count)
+    }
+
+    /// The last block [`Self::process`] produced, *before* the CTCSS /
+    /// voice-squelch mute was applied to the speaker output. Same
+    /// length as that call's return value; empty before the first call.
+    pub fn ungated_output(&self) -> &[Stereo] {
+        &self.ungated_buf
     }
 }
 
@@ -1149,6 +1165,34 @@ mod tests {
         assert!(
             output.iter().all(|s| s.l == 0.0 && s.r == 0.0),
             "silence in → zero out regardless"
+        );
+    }
+
+    /// #734 — the chain keeps an ungated copy of the block it just
+    /// zeroed for a closed CTCSS / voice gate, so imaging decoders
+    /// (APT / SSTV tones have no speech cadence) still get the audio.
+    #[test]
+    fn test_ungated_output_survives_a_closed_voice_gate() {
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
+        chain
+            .set_voice_squelch_mode(VoiceSquelchMode::Syllabic {
+                threshold: sdr_dsp::voice_squelch::VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+            })
+            .unwrap();
+        // A steady tone has no speech cadence: once the envelope
+        // filter's start-up transient has decayed (the long block), the
+        // Syllabic gate is closed although the input is a clean tone.
+        let input = stereo_tone(VS_LONG_BLOCK_SAMPLES, VS_NORMAL_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_LONG_BLOCK_SAMPLES];
+        let n = chain.process(&input, &mut output).unwrap();
+        assert!(!chain.voice_squelch_open(), "test premise: gate closed");
+        assert!(output[..n].iter().all(|s| s.l == 0.0 && s.r == 0.0));
+
+        let ungated = chain.ungated_output();
+        assert_eq!(ungated.len(), n);
+        assert!(
+            ungated.iter().any(|s| s.l.abs() > 0.0),
+            "ungated copy must keep the tone"
         );
     }
 

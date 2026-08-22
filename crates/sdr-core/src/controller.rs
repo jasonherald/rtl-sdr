@@ -867,9 +867,13 @@ fn apt_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_co
     // any stereo pilot is filtered out by the channel filter).
     // `extend` over a `map` iterator is exact-size, so `Vec`'s
     // internal reserve is precise — no manual `reserve` needed.
+    // Pre-gate audio: the speaker path zeroes on a closed power /
+    // CTCSS / voice squelch, and the APT 2400 Hz subcarrier has no
+    // speech cadence, so the gated buffer would feed the decoder
+    // black lines on every fade (#734).
     state.apt_mono_buf.clear();
     state.apt_mono_buf.extend(
-        state.audio_buf[..audio_count]
+        state.radio.pre_gate_audio()[..audio_count]
             .iter()
             .map(|s| f32::midpoint(s.l, s.r)),
     );
@@ -999,9 +1003,10 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
 
     // Mono downmix. SSTV is mono — averaging L+R is equivalent to
     // either channel for FM-demodulated audio. Mirrors `apt_mono_buf`.
+    // Pre-gate audio for the same reason as the APT tap (#734).
     state.sstv_mono_buf.clear();
     state.sstv_mono_buf.extend(
-        state.audio_buf[..audio_count]
+        state.radio.pre_gate_audio()[..audio_count]
             .iter()
             .map(|s| f32::midpoint(s.l, s.r)),
     );
