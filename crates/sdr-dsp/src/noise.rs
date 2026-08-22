@@ -252,6 +252,11 @@ pub struct PowerSquelch {
     /// `diagnostic_snapshot` for issue #348 investigation; no
     /// behavioral effect.
     last_measured_db: f32,
+    /// Zero the block while the gate is closed (SDR++ behaviour,
+    /// the default). `false` keeps tracking the gate but passes the
+    /// block through so a downstream stage can keep an ungated copy
+    /// and apply the mute itself (#734).
+    mute_closed: bool,
 }
 
 impl PowerSquelch {
@@ -266,7 +271,15 @@ impl PowerSquelch {
             noise_floor_db: NOISE_FLOOR_INITIAL_DB,
             settle_count: 0,
             last_measured_db: NOISE_FLOOR_INITIAL_DB,
+            mute_closed: true,
         }
+    }
+
+    /// Choose whether a closed gate zeroes the block (`true`, the
+    /// SDR++ default) or passes it through while still reporting
+    /// [`Self::is_open`] as `false`. See the `mute_closed` field.
+    pub fn set_mute_closed(&mut self, mute: bool) {
+        self.mute_closed = mute;
     }
 
     /// Returns whether the squelch is currently open (signal above threshold).
@@ -435,9 +448,9 @@ impl PowerSquelch {
             self.level_db
         };
 
-        if measured_db >= threshold_db {
+        if measured_db >= threshold_db || !self.mute_closed {
             output[..input.len()].copy_from_slice(input);
-            self.open = true;
+            self.open = measured_db >= threshold_db;
         } else {
             // Hard-zero the IQ on closed state — FM discriminators
             // are amplitude-invariant (they read atan2 of the phase
@@ -843,6 +856,22 @@ mod tests {
         squelch.process(&input, &mut output).unwrap();
         assert!(squelch.is_open(), "strong signal should open squelch");
         assert!(output[0].re > 0.0, "output should not be zeroed");
+    }
+
+    /// #734 — with IQ muting disabled the gate state is still tracked
+    /// but the block passes through, so a downstream stage can keep an
+    /// ungated copy and apply the mute itself.
+    #[test]
+    fn power_squelch_can_gate_without_muting() {
+        const HIGH_THRESHOLD_DB: f32 = 10.0;
+        const WEAK_AMPLITUDE: f32 = 0.001;
+        let mut sq = PowerSquelch::new(HIGH_THRESHOLD_DB);
+        sq.set_mute_closed(false);
+        let input = vec![Complex::new(WEAK_AMPLITUDE, 0.0); 64];
+        let mut output = vec![Complex::default(); 64];
+        sq.process(&input, &mut output).unwrap();
+        assert!(!sq.is_open(), "gate must still close on a weak block");
+        assert_eq!(output, input, "closed gate must pass IQ through unmuted");
     }
 
     #[test]

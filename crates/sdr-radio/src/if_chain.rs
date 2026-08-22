@@ -152,6 +152,17 @@ impl IfChain {
         self.squelch.set_level(db);
     }
 
+    /// Choose whether a closed squelch zeroes the IQ (default, the
+    /// SDR++ behaviour) or only reports the gate state via
+    /// [`Self::squelch_open`]. `RadioModule` turns muting off and
+    /// applies the exact-zero mute post-demod instead, so the imaging
+    /// taps can read ungated audio (#734). The AGC skip while the gate
+    /// is closed is keyed on the gate state, not on the zeros, so it is
+    /// unaffected.
+    pub fn set_squelch_mutes_iq(&mut self, mute: bool) {
+        self.squelch.set_mute_closed(mute);
+    }
+
     /// Enable or disable auto-squelch (noise floor tracking).
     ///
     /// When enabled, the squelch threshold is automatically derived from
@@ -499,6 +510,24 @@ mod tests {
         for s in &output {
             assert!(s.re.abs() < 1e-10);
         }
+    }
+
+    /// #734 — `RadioModule` moves the exact-zero mute to the AF side so
+    /// the imaging taps can read ungated audio; the IF chain must be
+    /// able to keep the gate state without zeroing IQ.
+    #[test]
+    fn squelch_can_gate_without_muting_iq() {
+        let mut chain = IfChain::new().unwrap();
+        chain.set_squelch_enabled(true);
+        chain.set_squelch_level(10.0); // very high threshold
+        chain.set_squelch_mutes_iq(false);
+
+        let input = vec![Complex::new(0.001, 0.0); 100];
+        let mut output = vec![Complex::default(); 100];
+        chain.process(&input, &mut output).unwrap();
+
+        assert!(!chain.squelch_open(), "gate state is still tracked");
+        assert_eq!(output, input, "IQ passes through unmuted");
     }
 
     #[test]
