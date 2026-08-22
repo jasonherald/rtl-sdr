@@ -2640,6 +2640,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // overlapping passes) won't cost a Viterbi reset.
             if state.lrpt_modulation != mode {
                 state.lrpt_modulation = mode;
+                // The harvest holds back the in-progress row group
+                // (#725); hand it to the viewer before the decoder
+                // goes away.
+                if let Some(decoder) = state.lrpt_decoder.as_mut() {
+                    decoder.flush_pending_lines();
+                }
                 state.lrpt_decoder = None;
                 state.lrpt_init_failed = false;
             }

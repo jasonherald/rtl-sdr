@@ -34,7 +34,7 @@ use std::collections::HashMap;
 
 use sdr_dsp::lrpt::{LrptDemod, LrptMode};
 use sdr_lrpt::LrptPipeline;
-use sdr_lrpt::image::IMAGE_WIDTH;
+use sdr_lrpt::image::{IMAGE_WIDTH, MCU_SIDE};
 use sdr_types::{Complex, DspError};
 
 use crate::lrpt_image::LrptImage;
@@ -107,10 +107,33 @@ impl LrptDecoder {
     /// image is append-only, so a duplicate would show up as a
     /// repeated row in the rendered viewer.
     fn harvest_new_lines(&mut self) {
+        self.harvest(false);
+    }
+
+    /// Push every line the assembler holds, including the row group
+    /// still in progress. For LOS / end of pass, when no further MCUs
+    /// will complete it.
+    pub fn flush_pending_lines(&mut self) {
+        self.harvest(true);
+    }
+
+    /// `place_mcu` grows a channel by a whole 8-row group on that
+    /// group's *first* MCU, and the other 13 packets fill it over the
+    /// next ~1 s. Pushing rows as soon as they exist handed the viewer
+    /// (and the LOS export) 8-row bands holding only the MCUs decoded
+    /// so far (#725). A group is therefore pushed only once the next
+    /// group has started — i.e. the last `MCU_SIDE` rows are held back
+    /// unless `include_in_progress` (the LOS flush).
+    fn harvest(&mut self, include_in_progress: bool) {
         let assembler = self.pipeline.assembler();
         for (&apid, channel) in assembler.channels() {
             let already = self.last_pushed_lines.get(&apid).copied().unwrap_or(0);
-            if channel.lines <= already {
+            let complete = if include_in_progress {
+                channel.lines
+            } else {
+                channel.lines.saturating_sub(MCU_SIDE)
+            };
+            if complete <= already {
                 continue;
             }
             // Track lines actually pushed so that if the bounds
@@ -118,7 +141,7 @@ impl LrptDecoder {
             // un-pushed rows and permanently drop them. Per
             // CodeRabbit round 1 on PR #543.
             let mut pushed = already;
-            for line_idx in already..channel.lines {
+            for line_idx in already..complete {
                 let start = line_idx * IMAGE_WIDTH;
                 let end = start + IMAGE_WIDTH;
                 // Defensive bounds check — `place_mcu` always
@@ -229,6 +252,53 @@ mod tests {
         assert!(
             image.snapshot_channel(APID_TEST).is_none(),
             "reset must clear the shared image",
+        );
+    }
+
+    /// #725 — `place_mcu` grows a channel to the full 8-row group on
+    /// the group's first MCU, while the remaining 13 packets fill it
+    /// over the next ~1 s. Harvesting immediately pushed 8-row bands
+    /// holding only the MCUs decoded so far (slivers in the live
+    /// viewer and the LOS export). A group is pushed once the next
+    /// group has started; `flush_pending_lines` pushes the rest at LOS.
+    #[test]
+    fn harvest_holds_back_the_in_progress_row_group() {
+        let image = LrptImage::new();
+        let mut decoder = LrptDecoder::new(image.clone(), LrptMode::Qpsk).unwrap();
+        let block = [[200_u8; MCU_SIDE]; MCU_SIDE];
+
+        // First MCU of row group 0: the group is in progress.
+        decoder
+            .pipeline
+            .assembler_mut()
+            .place_mcu(APID_TEST, 0, 0, &block);
+        decoder.harvest_new_lines();
+        assert!(
+            image.snapshot_channel(APID_TEST).is_none(),
+            "an in-progress group must not reach the viewer"
+        );
+
+        // Row group 1 starts: group 0 is complete and is pushed.
+        decoder
+            .pipeline
+            .assembler_mut()
+            .place_mcu(APID_TEST, 1, 0, &block);
+        decoder.harvest_new_lines();
+        let snap = image.snapshot_channel(APID_TEST).expect("group 0 pushed");
+        assert_eq!(snap.lines, MCU_SIDE, "exactly one complete group");
+
+        // LOS: the final (possibly partial) group is flushed.
+        decoder.flush_pending_lines();
+        let snap = image.snapshot_channel(APID_TEST).expect("flushed");
+        assert_eq!(snap.lines, 2 * MCU_SIDE);
+        // And a further harvest pushes nothing twice.
+        decoder.harvest_new_lines();
+        assert_eq!(
+            image
+                .snapshot_channel(APID_TEST)
+                .expect("still there")
+                .lines,
+            2 * MCU_SIDE
         );
     }
 }
