@@ -496,38 +496,33 @@ impl RadioModule {
         // Applying the envelope to post-demod audio works for
         // all modulation types uniformly.
         //
-        // Ordering with the hard mute (Stage 4.5): the envelope runs on
-        // the real demod output first so the close edge is a release
-        // ramp rather than a step — hard-zeroing before the envelope
-        // left it nothing to ramp, so only the open edge was ever
-        // smoothed (#738).
+        // Close edge (#738): the envelope runs on the real demod output
+        // so the close is a release ramp rather than a step — the old
+        // order hard-zeroed the block first, leaving nothing to ramp,
+        // so only the open edge was ever smoothed. Once the release has
+        // settled (checked at the *start* of a block, so the block that
+        // crosses the threshold keeps its ramp) the block is hard-muted
+        // to exact silence instead of multiplied by a vanishing gain.
+        // This used to be the IF chain zeroing IQ before the demod
+        // (SDR++ behaviour); it moved after the demod so the imaging
+        // taps get real audio (#734). FM discriminators are
+        // amplitude-invariant, so the result at the speaker is
+        // otherwise identical.
         if self.if_chain.squelch_active() {
-            self.squelch_envelope
-                .set_gate_open(self.if_chain.squelch_open());
-            self.squelch_envelope
-                .process_stereo(&mut output[..af_count]);
+            let open = self.if_chain.squelch_open();
+            self.squelch_envelope.set_gate_open(open);
+            if !open && self.squelch_envelope.settle_if_closed() {
+                output[..af_count].fill(Stereo::default());
+            } else {
+                self.squelch_envelope
+                    .process_stereo(&mut output[..af_count]);
+            }
         } else {
             // Keep the envelope state coherent for when the user
             // re-enables squelch mid-session — force it to fully-
             // open so the first block post-enable doesn't fade in
             // from silence.
             self.squelch_envelope.reset_to_open();
-        }
-
-        // Stage 4.5: power-squelch hard mute once the release has settled.
-        // Runs AFTER the pre-envelope diagnostic snapshot so a closed
-        // squelch is distinguishable from a dead demod in the STAGE_AMP
-        // dump. This used to be the IF chain zeroing IQ before the demod
-        // (SDR++ behaviour); it moved after the demod so the imaging taps
-        // get real audio (#734), and now after the envelope so the
-        // listener hears a ramped close edge followed by exact silence —
-        // FM discriminators are amplitude-invariant, so the result at the
-        // speaker is otherwise identical.
-        if self.if_chain.squelch_active()
-            && !self.if_chain.squelch_open()
-            && self.squelch_envelope.settle_if_closed()
-        {
-            output[..af_count].fill(Stereo::default());
         }
 
         // Diagnostic dump emission. Now that Stage 4 has run, we can
@@ -838,7 +833,6 @@ impl RadioModule {
         &self.if_chain
     }
 
-    /// Get a mutable reference to the IF chain for direct configuration.
     /// Enable or disable the software IF AGC. The preference is kept
     /// across mode switches and only applied in modes whose config
     /// allows it — Raw / LRPT / CW hand the IQ through untouched (#738).
@@ -848,6 +842,7 @@ impl RadioModule {
         self.if_chain.set_software_agc_enabled(enabled && allowed);
     }
 
+    /// Get a mutable reference to the IF chain for direct configuration.
     pub fn if_chain_mut(&mut self) -> &mut IfChain {
         &mut self.if_chain
     }
@@ -1536,10 +1531,24 @@ mod tests {
     /// exact silence once the release has settled.
     #[test]
     fn squelch_close_edge_is_ramped_then_exactly_silent() {
+        /// IQ amplitude that sits well above the squelch threshold
+        /// (−6 dBFS vs −30 dB) so the gate opens on the first block.
         const STRONG_AMPLITUDE: f32 = 0.5;
+        /// IQ amplitude 30 dB below the threshold so the gate closes
+        /// on the first weak block (the FM tone is still present, so
+        /// the demod keeps producing audio for the ramp to act on).
         const WEAK_AMPLITUDE: f32 = 0.001;
+        /// Manual threshold between the two amplitudes; the production
+        /// default is −100 dB (effectively open), which would never
+        /// close here.
         const THRESHOLD_DB: f32 = -30.0;
+        /// ~42 ms of IQ at the 48 kHz NFM IF rate — a typical DSP block,
+        /// short enough that the release is still audibly ramping when
+        /// the block ends.
         const BLOCK: usize = 2_000;
+        /// Upper bound on closed blocks to reach exact silence: 50 ×
+        /// 42 ms ≈ 2 s, far beyond the release time constant, so a
+        /// settle that never happens fails the test rather than hides.
         const SETTLE_BLOCKS: usize = 50;
         let mut radio = RadioModule::with_default_rate().unwrap();
         radio.set_mode(DemodMode::Nfm).unwrap();
@@ -1612,5 +1621,56 @@ mod tests {
         radio.set_software_agc_enabled(false);
         radio.set_mode(DemodMode::Wfm).unwrap();
         assert!(!radio.if_chain().software_agc_enabled());
+    }
+
+    /// Codacy on PR #800 — the block in which the release crosses the
+    /// settle threshold must keep its ramp: the last audible block ends
+    /// below −60 dB of the open level, so exact silence never starts
+    /// with a step.
+    #[test]
+    fn squelch_release_reaches_silence_without_a_step() {
+        /// Opens the gate on the first block (see the sibling test).
+        const STRONG_AMPLITUDE: f32 = 0.5;
+        /// Closes the gate while the demod still produces audio.
+        const WEAK_AMPLITUDE: f32 = 0.001;
+        /// Manual threshold between the two amplitudes.
+        const THRESHOLD_DB: f32 = -30.0;
+        /// ~0.4 s of IQ — a block long enough for the release to settle
+        /// *inside* it, so zeroing the whole block (the bug) would step
+        /// from full level to silence.
+        const BLOCK: usize = 20_000;
+        /// Upper bound on closed blocks: 50 × 0.4 s ≫ the release time
+        /// constant, so a release that never settles fails loudly.
+        const SETTLE_BLOCKS: usize = 50;
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        radio.set_squelch_enabled(true);
+        radio.set_squelch(THRESHOLD_DB);
+        let mut output = vec![Stereo::default(); radio.max_output_samples(BLOCK)];
+
+        let strong = fm_tone_iq(BLOCK, STRONG_AMPLITUDE);
+        let mut open_peak = 0.0_f32;
+        for _ in 0..5 {
+            let count = radio.process(&strong, &mut output).unwrap();
+            open_peak = peak(&output[..count]);
+        }
+        assert!(radio.if_chain().squelch_open() && open_peak > 0.0);
+
+        let weak = fm_tone_iq(BLOCK, WEAK_AMPLITUDE);
+        let mut last_audible_tail = f32::NAN;
+        let mut silent = false;
+        for _ in 0..SETTLE_BLOCKS {
+            let count = radio.process(&weak, &mut output).unwrap();
+            if peak(&output[..count]) <= 0.0 {
+                silent = true;
+                break;
+            }
+            last_audible_tail = output[count - 1].l.abs().max(output[count - 1].r.abs());
+        }
+        assert!(silent, "must reach exact silence");
+        assert!(
+            last_audible_tail < open_peak * 1e-3,
+            "last audible block must end below -60 dB before silence, got {last_audible_tail} (open {open_peak})"
+        );
     }
 }
