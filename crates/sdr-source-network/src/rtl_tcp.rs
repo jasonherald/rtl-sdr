@@ -37,6 +37,7 @@
 //! is responsible for coalescing intents before driving `set_*`. Matches
 //! upstream GQRX/SDR++ behavior.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -101,6 +102,17 @@ const CONNECT_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 /// stack buffer the data pump reads into. Keeps the read-chunk and
 /// initial-allocation policy in one place so they can't drift.
 const RECV_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Upper-16-bit field of a `SetIfGain` param is the 1-based IF stage;
+/// the lower 16 bits carry the gain (tenths of dB). Mirrors the server's
+/// `dispatch.rs` and upstream rtl_tcp.c.
+const IF_GAIN_STAGE_SHIFT_BITS: u32 = 16;
+
+/// Sticky replay keeps one `SetIfGain` value per stage.
+const IF_GAIN_STAGES: usize = sdr_pipeline::source_manager::RTL_TCP_IF_GAIN_STAGES;
+
+/// Granularity at which the backoff sleep re-checks the shutdown flag.
+const RETRY_SLEEP_STEP: Duration = Duration::from_millis(100);
 
 /// Metadata parsed from the server's `dongle_info_t` header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +260,11 @@ pub struct RtlTcpConfig {
     /// network hiccup but still fast enough that a yanked cable doesn't
     /// leave the UI frozen in Connected state until the kernel
     /// keepalive finally fires.
+    ///
+    /// **Applies to the raw pass-through (`Codec::None`) only.** A framed
+    /// codec (LZ4) cannot resume after a partial read, so those sessions
+    /// tear down for reconnect on the first timeout regardless of this
+    /// value (#743).
     pub max_consecutive_timeouts: u32,
 
     /// Timeout for each TCP `connect()` attempt. Default 10 s. Without
@@ -416,7 +433,7 @@ struct SharedState {
     /// because it's accessed from two threads; a lock-free ring buffer
     /// would be lower overhead but adds unsafe, and this matches the
     /// simplicity of the sibling `NetworkSource`.
-    rx_buf: Mutex<Vec<u8>>,
+    rx_buf: Mutex<VecDeque<u8>>,
 
     /// Running count of bytes dropped to keep `rx_buf` under its cap,
     /// for observability / UI "consumer too slow" indicators.
@@ -442,6 +459,14 @@ struct SharedState {
     /// can share it without racing. Replaced on every reconnect.
     command_sink: Mutex<Option<TcpStream>>,
 
+    /// Clone of the raw socket held for the whole session, so
+    /// `stop_manager` has a cancellation handle that does NOT go through
+    /// the `command_sink` mutex: it unblocks a manager parked in the
+    /// handshake reads (a peer that accepts and sends nothing) and a
+    /// replay `write_all` stalled on a non-reading peer while it holds
+    /// the sink lock (#745). Cleared at session end by `run_data_pump`.
+    pending_stream: Mutex<Option<TcpStream>>,
+
     /// Latest values for each sticky command op, replayed on reconnect
     /// so the server state matches what the UI thinks it has set.
     /// Using AtomicU32 rather than a HashMap since the op set is small
@@ -462,7 +487,11 @@ struct SharedState {
     // common setters. Addresses CodeRabbit round 5 concern that these
     // previously returned Ok without persisting.
     last_testmode: AtomicU32,
-    last_if_gain: AtomicU32,
+    /// One `SetIfGain` param per stage (index `stage - 1`); the stage
+    /// number lives in the param's upper 16 bits so the raw value can be
+    /// replayed verbatim. `if_gain_mask` says which stages are recorded.
+    last_if_gain: [AtomicU32; IF_GAIN_STAGES],
+    if_gain_mask: AtomicU32,
     last_rtl_xtal: AtomicU32,
     last_tuner_xtal: AtomicU32,
     // Sentinel: bit 0 of `replay_mask` is set once ANY value has been
@@ -478,8 +507,9 @@ impl SharedState {
             shutdown: AtomicBool::new(false),
             state: Mutex::new(ConnectionState::Disconnected),
             tuner: Mutex::new(None),
-            rx_buf: Mutex::new(Vec::with_capacity(RECV_CHUNK_BYTES)),
+            rx_buf: Mutex::new(VecDeque::with_capacity(RECV_CHUNK_BYTES)),
             command_sink: Mutex::new(None),
+            pending_stream: Mutex::new(None),
             last_center_freq_hz: AtomicU32::new(0),
             last_sample_rate_hz: AtomicU32::new(0),
             last_gain_mode: AtomicU32::new(0),
@@ -496,7 +526,8 @@ impl SharedState {
             cached_sample_rate_bits: AtomicU64::new(DEFAULT_CLIENT_SAMPLE_RATE_HZ.to_bits()),
             cached_frequency_bits: AtomicU64::new(DEFAULT_CLIENT_CENTER_FREQ_HZ.to_bits()),
             last_testmode: AtomicU32::new(0),
-            last_if_gain: AtomicU32::new(0),
+            last_if_gain: std::array::from_fn(|_| AtomicU32::new(0)),
+            if_gain_mask: AtomicU32::new(0),
             last_rtl_xtal: AtomicU32::new(0),
             last_tuner_xtal: AtomicU32::new(0),
         }
@@ -512,7 +543,7 @@ impl SharedState {
 /// bytes would leave `rx` starting mid-pair — subsequent `read_samples`
 /// calls would then pair `Q[n]` with `I[n+1]`, phase-shifting the
 /// stream until another odd drop happened to realign it.
-fn append_with_cap_inner(rx: &mut Vec<u8>, chunk: &[u8]) -> usize {
+fn append_with_cap_inner(rx: &mut VecDeque<u8>, chunk: &[u8]) -> usize {
     let desired_total = rx.len().saturating_add(chunk.len());
     let raw_excess = desired_total.saturating_sub(RX_BUFFER_SOFT_CAP_BYTES);
     // Round up to even so we never split an I/Q pair.
@@ -522,7 +553,7 @@ fn append_with_cap_inner(rx: &mut Vec<u8>, chunk: &[u8]) -> usize {
     rx.drain(..drop_from_rx);
 
     let drop_from_chunk = total_drop.saturating_sub(drop_from_rx).min(chunk.len());
-    rx.extend_from_slice(&chunk[drop_from_chunk..]);
+    rx.extend(chunk[drop_from_chunk..].iter().copied());
     total_drop
 }
 
@@ -537,7 +568,7 @@ fn append_with_cap_inner(rx: &mut Vec<u8>, chunk: &[u8]) -> usize {
 ///
 /// When the buffer drains to below half-cap the flag rearms, so a
 /// subsequent stall will log again.
-fn append_with_cap_to_shared(shared: &SharedState, rx: &mut Vec<u8>, chunk: &[u8]) {
+fn append_with_cap_to_shared(shared: &SharedState, rx: &mut VecDeque<u8>, chunk: &[u8]) {
     let dropped = append_with_cap_inner(rx, chunk);
     if dropped > 0 {
         shared
@@ -602,15 +633,18 @@ impl RtlTcpSource {
     /// Callers should prefer the typed setters (`set_center_freq_hz`,
     /// etc.) — this is the low-level escape hatch used by the setters.
     pub fn send_command(&self, cmd: Command) -> Result<(), SourceError> {
-        // Remember the value for reconnect-replay before actually sending
-        // so we don't lose it if the write happens to race a reconnect.
-        self.record_command(cmd);
-
+        // Take the sink lock FIRST, then record: replay state and the
+        // wire write share one serialization point, so two concurrent
+        // gain setters can't update `replay_mask` in one order and hit
+        // the server in the other (CR round 2 on PR #792). Recording
+        // still happens before the write so a value isn't lost if the
+        // write races a reconnect.
         let mut sink = self
             .shared
             .command_sink
             .lock()
             .map_err(|_| SourceError::NotRunning)?;
+        self.record_command(cmd);
         let Some(stream) = sink.as_mut() else {
             // Not connected yet. Not an error — manager will replay on
             // reconnect via `record_command` above.
@@ -637,27 +671,71 @@ impl RtlTcpSource {
         // return `Ok(())` without actually being sent, because the
         // command sink wasn't up yet — silent loss. Now every op
         // survives the connect / reconnect cycle.
+        //
+        // `SetTunerGain` and `SetGainByIndex` both land on the server's
+        // `set_tuner_gain`; replaying both in table order let a stale
+        // index overwrite a newer dB value after a reconnect (#745).
+        // Recording one clears the other's replay bit — the same
+        // sibling-clearing the controller's reopen path does.
+        let sibling_bit = match cmd.op {
+            CommandOp::SetTunerGain => Some(u32::from((CommandOp::SetGainByIndex as u8) - 1)),
+            CommandOp::SetGainByIndex => Some(u32::from((CommandOp::SetTunerGain as u8) - 1)),
+            _ => None,
+        };
+        // IF gain is per stage (upper 16 bits of the param, 1-based);
+        // one slot collapsed every stage into the last write (#745).
+        if cmd.op == CommandOp::SetIfGain {
+            let stage = (cmd.param >> IF_GAIN_STAGE_SHIFT_BITS) as usize;
+            if (1..=IF_GAIN_STAGES).contains(&stage) {
+                self.shared.last_if_gain[stage - 1].store(cmd.param, Ordering::Relaxed);
+                self.shared
+                    .if_gain_mask
+                    .fetch_or(1u32 << (stage - 1), Ordering::Relaxed);
+                let bit = u32::from((cmd.op as u8) - 1);
+                self.shared
+                    .replay_mask
+                    .fetch_or(1u32 << bit, Ordering::Relaxed);
+            } else {
+                tracing::debug!(
+                    stage,
+                    "SetIfGain stage out of range; not recorded for replay"
+                );
+            }
+            return;
+        }
+        // `SetIfGain` returned above; its per-stage slots are not in
+        // this table, so the arm is `None` rather than a dead sentinel.
         let slot = match cmd.op {
-            CommandOp::SetCenterFreq => &self.shared.last_center_freq_hz,
-            CommandOp::SetSampleRate => &self.shared.last_sample_rate_hz,
-            CommandOp::SetGainMode => &self.shared.last_gain_mode,
-            CommandOp::SetTunerGain => &self.shared.last_tuner_gain,
-            CommandOp::SetFreqCorrection => &self.shared.last_ppm,
-            CommandOp::SetIfGain => &self.shared.last_if_gain,
-            CommandOp::SetTestMode => &self.shared.last_testmode,
-            CommandOp::SetAgcMode => &self.shared.last_agc_mode,
-            CommandOp::SetDirectSampling => &self.shared.last_direct_sampling,
-            CommandOp::SetOffsetTuning => &self.shared.last_offset_tuning,
-            CommandOp::SetRtlXtal => &self.shared.last_rtl_xtal,
-            CommandOp::SetTunerXtal => &self.shared.last_tuner_xtal,
-            CommandOp::SetGainByIndex => &self.shared.last_gain_by_index,
-            CommandOp::SetBiasTee => &self.shared.last_bias_tee,
+            CommandOp::SetCenterFreq => Some(&self.shared.last_center_freq_hz),
+            CommandOp::SetSampleRate => Some(&self.shared.last_sample_rate_hz),
+            CommandOp::SetGainMode => Some(&self.shared.last_gain_mode),
+            CommandOp::SetTunerGain => Some(&self.shared.last_tuner_gain),
+            CommandOp::SetFreqCorrection => Some(&self.shared.last_ppm),
+            CommandOp::SetIfGain => None,
+            CommandOp::SetTestMode => Some(&self.shared.last_testmode),
+            CommandOp::SetAgcMode => Some(&self.shared.last_agc_mode),
+            CommandOp::SetDirectSampling => Some(&self.shared.last_direct_sampling),
+            CommandOp::SetOffsetTuning => Some(&self.shared.last_offset_tuning),
+            CommandOp::SetRtlXtal => Some(&self.shared.last_rtl_xtal),
+            CommandOp::SetTunerXtal => Some(&self.shared.last_tuner_xtal),
+            CommandOp::SetGainByIndex => Some(&self.shared.last_gain_by_index),
+            CommandOp::SetBiasTee => Some(&self.shared.last_bias_tee),
+        };
+        let Some(slot) = slot else {
+            return;
         };
         slot.store(cmd.param, Ordering::Relaxed);
-        let bit = u32::from((cmd.op as u8) - 1);
-        self.shared
-            .replay_mask
-            .fetch_or(1u32 << bit, Ordering::Relaxed);
+        let own_bit = 1u32 << ((cmd.op as u8) - 1);
+        let sibling_clear = sibling_bit.map_or(u32::MAX, |bit| !(1u32 << bit));
+        // Single read-modify-write: clear the sibling and set our own bit
+        // together, so two concurrent gain setters can't interleave into
+        // "both bits set" (CR round 1 on PR #792).
+        let _ =
+            self.shared
+                .replay_mask
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mask| {
+                    Some((mask & sibling_clear) | own_bit)
+                });
     }
 
     /// Convenience typed setters — each one round-trips through
@@ -792,15 +870,39 @@ impl RtlTcpSource {
 
     fn stop_manager(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
-        // Close the current socket so any blocked read returns fast.
-        if let Ok(mut sink) = self.shared.command_sink.lock() {
-            if let Some(s) = sink.take() {
-                let _ = s.shutdown(std::net::Shutdown::Both);
-            }
+        // Close the socket through the session cancel handle FIRST: it is
+        // guarded by its own mutex, so this works even while
+        // `replay_sticky_commands` / `send_command` hold `command_sink`
+        // in a blocked `write_all` against a non-reading peer — the
+        // shutdown makes that write fail, which releases the sink lock
+        // for the teardown below (#745).
+        if let Ok(mut pending) = self.shared.pending_stream.lock()
+            && let Some(s) = pending.take()
+        {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        if let Ok(mut sink) = self.shared.command_sink.lock()
+            && let Some(s) = sink.take()
+        {
+            let _ = s.shutdown(std::net::Shutdown::Both);
         }
         if let Some(h) = self.manager.take() {
             let _ = h.join();
         }
+        // The manager leaves terminal states (Failed / AuthRequired /
+        // ...) in place when it returns early; after an explicit stop
+        // the public view must read Disconnected with no tuner (#745).
+        set_state(&self.shared, ConnectionState::Disconnected);
+        if let Ok(mut tuner) = self.shared.tuner.lock() {
+            *tuner = None;
+        }
+    }
+
+    /// Bytes dropped from the receive buffer so far to keep it under
+    /// [`RX_BUFFER_SOFT_CAP_BYTES`] — a "consumer too slow" indicator.
+    #[must_use]
+    pub fn rx_dropped_bytes(&self) -> u64 {
+        self.shared.rx_dropped_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -846,6 +948,10 @@ fn connection_manager(host: String, port: u16, shared: Arc<SharedState>, config:
                 // run_data_pump returned Ok — connection dropped transiently.
             }
             Err(e) => {
+                // A failed handshake drops its stream; remove its clone.
+                // Successful sessions keep it as the cancel handle until
+                // `run_data_pump` clears it at session end.
+                clear_pending_stream(&shared);
                 tracing::warn!(%e, host = %host, port, attempt, "rtl_tcp connect failed");
                 // Route each terminal error-kind to its
                 // dedicated `ConnectionState` variant so the UI
@@ -1014,6 +1120,30 @@ fn attempt_connect(
     // cancellation hook, so we let the helper finish naturally after
     // shutdown and just ignore its result.
     let stream = connect_cancellable(addrs, config.connect_timeout, &shared.shutdown)?;
+
+    // Let `stop_manager` cut the handshake reads short (#745).
+    match stream.try_clone() {
+        Ok(clone) => {
+            if let Ok(mut pending) = shared.pending_stream.lock() {
+                *pending = Some(clone);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%e, "rtl_tcp: could not clone the socket for stop(); a silent peer may delay stop by the read timeout");
+        }
+    }
+    // `stop_manager` sets `shutdown` and then takes `pending_stream`. If
+    // it ran between `connect_cancellable`'s last poll and the publish
+    // above, it found nothing to close and is already waiting in
+    // `join()` — so re-check here rather than walking into the handshake
+    // reads with a clone nobody will shut down.
+    if shared.shutdown.load(Ordering::Relaxed) {
+        clear_pending_stream(shared);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        return Err(SourceError::Io(std::io::Error::from(
+            std::io::ErrorKind::Interrupted,
+        )));
+    }
 
     stream.set_read_timeout(Some(config.data_read_timeout))?;
     if let Err(e) = set_keepalive(&stream, true) {
@@ -1275,6 +1405,8 @@ fn attempt_connect(
     if let Ok(mut slot) = shared.command_sink.lock() {
         *slot = Some(sink);
     }
+    // `pending_stream` stays populated for the session as the lock-free
+    // cancellation handle (see its field doc).
 
     Ok(HandshakeOutcome { stream, codec })
 }
@@ -1361,8 +1493,18 @@ fn run_data_pump(
     //
     // Read timeout was installed in `attempt_connect` on the
     // underlying TcpStream; `Decoder::Lz4` delegates its `read()`
-    // to the inner stream so `SO_RCVTIMEO` still enforces the
-    // stall-detection path below unchanged.
+    // to the inner stream so `SO_RCVTIMEO` still fires. BUT a framed
+    // decoder cannot resume after a timeout: its `read_exact` has
+    // already consumed part of a header/body when `SO_RCVTIMEO`
+    // returns, so retrying on the same decoder restarts mid-frame and
+    // surfaces as terminal `InvalidData`. For framed codecs the first
+    // timeout is therefore a teardown-and-reconnect (#743); only the
+    // raw pass-through tolerates `max_consecutive_timeouts`.
+    let tolerated_timeouts = if codec == Codec::None {
+        config.max_consecutive_timeouts
+    } else {
+        1
+    };
     let mut reader = Decoder::new(codec, stream);
     let mut buf = [0u8; RECV_CHUNK_BYTES];
     let mut consecutive_timeouts: u32 = 0;
@@ -1394,7 +1536,7 @@ fn run_data_pump(
                 // can be a transient stall; repeated timeouts mean the
                 // peer is dead.
                 consecutive_timeouts = consecutive_timeouts.saturating_add(1);
-                if consecutive_timeouts >= config.max_consecutive_timeouts {
+                if consecutive_timeouts >= tolerated_timeouts {
                     tracing::info!(
                         consecutive_timeouts,
                         "rtl_tcp stream stalled, breaking out for reconnect"
@@ -1428,10 +1570,11 @@ fn run_data_pump(
     }
 
     // Drop the command sink so subsequent send_command calls stop
-    // writing into a dead stream.
+    // writing into a dead stream, and the session cancel handle with it.
     if let Ok(mut sink) = shared.command_sink.lock() {
         *sink = None;
     }
+    clear_pending_stream(shared);
     // Clear any buffered I/Q so the next successful session doesn't
     // rewind the consumer with pre-drop samples from the previous
     // server. Stale samples are useless for a live SDR; the user wants
@@ -1448,22 +1591,29 @@ fn run_data_pump(
 }
 
 fn replay_sticky_commands(shared: &Arc<SharedState>) {
-    let mask = shared.replay_mask.load(Ordering::Relaxed);
-    let replay_bit = |bit: u32| mask & (1u32 << bit) != 0;
     let Ok(mut sink) = shared.command_sink.lock() else {
         return;
     };
     let Some(stream) = sink.as_mut() else {
         return;
     };
+    // Snapshot the masks only while holding the sink lock: setters record
+    // under the same lock, so a gain written while replay waited for it
+    // cannot leave a stale sibling in the mask we act on (CR round 3 on
+    // PR #792).
+    let mask = shared.replay_mask.load(Ordering::Relaxed);
+    let replay_bit = |bit: u32| mask & (1u32 << bit) != 0;
 
+    let if_gain_mask = shared.if_gain_mask.load(Ordering::Relaxed);
+    let if_gain_ops = (0..IF_GAIN_STAGES)
+        .filter(|stage_idx| if_gain_mask & (1u32 << stage_idx) != 0)
+        .map(|stage_idx| (CommandOp::SetIfGain, &shared.last_if_gain[stage_idx]));
     let ops = [
         (CommandOp::SetCenterFreq, &shared.last_center_freq_hz),
         (CommandOp::SetSampleRate, &shared.last_sample_rate_hz),
         (CommandOp::SetGainMode, &shared.last_gain_mode),
         (CommandOp::SetTunerGain, &shared.last_tuner_gain),
         (CommandOp::SetFreqCorrection, &shared.last_ppm),
-        (CommandOp::SetIfGain, &shared.last_if_gain),
         (CommandOp::SetTestMode, &shared.last_testmode),
         (CommandOp::SetAgcMode, &shared.last_agc_mode),
         (CommandOp::SetDirectSampling, &shared.last_direct_sampling),
@@ -1473,7 +1623,21 @@ fn replay_sticky_commands(shared: &Arc<SharedState>) {
         (CommandOp::SetGainByIndex, &shared.last_gain_by_index),
         (CommandOp::SetBiasTee, &shared.last_bias_tee),
     ];
-    for (op, slot) in ops {
+    // IF gain stages go where `SetIfGain` sits in opcode order — before
+    // the first op with a higher opcode — one command per recorded
+    // stage. Derived from the table so a reorder cannot silently move
+    // the insertion point.
+    let if_gain_at = ops
+        .iter()
+        .position(|(op, _)| (*op as u8) > (CommandOp::SetIfGain as u8))
+        .unwrap_or(ops.len());
+    let (head, tail) = ops.split_at(if_gain_at);
+    for (op, slot) in head
+        .iter()
+        .copied()
+        .chain(if_gain_ops)
+        .chain(tail.iter().copied())
+    {
         let bit = u32::from((op as u8) - 1);
         if !replay_bit(bit) {
             continue;
@@ -1502,12 +1666,18 @@ fn backoff_delay(attempt: u32) -> Duration {
 }
 
 fn sleep_until(deadline: Instant, shutdown: &AtomicBool) {
-    let step = Duration::from_millis(100);
+    let step = RETRY_SLEEP_STEP;
     while Instant::now() < deadline {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
         thread::sleep(step.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn clear_pending_stream(shared: &SharedState) {
+    if let Ok(mut pending) = shared.pending_stream.lock() {
+        *pending = None;
     }
 }
 
@@ -1750,7 +1920,10 @@ impl Source for RtlTcpSource {
             last_bias_tee: self.shared.last_bias_tee.load(Ordering::Relaxed),
             last_gain_by_index: self.shared.last_gain_by_index.load(Ordering::Relaxed),
             last_testmode: self.shared.last_testmode.load(Ordering::Relaxed),
-            last_if_gain: self.shared.last_if_gain.load(Ordering::Relaxed),
+            last_if_gain: std::array::from_fn(|i| {
+                self.shared.last_if_gain[i].load(Ordering::Relaxed)
+            }),
+            if_gain_mask: self.shared.if_gain_mask.load(Ordering::Relaxed),
             last_rtl_xtal: self.shared.last_rtl_xtal.load(Ordering::Relaxed),
             last_tuner_xtal: self.shared.last_tuner_xtal.load(Ordering::Relaxed),
         })
@@ -1796,9 +1969,12 @@ impl Source for RtlTcpSource {
         self.shared
             .last_testmode
             .store(snapshot.last_testmode, Ordering::Relaxed);
+        for (slot, value) in self.shared.last_if_gain.iter().zip(snapshot.last_if_gain) {
+            slot.store(value, Ordering::Relaxed);
+        }
         self.shared
-            .last_if_gain
-            .store(snapshot.last_if_gain, Ordering::Relaxed);
+            .if_gain_mask
+            .store(snapshot.if_gain_mask, Ordering::Relaxed);
         self.shared
             .last_rtl_xtal
             .store(snapshot.last_rtl_xtal, Ordering::Relaxed);
@@ -1892,7 +2068,7 @@ mod tests {
 
     #[test]
     fn append_with_cap_drops_oldest_when_full() {
-        let mut rx = vec![0u8; RX_BUFFER_SOFT_CAP_BYTES - 10];
+        let mut rx: VecDeque<u8> = VecDeque::from(vec![0u8; RX_BUFFER_SOFT_CAP_BYTES - 10]);
         // Mark the tail so we can verify what survives.
         rx[RX_BUFFER_SOFT_CAP_BYTES - 11] = 0xAA;
         let incoming = vec![0xFFu8; 100]; // 100 bytes incoming — need to drop 90
@@ -1900,13 +2076,13 @@ mod tests {
         assert_eq!(dropped, 90);
         assert_eq!(rx.len(), RX_BUFFER_SOFT_CAP_BYTES);
         // Tail should be the 100 new 0xFF bytes.
-        assert!(rx[rx.len() - 100..].iter().all(|&b| b == 0xFF));
+        assert!(rx.range(rx.len() - 100..).all(|&b| b == 0xFF));
     }
 
     #[test]
     fn append_with_cap_handles_oversized_chunk() {
         // Chunk larger than the cap: keep only the tail of the chunk.
-        let mut rx = Vec::new();
+        let mut rx: VecDeque<u8> = VecDeque::new();
         let mut big = vec![0u8; RX_BUFFER_SOFT_CAP_BYTES + 1000];
         // Mark the tail so we can verify it survives.
         let len = big.len();
@@ -1914,7 +2090,7 @@ mod tests {
         let dropped = append_with_cap_inner(&mut rx, &big);
         assert_eq!(dropped, 1000);
         assert_eq!(rx.len(), RX_BUFFER_SOFT_CAP_BYTES);
-        assert_eq!(*rx.last().unwrap(), 0xAB);
+        assert_eq!(*rx.back().unwrap(), 0xAB);
     }
 
     #[test]
@@ -1927,7 +2103,7 @@ mod tests {
         // Mark the I byte of the pair that should survive after drop so
         // we can verify it ends up at rx[0] (still an I position, not
         // shifted into a Q slot).
-        let mut rx = vec![0u8; RX_BUFFER_SOFT_CAP_BYTES];
+        let mut rx: VecDeque<u8> = VecDeque::from(vec![0u8; RX_BUFFER_SOFT_CAP_BYTES]);
         rx[0] = 0x11; // I of dropped pair 0
         rx[1] = 0x12; // Q of dropped pair 0
         rx[2] = 0xAA; // I of surviving pair 1 — must land at rx[0] post-drop
@@ -1945,7 +2121,7 @@ mod tests {
 
     #[test]
     fn append_with_cap_no_drop_below_cap() {
-        let mut rx = vec![0u8; 1000];
+        let mut rx: VecDeque<u8> = VecDeque::from(vec![0u8; 1000]);
         let incoming = vec![0xFFu8; 500];
         let dropped = append_with_cap_inner(&mut rx, &incoming);
         assert_eq!(dropped, 0);
@@ -2088,7 +2264,7 @@ mod tests {
         // run_data_pump takes on disconnect.
         let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         if let Ok(mut rx) = src.shared.rx_buf.lock() {
-            rx.extend_from_slice(&[0u8; 1024]);
+            rx.extend(&[0u8; 1024]);
         }
         src.shared.rx_in_overflow.store(true, Ordering::Relaxed);
         if let Ok(mut sink) = src.shared.command_sink.lock() {
@@ -3201,7 +3377,7 @@ mod tests {
         let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         // 128 is midscale zero, 255 is +1 - small epsilon, 0 is -1.
         if let Ok(mut rx) = src.shared.rx_buf.lock() {
-            rx.extend_from_slice(&[128, 128, 255, 0, 0, 255]);
+            rx.extend(&[128, 128, 255, 0, 0, 255]);
         }
         let mut out = [Complex::default(); 3];
         // Call read_samples via the trait impl, matching public API.
@@ -3225,7 +3401,7 @@ mod tests {
         // rather than produce half a sample.
         let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
         if let Ok(mut rx) = src.shared.rx_buf.lock() {
-            rx.extend_from_slice(&[128, 128, 200]); // 1.5 pairs
+            rx.extend(&[128, 128, 200]); // 1.5 pairs
         }
         let mut out = [Complex::default(); 2];
         let mut src = src;
@@ -3508,12 +3684,22 @@ mod tests {
             CommandOp::SetBiasTee,
         ];
         for op in all_ops {
-            src.record_command(Command { op, param: 42 });
+            // `SetIfGain` carries its 1-based stage in the upper 16
+            // bits; stage 0 is rejected, so give it a real stage.
+            let param = if op == CommandOp::SetIfGain {
+                (1 << IF_GAIN_STAGE_SHIFT_BITS) | 0x2a
+            } else {
+                42
+            };
+            src.record_command(Command { op, param });
         }
         let mask = src.shared.replay_mask.load(Ordering::Relaxed);
         // Every op from 0x01..=0x0e should have its bit set (bit index
-        // = opcode - 1), so the low 14 bits should all be 1.
-        assert_eq!(mask & 0x3fff, 0x3fff, "mask={mask:#x}");
+        // = opcode - 1) — except `SetTunerGain`, whose replay bit the
+        // later `SetGainByIndex` clears (they drive the same server
+        // gain; #745).
+        let tuner_gain_bit = 1u32 << ((CommandOp::SetTunerGain as u32) - 1);
+        assert_eq!(mask & 0x3fff, 0x3fff & !tuner_gain_bit, "mask={mask:#x}");
     }
 
     #[test]
@@ -3527,7 +3713,7 @@ mod tests {
         // Simulate first overflow.
         {
             let mut rx = src.shared.rx_buf.lock().unwrap();
-            *rx = vec![0u8; RX_BUFFER_SOFT_CAP_BYTES];
+            *rx = VecDeque::from(vec![0u8; RX_BUFFER_SOFT_CAP_BYTES]);
             append_with_cap_to_shared(&src.shared, &mut rx, &[0xFFu8; 100]);
         }
         assert!(src.shared.rx_in_overflow.load(Ordering::Relaxed));
@@ -3550,6 +3736,313 @@ mod tests {
             !src.shared.rx_in_overflow.load(Ordering::Relaxed),
             "flag should rearm once buffer drains below half-cap"
         );
+    }
+
+    /// #743 — a framed (LZ4) stream cannot resume after a partial read:
+    /// `read_exact` inside the frame decoder has already consumed bytes
+    /// when `SO_RCVTIMEO` fires, so retrying on the same decoder restarts
+    /// at the wrong offset and surfaces as terminal corruption. The pump
+    /// must tear down for reconnect on the FIRST timeout instead.
+    #[test]
+    fn lz4_stall_breaks_out_after_a_single_timeout() {
+        /// Long enough that the legacy "N consecutive timeouts" policy
+        /// (N × read timeout = 2 s) would still be Connected.
+        const LZ4_STALL_MAX_TIMEOUTS: u32 = 10;
+        const LZ4_STALL_SERVER_HOLD: Duration = Duration::from_secs(3);
+        const LZ4_STALL_LEAVE_DEADLINE: Duration = Duration::from_secs(1);
+        /// The server serves two sessions so the test can observe the
+        /// reconnect, not just the departure from `Connected`.
+        const LZ4_STALL_SESSIONS: usize = 2;
+        const LZ4_STALL_RECONNECT_DEADLINE: Duration = Duration::from_secs(3);
+        let (listener, mut config) = rtlx_test_listener_and_config();
+        config.max_consecutive_timeouts = LZ4_STALL_MAX_TIMEOUTS;
+        let addr = listener.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            let mut socks = Vec::new();
+            for _ in 0..LZ4_STALL_SESSIONS {
+                let (mut sock, _) = listener.accept().expect("accept");
+                let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+                sock.read_exact(&mut hello_buf).expect("read hello");
+                let header = DongleInfo {
+                    tuner: TunerTypeCode::R820t,
+                    gain_count: RTLX_TEST_GAIN_COUNT,
+                }
+                .to_bytes();
+                sock.write_all(&header).unwrap();
+                let ext = ServerExtension {
+                    codec: Codec::Lz4,
+                    granted_role: Some(Role::Control),
+                    status: Status::Ok,
+                    version: PROTOCOL_VERSION,
+                };
+                sock.write_all(&ext.to_bytes()).unwrap();
+                // Silence: the client's next read hits the timeout.
+                socks.push(sock);
+            }
+            thread::sleep(LZ4_STALL_SERVER_HOLD);
+        });
+
+        let mut src = RtlTcpSource::with_config(&addr.ip().to_string(), addr.port(), config);
+        src.start_manager().unwrap();
+        let deadline = Instant::now() + RTLX_TEST_STATE_DEADLINE;
+        while Instant::now() < deadline
+            && !matches!(src.connection_state(), ConnectionState::Connected { .. })
+        {
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        assert!(
+            matches!(
+                src.connection_state(),
+                ConnectionState::Connected {
+                    codec: Codec::Lz4,
+                    ..
+                }
+            ),
+            "test premise: LZ4 session established"
+        );
+
+        let leave_deadline = Instant::now() + LZ4_STALL_LEAVE_DEADLINE;
+        let mut left = false;
+        while Instant::now() < leave_deadline {
+            if !matches!(src.connection_state(), ConnectionState::Connected { .. }) {
+                left = true;
+                break;
+            }
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        assert!(left, "LZ4 pump must tear down on the first read timeout");
+
+        // ...and come back: the teardown is a reconnect, not a failure.
+        let reconnect_deadline = Instant::now() + LZ4_STALL_RECONNECT_DEADLINE;
+        let mut reconnected = false;
+        while Instant::now() < reconnect_deadline {
+            if matches!(src.connection_state(), ConnectionState::Connected { .. }) {
+                reconnected = true;
+                break;
+            }
+            assert!(
+                !matches!(src.connection_state(), ConnectionState::Failed { .. }),
+                "a stall must not be terminal"
+            );
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
+        src.stop_manager();
+        let _ = server_thread.join();
+        assert!(
+            reconnected,
+            "client must reconnect after the stall teardown"
+        );
+    }
+
+    /// #745 — `SetTunerGain` and `SetGainByIndex` both drive the same
+    /// server-side gain; replaying both in table order lets a stale
+    /// index overwrite a newer dB value. Recording one clears the other.
+    #[test]
+    fn recording_a_gain_setter_clears_its_sibling_replay() {
+        const GAIN_BIT: u32 = (CommandOp::SetTunerGain as u32) - 1;
+        const INDEX_BIT: u32 = (CommandOp::SetGainByIndex as u32) - 1;
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        src.record_command(Command {
+            op: CommandOp::SetGainByIndex,
+            param: 5,
+        });
+        src.record_command(Command {
+            op: CommandOp::SetTunerGain,
+            param: 300,
+        });
+        let mask = src.shared.replay_mask.load(Ordering::Relaxed);
+        assert!(mask & (1 << GAIN_BIT) != 0, "newest setter replays");
+        assert!(
+            mask & (1 << INDEX_BIT) == 0,
+            "older sibling must not replay"
+        );
+
+        src.record_command(Command {
+            op: CommandOp::SetGainByIndex,
+            param: 7,
+        });
+        let mask = src.shared.replay_mask.load(Ordering::Relaxed);
+        assert!(mask & (1 << INDEX_BIT) != 0);
+        assert_eq!(mask & (1 << GAIN_BIT), 0);
+    }
+
+    /// #745 — IF gain is per stage (upper 16 bits of the param); one
+    /// slot collapsed every stage into the last one written.
+    #[test]
+    fn if_gain_is_recorded_per_stage() {
+        const STAGE_1: u32 = 1;
+        const STAGE_3: u32 = 3;
+        const GAIN_1: u32 = 120;
+        const GAIN_3: u32 = 45;
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        src.record_command(Command {
+            op: CommandOp::SetIfGain,
+            param: (STAGE_1 << IF_GAIN_STAGE_SHIFT_BITS) | GAIN_1,
+        });
+        src.record_command(Command {
+            op: CommandOp::SetIfGain,
+            param: (STAGE_3 << IF_GAIN_STAGE_SHIFT_BITS) | GAIN_3,
+        });
+        let snap = src.rtl_tcp_sticky_snapshot().unwrap();
+        assert_eq!(
+            snap.last_if_gain[STAGE_1 as usize - 1],
+            (STAGE_1 << IF_GAIN_STAGE_SHIFT_BITS) | GAIN_1
+        );
+        assert_eq!(
+            snap.last_if_gain[STAGE_3 as usize - 1],
+            (STAGE_3 << IF_GAIN_STAGE_SHIFT_BITS) | GAIN_3
+        );
+        assert_eq!(
+            snap.if_gain_mask,
+            (1 << (STAGE_1 - 1)) | (1 << (STAGE_3 - 1))
+        );
+    }
+
+    /// #745 — a peer that accepts and then says nothing used to make
+    /// `stop()` wait for the full data-read timeout: the only way to
+    /// unblock the manager was the command sink, published only after
+    /// the handshake reads. The raw stream is now stashed before them.
+    #[test]
+    fn stop_before_handshake_returns_promptly() {
+        const SILENT_SERVER_HOLD: Duration = Duration::from_secs(8);
+        const STOP_DEADLINE: Duration = Duration::from_secs(1);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            if let Ok((_sock, _)) = listener.accept() {
+                thread::sleep(SILENT_SERVER_HOLD);
+            }
+        });
+        // Default config: 5 s data-read timeout.
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        src.start_manager().unwrap();
+        // Give the manager time to connect and block in the header read.
+        thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        src.stop_manager();
+        let elapsed = started.elapsed();
+        drop(server_thread); // let the silent server finish on its own
+        assert!(
+            elapsed < STOP_DEADLINE,
+            "stop blocked for {elapsed:?} waiting on the pre-handshake read"
+        );
+    }
+
+    /// #745 (CR round 5 on PR #792) — `stop()` must not wait for a
+    /// command write blocked on a non-reading peer: the session cancel
+    /// handle shuts the socket without taking the sink lock. A sender
+    /// thread floods commands at a peer that completes the handshake and
+    /// then never reads; whether `write_all` actually blocks depends on
+    /// the loopback socket buffers, but `stop_manager` must return
+    /// promptly either way.
+    #[test]
+    fn stop_during_command_flood_returns_promptly() {
+        const FLOOD_SERVER_HOLD: Duration = Duration::from_secs(6);
+        const FLOOD_WARMUP: Duration = Duration::from_millis(300);
+        const STOP_DEADLINE: Duration = Duration::from_secs(1);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let header = DongleInfo {
+                    tuner: TunerTypeCode::R820t,
+                    gain_count: 29,
+                }
+                .to_bytes();
+                let _ = sock.write_all(&header);
+                // Never read: the client's sends back up.
+                thread::sleep(FLOOD_SERVER_HOLD);
+            }
+        });
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        src.start_manager().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && !matches!(src.connection_state(), ConnectionState::Connected { .. })
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            matches!(src.connection_state(), ConnectionState::Connected { .. }),
+            "test premise: connected"
+        );
+        let shared = Arc::clone(&src.shared);
+        let flooding = Arc::new(AtomicBool::new(true));
+        let flood_flag = Arc::clone(&flooding);
+        let flooder = thread::spawn(move || {
+            let mut hz = 100_000_000u32;
+            while flood_flag.load(Ordering::Relaxed) {
+                if let Ok(mut sink) = shared.command_sink.lock() {
+                    let Some(stream) = sink.as_mut() else { break };
+                    let cmd = Command {
+                        op: CommandOp::SetCenterFreq,
+                        param: hz,
+                    };
+                    if stream.write_all(&cmd.to_bytes()).is_err() {
+                        break;
+                    }
+                    hz = hz.wrapping_add(1);
+                }
+            }
+        });
+        thread::sleep(FLOOD_WARMUP);
+        let started = Instant::now();
+        src.stop_manager();
+        let elapsed = started.elapsed();
+        flooding.store(false, Ordering::Relaxed);
+        let _ = flooder.join();
+        drop(server_thread);
+        assert!(
+            elapsed < STOP_DEADLINE,
+            "stop blocked for {elapsed:?} behind a command write"
+        );
+    }
+
+    /// #745 — after `stop()` the public view must read Disconnected
+    /// with no tuner, even when the manager ended in a terminal state.
+    #[test]
+    fn stop_manager_resets_state_and_tuner() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(b"XXXXjunknoise");
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let mut src = RtlTcpSource::new(&addr.ip().to_string(), addr.port());
+        src.start_manager().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && !matches!(src.connection_state(), ConnectionState::Failed { .. })
+        {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            matches!(src.connection_state(), ConnectionState::Failed { .. }),
+            "test premise: terminal Failed state"
+        );
+        src.stop_manager();
+        let _ = server_thread.join();
+        assert!(matches!(
+            src.connection_state(),
+            ConnectionState::Disconnected
+        ));
+        assert!(src.tuner_info().is_none());
+    }
+
+    /// #745 — the drop counter has a reader.
+    #[test]
+    fn rx_dropped_bytes_is_observable() {
+        let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+        assert_eq!(src.rx_dropped_bytes(), 0);
+        {
+            let mut rx = src.shared.rx_buf.lock().unwrap();
+            rx.clear();
+            rx.extend(std::iter::repeat_n(0u8, RX_BUFFER_SOFT_CAP_BYTES));
+            append_with_cap_to_shared(&src.shared, &mut rx, &[0xFFu8; 100]);
+        }
+        assert_eq!(src.rx_dropped_bytes(), 100);
     }
 
     #[test]
