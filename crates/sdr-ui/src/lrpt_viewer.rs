@@ -53,7 +53,7 @@ use sdr_lrpt::image::IMAGE_WIDTH;
 use sdr_radio::lrpt_image::LrptImage;
 
 use crate::messages::UiToDsp;
-use crate::viewer::ViewerError;
+use crate::viewer::{ViewerError, plain_toast, show_toast_in};
 
 // ─── False-colour composite catalog ────────────────────────────────────
 //
@@ -2430,12 +2430,8 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
             })
             .await;
             let toast = match result {
-                Ok(Ok(())) => adw::Toast::builder()
-                    .title(format!("Saved {}", path_for_msg.display()))
-                    .build(),
-                Ok(Err(e)) => adw::Toast::builder()
-                    .title(format!("PNG export failed: {e}"))
-                    .build(),
+                Ok(Ok(())) => plain_toast(&format!("Saved {}", path_for_msg.display())),
+                Ok(Err(e)) => plain_toast(&format!("PNG export failed: {e}")),
                 Err(e) => {
                     // Worker thread panicked. `Box<dyn Any>`
                     // doesn't implement Display — log via Debug,
@@ -2513,17 +2509,6 @@ fn composite_export_path(recipe_name: &str) -> PathBuf {
     glib::home_dir()
         .join("sdr-recordings")
         .join(format!("lrpt-composite-{slug}-{timestamp}.png"))
-}
-
-/// Walk the window content tree looking for a [`adw::ToastOverlay`]
-/// to display `toast` in. Falls through silently if the layout
-/// changes — toasts are best-effort feedback, not load-bearing UI.
-fn show_toast_in<W: gtk4::prelude::IsA<gtk4::Window>>(window: &W, toast: adw::Toast) {
-    if let Some(child) = window.as_ref().child()
-        && let Some(overlay) = child.downcast_ref::<adw::ToastOverlay>()
-    {
-        overlay.add_toast(toast);
-    }
 }
 
 // ─── Live viewer action ────────────────────────────────────────────────

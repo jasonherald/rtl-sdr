@@ -9,6 +9,8 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::subclass::prelude::ObjectSubclassIsExt;
+
+use crate::viewer::plain_toast;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_core::Engine;
@@ -928,6 +930,10 @@ pub fn build_window(
         let _ = state_for_close.app_hold_guard.borrow_mut().take();
         app_for_close.remove_action(crate::notify::TUNE_SATELLITE_ACTION);
         transcription_engine_close.borrow_mut().shutdown_nonblocking();
+        // Same synchronous persist as the tray quit path (#762).
+        if let Err(e) = config_for_close.flush() {
+            tracing::warn!("config flush at close failed: {e}");
+        }
         glib::Propagation::Proceed
     });
 
@@ -988,6 +994,7 @@ pub fn build_window(
     let state_for_quit = Rc::clone(&state);
     let window_for_quit = window.clone();
     let transcription_for_quit = Rc::clone(&transcription_engine);
+    let config_for_quit = std::sync::Arc::clone(config);
     tray_quit.connect_activate(move |_, _| {
         if state_for_quit.is_recording() {
             // Confirmation modal. WM-close (clicking the dialog's X)
@@ -1007,6 +1014,7 @@ pub fn build_window(
             let state_for_response = Rc::clone(&state_for_quit);
             let window_for_response = window_for_quit.clone();
             let transcription_for_response = Rc::clone(&transcription_for_quit);
+            let config_for_response = std::sync::Arc::clone(&config_for_quit);
             dialog.connect_response(None, move |dlg, response| {
                 if response == "quit" {
                     perform_real_quit(
@@ -1014,6 +1022,7 @@ pub fn build_window(
                         &state_for_response,
                         &window_for_response,
                         &transcription_for_response,
+                        &config_for_response,
                     );
                 }
                 dlg.close();
@@ -1026,6 +1035,7 @@ pub fn build_window(
             &state_for_quit,
             &window_for_quit,
             &transcription_for_quit,
+            &config_for_quit,
         );
     });
     app.add_action(&tray_quit);
@@ -1748,7 +1758,7 @@ fn handle_dsp_message(
         DspToUi::Error(err_msg) => {
             tracing::warn!(error = %err_msg, "DSP error");
             if let Some(overlay) = toast_overlay_weak.upgrade() {
-                let toast = adw::Toast::new(&err_msg);
+                let toast = plain_toast(&err_msg);
                 overlay.add_toast(toast);
             }
         }
@@ -1798,7 +1808,7 @@ fn handle_dsp_message(
                 let name = path
                     .file_name()
                     .map_or("file".to_string(), |n| n.to_string_lossy().to_string());
-                let toast = adw::Toast::new(&format!("Recording audio: {name}"));
+                let toast = plain_toast(&format!("Recording audio: {name}"));
                 overlay.add_toast(toast);
             }
         }
@@ -1808,7 +1818,7 @@ fn handle_dsp_message(
             state.audio_recording_active.set(false);
             record_audio_row.set_active(false);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
-                let toast = adw::Toast::new("Audio recording saved");
+                let toast = plain_toast("Audio recording saved");
                 overlay.add_toast(toast);
             }
         }
@@ -1822,7 +1832,7 @@ fn handle_dsp_message(
                 let name = path
                     .file_name()
                     .map_or("file".to_string(), |n| n.to_string_lossy().to_string());
-                let toast = adw::Toast::new(&format!("Recording IQ: {name}"));
+                let toast = plain_toast(&format!("Recording IQ: {name}"));
                 overlay.add_toast(toast);
             }
         }
@@ -1832,7 +1842,7 @@ fn handle_dsp_message(
             state.iq_recording_active.set(false);
             record_iq_row.set_active(false);
             if let Some(overlay) = toast_overlay_weak.upgrade() {
-                let toast = adw::Toast::new("IQ recording saved");
+                let toast = plain_toast("IQ recording saved");
                 overlay.add_toast(toast);
             }
         }
@@ -1877,7 +1887,7 @@ fn handle_dsp_message(
                 transcription_enable_row.set_active(false);
 
                 if let Some(overlay) = toast_overlay_weak.upgrade() {
-                    let toast = adw::Toast::new(
+                    let toast = plain_toast(
                         "Transcription stopped — demod mode changed. Press Start to resume.",
                     );
                     overlay.add_toast(toast);
@@ -2181,7 +2191,7 @@ fn handle_dsp_message(
         DspToUi::ScannerEmptyRotation => {
             tracing::info!("scanner rotation empty");
             if let Some(overlay) = toast_overlay_weak.upgrade() {
-                overlay.add_toast(adw::Toast::new(
+                overlay.add_toast(plain_toast(
                     "Scanner has no active channels (all locked or disabled)",
                 ));
             }
@@ -2299,7 +2309,7 @@ fn handle_dsp_message(
                 }
             };
             if let Some(overlay) = toast_overlay_weak.upgrade() {
-                overlay.add_toast(adw::Toast::new(message));
+                overlay.add_toast(plain_toast(message));
             }
         }
         DspToUi::AcarsMessage(msg) => {
@@ -2615,7 +2625,7 @@ fn handle_dsp_message(
                                 "AOS aborted: ACARS disengage failed",
                             );
                             if let Some(overlay) = toast_overlay_weak.upgrade() {
-                                overlay.add_toast(adw::Toast::new(&format!(
+                                overlay.add_toast(plain_toast(&format!(
                                     "Pass {satellite} aborted: ACARS disengage failed"
                                 )));
                             }
@@ -2626,7 +2636,7 @@ fn handle_dsp_message(
                     // the actionable error (e.g. "scanner is
                     // running" or "RTL-SDR required").
                     if let Some(overlay) = toast_overlay_weak.upgrade() {
-                        overlay.add_toast(adw::Toast::new(&format!("ACARS: {err}")));
+                        overlay.add_toast(plain_toast(&format!("ACARS: {err}")));
                     }
                 }
             }
@@ -2638,7 +2648,7 @@ fn handle_dsp_message(
         DspToUi::AcarsOutputError { kind, message } => {
             tracing::warn!(kind, message, "ACARS output error");
             if let Some(overlay) = toast_overlay_weak.upgrade() {
-                overlay.add_toast(adw::Toast::new(&format!(
+                overlay.add_toast(plain_toast(&format!(
                     "ACARS {kind} output error: {message}"
                 )));
             }
@@ -6165,7 +6175,7 @@ fn connect_share_switch(
             // touching `running` or widget lock state.
             if widgets.source_device_row.selected() == DEVICE_RTLSDR {
                 if let Some(overlay) = toast_overlay_weak.upgrade() {
-                    overlay.add_toast(adw::Toast::new(
+                    overlay.add_toast(plain_toast(
                         "Switch the source away from local RTL-SDR before sharing over network.",
                     ));
                 }
@@ -6201,7 +6211,7 @@ fn connect_share_switch(
                             Err(e) => {
                                 tracing::warn!(error = %e, "mDNS advertiser failed; server running without LAN advertisement");
                                 if let Some(overlay) = toast_overlay_weak.upgrade() {
-                                    overlay.add_toast(adw::Toast::new(&format!(
+                                    overlay.add_toast(plain_toast(&format!(
                                         "Server running, but mDNS advertising failed: {e}"
                                     )));
                                 }
@@ -6225,7 +6235,7 @@ fn connect_share_switch(
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to start rtl_tcp server");
                     if let Some(overlay) = toast_overlay_weak.upgrade() {
-                        overlay.add_toast(adw::Toast::new(&format!(
+                        overlay.add_toast(plain_toast(&format!(
                             "Couldn't share over network: {e}"
                         )));
                     }
@@ -6435,7 +6445,7 @@ fn connect_share_switch(
             let clipboard = btn.clipboard();
             clipboard.set_text(&hex);
             if let Some(overlay) = toast_overlay_for_copy.upgrade() {
-                overlay.add_toast(adw::Toast::new("Key copied to clipboard"));
+                overlay.add_toast(plain_toast("Key copied to clipboard"));
             }
         });
 
@@ -6494,7 +6504,7 @@ fn connect_share_switch(
             if let Err(e) = save_server_auth_key_to_keyring(&fresh) {
                 tracing::warn!(%e, "rtl_tcp auth-key regenerate keyring write failed");
                 if let Some(overlay) = toast_overlay_for_regen.upgrade() {
-                    overlay.add_toast(adw::Toast::new(&format!(
+                    overlay.add_toast(plain_toast(&format!(
                         "Couldn't save new key to keyring: {e}"
                     )));
                 }
@@ -6509,7 +6519,7 @@ fn connect_share_switch(
                 key_row.set_subtitle(crate::sidebar::server_panel::AUTH_KEY_MASKED_PLACEHOLDER);
             }
             if let Some(overlay) = toast_overlay_for_regen.upgrade() {
-                overlay.add_toast(adw::Toast::new("New key generated"));
+                overlay.add_toast(plain_toast("New key generated"));
             }
         });
 
@@ -7474,7 +7484,7 @@ fn apply_live_auth_change(
     if let Err(e) = handle.server.set_auth_key(new_key) {
         tracing::warn!(%e, "Server::set_auth_key failed on live auth change");
         if let Some(overlay) = toast_overlay.upgrade() {
-            overlay.add_toast(adw::Toast::new(&format!(
+            overlay.add_toast(plain_toast(&format!(
                 "Couldn't update auth on the running server: {e}"
             )));
         }
@@ -7531,7 +7541,7 @@ fn refresh_advertiser_for_auth_change(
                 "mDNS advertiser rebuild after auth toggle failed; TXT auth_required will be stale until next start"
             );
             if let Some(overlay) = toast_overlay.upgrade() {
-                overlay.add_toast(adw::Toast::new(&format!(
+                overlay.add_toast(plain_toast(&format!(
                     "Couldn't refresh mDNS advertisement after auth toggle: {e}"
                 )));
             }
@@ -8034,7 +8044,7 @@ fn connect_source_panel(
                     // "(< 28 MHz)" failed to parse (GTK-WARNING, blank toast).
                     "Direct Sampling on — retune to an HF frequency (below 28 MHz)."
                 };
-                overlay.add_toast(adw::Toast::new(msg));
+                overlay.add_toast(plain_toast(msg));
             }
         });
 
@@ -8487,7 +8497,7 @@ fn connect_source_panel(
             // world while the rtl_tcp server has the dongle claimed.
             if selected == DEVICE_RTLSDR && server_running.get() {
                 if let Some(overlay) = toast_overlay_weak.upgrade() {
-                    overlay.add_toast(adw::Toast::new(
+                    overlay.add_toast(plain_toast(
                         "Stop the network server first before switching to local RTL-SDR.",
                     ));
                 }
@@ -11260,7 +11270,7 @@ fn connect_satellites_panel(
         let auto_record_composites_switch_a = panel.auto_record_composites_switch.clone();
         let post_toast = move |overlay_weak: &glib::WeakRef<adw::ToastOverlay>, msg: &str| {
             if let Some(overlay) = overlay_weak.upgrade() {
-                overlay.add_toast(adw::Toast::new(msg));
+                overlay.add_toast(plain_toast(msg));
             }
         };
         // Compute the rotate-180 flag for the currently-recording APT
@@ -14042,7 +14052,7 @@ fn connect_transcript_panel(
             // start with an actionable toast.
             #[cfg(feature = "sherpa")]
             if auto_break_enabled && !squelch_enabled_row_for_session.is_active() {
-                let toast = adw::Toast::new(
+                let toast = plain_toast(
                     "Auto Break needs squelch enabled to detect transmission boundaries. \
                      Enable squelch in the radio panel, or turn off Auto Break to use VAD.",
                 );
@@ -14659,8 +14669,15 @@ fn perform_real_quit(
     state: &Rc<AppState>,
     window: &adw::ApplicationWindow,
     transcription_engine: &Rc<RefCell<sdr_transcription::TranscriptionEngine>>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
     tracing::info!("tray-quit: shutting down");
+    // Persist synchronously: the auto-save handle's `Drop` only runs
+    // once every `Arc` clone captured by GTK closures and timers has
+    // died, which is too late for a setting changed < 1 s ago (#762).
+    if let Err(e) = config.flush() {
+        tracing::warn!("config flush at quit failed: {e}");
+    }
     // Join the tray worker thread first so its callbacks can't fire
     // against torn-down state during the rest of this teardown.
     if let Some(mut handle) = state.tray_handle.borrow_mut().take() {

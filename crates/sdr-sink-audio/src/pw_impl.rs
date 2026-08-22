@@ -73,85 +73,210 @@ pub fn list_audio_sinks() -> Vec<AudioDevice> {
         node_name: String::new(), // empty = system default
     }];
 
-    // Run a short-lived PipeWire main loop to collect sink names.
-    // Must run on a separate thread because PipeWire main loops
-    // are not reentrant and we may already have one running.
-    let result = std::thread::Builder::new()
-        .name("pw-enumerate".to_string())
-        .spawn(move || {
-            let Ok(main_loop) = pipewire::main_loop::MainLoopRc::new(None) else {
-                return Vec::new();
-            };
-            let Ok(context) = pipewire::context::ContextRc::new(&main_loop, None) else {
-                return Vec::new();
-            };
-            let Ok(core) = context.connect(None) else {
-                return Vec::new();
-            };
-            let Ok(registry) = core.get_registry() else {
-                return Vec::new();
-            };
-
-            let found_sinks = std::rc::Rc::new(std::cell::RefCell::new(Vec::<AudioDevice>::new()));
-            let found_clone = std::rc::Rc::clone(&found_sinks);
-
-            // Listen for global objects — Audio/Sink nodes are output devices
-            let listener = registry
-                .add_listener_local()
-                .global(move |global| {
-                    if let Some(props) = global.props {
-                        let media_class = props.get("media.class").unwrap_or("");
-                        if media_class == "Audio/Sink" {
-                            let display_name = props
-                                .get("node.description")
-                                .or_else(|| props.get("node.name"))
-                                .unwrap_or("Unknown Sink")
-                                .to_string();
-                            let node_name = props.get("node.name").unwrap_or("unknown").to_string();
-                            found_clone.borrow_mut().push(AudioDevice {
-                                display_name,
-                                node_name,
-                            });
-                        }
-                    }
-                })
-                .register();
-
-            // Listen for the "done" signal — fires after all globals are enumerated
-            let ml_quit = main_loop.downgrade();
-            let core_listener = core
-                .add_listener_local()
-                .done(move |_id, _seq| {
-                    if let Some(ml) = ml_quit.upgrade() {
-                        ml.quit();
-                    }
-                })
-                .register();
-
-            // Trigger sync — done callback fires after all globals are sent
-            core.sync(0).ok();
-            main_loop.run();
-
-            // Listeners must stay alive until after run() completes
-            drop(listener);
-            drop(core_listener);
-            found_sinks.borrow().clone()
-        })
-        .and_then(|handle| {
-            handle
-                .join()
-                .map_err(|_| std::io::Error::other("join failed"))
-        });
-
-    if let Ok(found) = result {
-        for dev in found {
-            if !sinks.iter().any(|s| s.node_name == dev.node_name) {
-                sinks.push(dev);
+    match enumerate_sinks_bounded() {
+        Ok(found) => {
+            for dev in found {
+                if !sinks.iter().any(|s| s.node_name == dev.node_name) {
+                    sinks.push(dev);
+                }
             }
         }
+        Err(e) => tracing::warn!("audio sink enumeration skipped: {e}"),
     }
 
     sinks
+}
+
+/// Bound on the PipeWire sink enumeration at panel build.
+const ENUMERATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a timed-out enumeration worker gets to honour the quit
+/// message before it is left to exit on its own.
+const ENUMERATE_QUIT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Why a PipeWire sink enumeration produced no list.
+#[derive(Debug, thiserror::Error)]
+enum EnumerateError {
+    /// A PipeWire setup call failed; `stage` names it.
+    #[error("PipeWire {stage}: {source}")]
+    Setup {
+        stage: &'static str,
+        #[source]
+        source: pipewire::Error,
+    },
+    /// The worker thread could not be spawned.
+    #[error("spawning the enumeration worker: {0}")]
+    Spawn(#[source] std::io::Error),
+    /// The daemon did not answer within `ENUMERATE_TIMEOUT`.
+    #[error("PipeWire did not answer within {0:?}")]
+    TimedOut(std::time::Duration),
+    /// The worker died without reporting (panicked).
+    #[error("the enumeration worker exited without a result")]
+    WorkerDied,
+    /// An earlier worker is still unresolved; nothing new was spawned.
+    #[error("a previous PipeWire enumeration is still in flight")]
+    Busy,
+}
+
+impl EnumerateError {
+    fn setup(stage: &'static str) -> impl FnOnce(pipewire::Error) -> Self {
+        move |source| Self::Setup { stage, source }
+    }
+}
+
+/// Set while an enumeration worker is alive. A worker that is wedged
+/// inside a blocking PipeWire setup call outlives its caller's timeout;
+/// while it does, further refreshes must not stack more workers on top
+/// of it (CR round 2 on PR #795).
+static ENUMERATE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Clears `ENUMERATE_IN_FLIGHT` when the worker exits, panic included.
+struct InFlightGuard;
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        ENUMERATE_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Run [`enumerate_sinks`] on its own thread, bounded by `ENUMERATE_TIMEOUT`.
+///
+/// PipeWire main loops are not reentrant and one may already be running,
+/// so the enumeration needs a worker. The caller (the GTK main thread at
+/// panel build) waits at most `ENUMERATE_TIMEOUT`: a wedged or absent
+/// daemon must not freeze startup, and "Default" alone is a usable answer
+/// (#771). On timeout the worker's main loop is told to quit and the
+/// thread is joined. A worker still stuck inside a blocking setup call
+/// (where the quit message cannot reach it) is left to exit on its own;
+/// it holds `ENUMERATE_IN_FLIGHT` until then, so the process never has
+/// more than one enumeration worker — a later refresh returns `Busy`.
+fn enumerate_sinks_bounded() -> Result<Vec<AudioDevice>, EnumerateError> {
+    if ENUMERATE_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(EnumerateError::Busy);
+    }
+    let guard = InFlightGuard;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (quit_tx, quit_rx) = pipewire::channel::channel::<Quit>();
+    let worker = std::thread::Builder::new()
+        .name("pw-enumerate".to_string())
+        .spawn(move || {
+            // The flag now belongs to the worker: it clears when this
+            // thread exits, however late that is.
+            let _guard = guard;
+            let _ = tx.send(enumerate_sinks(quit_rx));
+        })
+        .map_err(EnumerateError::Spawn)?;
+
+    match rx.recv_timeout(ENUMERATE_TIMEOUT) {
+        Ok(result) => {
+            let _ = worker.join();
+            result
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            Err(EnumerateError::WorkerDied)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let _ = quit_tx.send(Quit);
+            if rx.recv_timeout(ENUMERATE_QUIT_GRACE).is_ok() {
+                let _ = worker.join();
+            } else {
+                tracing::debug!("pw-enumerate worker ignored quit; left to exit on its own");
+            }
+            Err(EnumerateError::TimedOut(ENUMERATE_TIMEOUT))
+        }
+    }
+}
+
+/// Collect `Audio/Sink` nodes from a short-lived PipeWire main loop.
+/// Runs on its own thread (see [`enumerate_sinks_bounded`]); a `Quit`
+/// on `quit_rx` stops the loop early.
+fn enumerate_sinks(
+    quit_rx: pipewire::channel::Receiver<Quit>,
+) -> Result<Vec<AudioDevice>, EnumerateError> {
+    let main_loop =
+        pipewire::main_loop::MainLoopRc::new(None).map_err(EnumerateError::setup("main loop"))?;
+    let context = pipewire::context::ContextRc::new(&main_loop, None)
+        .map_err(EnumerateError::setup("context"))?;
+    let core = context
+        .connect_rc(None)
+        .map_err(EnumerateError::setup("connect"))?;
+    let registry = core
+        .get_registry_rc()
+        .map_err(EnumerateError::setup("registry"))?;
+
+    let found = std::rc::Rc::new(std::cell::RefCell::new(Vec::<AudioDevice>::new()));
+    let listener = register_sink_listener(&registry, std::rc::Rc::clone(&found));
+
+    let quit_loop = main_loop.clone();
+    let _quit_receiver = quit_rx.attach(main_loop.loop_(), move |_: Quit| {
+        quit_loop.quit();
+    });
+
+    run_until_synced(&core, &main_loop)?;
+
+    // Listeners must stay alive until after run() completes.
+    drop(listener);
+    let sinks = found.take();
+    Ok(sinks)
+}
+
+/// Listen for global objects and collect every `Audio/Sink` node.
+fn register_sink_listener(
+    registry: &pipewire::registry::RegistryRc,
+    found: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>>,
+) -> pipewire::registry::Listener {
+    registry
+        .add_listener_local()
+        .global(move |global| {
+            if let Some(sink) = global.props.and_then(sink_from_props) {
+                found.borrow_mut().push(sink);
+            }
+        })
+        .register()
+}
+
+/// Build an [`AudioDevice`] from a global's properties when it is an
+/// output sink.
+fn sink_from_props(props: &pipewire::spa::utils::dict::DictRef) -> Option<AudioDevice> {
+    if props.get("media.class") != Some("Audio/Sink") {
+        return None;
+    }
+    let display_name = props
+        .get("node.description")
+        .or_else(|| props.get("node.name"))
+        .unwrap_or("Unknown Sink")
+        .to_string();
+    let node_name = props.get("node.name").unwrap_or("unknown").to_string();
+    Some(AudioDevice {
+        display_name,
+        node_name,
+    })
+}
+
+/// Run the main loop until the core's `done` callback fires, which
+/// happens after every existing global has been announced.
+fn run_until_synced(
+    core: &pipewire::core::CoreRc,
+    main_loop: &pipewire::main_loop::MainLoopRc,
+) -> Result<(), EnumerateError> {
+    let quit_loop = main_loop.clone();
+    let core_listener = core
+        .add_listener_local()
+        .done(move |_id, _seq| {
+            quit_loop.quit();
+        })
+        .register();
+
+    core.sync(0).map_err(EnumerateError::setup("sync"))?;
+    main_loop.run();
+
+    drop(core_listener);
+    Ok(())
 }
 
 impl AudioSink {
@@ -526,5 +651,23 @@ mod tests {
     fn test_stop_before_start_returns_not_running() {
         let mut sink = AudioSink::new();
         assert!(matches!(sink.stop(), Err(SinkError::NotRunning)));
+    }
+
+    /// CR round 2 on PR #795 — while one enumeration worker is still
+    /// unresolved (wedged daemon), another refresh must not spawn a
+    /// second one; the caller gets `Busy` and the flag stays set for the
+    /// worker that owns it.
+    #[test]
+    fn enumeration_is_skipped_while_a_worker_is_in_flight() {
+        assert!(
+            ENUMERATE_IN_FLIGHT
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "no other test may hold the in-flight flag"
+        );
+        let result = enumerate_sinks_bounded();
+        assert!(matches!(result, Err(EnumerateError::Busy)), "{result:?}");
+        assert!(ENUMERATE_IN_FLIGHT.load(Ordering::Acquire));
+        ENUMERATE_IN_FLIGHT.store(false, Ordering::Release);
     }
 }
