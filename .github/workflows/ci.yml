@@ -155,9 +155,21 @@ jobs:
         run: cargo install --locked cargo-llvm-cov
       - name: Workspace coverage (LCOV)
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      # The official action is SHA-pinned only for its action.yml; it
+      # then bootstraps `get.sh` from the reporter repo's mutable
+      # `master` branch and hands the token to whatever that fetched.
+      # Fetch a pinned release of the reporter instead and verify it
+      # against a checksum recorded here before the token is exposed.
       - name: Upload to Codacy
         if: ${{ env.HAS_CODACY_TOKEN == 'true' }}
-        uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
-        with:
-          project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
-          coverage-reports: lcov.info
+        env:
+          CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+          REPORTER_VERSION: 14.1.3
+          REPORTER_SHA512: 73a6c93fc5db509fd0423d6e545759c3f61d8360ee12054e32a9277daab6add0da6c6639248f6ed6c0042366440293ebc0b6144325aef52c5d3d4b230d65eb17
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o codacy-coverage-reporter \
+            "https://github.com/codacy/codacy-coverage-reporter/releases/download/${REPORTER_VERSION}/codacy-coverage-reporter-linux"
+          echo "${REPORTER_SHA512}  codacy-coverage-reporter" | sha512sum -c -
+          chmod +x codacy-coverage-reporter
+          ./codacy-coverage-reporter report -r lcov.info

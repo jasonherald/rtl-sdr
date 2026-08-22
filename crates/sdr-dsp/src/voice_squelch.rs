@@ -725,14 +725,15 @@ impl VoiceSquelch {
     /// word whenever a consonant or brief pause dips below the
     /// detector's threshold. Instead:
     ///
-    /// - Each "strong" block (detector reports open) resets a
-    ///   `hang_samples_remaining` counter to
+    /// - Each "strong" verdict window (detector reports open)
+    ///   resets a `hang_samples_remaining` counter to
     ///   [`VOICE_SQUELCH_HANG_TIME_SAMPLES`] (500 ms by default).
-    /// - Each "weak" block (detector reports closed) decrements
-    ///   the counter by the block's length.
+    /// - Each "weak" verdict window (detector reports closed)
+    ///   decrements the counter by one window
+    ///   ([`VOICE_SQUELCH_RMS_WINDOW_SAMPLES`]).
     /// - The gate only actually transitions to closed when the
     ///   counter hits zero — i.e. after 500 ms of sustained
-    ///   weakness with no intervening strong block.
+    ///   weakness with no intervening strong window.
     ///
     /// The detectors judge from a rolling RMS over the last
     /// [`VOICE_SQUELCH_RMS_WINDOW_SAMPLES`] (100 ms), so a verdict is
@@ -746,7 +747,7 @@ impl VoiceSquelch {
     /// judging every small block reloaded or bled it at a cadence
     /// set by the callback size (CR on PR #797).
     ///
-    /// Opening is immediate (first strong block after a closed
+    /// Opening is immediate (first strong window after a closed
     /// state flips the gate open and resets the counter); only
     /// the close direction is gated by hang time. This is the
     /// standard scanner-squelch pattern.
@@ -1239,8 +1240,10 @@ mod tests {
         ));
         assert_eq!(stream.len() % VOICE_SQUELCH_RMS_WINDOW_SAMPLES, 0);
 
-        // Gate state after each call that ends exactly on a window
-        // boundary, keyed by the number of samples fed so far.
+        // Gate state after every call that completes at least one
+        // new window, keyed by the last completed window boundary.
+        // Verdicts are only taken at boundaries, so the state after
+        // the call is the state at that boundary.
         let observe = |block: usize| -> Vec<(usize, bool)> {
             let mut vs = VoiceSquelch::new(
                 VoiceSquelchMode::Syllabic {
@@ -1250,12 +1253,15 @@ mod tests {
             )
             .unwrap();
             let mut fed = 0;
+            let mut last_boundary = 0;
             let mut states = Vec::new();
             for chunk in stream.chunks(block) {
                 vs.accept_samples(chunk);
                 fed += chunk.len();
-                if fed % VOICE_SQUELCH_RMS_WINDOW_SAMPLES == 0 {
-                    states.push((fed, vs.is_open()));
+                let boundary = fed - fed % VOICE_SQUELCH_RMS_WINDOW_SAMPLES;
+                if boundary > last_boundary {
+                    last_boundary = boundary;
+                    states.push((boundary, vs.is_open()));
                 }
             }
             states
@@ -1266,7 +1272,18 @@ mod tests {
         assert!(reference.iter().any(|&(_, o)| !o), "{reference:?}");
         for block in [7, 480, 10_007, stream.len()] {
             let observed = observe(block);
-            assert!(!observed.is_empty(), "block size {block} observes nothing");
+            // A one-shot delivery can only observe the final boundary;
+            // every smaller block size must observe most of them.
+            let min_observed = if block >= stream.len() {
+                1
+            } else {
+                reference.len() / 2
+            };
+            assert!(
+                observed.len() >= min_observed,
+                "block size {block} observes too few boundaries: {}",
+                observed.len()
+            );
             for (fed, open) in observed {
                 let expected = reference.iter().find(|(f, _)| *f == fed).map(|(_, o)| *o);
                 assert_eq!(Some(open), expected, "block size {block} at {fed} samples");

@@ -1571,6 +1571,11 @@ mod tests {
             );
         }
         assert!(
+            AptDecoder::new(MIN_INPUT_RATE_HZ + 1).is_ok(),
+            "the floor is exclusive: {} Hz is accepted",
+            MIN_INPUT_RATE_HZ + 1
+        );
+        assert!(
             AptDecoder::new(11_025).is_ok(),
             "11 025 Hz clears the floor"
         );
