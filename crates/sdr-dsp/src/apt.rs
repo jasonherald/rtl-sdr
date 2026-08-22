@@ -2737,4 +2737,63 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Codacy on PR #801 — the lock is dropped after exactly
+    /// `MAX_NOMINAL_FALLBACKS` consecutive drifted matches: the first
+    /// seven (and the eighth itself) slice at the nominal start, and
+    /// only after the eighth does the next search run unconstrained.
+    #[test]
+    fn lock_is_dropped_after_exactly_max_nominal_fallbacks() -> Result<(), DspError> {
+        let mut d = AptDecoder::new(TEST_INPUT_RATE_HZ)?;
+        // A silent accumulator scores ~0 at the nominal start.
+        d.accumulator = vec![0.0; MIN_ACCUMULATOR_FOR_DECODE + d.prime];
+        d.locked = true;
+        let drifted = SyncMatch {
+            offset: MAX_SYNC_DRIFT_SAMPLES + 1,
+            channel: SyncChannel::A,
+            quality: 0.9,
+        };
+        for n in 1..MAX_NOMINAL_FALLBACKS {
+            let m = d.gate_sync_match(drifted);
+            assert_eq!(m.offset, 0, "fallback {n} slices at the nominal start");
+            assert!(d.locked, "still locked after {n} fallbacks");
+            assert_eq!(d.nominal_fallbacks, n);
+        }
+        let m = d.gate_sync_match(drifted);
+        assert_eq!(
+            m.offset, 0,
+            "the eighth fallback still slices at the nominal start"
+        );
+        assert!(
+            !d.locked,
+            "lock dropped after exactly {MAX_NOMINAL_FALLBACKS}"
+        );
+        assert_eq!(d.nominal_fallbacks, 0);
+        // Unlocked: the drifted match is used as-is and a confident one
+        // re-locks.
+        assert_eq!(d.gate_sync_match(drifted).offset, drifted.offset);
+        assert!(d.locked, "a confident match re-locks");
+        Ok(())
+    }
+
+    /// Codacy on PR #801 — `quality_at` scores the Sync B template too
+    /// (shared `template_for` path): the template against itself is
+    /// ~1, and against the Sync A template clearly lower.
+    #[test]
+    fn quality_at_scores_sync_b_against_its_own_template() {
+        let det = SyncDetector::new();
+        let (tpl_b, _) = build_square_template(SAMPLES_PER_SYNC_B_CYCLE, SYNC_BURST_CYCLES);
+        let own = det.quality_at(&tpl_b, 0, SyncChannel::B).unwrap();
+        assert!(own > 0.99, "Sync B template against itself: {own}");
+        let (tpl_a, _) = build_padded_sync_a_template(SAMPLES_PER_PIXEL);
+        let cross = det.quality_at(&tpl_a, 0, SyncChannel::B);
+        assert!(
+            cross.is_none_or(|q| q < own - 0.1),
+            "Sync A content must not score as Sync B: {cross:?} vs {own}"
+        );
+        assert!(
+            det.quality_at(&tpl_b, 1, SyncChannel::B).is_none(),
+            "window past the end"
+        );
+    }
 }

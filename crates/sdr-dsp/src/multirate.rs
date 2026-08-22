@@ -38,6 +38,11 @@ struct PolyphaseBank {
     phases: Vec<Vec<f32>>,
     /// Number of taps per phase.
     taps_per_phase: usize,
+    /// Length of the prototype before zero-padding to a multiple of
+    /// the phase count. The padding is appended, so it does not move
+    /// the impulse response's centre — the group delay is defined by
+    /// this length, not by `taps_per_phase × phases` (#774).
+    prototype_len: usize,
 }
 
 impl PolyphaseBank {
@@ -58,6 +63,7 @@ impl PolyphaseBank {
         Self {
             phases,
             taps_per_phase,
+            prototype_len: prototype.len(),
         }
     }
 }
@@ -119,11 +125,11 @@ impl PolyphaseResampler {
     }
 
     /// Group delay of the prototype lowpass in *input* samples:
-    /// `(N − 1) / 2` prototype taps at `interp ×` the input rate.
+    /// `(N − 1) / 2` prototype taps at `interp ×` the input rate, with
+    /// `N` the un-padded prototype length.
     #[allow(clippy::cast_precision_loss)]
     fn group_delay_input_samples(&self) -> f64 {
-        let prototype_len = self.bank.taps_per_phase * self.interp;
-        (prototype_len.saturating_sub(1)) as f64 / 2.0 / self.interp as f64
+        (self.bank.prototype_len.saturating_sub(1)) as f64 / 2.0 / self.interp as f64
     }
 
     /// Process complex samples through the resampler.
@@ -857,6 +863,62 @@ mod tests {
             "reported {reported}, measured {measured} (peak at output {peak_idx})"
         );
         assert!(reported > 0);
+        Ok(())
+    }
+
+    /// CR round 3 on PR #801 — `PolyphaseBank::build` zero-pads the
+    /// prototype up to a multiple of `interp`; the appended zeros do
+    /// not move the impulse response's centre, so the delay must come
+    /// from the *prototype* length (457 taps → exactly 38 input
+    /// samples at 6×), not the padded bank (462 → 38.42).
+    #[test]
+    fn polyphase_group_delay_uses_the_prototype_length_not_the_padded_bank() -> Result<(), DspError>
+    {
+        const INTERP: usize = 6;
+        const DECIM: usize = 1;
+        const PROTOTYPE_LEN: usize = 457; // not a multiple of INTERP
+        let prototype = vec![1.0_f32; PROTOTYPE_LEN];
+        let r = PolyphaseResampler::new(INTERP, DECIM, &prototype)?;
+        let expected = (PROTOTYPE_LEN - 1) as f64 / 2.0 / INTERP as f64;
+        assert!(
+            (r.group_delay_input_samples() - expected).abs() < 1e-9,
+            "got {}, expected {expected}",
+            r.group_delay_input_samples()
+        );
+        Ok(())
+    }
+
+    /// The same check end to end on the 8 kHz → 48 kHz path the
+    /// transcription resampler uses, measured with an impulse.
+    #[test]
+    fn upsampler_group_delay_matches_an_impulse_measurement() -> Result<(), DspError> {
+        const IN_RATE: f64 = 8_000.0;
+        const OUT_RATE: f64 = 48_000.0;
+        /// `OUT_RATE / IN_RATE`: output samples per input sample.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        const OUTPUTS_PER_INPUT: usize = (OUT_RATE / IN_RATE) as usize;
+        const IMPULSE_AT: usize = 200;
+        const LEN: usize = 1_000;
+        let mut r = RationalResampler::new(IN_RATE, OUT_RATE)?;
+        let mut input = vec![Complex::default(); LEN];
+        input[IMPULSE_AT] = Complex::new(1.0, 0.0);
+        let mut output = vec![Complex::default(); LEN * OUTPUTS_PER_INPUT + 8];
+        let n = r.process(&input, &mut output)?;
+        let (peak_idx, _) = output[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.re.abs()))
+            .fold(
+                (0, 0.0_f32),
+                |best, cur| if cur.1 > best.1 { cur } else { best },
+            );
+        // Peak lands at (IMPULSE_AT + delay) · OUTPUTS_PER_INPUT.
+        let measured = peak_idx / OUTPUTS_PER_INPUT - IMPULSE_AT;
+        let reported = r.group_delay_input_samples();
+        assert!(
+            reported.abs_diff(measured) <= 1,
+            "reported {reported}, measured {measured} (peak at output {peak_idx})"
+        );
         Ok(())
     }
 }
