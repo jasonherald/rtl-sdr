@@ -600,6 +600,12 @@ pub struct SyncDetector {
     template_b_norm: f32,
 }
 
+/// Denominator guard for the normalised cross-correlation: windows
+/// whose energy is below this are treated as zero-signal rather than
+/// dividing by (nearly) nothing. Shared by `find_best` and
+/// `quality_at` so both paths score identically.
+const NORMALIZED_CORRELATION_DENOM_GUARD: f32 = 1e-9;
+
 impl Default for SyncDetector {
     fn default() -> Self {
         Self::new()
@@ -653,10 +659,14 @@ impl SyncDetector {
         // Naive O(N·L) normalized cross-correlation. Good enough at APT
         // sample rates: even a generous 2-line search window is under
         // ~4 M multiplies, negligible at 2 lines/sec.
-        let denom_guard = 1e-9_f32;
         for tau in 0..=envelope.len() - len {
             let window = &envelope[tau..tau + len];
-            let ncc = normalized_corr(window, template, template_norm, denom_guard);
+            let ncc = normalized_corr(
+                window,
+                template,
+                template_norm,
+                NORMALIZED_CORRELATION_DENOM_GUARD,
+            );
             if ncc > best_ncc {
                 best_ncc = ncc;
                 best_off = tau;
@@ -678,7 +688,15 @@ impl SyncDetector {
         let (template, template_norm) = self.template_for(channel);
         let end = offset.checked_add(template.len())?;
         let window = envelope.get(offset..end)?;
-        Some(normalized_corr(window, template, template_norm, 1e-9_f32).clamp(0.0, 1.0))
+        Some(
+            normalized_corr(
+                window,
+                template,
+                template_norm,
+                NORMALIZED_CORRELATION_DENOM_GUARD,
+            )
+            .clamp(0.0, 1.0),
+        )
     }
 
     /// The matched-filter template and its norm for `channel`.

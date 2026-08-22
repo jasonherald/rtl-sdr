@@ -825,6 +825,8 @@ mod tests {
     fn rational_resampler_reports_its_group_delay() -> Result<(), DspError> {
         const IN_RATE: f64 = 12_480.0;
         const OUT_RATE: f64 = 4_160.0;
+        /// `IN_RATE / OUT_RATE`: input samples per output sample.
+        const INPUT_SAMPLES_PER_OUTPUT: usize = 3;
         const IMPULSE_AT: usize = 600;
         const LEN: usize = 3_000;
         let mut r = RationalResampler::new(IN_RATE, OUT_RATE)?;
@@ -840,7 +842,7 @@ mod tests {
                 (0, 0.0_f32),
                 |best, cur| if cur.1 > best.1 { cur } else { best },
             );
-        let measured = peak_idx * 3 - IMPULSE_AT;
+        let measured = peak_idx * INPUT_SAMPLES_PER_OUTPUT - IMPULSE_AT;
         let reported = r.group_delay_input_samples();
         assert!(
             reported.abs_diff(measured) <= 3,

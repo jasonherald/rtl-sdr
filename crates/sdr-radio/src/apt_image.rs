@@ -1095,9 +1095,19 @@ mod tests {
     /// pixel into the video band and seamed the image.
     #[test]
     fn rotate_180_per_channel_starts_after_the_39px_sync_field() {
+        /// Two rows are the smallest image in which a 180° rotation
+        /// moves pixels across rows, so the boundary is observable.
         const HEIGHT: usize = 2;
-        /// Row stride of the synthetic pattern so the two rows differ.
+        /// A small non-zero stride makes the two rows' patterns differ,
+        /// so a moved pixel cannot be mistaken for an untouched one.
         const TEST_ROTATION_ROW_STRIDE: usize = 7;
+        /// Expected APT geometry, written out independently of the
+        /// production constants so boundary drift is detected:
+        /// 39-px Sync A field + 47-px space → last non-video column 85,
+        /// first video column 86, last video column 86 + 909 − 1.
+        const EXPECTED_LAST_NON_VIDEO_COL: usize = 85;
+        const EXPECTED_FIRST_VIDEO_COL: usize = 86;
+        const EXPECTED_LAST_VIDEO_COL: usize = 994;
         let width = AptImage::WIDTH;
         let mut image = vec![0_u8; width * HEIGHT];
         for row in 0..HEIGHT {
@@ -1109,12 +1119,12 @@ mod tests {
         let original = image.clone();
         rotate_180_per_channel(&mut image, HEIGHT);
         assert_eq!(
-            image[85], original[85],
+            image[EXPECTED_LAST_NON_VIDEO_COL], original[EXPECTED_LAST_NON_VIDEO_COL],
             "column 85 is the last pre-video space px, untouched"
         );
         assert_eq!(
-            image[86],
-            original[width + 994],
+            image[EXPECTED_FIRST_VIDEO_COL],
+            original[width + EXPECTED_LAST_VIDEO_COL],
             "column 86 is the first video px, rotated"
         );
     }
