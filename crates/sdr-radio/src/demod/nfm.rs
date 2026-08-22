@@ -1,7 +1,7 @@
 //! Narrowband FM demodulator.
 
 use sdr_dsp::demod::FmDemod;
-use sdr_dsp::filter::{DEEMPHASIS_TAU_US, FirFilter};
+use sdr_dsp::filter::FirFilter;
 use sdr_dsp::taps;
 use sdr_types::{Complex, DspError, Stereo};
 
@@ -102,8 +102,7 @@ impl NfmDemodulator {
             default_snap_interval: NFM_SNAP_INTERVAL,
             vfo_reference: VfoReference::Center,
             deemp_allowed: true,
-            post_proc_enabled: true,
-            default_deemp_tau: DEEMPHASIS_TAU_US,
+            if_agc_allowed: true,
             fm_if_nr_allowed: true,
             nb_allowed: false,
             high_pass_allowed: true,
@@ -197,10 +196,7 @@ mod tests {
         assert!(cfg.fm_if_nr_allowed);
         assert!(cfg.squelch_allowed);
         assert!(cfg.deemp_allowed);
-        assert!(
-            cfg.default_deemp_tau > 0.0,
-            "NFM should default to active deemphasis"
-        );
+        assert!(cfg.if_agc_allowed);
         assert!(!cfg.nb_allowed);
     }
 
