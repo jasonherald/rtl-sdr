@@ -77,7 +77,7 @@ pub enum TleFreshness {
     Fresh,
     /// Between [`TLE_WARN_AGE`] and [`TLE_MAX_AGE`]: usable, flag it.
     Stale,
-    /// At or beyond [`TLE_MAX_AGE`]: refuse to propagate.
+    /// Older than [`TLE_MAX_AGE`]: refuse to propagate.
     Expired,
 }
 
@@ -85,7 +85,7 @@ impl TleFreshness {
     /// Classify an element age (`when - epoch`).
     #[must_use]
     pub fn for_age(age: chrono::Duration) -> Self {
-        if age >= TLE_MAX_AGE {
+        if age > TLE_MAX_AGE {
             Self::Expired
         } else if age >= TLE_WARN_AGE {
             Self::Stale
@@ -200,10 +200,16 @@ impl Satellite {
     ///
     /// # Errors
     ///
-    /// Returns [`SatelliteError::Propagation`] if the SGP4 propagator
-    /// fails — usually because `when` is far enough from the epoch
-    /// that the orbital elements no longer describe physical motion.
+    /// * [`SatelliteError::TleExpired`] if `when` is more than
+    ///   [`TLE_MAX_AGE`] past the epoch — the policy is enforced here
+    ///   so real-time tracking cannot bypass the pass-prediction gate
+    ///   (#718).
+    /// * [`SatelliteError::Propagation`] if the SGP4 propagator fails
+    ///   or returns a non-finite state — usually because `when` is far
+    ///   enough from the epoch that the orbital elements no longer
+    ///   describe physical motion.
     pub fn propagate(&self, when: DateTime<Utc>) -> Result<EciState, SatelliteError> {
+        self.check_not_expired(when)?;
         let dt = when - self.epoch;
         // SGP4 wants minutes since epoch as f64. `num_microseconds`
         // is the most precise integer span chrono will give us; over
@@ -568,15 +574,29 @@ mod tests {
             TleFreshness::Fresh
         );
         assert_eq!(sat.freshness(epoch + TLE_WARN_AGE), TleFreshness::Stale);
+        assert_eq!(sat.freshness(epoch + TLE_MAX_AGE), TleFreshness::Stale);
         assert_eq!(
-            sat.freshness(epoch + TLE_MAX_AGE - chrono::Duration::seconds(1)),
-            TleFreshness::Stale
+            sat.freshness(epoch + TLE_MAX_AGE + chrono::Duration::seconds(1)),
+            TleFreshness::Expired
         );
-        assert_eq!(sat.freshness(epoch + TLE_MAX_AGE), TleFreshness::Expired);
         // Elements from the "future" (clock skew) are simply fresh.
         assert_eq!(
             sat.freshness(epoch - chrono::Duration::days(3)),
             TleFreshness::Fresh
         );
+    }
+
+    /// Codacy on PR #799 — the expiry policy lives in `propagate`, so
+    /// `track()` / Doppler cannot use elements the pass predictor
+    /// would refuse.
+    #[test]
+    fn propagate_refuses_expired_elements() {
+        let sat = Satellite::from_tle(TEST_TLE_NAME, TEST_TLE_LINE1, TEST_TLE_LINE2).unwrap();
+        let when = sat.epoch() + TLE_MAX_AGE + chrono::Duration::days(1);
+        assert!(matches!(
+            sat.propagate(when),
+            Err(SatelliteError::TleExpired { .. })
+        ));
+        assert!(sat.propagate(sat.epoch() + TLE_MAX_AGE).is_ok());
     }
 }

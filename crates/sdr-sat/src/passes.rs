@@ -21,8 +21,8 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::sgp4_core::{
-    EARTH_ROTATION_RAD_PER_SEC, Satellite, SatelliteError, TleFreshness, ecef_to_enu, eci_to_ecef,
-    geodetic_to_ecef, gmst_rad,
+    EARTH_ROTATION_RAD_PER_SEC, Satellite, SatelliteError, TLE_MAX_AGE, TleFreshness, ecef_to_enu,
+    eci_to_ecef, geodetic_to_ecef, gmst_rad,
 };
 
 /// Speed of light, km/s. Defined exactly by the SI metre.
@@ -176,8 +176,8 @@ pub struct Pass {
     pub start_az_deg: f64,
     /// Azimuth at LOS (degrees clockwise from true north).
     pub end_az_deg: f64,
-    /// Age of the TLE elements at the start of the enumeration window
-    /// — how much to trust this prediction (#718).
+    /// Age of the TLE elements at this pass's AOS — how much to trust
+    /// the prediction (#718).
     pub tle_age: Duration,
 }
 
@@ -308,10 +308,14 @@ pub fn is_ascending(satellite: &Satellite, when: DateTime<Utc>) -> Result<bool, 
 /// `min_elevation_deg` *within* the window. Symmetrically, passes that
 /// haven't fully ended by `to` are returned with `end == to`.
 ///
+/// The window is clamped at the elements' expiry horizon
+/// (`epoch + TLE_MAX_AGE`): nothing is predicted past it, and each
+/// returned pass carries the element age at its own AOS (#718).
+///
 /// # Errors
 ///
-/// * [`SatelliteError::TleExpired`] — the elements are older than
-///   [`crate::sgp4_core::TLE_MAX_AGE`] at `from` (#718).
+/// * [`SatelliteError::TleExpired`] — the elements are already older
+///   than [`crate::sgp4_core::TLE_MAX_AGE`] at `from` (#718).
 /// * [`SatelliteError::Propagation`] — SGP4 failed or returned a
 ///   non-finite state somewhere in the window. Earlier versions mapped
 ///   that to "below the horizon", which fabricated a setting edge plus
@@ -329,8 +333,25 @@ pub fn upcoming_passes(
         return Ok(Vec::new());
     }
     satellite.check_not_expired(from)?;
-    let tle_age = satellite.age_at(from);
+    let to = satellite
+        .epoch()
+        .checked_add_signed(TLE_MAX_AGE)
+        .map_or(to, |horizon| to.min(horizon));
+    if to <= from {
+        return Ok(Vec::new());
+    }
+    scan_window(station, satellite, from, to, min_elevation_deg)
+}
 
+/// The coarse scan + refinement behind [`upcoming_passes`], on a
+/// window already validated and clamped to the elements' horizon.
+fn scan_window(
+    station: &GroundStation,
+    satellite: &Satellite,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    min_elevation_deg: f64,
+) -> Result<Vec<Pass>, SatelliteError> {
     let mut passes = Vec::new();
     let mut t = from;
     let mut prev_el = elevation_at(station, satellite, t)?;
@@ -361,7 +382,7 @@ pub fn upcoming_passes(
             // Setting edge: refine, build the Pass, push.
             (Some(open_at), true, false) => {
                 let end = refine_crossing(station, satellite, t, next_t, min_elevation_deg, false)?;
-                passes.push(build_pass(station, satellite, open_at, end, tle_age)?);
+                passes.push(build_pass(station, satellite, open_at, end)?);
                 pass_open = None;
             }
             _ => {}
@@ -373,7 +394,7 @@ pub fn upcoming_passes(
 
     // Pass still open at `to` — emit it with end clamped.
     if let Some(open_at) = pass_open {
-        passes.push(build_pass(station, satellite, open_at, to, tle_age)?);
+        passes.push(build_pass(station, satellite, open_at, to)?);
     }
 
     Ok(passes)
@@ -441,7 +462,6 @@ fn build_pass(
     satellite: &Satellite,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    tle_age: Duration,
 ) -> Result<Pass, SatelliteError> {
     let aos = track(station, satellite, start)?;
     let los = track(station, satellite, end)?;
@@ -470,7 +490,7 @@ fn build_pass(
         max_el_time: max_t,
         start_az_deg: aos.azimuth_deg,
         end_az_deg: los.azimuth_deg,
-        tle_age,
+        tle_age: satellite.age_at(start),
     })
 }
 
@@ -800,8 +820,8 @@ mod tests {
         );
     }
 
-    /// #718 — every pass carries the element age at the window start
-    /// so the UI can flag stale-but-usable predictions.
+    /// #718 — every pass carries the element age at its own AOS so
+    /// the UI can flag stale-but-usable predictions.
     #[test]
     fn passes_carry_the_tle_age_at_window_start() {
         let sat = test_satellite();
@@ -811,10 +831,8 @@ mod tests {
         let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG).unwrap();
         assert!(!passes.is_empty(), "a day of NOAA passes expected");
         for pass in &passes {
-            assert_eq!(
-                pass.tle_age,
-                crate::sgp4_core::TLE_WARN_AGE + Duration::days(2)
-            );
+            assert_eq!(pass.tle_age, pass.start - sat.epoch());
+            assert!(pass.tle_age >= crate::sgp4_core::TLE_WARN_AGE + Duration::days(2));
             assert_eq!(pass.tle_freshness(), TleFreshness::Stale);
         }
     }
@@ -839,5 +857,93 @@ mod tests {
         let from = to - Duration::hours(1);
         let result = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG);
         assert!(result.is_err(), "got {result:?}");
+    }
+
+    /// CR round 1 on PR #799 — freshness applies to the whole window:
+    /// a window that crosses `TLE_MAX_AGE` is clamped at the expiry
+    /// horizon, so no pass starting after it is ever returned.
+    #[test]
+    fn window_crossing_the_expiry_horizon_is_clamped() {
+        let sat = test_satellite();
+        let station = test_station();
+        let expiry = sat.epoch() + crate::sgp4_core::TLE_MAX_AGE;
+        let from = expiry - Duration::days(1);
+        let to = expiry + Duration::days(1);
+        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG).unwrap();
+        assert!(
+            !passes.is_empty(),
+            "a day of Vanguard passes expected before expiry"
+        );
+        for pass in &passes {
+            assert!(
+                pass.start < expiry,
+                "pass at {} starts after expiry",
+                pass.start
+            );
+            assert!(
+                pass.end <= expiry,
+                "pass ending {} runs past expiry",
+                pass.end
+            );
+            assert_eq!(
+                pass.tle_age,
+                pass.start - sat.epoch(),
+                "age is at the pass start"
+            );
+        }
+    }
+
+    /// CR round 1 on PR #799 — each pass reports the element age at
+    /// its own start, so a window straddling `TLE_WARN_AGE` yields
+    /// fresh passes before the threshold and stale ones after it.
+    #[test]
+    fn passes_straddling_the_warn_threshold_report_their_own_age() {
+        let sat = test_satellite();
+        let station = test_station();
+        let warn = sat.epoch() + crate::sgp4_core::TLE_WARN_AGE;
+        let from = warn - Duration::days(1);
+        let to = warn + Duration::days(1);
+        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG).unwrap();
+        let fresh = passes
+            .iter()
+            .filter(|p| p.tle_freshness() == TleFreshness::Fresh)
+            .count();
+        let stale = passes
+            .iter()
+            .filter(|p| p.tle_freshness() == TleFreshness::Stale)
+            .count();
+        assert!(
+            fresh > 0 && stale > 0,
+            "expected both bands, got {passes:?}"
+        );
+        for pass in &passes {
+            assert_eq!(
+                pass.tle_freshness() == TleFreshness::Stale,
+                pass.start >= warn
+            );
+        }
+    }
+
+    /// Codacy on PR #799 — a pass still in progress at `to` is returned
+    /// with `end == to` (LOS is outside the window).
+    #[test]
+    fn pass_in_progress_at_window_end_is_clamped_to_it() {
+        let sat = test_satellite();
+        let station = test_station();
+        let day = upcoming_passes(
+            &station,
+            &sat,
+            sat.epoch(),
+            sat.epoch() + Duration::days(1),
+            TEST_MIN_ELEVATION_DEG,
+        )
+        .unwrap();
+        let reference = day.first().expect("a pass within a day");
+        let to = reference.max_el_time;
+        let from = reference.start - Duration::minutes(5);
+        let passes = upcoming_passes(&station, &sat, from, to, TEST_MIN_ELEVATION_DEG).unwrap();
+        assert_eq!(passes.len(), 1, "{passes:?}");
+        assert_eq!(passes[0].end, to, "LOS must be clamped to the window end");
+        assert!((passes[0].start - reference.start).num_seconds().abs() <= 2);
     }
 }
