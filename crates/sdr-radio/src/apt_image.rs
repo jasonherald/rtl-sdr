@@ -1091,22 +1091,26 @@ mod tests {
 
     /// #774 — the video band starts after the 39-px Sync A *field* and
     /// the 47-px space, i.e. at column 86; rotating from column 85
-    /// dragged the last sync pixel into the video and seamed the image.
+    /// (38-px template width + 47) dragged the last pre-video space
+    /// pixel into the video band and seamed the image.
     #[test]
     fn rotate_180_per_channel_starts_after_the_39px_sync_field() {
         const HEIGHT: usize = 2;
+        /// Row stride of the synthetic pattern so the two rows differ.
+        const TEST_ROTATION_ROW_STRIDE: usize = 7;
         let width = AptImage::WIDTH;
         let mut image = vec![0_u8; width * HEIGHT];
         for row in 0..HEIGHT {
             for col in 0..width {
-                image[row * width + col] = ((row * 7 + col) % 251) as u8;
+                image[row * width + col] =
+                    ((row * TEST_ROTATION_ROW_STRIDE + col) % TEST_PIXEL_PATTERN_MODULUS) as u8;
             }
         }
         let original = image.clone();
         rotate_180_per_channel(&mut image, HEIGHT);
         assert_eq!(
             image[85], original[85],
-            "column 85 is the last Sync A px, untouched"
+            "column 85 is the last pre-video space px, untouched"
         );
         assert_eq!(
             image[86],

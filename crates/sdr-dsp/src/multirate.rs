@@ -822,16 +822,16 @@ mod tests {
     /// #774 — callers that align a per-line resample need the filter
     /// chain's group delay in input samples; measure it with an impulse.
     #[test]
-    fn rational_resampler_reports_its_group_delay() {
+    fn rational_resampler_reports_its_group_delay() -> Result<(), DspError> {
         const IN_RATE: f64 = 12_480.0;
         const OUT_RATE: f64 = 4_160.0;
         const IMPULSE_AT: usize = 600;
         const LEN: usize = 3_000;
-        let mut r = RationalResampler::new(IN_RATE, OUT_RATE).unwrap();
+        let mut r = RationalResampler::new(IN_RATE, OUT_RATE)?;
         let mut input = vec![Complex::default(); LEN];
         input[IMPULSE_AT] = Complex::new(1.0, 0.0);
         let mut output = vec![Complex::default(); LEN];
-        let n = r.process(&input, &mut output).unwrap();
+        let n = r.process(&input, &mut output)?;
         let (peak_idx, _) = output[..n]
             .iter()
             .enumerate()
@@ -847,5 +847,6 @@ mod tests {
             "reported {reported}, measured {measured} (peak at output {peak_idx})"
         );
         assert!(reported > 0);
+        Ok(())
     }
 }

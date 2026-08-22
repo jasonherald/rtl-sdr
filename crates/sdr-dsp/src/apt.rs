@@ -641,10 +641,7 @@ impl SyncDetector {
     /// correlation peak in `[0.0, 1.0]`.
     #[must_use]
     pub fn find_best(&self, envelope: &[f32], channel: SyncChannel) -> Option<SyncMatch> {
-        let (template, template_norm) = match channel {
-            SyncChannel::A => (self.template_a.as_slice(), self.template_a_norm),
-            SyncChannel::B => (self.template_b.as_slice(), self.template_b_norm),
-        };
+        let (template, template_norm) = self.template_for(channel);
         let len = template.len();
         if envelope.len() < len {
             return None;
@@ -678,12 +675,18 @@ impl SyncDetector {
     /// template does not fit.
     #[must_use]
     pub fn quality_at(&self, envelope: &[f32], offset: usize, channel: SyncChannel) -> Option<f32> {
-        let (template, template_norm) = match channel {
+        let (template, template_norm) = self.template_for(channel);
+        let end = offset.checked_add(template.len())?;
+        let window = envelope.get(offset..end)?;
+        Some(normalized_corr(window, template, template_norm, 1e-9_f32).clamp(0.0, 1.0))
+    }
+
+    /// The matched-filter template and its norm for `channel`.
+    fn template_for(&self, channel: SyncChannel) -> (&[f32], f32) {
+        match channel {
             SyncChannel::A => (self.template_a.as_slice(), self.template_a_norm),
             SyncChannel::B => (self.template_b.as_slice(), self.template_b_norm),
-        };
-        let window = envelope.get(offset..offset + template.len())?;
-        Some(normalized_corr(window, template, template_norm, 1e-9_f32).clamp(0.0, 1.0))
+        }
     }
 }
 
@@ -995,6 +998,14 @@ impl AptDecoder {
             .group_delay_input_samples()
             .div_ceil(SAMPLES_PER_PIXEL)
             * SAMPLES_PER_PIXEL;
+        // `drain_accumulator` refills the whole history from the drained
+        // line, which needs a line to be at least `prime` long; the
+        // resampler's delay is ~150 samples against a 6240-sample line.
+        if prime > SAMPLES_PER_LINE {
+            return Err(DspError::InvalidParameter(format!(
+                "final resampler group delay ({prime}) exceeds a line ({SAMPLES_PER_LINE})"
+            )));
+        }
 
         Ok(Self {
             input_rate_hz,
@@ -1259,14 +1270,16 @@ impl AptDecoder {
     /// correlation actually measured there, so a line buried in noise
     /// becomes one low-quality row instead of a skipped row that
     /// compresses the image. After `MAX_NOMINAL_FALLBACKS` such rows
-    /// the lock is dropped and the search is unconstrained again.
+    /// the lock is dropped (that line still at nominal spacing) and the
+    /// next search is unconstrained again.
     fn gate_sync_match(&mut self, m: SyncMatch) -> SyncMatch {
         if self.locked && m.offset > MAX_SYNC_DRIFT_SAMPLES {
             self.nominal_fallbacks += 1;
             if self.nominal_fallbacks >= MAX_NOMINAL_FALLBACKS {
+                // This line still keeps its nominal start; only the
+                // *next* search runs unconstrained.
                 self.locked = false;
                 self.nominal_fallbacks = 0;
-                return m;
             }
             let quality = self
                 .sync_detector
@@ -1331,16 +1344,12 @@ impl AptDecoder {
 
     /// Drop `line_end` samples from the accumulator, keeping the last
     /// `prime` of them as the priming context for the next line.
+    /// `line_end >= SAMPLES_PER_LINE >= prime` (checked in `new`), so
+    /// the drained span always covers the whole history.
     fn drain_accumulator(&mut self, line_end: usize) {
         let prime = self.prime;
-        if line_end >= prime {
-            self.history
-                .copy_from_slice(&self.accumulator[line_end - prime..line_end]);
-        } else {
-            self.history.rotate_left(line_end);
-            let keep = prime - line_end;
-            self.history[keep..].copy_from_slice(&self.accumulator[..line_end]);
-        }
+        self.history
+            .copy_from_slice(&self.accumulator[line_end - prime..line_end]);
         self.accumulator.drain(..line_end);
         self.accumulator_start_intermediate_sample += line_end as u64;
     }
@@ -2578,19 +2587,19 @@ mod tests {
     /// burst must land in the first ~30 columns, and the video body
     /// must already be flat at its nominal level by column 60.
     #[test]
-    fn decoded_line_keeps_sync_a_in_the_first_columns() {
+    fn decoded_line_keeps_sync_a_in_the_first_columns() -> Result<(), DspError> {
         const SYNC_PROBE: std::ops::Range<usize> = 4..28;
         const SHIFTED_PROBE: std::ops::Range<usize> = 50..80;
         const VIDEO_PROBE: std::ops::Range<usize> = 60..90;
         let rate = TEST_INPUT_RATE_HZ;
-        let mut d = AptDecoder::new(rate).unwrap();
+        let mut d = AptDecoder::new(rate)?;
         let one_line = synth_line_audio(rate, TEST_GREY_LEVEL);
         let mut audio = Vec::with_capacity(one_line.len() * 4);
         for _ in 0..4 {
             audio.extend_from_slice(&one_line);
         }
         let mut out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
-        let produced = d.process(&audio, &mut out).unwrap();
+        let produced = d.process(&audio, &mut out)?;
         assert!(produced >= 2, "need a settled line, got {produced}");
         let line = &out[produced - 1];
         let spread = |r: std::ops::Range<usize>| -> f32 {
@@ -2615,6 +2624,7 @@ mod tests {
             line.pixels[..8].iter().any(|&p| p > 0),
             "no zero ramp at the line start"
         );
+        Ok(())
     }
 
     /// #774 — `SYNC_A_TOTAL_PX` (38) is the matched-filter template
@@ -2630,9 +2640,9 @@ mod tests {
     /// quality floor keeps the nominal line spacing instead of
     /// jumping to wherever the noise correlated best.
     #[test]
-    fn weak_sync_after_lock_keeps_nominal_line_spacing() {
+    fn weak_sync_after_lock_keeps_nominal_line_spacing() -> Result<(), DspError> {
         let rate = TEST_INPUT_RATE_HZ;
-        let mut d = AptDecoder::new(rate).unwrap();
+        let mut d = AptDecoder::new(rate)?;
         let one_line = synth_line_audio(rate, TEST_GREY_LEVEL);
         let line_len = one_line.len();
         let mut audio = Vec::with_capacity(line_len * 9);
@@ -2653,7 +2663,7 @@ mod tests {
             audio.extend_from_slice(&one_line);
         }
         let mut out = vec![AptLine::default(); 16];
-        let produced = d.process(&audio, &mut out).unwrap();
+        let produced = d.process(&audio, &mut out)?;
         assert!(produced >= 6, "got {produced} lines");
         let nominal = line_len as f64;
         for pair in out[..produced].windows(2) {
@@ -2669,5 +2679,44 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+        Ok(())
+    }
+
+    /// #774 — the priming context is refilled from each drained line,
+    /// which relies on the resampler delay being far shorter than a
+    /// line; pin the invariant and that the history really is the
+    /// line's tail (the next line's resample reads it).
+    #[test]
+    fn priming_context_is_shorter_than_a_line_and_tracks_the_drained_tail() -> Result<(), DspError>
+    {
+        let rate = TEST_INPUT_RATE_HZ;
+        let mut d = AptDecoder::new(rate)?;
+        assert!(
+            d.prime > 0 && d.prime <= SAMPLES_PER_LINE,
+            "prime = {}",
+            d.prime
+        );
+        assert_eq!(
+            d.prime % SAMPLES_PER_PIXEL,
+            0,
+            "prime is a whole number of pixels"
+        );
+        assert!(
+            d.history.iter().all(|&v| v == 0.0),
+            "fresh decoder has a zero context"
+        );
+
+        let one_line = synth_line_audio(rate, TEST_GREY_LEVEL);
+        let mut audio = Vec::with_capacity(one_line.len() * 3);
+        for _ in 0..3 {
+            audio.extend_from_slice(&one_line);
+        }
+        let mut out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        assert!(d.process(&audio, &mut out)? > 0);
+        assert!(
+            d.history.iter().any(|&v| v != 0.0),
+            "history holds the drained tail"
+        );
+        Ok(())
     }
 }
