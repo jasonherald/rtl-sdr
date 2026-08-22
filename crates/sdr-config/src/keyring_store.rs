@@ -9,8 +9,6 @@
 pub enum KeyringError {
     #[error("no secure storage available — install GNOME Keyring or KeePassXC")]
     NoBackend,
-    #[error("credential not found")]
-    NotFound,
     #[error("keyring error: {0}")]
     Platform(String),
 }
@@ -50,6 +48,10 @@ impl KeyringStore {
     }
 
     /// Check whether a credential exists for the given key.
+    ///
+    /// The Secret Service API has no metadata-only existence query, so
+    /// this reads the secret (and on a locked GNOME Keyring triggers the
+    /// unlock prompt). Call it off the main thread, or cache the result.
     ///
     /// # Errors
     ///

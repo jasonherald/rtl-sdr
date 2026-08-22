@@ -101,20 +101,6 @@ fn map_soap_error(fn_name: &str, err: &SoapError) -> SdrCoreError {
 /// descriptive thread-local last-error message.
 fn map_keyring_error(fn_name: &str, err: &KeyringError) -> SdrCoreError {
     match err {
-        KeyringError::NotFound => {
-            set_last_error(format!("{fn_name}: credential not found"));
-            // Callers: `load_credentials` doesn't even reach this
-            // arm any more — it uses the OK-plus-empty-buffer
-            // sentinel for the "not stored" case and reserves
-            // `Io` strictly for backend failures. This branch is
-            // kept for other keyring operations (delete's
-            // `NotFound`, for instance, is absorbed upstream in
-            // `delete_credentials`'s idempotent handling). The
-            // Swift wrapper propagates every non-zero rc via
-            // `checkRc`, so anything hitting this path surfaces
-            // as an `SdrCoreError` with the message above.
-            SdrCoreError::Io
-        }
         KeyringError::NoBackend => {
             // Generic message is correct on every platform —
             // on macOS, the Apple Keychain backend failing is
@@ -435,17 +421,11 @@ pub extern "C" fn sdr_core_radioreference_delete_credentials() -> i32 {
         // the other is already removed is worse than reporting
         // a partial failure. Then pick whichever real error
         // happened (preferring the username path for message
-        // ordering). `KeyringError::NotFound` is treated as
-        // success — matches the header's "idempotent" contract.
-        // Per CodeRabbit round 1 on PR #346.
-        let user_err = match store.delete(KEY_RR_USERNAME) {
-            Ok(()) | Err(KeyringError::NotFound) => None,
-            Err(e) => Some(e),
-        };
-        let pass_err = match store.delete(KEY_RR_PASSWORD) {
-            Ok(()) | Err(KeyringError::NotFound) => None,
-            Err(e) => Some(e),
-        };
+        // ordering). Per CodeRabbit round 1 on PR #346.
+        // `KeyringStore::delete` already absorbs a missing entry as
+        // `Ok(())` — matches the header's "idempotent" contract.
+        let user_err = store.delete(KEY_RR_USERNAME).err();
+        let pass_err = store.delete(KEY_RR_PASSWORD).err();
         if let Some(e) = user_err.or(pass_err) {
             return map_keyring_error("sdr_core_radioreference_delete_credentials", &e).as_int();
         }
