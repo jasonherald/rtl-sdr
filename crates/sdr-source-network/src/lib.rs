@@ -150,7 +150,7 @@ impl DeadlineResolver {
     }
 }
 
-/// Try each address in turn/// Try each address in turn, giving every attempt only the time left
+/// Try each address in turn, giving every attempt only the time left
 /// until `deadline`, so several unreachable addresses cannot stretch
 /// `start()` past one `connect_timeout` in total.
 fn connect_any_with_deadline(
@@ -391,13 +391,14 @@ impl Source for NetworkSource {
                     move || Ok((bind_host.as_str(), port).to_socket_addrs()?.collect()),
                     deadline,
                 )?;
-                let Some(bind_addr) = addrs.first() else {
+                if addrs.is_empty() {
                     return Err(SourceError::Io(std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         format!("no address resolved for {}", self.hostname),
                     )));
-                };
-                let socket = UdpSocket::bind(bind_addr)?;
+                }
+                // A slice of addresses binds the first one that works.
+                let socket = UdpSocket::bind(addrs.as_slice())?;
                 socket.set_read_timeout(Some(self.read_timeout))?;
                 NetworkConnection::Udp(socket)
             }
@@ -599,6 +600,10 @@ mod tests {
         const DATAGRAM_SAMPLES: usize = 30_000;
         const OUTPUT_SAMPLES: usize = 16_384;
         const READ_TIMEOUT: Duration = Duration::from_millis(500);
+        /// Int8 complex sample: one I byte + one Q byte.
+        const INT8_COMPLEX_BYTES: usize = 2;
+        /// Payload byte cycle — prime, so no 2-byte pattern repeats early.
+        const PAYLOAD_CYCLE: usize = 251;
         // Port 0: the OS assigns one and NetworkSource holds it from
         // bind onward, so nothing can claim it in between.
         let mut source = NetworkSource::new("127.0.0.1", 0, Protocol::Udp);
@@ -608,7 +613,9 @@ mod tests {
         let port = source.local_addr().expect("bound").port();
 
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let payload: Vec<u8> = (0..DATAGRAM_SAMPLES * 2).map(|i| (i % 251) as u8).collect();
+        let payload: Vec<u8> = (0..DATAGRAM_SAMPLES * INT8_COMPLEX_BYTES)
+            .map(|i| (i % PAYLOAD_CYCLE) as u8)
+            .collect();
         sender
             .send_to(&payload, ("127.0.0.1", port))
             .expect("loopback accepts a 60 kB datagram");
