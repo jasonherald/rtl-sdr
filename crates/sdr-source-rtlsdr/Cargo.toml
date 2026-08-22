@@ -10,9 +10,7 @@ repository.workspace = true
 sdr-types.workspace = true
 sdr-pipeline.workspace = true
 librtlsdr-rs.workspace = true
-sdr-config.workspace = true
 rusb.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 
 [lints]

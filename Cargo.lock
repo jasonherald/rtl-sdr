@@ -3423,10 +3423,8 @@ version = "0.1.0"
 dependencies = [
  "librtlsdr-rs",
  "rusb",
- "sdr-config",
  "sdr-pipeline",
  "sdr-types",
- "thiserror 2.0.20",
  "tracing",
 ]
 
