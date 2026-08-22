@@ -1299,6 +1299,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                         let acars_center = state.acars_region.center_hz();
                         match apply_acars_geometry(
                             state,
+                            dsp_tx,
                             crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
                             acars_center,
                             crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
@@ -1343,12 +1344,21 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 tracing::error!("ACARS geometry reassert failed post-Start: {err}");
                                 let snapshot_clone = state.acars_pre_lock.clone();
                                 let live_restore = match &snapshot_clone {
-                                    Some(snap) => apply_acars_geometry(
-                                        state,
-                                        snap.source_rate_hz,
-                                        snap.center_freq_hz,
-                                        snap.frontend_decim,
-                                    ),
+                                    Some(snap) => {
+                                        // Restore the pre-engage offset BEFORE
+                                        // the geometry rebuild so `rebuild_vfo`
+                                        // clamps it against the restored rate
+                                        // and echoes the applied value once
+                                        // (#699, CR round 3 on PR #787).
+                                        state.vfo_offset = snap.vfo_offset_hz;
+                                        apply_acars_geometry(
+                                            state,
+                                            dsp_tx,
+                                            snap.source_rate_hz,
+                                            snap.center_freq_hz,
+                                            snap.frontend_decim,
+                                        )
+                                    }
                                     None => Ok(()),
                                 };
 
@@ -1370,31 +1380,6 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                     tracing::error!(
                                         "ACARS live-graph restore ALSO failed: {restore_err}"
                                     );
-                                } else if let Some(snap) = &snapshot_clone {
-                                    // Live restore succeeded for
-                                    // rate/center/decim, but
-                                    // `apply_acars_geometry` doesn't
-                                    // touch `state.vfo_offset` — it
-                                    // just rebuilds the VFO at
-                                    // whatever offset is currently
-                                    // in state. If the user changed
-                                    // VfoOffset between engage and
-                                    // Start (the airband-lock UI
-                                    // greys it but DSP doesn't
-                                    // enforce in v1), state.vfo_offset
-                                    // could differ from
-                                    // snapshot.vfo_offset_hz. Replay
-                                    // the snapshot's offset so the
-                                    // restored channel comes back at
-                                    // the user's pre-engage tuning,
-                                    // matching the explicit reapply
-                                    // in `handle_set_acars_enabled`'s
-                                    // disengage branch. CR round 13
-                                    // on PR #584.
-                                    state.vfo_offset = snap.vfo_offset_hz;
-                                    if let Some(vfo) = state.vfo.as_mut() {
-                                        vfo.set_offset(snap.vfo_offset_hz);
-                                    }
                                 }
 
                                 state.acars_bank = None;
@@ -1550,7 +1535,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 }
 
                 // Rebuild the RxVfo for the new demod's IF rate and bandwidth.
-                if let Err(e) = rebuild_vfo(state) {
+                if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
                     tracing::warn!("VFO rebuild on mode switch failed: {e}");
                     let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
                 }
@@ -1699,6 +1684,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             if acars_lock_rejects_geometry_change(state, dsp_tx, "SetSampleRate") {
                 return;
             }
+            if iq_recording_rejects_rate_change(state, dsp_tx, "SetSampleRate") {
+                return;
+            }
             tracing::debug!(sample_rate = rate, "set sample rate");
             state.configured_sample_rate = rate;
             if let Some(source) = &mut state.source {
@@ -1732,7 +1720,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
             match rebuild_frontend(state) {
                 Ok(()) => {
-                    if let Err(e) = rebuild_vfo(state) {
+                    if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
                         tracing::warn!("VFO rebuild on sample rate change failed: {e}");
                         let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
                     }
@@ -1758,7 +1746,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 let _ = dsp_tx.send(DspToUi::Error(format!("Decimation failed: {e}")));
             } else {
                 // Rebuild VFO for the new effective sample rate.
-                if let Err(e) = rebuild_vfo(state) {
+                if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
                     tracing::warn!("VFO rebuild on decimation change failed: {e}");
                     let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
                 }
@@ -1907,11 +1895,27 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             let raw_rate = state.frontend.sample_rate();
             let effective_rate = state.frontend.effective_sample_rate();
             let vfo_exists = state.vfo.is_some();
+            // The spectrum spans the RAW rate but the VFO mixes at the
+            // post-decimation rate: an offset beyond ±effective/2
+            // wraps (`hz_to_rads` aliases it) and the user hears a
+            // different station than the readout claims — the #337
+            // symptom. Clamp to the reachable span and echo the
+            // clamped value so every readout agrees (#699).
+            let reachable = vfo_reachable_offset_hz(effective_rate);
+            let clamped = offset.clamp(-reachable, reachable);
+            if (clamped - offset).abs() > f64::EPSILON {
+                tracing::warn!(
+                    requested_hz = offset,
+                    clamped_hz = clamped,
+                    effective_sample_rate_hz = effective_rate,
+                    "VFO offset outside ±effective/2; clamped"
+                );
+            }
+            let offset = clamped;
             tracing::debug!(
                 offset_hz = offset,
                 raw_sample_rate_hz = raw_rate,
                 effective_sample_rate_hz = effective_rate,
-                offset_within_effective = offset.abs() < effective_rate / 2.0,
                 vfo_exists,
                 "set VFO offset"
             );
@@ -2189,16 +2193,25 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // The Start path intentionally invalidates the bank
             // for the lazy-rebuild window — bank can be None
             // while ACARS is still engaged. CR round 5 on PR #584.
-            let acars_outcome =
-                if state.acars_pre_lock.is_some() && source_type != SourceType::RtlSdr {
-                    tracing::info!(
-                        ?source_type,
-                        "ACARS auto-disabling: source type changing to non-RTL-SDR"
-                    );
-                    handle_set_acars_enabled(state, false, dsp_tx)
-                } else {
-                    AcarsHandlerOutcome::Normal
-                };
+            // While an IQ recording is open on a live source, leave the
+            // disengage to `cleanup()` below: it stops the recording first
+            // and then performs the forced ACARS teardown, whereas the
+            // user-path disengage would be refused by the recording mutex
+            // (#695) and emit a misleading failure for a switch that is
+            // about to succeed.
+            let defer_to_cleanup = state.iq_writer.is_some() && state.running;
+            let acars_outcome = if state.acars_pre_lock.is_some()
+                && source_type != SourceType::RtlSdr
+                && !defer_to_cleanup
+            {
+                tracing::info!(
+                    ?source_type,
+                    "ACARS auto-disabling: source type changing to non-RTL-SDR"
+                );
+                handle_set_acars_enabled(state, false, dsp_tx)
+            } else {
+                AcarsHandlerOutcome::Normal
+            };
             let was_running = state.running;
             if was_running {
                 cleanup(state, dsp_tx);
@@ -2656,6 +2669,19 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::StartIqRecording(path) => {
             tracing::info!(?path, "start IQ recording");
+            // The header bakes in `state.sample_rate`, which is only
+            // authoritative while a source is open (it is read back
+            // from the hardware in `open_source`). With no source
+            // there is no IQ to record anyway, and a writer opened
+            // now would get whatever stale rate the last session
+            // left behind (#695).
+            if state.source.is_none() {
+                tracing::warn!("IQ recording rejected: no source is running");
+                let _ = dsp_tx.send(DspToUi::Error(
+                    "IQ record failed: press Play before recording IQ".to_string(),
+                ));
+                return;
+            }
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let iq_rate = state.sample_rate as u32;
             // Open-first, apply-mutex-on-success — same rationale
@@ -3130,7 +3156,7 @@ fn apply_scanner_commands(
                         // below; rebuild picks it up via
                         // `state.bandwidth`.
                         state.bandwidth = bandwidth;
-                        if let Err(e) = rebuild_vfo(state) {
+                        if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
                             tracing::warn!(?e, "scanner retune: VFO rebuild failed");
                         }
                     }
@@ -3662,7 +3688,7 @@ fn open_source(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(
 
     // Rebuild frontend and VFO before committing the source to state.
     // If either fails, stop the source to avoid a leaked running source.
-    if let Err(e) = rebuild_frontend(state).and_then(|()| rebuild_vfo(state)) {
+    if let Err(e) = rebuild_frontend(state).and_then(|()| rebuild_vfo_echoing(state, dsp_tx)) {
         let _ = source.stop();
         return Err(e);
     }
@@ -3695,6 +3721,16 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // signal); `acars_bank.is_some()` is too narrow because the
     // Start path intentionally invalidates the bank for the
     // lazy-rebuild window. CR round 5 on PR #584.
+    // Stop recordings FIRST (Drop patches the WAV header sizes) and tell
+    // the UI via `AudioRecordingStopped` / `IqRecordingStopped` so its
+    // recording-active flags clear — `SourceStopped` alone does not.
+    // The ACARS disengage below refuses to change geometry while an IQ
+    // writer is open (#695), and cleanup is the one path that must
+    // always get through — the recording is ending anyway.
+    if stop_any_recording(state, dsp_tx) {
+        tracing::info!("recording finalized on cleanup");
+    }
+
     let mut acars_forced_off = false;
     if state.acars_pre_lock.is_some() {
         // Cleanup is already tearing the source down, so
@@ -3769,14 +3805,6 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
 
     if was_network_sink {
         let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
-    }
-
-    // Finalize any active recordings (Drop patches the WAV header sizes).
-    if state.audio_writer.take().is_some() {
-        tracing::info!("audio recording finalized on cleanup");
-    }
-    if state.iq_writer.take().is_some() {
-        tracing::info!("IQ recording finalized on cleanup");
     }
 
     state.source = None;
@@ -3922,15 +3950,23 @@ fn apply_persisted_frontend_settings(state: &DspState, frontend: &mut IqFrontend
 ///
 /// Also tells `RadioModule` that its input is now at the demod IF rate (since the
 /// VFO handles resampling from the frontend effective rate to the IF rate).
-fn rebuild_vfo(state: &mut DspState) -> Result<(), String> {
+/// Rebuild the VFO for the current frontend rate, demod IF rate,
+/// bandwidth and offset. Transactional: the new VFO is built and the
+/// radio input rate applied before `state.vfo_offset` / `state.vfo`
+/// are committed, so a failure leaves the previous VFO and offset in
+/// place. Returns `Ok(true)` when the retained offset had to be clamped
+/// to the new reachable span (#699) — callers with a UI channel should
+/// echo `VfoOffsetChanged` in that case; see [`rebuild_vfo_echoing`].
+fn rebuild_vfo(state: &mut DspState) -> Result<bool, String> {
     let effective_rate = state.frontend.effective_sample_rate();
+    let reachable = vfo_reachable_offset_hz(effective_rate);
+    let applied_offset = state.vfo_offset.clamp(-reachable, reachable);
+    let offset_clamped = (applied_offset - state.vfo_offset).abs() > f64::EPSILON;
     let demod_cfg = state.radio.demod_config();
     let if_rate = demod_cfg.if_sample_rate;
 
-    let vfo = RxVfo::new(effective_rate, if_rate, state.bandwidth, state.vfo_offset)
+    let vfo = RxVfo::new(effective_rate, if_rate, state.bandwidth, applied_offset)
         .map_err(|e| format!("RxVfo build: {e}"))?;
-
-    state.vfo = Some(vfo);
 
     // Tell RadioModule it receives samples at the demod IF rate — no internal
     // resampling needed since the VFO already handled it.
@@ -3939,6 +3975,18 @@ fn rebuild_vfo(state: &mut DspState) -> Result<(), String> {
         .set_input_sample_rate(if_rate)
         .map_err(|e| format!("radio input rate: {e}"))?;
 
+    // Both succeeded — commit.
+    if offset_clamped {
+        tracing::warn!(
+            previous_hz = state.vfo_offset,
+            clamped_hz = applied_offset,
+            reachable_hz = reachable,
+            "VFO offset outside the new ±effective/2 span; clamped"
+        );
+    }
+    state.vfo_offset = applied_offset;
+    state.vfo = Some(vfo);
+
     tracing::debug!(
         frontend_rate = effective_rate,
         if_rate,
@@ -3946,6 +3994,16 @@ fn rebuild_vfo(state: &mut DspState) -> Result<(), String> {
         offset = state.vfo_offset,
         "RxVfo rebuilt"
     );
+    Ok(offset_clamped)
+}
+
+/// [`rebuild_vfo`] plus the `VfoOffsetChanged` echo when the retained
+/// offset was clamped, so the UI overlay / frequency readout follow the
+/// engine after a decimation, sample-rate or demod-mode transition.
+fn rebuild_vfo_echoing(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(), String> {
+    if rebuild_vfo(state)? {
+        let _ = dsp_tx.send(DspToUi::VfoOffsetChanged(state.vfo_offset));
+    }
     Ok(())
 }
 
@@ -4061,7 +4119,7 @@ fn process_iq_block(
     {
         tracing::warn!("IQ recording write error: {e}");
         state.iq_writer = None;
-        let _ = dsp_tx.send(DspToUi::Error("IQ recording write failed".to_string()));
+        let _ = dsp_tx.send(DspToUi::Error(recording_write_error_message("IQ", &e)));
         let _ = dsp_tx.send(DspToUi::IqRecordingStopped);
     }
 
@@ -4481,7 +4539,7 @@ fn process_iq_block(
                             tracing::warn!("audio recording write error: {e}");
                             state.audio_writer = None;
                             let _ = dsp_tx
-                                .send(DspToUi::Error("Audio recording write failed".to_string()));
+                                .send(DspToUi::Error(recording_write_error_message("Audio", &e)));
                             let _ = dsp_tx.send(DspToUi::AudioRecordingStopped);
                         }
 
@@ -4610,6 +4668,7 @@ fn process_iq_block(
 /// gets restored on disengage automatically.
 fn apply_acars_geometry(
     state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
     target_source_rate_hz: f64,
     target_center_hz: f64,
     target_frontend_decim: u32,
@@ -4639,7 +4698,8 @@ fn apply_acars_geometry(
         .map_err(|e| AcarsEnableError::FrontendDecimFailed(e.to_string()))?;
 
     rebuild_frontend(state).map_err(AcarsEnableError::FrontendRebuildFailed)?;
-    rebuild_vfo(state).map_err(AcarsEnableError::VfoRebuildFailed)?;
+    // Echo a clamped offset like every other rate transition (#699).
+    rebuild_vfo_echoing(state, dsp_tx).map_err(AcarsEnableError::VfoRebuildFailed)?;
 
     // Reset tune-dependent state. ACARS engage/disengage IS a
     // retune (forced to airband or restored to snapshot), so it
@@ -4699,6 +4759,48 @@ enum AcarsHandlerOutcome {
 /// (`Tune` / `SetDemodMode` / `SetSampleRate` / `SetDecimation` /
 /// `SetVfoOffset`) and
 /// `return`s on `true`. CR round 14 on PR #584.
+/// User-facing message for a failed recording write. The WAV size cap
+/// (#694) is an expected end-of-file condition, not a fault, so it gets
+/// its own wording.
+fn recording_write_error_message(kind: &str, err: &std::io::Error) -> String {
+    // A full filesystem also arrives as `StorageFull`; only the writer's
+    // typed marker means the WAV structural limit.
+    if crate::wav_writer::is_wav_limit(err) {
+        format!("{kind} recording stopped: WAV 4 GiB limit reached")
+    } else {
+        format!("{kind} recording write failed")
+    }
+}
+
+/// Largest VFO offset the post-decimation chain can reach without
+/// aliasing: half the effective sample rate (#699).
+fn vfo_reachable_offset_hz(effective_sample_rate_hz: f64) -> f64 {
+    effective_sample_rate_hz / 2.0
+}
+
+/// Returns `true` (after warn-logging and toasting) when an IQ
+/// recording is open. The WAV header committed to the sample rate at
+/// start, so a rate change mid-recording would silently desync header
+/// and data (#695). Mirrors [`acars_lock_rejects_geometry_change`].
+fn iq_recording_rejects_rate_change(
+    state: &DspState,
+    dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
+    cmd_label: &str,
+) -> bool {
+    if state.iq_writer.is_some() {
+        tracing::warn!(
+            cmd = cmd_label,
+            "IQ recording in progress: ignoring {cmd_label} command"
+        );
+        let _ = dsp_tx.send(crate::messages::DspToUi::Error(format!(
+            "{cmd_label} ignored: an IQ recording is in progress. \
+             Stop the recording to change the sample rate."
+        )));
+        return true;
+    }
+    false
+}
+
 fn acars_lock_rejects_geometry_change(
     state: &DspState,
     dsp_tx: &mpsc::Sender<crate::messages::DspToUi>,
@@ -4737,9 +4839,12 @@ fn handle_acars_engage_failure(
 ) -> AcarsHandlerOutcome {
     use crate::messages::DspToUi;
 
-    // Attempt rollback to snapshot tuning.
+    // Attempt rollback to snapshot tuning. Restore the offset first so
+    // the rebuild clamps + echoes it against the restored rate (#699).
+    state.vfo_offset = snapshot.vfo_offset_hz;
     let rollback = apply_acars_geometry(
         state,
+        dsp_tx,
         snapshot.source_rate_hz,
         snapshot.center_freq_hz,
         snapshot.frontend_decim,
@@ -5006,6 +5111,17 @@ fn handle_set_acars_enabled(
             return AcarsHandlerOutcome::Normal;
         }
 
+        // Refuse while an IQ recording is open: `apply_acars_geometry`
+        // forces the airband source rate, and the recording's WAV
+        // header already committed to the current one (#695).
+        if state.iq_writer.is_some() {
+            tracing::warn!("ACARS engage rejected: IQ recording in progress");
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(
+                AcarsEnableError::IqRecordingActive,
+            )));
+            return AcarsHandlerOutcome::Normal;
+        }
+
         // Snapshot the user's PRIOR config. `configured_sample_rate`
         // (not `sample_rate`) is the right field to capture: it's
         // the rate the user explicitly set, before any hardware-
@@ -5036,6 +5152,7 @@ fn handle_set_acars_enabled(
         // diverged.
         if let Err(err) = apply_acars_geometry(
             state,
+            dsp_tx,
             plan.target_source_rate_hz,
             plan.target_center_hz,
             plan.target_frontend_decim,
@@ -5085,12 +5202,28 @@ fn handle_set_acars_enabled(
             }
         }
     } else {
+        // Refuse a user-initiated disengage while an IQ recording is
+        // open: the restore puts the source back at the pre-lock rate
+        // and the recording's WAV header committed to the airband
+        // one (#695). `cleanup()` finalizes recordings before it
+        // disengages, so the forced teardown path is unaffected.
+        if state.acars_pre_lock.is_some() && state.iq_writer.is_some() {
+            tracing::warn!("ACARS disengage rejected: IQ recording in progress");
+            let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(
+                AcarsEnableError::IqRecordingActive,
+            )));
+            return AcarsHandlerOutcome::Normal;
+        }
         // Disengage. Idempotent: silently OK if already off.
         let Some(snapshot) = state.acars_pre_lock.take() else {
             let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
             return AcarsHandlerOutcome::Normal;
         };
         let restore = disengage(&snapshot);
+        // Restore the pre-engage offset BEFORE the geometry rebuild so
+        // `rebuild_vfo` clamps it against the restored rate and echoes
+        // the applied value once (#699, CR round 3 on PR #787).
+        state.vfo_offset = restore.target_vfo_offset_hz;
 
         // Try the restore FIRST, BEFORE tearing down the bank.
         // If `apply_acars_geometry` fails mid-flight, the
@@ -5103,6 +5236,7 @@ fn handle_set_acars_enabled(
         // path actually succeeds.
         if let Err(err) = apply_acars_geometry(
             state,
+            dsp_tx,
             restore.target_source_rate_hz,
             restore.target_center_hz,
             restore.target_frontend_decim,
@@ -5124,6 +5258,7 @@ fn handle_set_acars_enabled(
             let acars_center = state.acars_region.center_hz();
             let relock = apply_acars_geometry(
                 state,
+                dsp_tx,
                 crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
                 acars_center,
                 crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
@@ -5165,15 +5300,6 @@ fn handle_set_acars_enabled(
         // see None and short-circuit.
         state.acars_bank = None;
         state.acars_init_failed = false;
-
-        // VFO offset restore. The controller stores it on
-        // `state.vfo_offset` (read by `rebuild_vfo` and the
-        // VFO struct). Mirror the `UiToDsp::SetVfoOffset` arm
-        // (around `controller.rs:1219`).
-        state.vfo_offset = restore.target_vfo_offset_hz;
-        if let Some(vfo) = state.vfo.as_mut() {
-            vfo.set_offset(restore.target_vfo_offset_hz);
-        }
         tracing::info!("ACARS disengaged: source restored to snapshot");
         let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
         AcarsHandlerOutcome::Normal
@@ -5513,6 +5639,315 @@ mod tests {
             ],
             "direct sampling, RTL AGC, gain mode and gain must precede start()"
         );
+    }
+
+    fn temp_wav(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sdr-rs-ctl-test-{name}-{}.wav", std::process::id()))
+    }
+
+    /// #695 — the IQ WAV header bakes in the sample rate at start, so a
+    /// rate change mid-recording silently corrupts the file. Reject it.
+    #[test]
+    fn set_sample_rate_is_rejected_while_iq_recording() {
+        const NEW_RATE_HZ: f64 = 1_024_000.0;
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let path = temp_wav("rate-mutex");
+        state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+        let before = state.configured_sample_rate;
+        let _ = drain(&dsp_rx);
+
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetSampleRate(NEW_RATE_HZ));
+
+        assert!((state.configured_sample_rate - before).abs() < f64::EPSILON);
+        let events = drain(&dsp_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::Error(m) if m.to_lowercase().contains("recording"))),
+            "expected a recording-mutex error, got {events:?}"
+        );
+        state.iq_writer = None;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #695 — with no source there is no IQ flowing and `state.sample_rate`
+    /// may be stale; a recording started now would get a wrong header.
+    #[test]
+    fn start_iq_recording_requires_a_running_source() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        assert!(state.source.is_none());
+        let path = temp_wav("needs-source");
+        let _ = drain(&dsp_rx);
+
+        handle_command(&mut state, &dsp_tx, UiToDsp::StartIqRecording(path.clone()));
+
+        assert!(state.iq_writer.is_none(), "no writer without a source");
+        let events = drain(&dsp_rx);
+        assert!(
+            events.iter().any(|e| matches!(e, DspToUi::Error(_))),
+            "expected an error, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, DspToUi::IqRecordingStarted(_))),
+            "must not report a started recording"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #695 — ACARS engage forces the airband rate; refuse while recording.
+    #[test]
+    fn acars_engage_is_rejected_while_iq_recording() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let path = temp_wav("acars-mutex");
+        state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+        let _ = drain(&dsp_rx);
+
+        let _ = handle_set_acars_enabled(&mut state, true, &dsp_tx);
+
+        assert!(state.acars_pre_lock.is_none(), "must not engage");
+        let events = drain(&dsp_rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                DspToUi::AcarsEnabledChanged(Err(
+                    crate::acars_airband_lock::AcarsEnableError::IqRecordingActive
+                ))
+            )),
+            "expected AcarsEnabledChanged(Err(IqRecordingActive)), got {events:?}"
+        );
+        state.iq_writer = None;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #699 — the spectrum spans the raw rate but the VFO runs at the
+    /// post-decimation rate; an offset past ±effective/2 wraps to a
+    /// different station while the readout claims the clicked one.
+    #[test]
+    fn set_vfo_offset_is_clamped_to_half_effective_rate() {
+        const OVERSHOOT_FACTOR: f64 = 4.0;
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        rebuild_vfo(&mut state).unwrap();
+        let half = state.frontend.effective_sample_rate() / 2.0;
+        let _ = drain(&dsp_rx);
+
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetVfoOffset(half * OVERSHOOT_FACTOR),
+        );
+        assert!(
+            (state.vfo_offset - half).abs() < f64::EPSILON,
+            "offset must clamp to +effective/2, got {}",
+            state.vfo_offset
+        );
+        let events = drain(&dsp_rx);
+        assert!(
+            events.iter().any(
+                |e| matches!(e, DspToUi::VfoOffsetChanged(o) if (o - half).abs() < f64::EPSILON)
+            ),
+            "the echo must carry the clamped value, got {events:?}"
+        );
+
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetVfoOffset(-half * OVERSHOOT_FACTOR),
+        );
+        assert!((state.vfo_offset + half).abs() < f64::EPSILON);
+    }
+
+    /// #699 (CR round 1) — an offset that was reachable can become
+    /// unreachable when decimation shrinks the effective rate; the
+    /// rebuild must re-clamp it and echo the applied value.
+    #[test]
+    fn decimation_change_reclamps_vfo_offset_and_echoes() {
+        const DECIM_START: u32 = 1;
+        const DECIM_NARROW: u32 = 8;
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetDecimation(DECIM_START));
+        let wide_half = state.frontend.effective_sample_rate() / 2.0;
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetVfoOffset(wide_half));
+        assert!((state.vfo_offset - wide_half).abs() < f64::EPSILON);
+        let _ = drain(&dsp_rx);
+
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetDecimation(DECIM_NARROW));
+        let narrow_half = state.frontend.effective_sample_rate() / 2.0;
+        assert!(
+            narrow_half < wide_half,
+            "test premise: decimation narrowed the span"
+        );
+        assert!(
+            (state.vfo_offset - narrow_half).abs() < f64::EPSILON,
+            "offset must re-clamp to the new ±effective/2, got {}",
+            state.vfo_offset
+        );
+        let events = drain(&dsp_rx);
+        assert!(
+            events.iter().any(
+                |e| matches!(e, DspToUi::VfoOffsetChanged(o) if (o - narrow_half).abs() < f64::EPSILON)
+            ),
+            "expected VfoOffsetChanged({narrow_half}), got {events:?}"
+        );
+    }
+
+    fn test_pre_lock_snapshot() -> crate::acars_airband_lock::PreLockSnapshot {
+        crate::acars_airband_lock::PreLockSnapshot {
+            source_rate_hz: 2_400_000.0,
+            center_freq_hz: 100_000_000.0,
+            vfo_offset_hz: 0.0,
+            source_type: SourceType::RtlSdr,
+            frontend_decim: 8,
+        }
+    }
+
+    /// #695 (CR round 3) — a user-initiated ACARS disengage restores the
+    /// pre-lock source rate, which would desync an open IQ recording.
+    #[test]
+    fn acars_disengage_is_rejected_while_iq_recording() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let path = temp_wav("acars-disengage-mutex");
+        state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+        state.acars_pre_lock = Some(test_pre_lock_snapshot());
+        let _ = drain(&dsp_rx);
+
+        let _ = handle_set_acars_enabled(&mut state, false, &dsp_tx);
+
+        assert!(state.acars_pre_lock.is_some(), "must stay engaged");
+        let events = drain(&dsp_rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                DspToUi::AcarsEnabledChanged(Err(
+                    crate::acars_airband_lock::AcarsEnableError::IqRecordingActive
+                ))
+            )),
+            "expected AcarsEnabledChanged(Err(IqRecordingActive)), got {events:?}"
+        );
+        state.iq_writer = None;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #695 (CR round 3) — `cleanup()` is the forced teardown path: it
+    /// finalizes the recording first, so the ACARS disengage inside it
+    /// must not be blocked by the recording mutex.
+    #[test]
+    fn cleanup_disengages_acars_even_while_iq_recording() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let path = temp_wav("acars-cleanup");
+        state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+        state.acars_pre_lock = Some(test_pre_lock_snapshot());
+        let _ = drain(&dsp_rx);
+
+        cleanup(&mut state, &dsp_tx);
+
+        assert!(state.iq_writer.is_none(), "cleanup finalizes the recording");
+        assert!(state.acars_pre_lock.is_none(), "cleanup disengages ACARS");
+        let events = drain(&dsp_rx);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                DspToUi::AcarsEnabledChanged(Err(
+                    crate::acars_airband_lock::AcarsEnableError::IqRecordingActive
+                ))
+            )),
+            "cleanup must not trip the recording mutex, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::AcarsEnabledChanged(Ok(false)))),
+            "cleanup must ack the disengage, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::IqRecordingStopped)),
+            "cleanup must tell the UI the recording stopped, got {events:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #699 (CR round 3) — `rebuild_vfo` must be transactional: if the
+    /// new VFO cannot be built, neither the offset nor the old VFO change.
+    #[test]
+    fn rebuild_vfo_failure_leaves_state_untouched() {
+        const UNREACHABLE_OFFSET_HZ: f64 = 1.0e9;
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx).unwrap();
+        rebuild_vfo(&mut state).unwrap();
+        state.vfo_offset = UNREACHABLE_OFFSET_HZ;
+        state.bandwidth = 0.0; // RxVfo::new rejects a zero-width channel
+        assert!(
+            rebuild_vfo(&mut state).is_err(),
+            "test premise: rebuild fails"
+        );
+        assert!(
+            (state.vfo_offset - UNREACHABLE_OFFSET_HZ).abs() < f64::EPSILON,
+            "a failed rebuild must not clamp the stored offset"
+        );
+        assert!(state.vfo.is_some(), "the previous VFO must survive");
+    }
+
+    /// #695 (CR round 5) — switching source type while IQ-recording with
+    /// ACARS engaged must not trip the recording mutex: `cleanup()` stops
+    /// the recording first and then performs the forced ACARS teardown.
+    #[test]
+    fn source_type_switch_while_iq_recording_defers_acars_teardown_to_cleanup() {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let path = temp_wav("acars-source-switch");
+        state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+        state.acars_pre_lock = Some(test_pre_lock_snapshot());
+        state.running = true;
+        let _ = drain(&dsp_rx);
+
+        // File source with an empty path: the restart after cleanup fails
+        // fast and without hardware.
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetSourceType(SourceType::File),
+        );
+
+        let events = drain(&dsp_rx);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                DspToUi::AcarsEnabledChanged(Err(
+                    crate::acars_airband_lock::AcarsEnableError::IqRecordingActive
+                ))
+            )),
+            "source switch must not report a recording-mutex failure, got {events:?}"
+        );
+        assert!(state.acars_pre_lock.is_none(), "ACARS torn down by cleanup");
+        assert!(state.iq_writer.is_none(), "recording stopped by cleanup");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::IqRecordingStopped)),
+            "expected IqRecordingStopped, got {events:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #694 (CR round 5) — only the WAV structural limit gets the
+    /// "4 GiB limit" wording; a full filesystem is a plain write failure.
+    #[test]
+    fn recording_write_error_message_distinguishes_wav_limit_from_disk_full() {
+        let wav_limit = crate::wav_writer::wav_limit_error();
+        assert!(recording_write_error_message("IQ", &wav_limit).contains("4 GiB"));
+        let disk_full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        assert!(!recording_write_error_message("IQ", &disk_full).contains("4 GiB"));
+        assert!(recording_write_error_message("IQ", &disk_full).contains("write failed"));
     }
 
     /// #692 — the IQ-correction switch must not share state with DC blocking.

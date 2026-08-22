@@ -1656,31 +1656,79 @@ mod tests {
         destroy(h);
     }
 
+    /// Forwards `SDR_EVT_ERROR` messages to the `mpsc::Sender<String>`
+    /// passed as `user_data`; every other event kind is ignored.
+    unsafe extern "C" fn error_capture_cb(
+        event: *const crate::event::SdrEvent,
+        user_data: *mut std::ffi::c_void,
+    ) {
+        // SAFETY: `event` is valid for the duration of the callback
+        // (dispatcher contract) and `user_data` is the boxed sender
+        // this test registered and keeps alive until unregistration.
+        unsafe {
+            let event = &*event;
+            if event.kind != crate::event::SDR_EVT_ERROR {
+                return;
+            }
+            let msg = std::ffi::CStr::from_ptr(event.payload.error.utf8)
+                .to_string_lossy()
+                .into_owned();
+            let tx = &*user_data.cast::<std::sync::mpsc::Sender<String>>();
+            let _ = tx.send(msg);
+        }
+    }
+
     #[test]
-    fn iq_recording_start_stop_round_trip() {
-        // Same shape as the audio recording round-trip test —
-        // verifies the controller opened + finalized the WAV
-        // file, not just that `send_command` returned OK. Per
-        // CodeRabbit round 2 on PR #345.
+    fn iq_recording_without_source_is_rejected() {
+        // #695 — the IQ WAV header bakes in the source sample rate,
+        // which is only authoritative while a source is open. A
+        // headless handle has no source, so the controller must
+        // refuse to open a writer: the FFI call itself still returns
+        // Ok (`send_command` is asynchronous) and the rejection
+        // surfaces as an `SDR_EVT_ERROR` event. Previously (PR #345)
+        // this round-trip expected a finalized header on disk.
+        const ERROR_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const EXPECTED_ERROR: &str = "IQ record failed: press Play before recording IQ";
+
         let h = make_handle();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let user_data = Box::into_raw(Box::new(tx)).cast::<std::ffi::c_void>();
+        assert_eq!(
+            unsafe {
+                crate::event::sdr_core_set_event_callback(h, Some(error_capture_cb), user_data)
+            },
+            SdrCoreError::Ok.as_int()
+        );
+
         let tmp = unique_temp_wav("sdr-ffi-iq-test");
         let path = CString::new(tmp.to_string_lossy().into_owned()).unwrap();
         assert_eq!(
             unsafe { sdr_core_start_iq_recording(h, path.as_ptr()) },
             SdrCoreError::Ok.as_int()
         );
+        let msg = rx
+            .recv_timeout(ERROR_EVENT_TIMEOUT)
+            .expect("controller must emit SDR_EVT_ERROR for the rejected IQ recording");
+        assert_eq!(msg, EXPECTED_ERROR);
         assert_eq!(
             unsafe { sdr_core_stop_iq_recording(h) },
             SdrCoreError::Ok.as_int()
         );
-        std::thread::sleep(std::time::Duration::from_millis(RECORDING_FLUSH_WAIT_MS));
-        let metadata =
-            std::fs::metadata(&tmp).expect("IQ recording should create a WAV file before cleanup");
         assert!(
-            metadata.len() >= WAV_HEADER_BYTES,
-            "IQ recording should finalize at least a WAV header"
+            std::fs::metadata(&tmp).is_err(),
+            "IQ recording must not open a WAV file while no source is running"
         );
-        std::fs::remove_file(&tmp).unwrap();
+
+        // Unregister before freeing the sender: the setter waits for
+        // in-flight dispatches, so no callback can observe a dangling
+        // `user_data` afterwards.
+        assert_eq!(
+            unsafe { crate::event::sdr_core_set_event_callback(h, None, std::ptr::null_mut()) },
+            SdrCoreError::Ok.as_int()
+        );
+        // SAFETY: `user_data` came from `Box::into_raw` above and no
+        // callback can run after unregistration.
+        drop(unsafe { Box::from_raw(user_data.cast::<std::sync::mpsc::Sender<String>>()) });
         destroy(h);
     }
 
