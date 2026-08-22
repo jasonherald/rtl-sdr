@@ -142,6 +142,11 @@ pub struct Scanner {
     /// this at settle expiry to decide Dwelling vs direct
     /// Listening. Reset to `false` on every retune entry.
     squelch_open: bool,
+    /// Sub-microsecond remainder of the last `SampleTick` conversion,
+    /// in sample·µs units (`< sample_rate_hz`), carried into the next
+    /// tick so many tiny ticks measure the same duration as one large
+    /// one (CR on PR #798).
+    tick_carry: u64,
 }
 
 impl Default for Scanner {
@@ -155,6 +160,7 @@ impl Default for Scanner {
             hops_since_priority_sweep: 0,
             priority_sweep_visited: None,
             squelch_open: false,
+            tick_carry: 0,
         }
     }
 }
@@ -545,7 +551,7 @@ impl Scanner {
         // converted at the rate it was produced, so a mid-countdown
         // sample-rate change neither drains a dwell in a few ms nor
         // stretches a hang to tens of seconds (#759).
-        let elapsed_us = samples_to_us(samples_consumed, sample_rate_hz);
+        let elapsed_us = self.tick_elapsed_us(samples_consumed, sample_rate_hz);
         let next_phase: Option<Phase> = match &mut self.phase {
             Phase::Idle
             | Phase::Listening {
@@ -753,18 +759,33 @@ impl Scanner {
     }
 }
 
+impl Scanner {
+    /// Duration of `samples` at `sample_rate_hz` in whole microseconds,
+    /// with the sub-microsecond remainder carried to the next call so
+    /// the conversion is exact over any sequence of ticks. (Rounding
+    /// each tick up expired a 100 ms dwell after ~42 ms of one-sample
+    /// ticks at 2.4 Msps.) The carry is in sample·µs units and is only
+    /// meaningful at one rate; a rate change discards it, which is at
+    /// most one microsecond.
+    fn tick_elapsed_us(&mut self, samples: u32, sample_rate_hz: NonZeroU32) -> u64 {
+        let rate = u64::from(sample_rate_hz.get());
+        let carry = if self.tick_carry < rate {
+            self.tick_carry
+        } else {
+            0
+        };
+        let total = u64::from(samples) * US_PER_SEC + carry;
+        self.tick_carry = total % rate;
+        total / rate
+    }
+}
+
 const US_PER_MS: u64 = 1_000;
 const US_PER_SEC: u64 = 1_000_000;
 
 /// Milliseconds → microseconds for seeding `us_until_*`.
 fn ms_to_us(ms: u32) -> u64 {
     u64::from(ms) * US_PER_MS
-}
-
-/// Duration of `samples` at `sample_rate_hz`, in microseconds,
-/// rounded up so a countdown never stalls on sub-microsecond blocks.
-fn samples_to_us(samples: u32, sample_rate_hz: NonZeroU32) -> u64 {
-    (u64::from(samples) * US_PER_SEC).div_ceil(u64::from(sample_rate_hz.get()))
 }
 
 #[cfg(test)]
@@ -1742,5 +1763,43 @@ mod tests {
 
         let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
         assert_eq!(s.state(), ScannerState::Hanging, "{commands:?}");
+    }
+
+    /// CR round 2 on PR #798 — tick durations must not be rounded up
+    /// per event: at 2.4 Msps a one-sample tick is 0.417 µs, and
+    /// ceiling each one to 1 µs expired a 100 ms dwell after ~42 ms of
+    /// audio. The same duration delivered as one tick or as
+    /// one-sample ticks must expire the dwell at the same point.
+    #[test]
+    fn countdown_is_exact_across_many_tiny_ticks() {
+        const HIGH_RATE: u32 = 2_400_000;
+        let dwell_samples = HIGH_RATE / 1000 * DEFAULT_DWELL_MS;
+        let settle_samples = HIGH_RATE / 1000 * SETTLE_MS;
+
+        let mut one_shot = Scanner::new();
+        let mut tiny = Scanner::new();
+        for s in [&mut one_shot, &mut tiny] {
+            s.handle_event(ScannerEvent::ChannelsChanged(vec![
+                ch("A", 146_520_000, 0),
+                ch("B", 162_550_000, 0),
+            ]));
+            s.handle_event(ScannerEvent::SetEnabled(true));
+            s.handle_event(tick_at(settle_samples, HIGH_RATE));
+            assert_eq!(s.state(), ScannerState::Dwelling);
+        }
+
+        // All but one sample of the dwell: neither may advance.
+        let commands = one_shot.handle_event(tick_at(dwell_samples - 1, HIGH_RATE));
+        assert!(!has_retune(&commands), "one-shot: {commands:?}");
+        for _ in 0..dwell_samples - 1 {
+            let commands = tiny.handle_event(tick_at(1, HIGH_RATE));
+            assert!(
+                !has_retune(&commands),
+                "tiny ticks advanced early: {commands:?}"
+            );
+        }
+        // The last sample completes the dwell for both.
+        assert!(has_retune(&one_shot.handle_event(tick_at(1, HIGH_RATE))));
+        assert!(has_retune(&tiny.handle_event(tick_at(1, HIGH_RATE))));
     }
 }
