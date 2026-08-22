@@ -39,10 +39,24 @@ pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     // Follow a symlink to its final target; rename over the link itself
     // would replace the link with a regular file.
     let target = resolve_link_target(path)?;
-    let tmp_id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
-    let tmp = target.with_extension(format!("tmp.{}.{tmp_id}", std::process::id()));
+    // Exclusive creation (`create_new`): never follow a pre-existing
+    // symlink / hard link planted at the temp name in a directory another
+    // user can write to. A collision just moves on to the next id.
+    let (tmp, file) = loop {
+        let tmp_id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let tmp = target.with_extension(format!("tmp.{}.{tmp_id}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    };
     let result = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = file;
         // Keep the replaced file's mode (a 0600 config must not come
         // back as 0644 after a save).
         if let Ok(meta) = std::fs::metadata(&target) {
@@ -117,9 +131,12 @@ fn resolve_link_target(path: &Path) -> std::io::Result<PathBuf> {
 fn sync_parent_dir(path: &Path) {
     #[cfg(unix)]
     {
-        if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::File::open(parent).and_then(|dir| dir.sync_all())
-        {
+        // A bare relative path has an empty parent; that is the cwd.
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        if let Err(e) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
             tracing::debug!("directory fsync skipped: {e}");
         }
     }
@@ -160,6 +177,9 @@ fn back_up_corrupt_config(path: &Path) -> std::io::Result<PathBuf> {
     ));
     let backup = PathBuf::from(backup);
     std::fs::rename(&target, &backup)?;
+    // Make the rename durable before the reset writes a new file, or a
+    // crash in between could lose both.
+    sync_parent_dir(&target);
     tracing::warn!(backup = %backup.display(), "corrupt config backed up");
     Ok(backup)
 }
@@ -328,9 +348,10 @@ impl ConfigManager {
         F: FnOnce(&mut Value) -> R,
     {
         let mut data = self.data.write().unwrap_or_else(PoisonError::into_inner);
-        let result = f(&mut data);
+        // Mark dirty BEFORE the callback: if it mutates and then panics,
+        // the change must still reach the next flush.
         self.modified.store(true, Ordering::Release);
-        result
+        f(&mut data)
     }
 
     /// Enable periodic auto-save on a background thread.
@@ -605,28 +626,37 @@ mod tests {
     /// #760 — `save()`, the auto-save worker and a second manager all used
     /// one fixed `config.tmp`, so concurrent writes interleaved and could
     /// publish torn JSON (next launch: full reset). Every writer must own
-    /// its own temp file and every save must succeed.
+    /// its own temp file and every save must succeed — across two
+    /// independent managers on the same path (no shared write lock) with
+    /// the auto-save worker of one of them running.
     #[test]
     fn concurrent_saves_never_publish_torn_json() {
-        const WRITERS: usize = 8;
+        const WRITERS_PER_MANAGER: usize = 4;
         const SAVES_PER_WRITER: usize = 40;
         let dir = temp_dir("concurrent");
         let path = dir.join("config.json");
-        let mgr = Arc::new(ConfigManager::load(&path, &json!({"n": 0})).unwrap());
-        let handles: Vec<_> = (0..WRITERS)
-            .map(|w| {
-                let mgr = Arc::clone(&mgr);
-                thread::spawn(move || {
+        let mut first = ConfigManager::load(&path, &json!({"n": 0})).unwrap();
+        first.enable_auto_save();
+        let managers = [
+            Arc::new(first),
+            Arc::new(ConfigManager::load(&path, &json!({"n": 0})).unwrap()),
+        ];
+        let mut handles = Vec::new();
+        for (m, mgr) in managers.iter().enumerate() {
+            for w in 0..WRITERS_PER_MANAGER {
+                let mgr = Arc::clone(mgr);
+                handles.push(thread::spawn(move || {
                     for i in 0..SAVES_PER_WRITER {
-                        mgr.write(|v| v["n"] = json!(w * SAVES_PER_WRITER + i));
+                        mgr.write(|v| v["n"] = json!((m * 10 + w) * SAVES_PER_WRITER + i));
                         mgr.save().expect("every concurrent save succeeds");
                     }
-                })
-            })
-            .collect();
+                }));
+            }
+        }
         for h in handles {
             h.join().unwrap();
         }
+        drop(managers); // stops the auto-save worker (final flush)
         let on_disk: Value = serde_json::from_slice(&fs::read(&path).unwrap())
             .expect("the published file is always complete JSON");
         assert!(on_disk["n"].is_number());
