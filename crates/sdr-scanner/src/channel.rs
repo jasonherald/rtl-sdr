@@ -37,7 +37,32 @@ pub struct ScannerChannel {
     pub hang_ms: u32,
 }
 
+/// The subset of a [`ScannerChannel`] that decides what the radio is
+/// tuned to. Two channels with equal tune configs can be swapped
+/// without a retune; dwell / hang / priority are scheduling inputs
+/// and deliberately excluded (#758).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TuneConfig {
+    pub frequency_hz: u64,
+    pub demod_mode: DemodMode,
+    pub bandwidth: f64,
+    pub ctcss: Option<sdr_radio::af_chain::CtcssMode>,
+    pub voice_squelch: Option<sdr_dsp::voice_squelch::VoiceSquelchMode>,
+}
+
 impl ScannerChannel {
+    /// The tune-affecting part of this channel — see [`TuneConfig`].
+    #[must_use]
+    pub fn tune_config(&self) -> TuneConfig {
+        TuneConfig {
+            frequency_hz: self.key.frequency_hz,
+            demod_mode: self.demod_mode,
+            bandwidth: self.bandwidth,
+            ctcss: self.ctcss,
+            voice_squelch: self.voice_squelch,
+        }
+    }
+
     /// Convenience accessor — reads through to `key.frequency_hz`.
     #[inline]
     #[must_use]

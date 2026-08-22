@@ -12,7 +12,7 @@ pub mod events;
 pub mod scanner;
 pub mod state;
 
-pub use channel::{ChannelKey, ScannerChannel};
+pub use channel::{ChannelKey, ScannerChannel, TuneConfig};
 pub use commands::ScannerCommand;
 pub use events::{ScannerEvent, SquelchState};
 pub use scanner::Scanner;
