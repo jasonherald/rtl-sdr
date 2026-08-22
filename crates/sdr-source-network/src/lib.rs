@@ -175,6 +175,15 @@ fn connect_any_with_deadline(
     Err(last_err)
 }
 
+/// `now + timeout` as a `SourceError` instead of the overflow panic
+/// `Instant + Duration` has for huge timeouts (`set_timeouts` accepts any
+/// `Duration`).
+fn startup_deadline(timeout: Duration) -> Result<Instant, SourceError> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        SourceError::InvalidParameter(format!("connect timeout {timeout:?} is too large"))
+    })
+}
+
 impl NetworkSource {
     /// Create a new network source.
     pub fn new(hostname: &str, port: u16, protocol: Protocol) -> Self {
@@ -355,7 +364,7 @@ impl Source for NetworkSource {
             Protocol::TcpClient => {
                 // One end-to-end deadline covers resolution AND every
                 // connect attempt.
-                let deadline = Instant::now() + self.connect_timeout;
+                let deadline = startup_deadline(self.connect_timeout)?;
                 let target = format!("{}:{}", self.hostname, self.port);
                 let host = self.hostname.clone();
                 let port = self.port;
@@ -378,7 +387,7 @@ impl Source for NetworkSource {
                 // The hostname is the LOCAL bind address (SDR++ semantics);
                 // empty means every interface. A name (not a literal) is
                 // resolved under the same deadline as the TCP path.
-                let deadline = Instant::now() + self.connect_timeout;
+                let deadline = startup_deadline(self.connect_timeout)?;
                 let bind_host = if self.hostname.is_empty() {
                     "0.0.0.0".to_string()
                 } else {
@@ -403,8 +412,17 @@ impl Source for NetworkSource {
                 NetworkConnection::Udp(socket)
             }
         };
-        self.connection = Some(conn);
+        // Size the buffers once here so steady-state reads never allocate
+        // (the UDP buffer alone is 4 MiB of zero-fill).
+        let recv_capacity = match conn {
+            NetworkConnection::Tcp(_) => TCP_RECV_CHUNK_BYTES,
+            NetworkConnection::Udp(_) => UDP_RECV_BUFFER_BYTES,
+        };
+        self.recv_buf.clear();
+        self.recv_buf.resize(recv_capacity, 0);
         self.carry_buf.clear();
+        self.carry_buf.reserve(recv_capacity);
+        self.connection = Some(conn);
         Ok(())
     }
 
@@ -626,6 +644,24 @@ mod tests {
             let n = source.read_samples(&mut out).unwrap();
             if n == 0 {
                 break;
+            }
+            // Every sample must be the right I/Q pair from the payload —
+            // a path that reordered or corrupted bytes while keeping the
+            // count would otherwise pass.
+            for (i, sample) in out[..n].iter().enumerate() {
+                let offset = (total + i) * INT8_COMPLEX_BYTES;
+                let expected_re = f32::from(payload[offset] as i8) / 128.0;
+                let expected_im = f32::from(payload[offset + 1] as i8) / 128.0;
+                assert!(
+                    (sample.re - expected_re).abs() < f32::EPSILON,
+                    "sample {} re",
+                    total + i
+                );
+                assert!(
+                    (sample.im - expected_im).abs() < f32::EPSILON,
+                    "sample {} im",
+                    total + i
+                );
             }
             total += n;
         }
