@@ -1550,7 +1550,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 }
 
                 // Rebuild the RxVfo for the new demod's IF rate and bandwidth.
-                if let Err(e) = rebuild_vfo(state) {
+                if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
                     tracing::warn!("VFO rebuild on mode switch failed: {e}");
                     let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
                 }
@@ -1735,7 +1735,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
             match rebuild_frontend(state) {
                 Ok(()) => {
-                    if let Err(e) = rebuild_vfo(state) {
+                    if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
                         tracing::warn!("VFO rebuild on sample rate change failed: {e}");
                         let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
                     }
@@ -1761,7 +1761,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 let _ = dsp_tx.send(DspToUi::Error(format!("Decimation failed: {e}")));
             } else {
                 // Rebuild VFO for the new effective sample rate.
-                if let Err(e) = rebuild_vfo(state) {
+                if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
                     tracing::warn!("VFO rebuild on decimation change failed: {e}");
                     let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
                 }
@@ -3162,7 +3162,7 @@ fn apply_scanner_commands(
                         // below; rebuild picks it up via
                         // `state.bandwidth`.
                         state.bandwidth = bandwidth;
-                        if let Err(e) = rebuild_vfo(state) {
+                        if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
                             tracing::warn!(?e, "scanner retune: VFO rebuild failed");
                         }
                     }
@@ -3694,7 +3694,7 @@ fn open_source(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(
 
     // Rebuild frontend and VFO before committing the source to state.
     // If either fails, stop the source to avoid a leaked running source.
-    if let Err(e) = rebuild_frontend(state).and_then(|()| rebuild_vfo(state)) {
+    if let Err(e) = rebuild_frontend(state).and_then(|()| rebuild_vfo_echoing(state, dsp_tx)) {
         let _ = source.stop();
         return Err(e);
     }
@@ -3954,7 +3954,32 @@ fn apply_persisted_frontend_settings(state: &DspState, frontend: &mut IqFrontend
 ///
 /// Also tells `RadioModule` that its input is now at the demod IF rate (since the
 /// VFO handles resampling from the frontend effective rate to the IF rate).
-fn rebuild_vfo(state: &mut DspState) -> Result<(), String> {
+/// Clamp `state.vfo_offset` to the span the current effective rate can
+/// reach (#699). Returns `true` when the stored offset changed, so the
+/// caller can echo `VfoOffsetChanged` and keep every readout honest.
+fn clamp_vfo_offset_to_reachable(state: &mut DspState) -> bool {
+    let reachable = vfo_reachable_offset_hz(state.frontend.effective_sample_rate());
+    let clamped = state.vfo_offset.clamp(-reachable, reachable);
+    if (clamped - state.vfo_offset).abs() > f64::EPSILON {
+        tracing::warn!(
+            previous_hz = state.vfo_offset,
+            clamped_hz = clamped,
+            reachable_hz = reachable,
+            "VFO offset outside the new ±effective/2 span; clamped"
+        );
+        state.vfo_offset = clamped;
+        return true;
+    }
+    false
+}
+
+/// Rebuild the VFO for the current frontend rate, demod IF rate,
+/// bandwidth and offset. Returns `Ok(true)` when the retained offset had
+/// to be clamped to the new reachable span (#699) — callers with a UI
+/// channel should echo `VfoOffsetChanged` in that case; see
+/// [`rebuild_vfo_echoing`].
+fn rebuild_vfo(state: &mut DspState) -> Result<bool, String> {
+    let offset_clamped = clamp_vfo_offset_to_reachable(state);
     let effective_rate = state.frontend.effective_sample_rate();
     let demod_cfg = state.radio.demod_config();
     let if_rate = demod_cfg.if_sample_rate;
@@ -3978,6 +4003,16 @@ fn rebuild_vfo(state: &mut DspState) -> Result<(), String> {
         offset = state.vfo_offset,
         "RxVfo rebuilt"
     );
+    Ok(offset_clamped)
+}
+
+/// [`rebuild_vfo`] plus the `VfoOffsetChanged` echo when the retained
+/// offset was clamped, so the UI overlay / frequency readout follow the
+/// engine after a decimation, sample-rate or demod-mode transition.
+fn rebuild_vfo_echoing(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) -> Result<(), String> {
+    if rebuild_vfo(state)? {
+        let _ = dsp_tx.send(DspToUi::VfoOffsetChanged(state.vfo_offset));
+    }
     Ok(())
 }
 
@@ -5717,6 +5752,41 @@ mod tests {
             UiToDsp::SetVfoOffset(-half * OVERSHOOT_FACTOR),
         );
         assert!((state.vfo_offset + half).abs() < f64::EPSILON);
+    }
+
+    /// #699 (CR round 1) — an offset that was reachable can become
+    /// unreachable when decimation shrinks the effective rate; the
+    /// rebuild must re-clamp it and echo the applied value.
+    #[test]
+    fn decimation_change_reclamps_vfo_offset_and_echoes() {
+        const DECIM_START: u32 = 1;
+        const DECIM_NARROW: u32 = 8;
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetDecimation(DECIM_START));
+        let wide_half = state.frontend.effective_sample_rate() / 2.0;
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetVfoOffset(wide_half));
+        assert!((state.vfo_offset - wide_half).abs() < f64::EPSILON);
+        let _ = drain(&dsp_rx);
+
+        handle_command(&mut state, &dsp_tx, UiToDsp::SetDecimation(DECIM_NARROW));
+        let narrow_half = state.frontend.effective_sample_rate() / 2.0;
+        assert!(
+            narrow_half < wide_half,
+            "test premise: decimation narrowed the span"
+        );
+        assert!(
+            (state.vfo_offset - narrow_half).abs() < f64::EPSILON,
+            "offset must re-clamp to the new ±effective/2, got {}",
+            state.vfo_offset
+        );
+        let events = drain(&dsp_rx);
+        assert!(
+            events.iter().any(
+                |e| matches!(e, DspToUi::VfoOffsetChanged(o) if (o - narrow_half).abs() < f64::EPSILON)
+            ),
+            "expected VfoOffsetChanged({narrow_half}), got {events:?}"
+        );
     }
 
     /// #692 — the IQ-correction switch must not share state with DC blocking.

@@ -21,11 +21,9 @@ const BITS_PER_SAMPLE: u16 = 32;
 /// Bytes per f32 sample.
 const BYTES_PER_SAMPLE: u32 = 4;
 
-/// Bytes per interleaved stereo (L, R) frame.
-const STEREO_FRAME_BYTES: u32 = 2 * BYTES_PER_SAMPLE;
-
-/// Bytes per interleaved IQ (I, Q) frame.
-const IQ_FRAME_BYTES: u32 = 2 * BYTES_PER_SAMPLE;
+/// Bytes per interleaved two-channel f32 frame — one (L, R) stereo pair
+/// or one (I, Q) pair; both recording kinds share this layout.
+const FRAME_BYTES: u32 = 2 * BYTES_PER_SAMPLE;
 
 /// Offset of the RIFF file-size field (byte 4).
 const RIFF_SIZE_OFFSET: u64 = 4;
@@ -40,8 +38,11 @@ const RIFF_HEADER_PREFIX: u32 = 8;
 /// `data` size and the RIFF size (`data + 36`) are `u32` fields, so the
 /// data chunk is capped just under 4 GiB. IQ at 2.4 Msps reaches this in
 /// ~224 s; the writer refuses writes past it instead of wrapping the
-/// header (#694).
-pub const MAX_WAV_DATA_BYTES: u64 = u32::MAX as u64 - (WAV_HEADER_SIZE - RIFF_HEADER_PREFIX) as u64;
+/// header (#694). Rounded down to a whole number of frames so the cap
+/// is reached exactly rather than with an unusable tail.
+pub const MAX_WAV_DATA_BYTES: u64 =
+    (u32::MAX as u64 - (WAV_HEADER_SIZE - RIFF_HEADER_PREFIX) as u64) / FRAME_BYTES as u64
+        * FRAME_BYTES as u64;
 
 /// Writes demodulated stereo audio or raw IQ samples to a WAV file.
 ///
@@ -107,25 +108,26 @@ impl WavWriter {
         self.bytes_written
     }
 
-    /// `true` once the data chunk has reached the WAV size cap; every
-    /// further write returns [`std::io::ErrorKind::StorageFull`].
+    /// `true` once fewer than one complete frame fits under the WAV size
+    /// cap; every further non-empty write returns
+    /// [`std::io::ErrorKind::StorageFull`].
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.bytes_written >= self.max_data_bytes
+        self.max_data_bytes.saturating_sub(self.bytes_written) < u64::from(FRAME_BYTES)
     }
 
-    /// Account for `bytes` of sample data, refusing the whole write if it
-    /// would push the data chunk past the cap (so the file never holds a
-    /// partial frame and the header always describes what is on disk).
-    fn reserve(&mut self, bytes: u64) -> std::io::Result<()> {
-        let after = self.bytes_written.saturating_add(bytes);
-        if after > self.max_data_bytes {
+    /// Check that `bytes` more of sample data fit under the cap without
+    /// touching the accounting; the whole write is refused if not, so the
+    /// file never holds a partial frame. `bytes_written` is advanced only
+    /// after the writer has accepted the complete buffer, so the header
+    /// written by `finalize` never describes bytes that are not on disk.
+    fn check_capacity(&self, bytes: u64) -> std::io::Result<()> {
+        if self.bytes_written.saturating_add(bytes) > self.max_data_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::StorageFull,
                 "WAV data chunk limit reached (4 GiB); start a new recording",
             ));
         }
-        self.bytes_written = after;
         Ok(())
     }
 
@@ -141,7 +143,8 @@ impl WavWriter {
     /// [`std::io::ErrorKind::StorageFull`] (with nothing written) if the
     /// slice would push the data chunk past [`MAX_WAV_DATA_BYTES`].
     pub fn write_stereo(&mut self, samples: &[Stereo]) -> std::io::Result<()> {
-        self.reserve(samples.len() as u64 * u64::from(STEREO_FRAME_BYTES))?;
+        let bytes = samples.len() as u64 * u64::from(FRAME_BYTES);
+        self.check_capacity(bytes)?;
         #[cfg(target_endian = "little")]
         {
             self.writer.write_all(bytemuck::cast_slice(samples))?;
@@ -153,6 +156,7 @@ impl WavWriter {
                 self.writer.write_all(&s.r.to_le_bytes())?;
             }
         }
+        self.bytes_written += bytes;
         Ok(())
     }
 
@@ -168,7 +172,8 @@ impl WavWriter {
     /// [`std::io::ErrorKind::StorageFull`] (with nothing written) if the
     /// slice would push the data chunk past [`MAX_WAV_DATA_BYTES`].
     pub fn write_iq(&mut self, samples: &[Complex]) -> std::io::Result<()> {
-        self.reserve(samples.len() as u64 * u64::from(IQ_FRAME_BYTES))?;
+        let bytes = samples.len() as u64 * u64::from(FRAME_BYTES);
+        self.check_capacity(bytes)?;
         #[cfg(target_endian = "little")]
         {
             self.writer.write_all(bytemuck::cast_slice(samples))?;
@@ -180,6 +185,7 @@ impl WavWriter {
                 self.writer.write_all(&s.im.to_le_bytes())?;
             }
         }
+        self.bytes_written += bytes;
         Ok(())
     }
 
@@ -199,7 +205,7 @@ impl WavWriter {
 
         self.writer.flush()?;
 
-        // `reserve` guarantees `bytes_written <= MAX_WAV_DATA_BYTES`, so
+        // `check_capacity` guarantees `bytes_written <= MAX_WAV_DATA_BYTES`, so
         // both header fields fit; the conversion is checked anyway rather
         // than trusted (#694).
         let data_size = u32::try_from(self.bytes_written).map_err(|_| {
@@ -325,7 +331,10 @@ mod tests {
     /// write that would cross it and keep the file consistent.
     #[test]
     fn write_refuses_past_data_cap() {
-        const TEST_CAP_BYTES: u64 = 16; // two stereo f32 frames
+        // Two stereo frames (16 bytes) plus 4 bytes that cannot hold a
+        // complete frame — `is_full` must report full at that point.
+        const TEST_CAP_BYTES: u64 = 20;
+        const EXPECTED_DATA_BYTES: u64 = 16;
         let dir = std::env::temp_dir();
         let path = dir.join("test_data_cap.wav");
 
@@ -335,17 +344,18 @@ mod tests {
             let mut writer = WavWriter::new(&path, 48_000, 2).unwrap();
             writer.max_data_bytes = TEST_CAP_BYTES;
             writer.write_stereo(&two).unwrap();
+            assert!(writer.is_full(), "less than one frame left counts as full");
             let err = writer.write_stereo(&one).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
-            assert!(writer.is_full());
+            assert_eq!(writer.bytes_written(), EXPECTED_DATA_BYTES);
         }
 
         let data = std::fs::read(&path).unwrap();
         let data_size = u32::from_le_bytes([data[40], data[41], data[42], data[43]]);
-        assert_eq!(u64::from(data_size), TEST_CAP_BYTES);
+        assert_eq!(u64::from(data_size), EXPECTED_DATA_BYTES);
         assert_eq!(
             data.len() as u64,
-            u64::from(WAV_HEADER_SIZE) + TEST_CAP_BYTES
+            u64::from(WAV_HEADER_SIZE) + EXPECTED_DATA_BYTES
         );
 
         std::fs::remove_file(&path).unwrap();
