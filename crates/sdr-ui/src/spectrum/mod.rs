@@ -25,6 +25,10 @@ use waterfall::WaterfallRenderer;
 
 use crate::messages::UiToDsp;
 
+/// Smallest display bandwidth the spectrum accepts from the engine; below
+/// this the VFO zoom clamp (`MIN_DISPLAY_SPAN_HZ`) would invert (#768).
+const MIN_DISPLAY_BANDWIDTH_HZ: f64 = 1_000.0;
+
 /// Shared cursor callback type — invoked with `(frequency_hz, power_db)`.
 type CursorCallback = Rc<RefCell<Option<Box<dyn Fn(f64, f32)>>>>;
 
@@ -364,6 +368,16 @@ impl SpectrumHandle {
     /// source switch). Sets the display to show +/-bandwidth/2 centered on DC
     /// and stores the full bandwidth for zoom calculations.
     pub fn set_display_bandwidth(&self, effective_sample_rate: f64) {
+        // Same guard `enter_scanner_mode` applies: a file/network source
+        // can report 0 / NaN / a sub-kHz rate, and `zoom()` clamps
+        // against this value (#768). Keep the previous span instead.
+        if !effective_sample_rate.is_finite() || effective_sample_rate < MIN_DISPLAY_BANDWIDTH_HZ {
+            tracing::warn!(
+                effective_sample_rate,
+                "ignoring invalid display bandwidth; keeping the current span"
+            );
+            return;
+        }
         let half = effective_sample_rate / 2.0;
         let mut vfo = self.vfo_state.borrow_mut();
         vfo.display_start_hz = -half;

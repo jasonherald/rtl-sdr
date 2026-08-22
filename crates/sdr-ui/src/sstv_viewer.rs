@@ -696,11 +696,18 @@ fn default_export_path() -> PathBuf {
 }
 
 /// Show `toast` inside the window's [`adw::ToastOverlay`], if present.
-fn show_toast_in<W: gtk4::prelude::IsA<gtk4::Window>>(window: &W, toast: adw::Toast) {
-    if let Some(child) = window.as_ref().child()
-        && let Some(overlay) = child.downcast_ref::<adw::ToastOverlay>()
+fn show_toast_in(window: &adw::Window, toast: adw::Toast) {
+    // The overlay was installed with `adw::Window::set_content`, so it
+    // is `content()`; `gtk::Window::child()` returns libadwaita's internal
+    // wrapper and the downcast silently failed — no toast ever showed (#765).
+    use adw::prelude::AdwWindowExt;
+    if let Some(overlay) = window
+        .content()
+        .and_then(|c| c.downcast::<adw::ToastOverlay>().ok())
     {
         overlay.add_toast(toast);
+    } else {
+        tracing::warn!("viewer toast dropped: window content is not a ToastOverlay");
     }
 }
 

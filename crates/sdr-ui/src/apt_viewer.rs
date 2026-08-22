@@ -100,38 +100,32 @@ pub struct AptImageRenderer {
     rotate_180: bool,
 }
 
-impl Default for AptImageRenderer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AptImageRenderer {
     /// Build an empty renderer with a full-pass-sized backing surface.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if Cairo can't allocate the (`LINE_PIXELS` × `MAX_LINES`)
-    /// ARGB32 surface — about 17 MB of zeroed memory. Realistically
-    /// unreachable on any machine that's running a desktop in the
-    /// first place; the alternative would be a fallible constructor
-    /// that callers would have to plumb errors through for a
-    /// for-all-practical-purposes-infallible allocation.
-    #[must_use]
+    /// Returns [`ViewerError::Cairo`] if Cairo can't allocate the
+    /// (`LINE_PIXELS` × `MAX_LINES`) ARGB32 surface — about 17 MB. A
+    /// library crate must not panic on it (#771); the viewer surfaces it
+    /// and simply doesn't open.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    pub fn new() -> Self {
+    pub fn try_new() -> Result<Self, ViewerError> {
         let surface = cairo::ImageSurface::create(
             cairo::Format::ARgb32,
             LINE_PIXELS as i32,
             MAX_LINES as i32,
         )
-        .expect("APT renderer: ARGB32 surface allocation (~17 MB) failed at startup");
-        Self {
+        .map_err(|source| ViewerError::Cairo {
+            op: "create ARGB32 surface",
+            source,
+        })?;
+        Ok(Self {
             surface,
             n_lines: 0,
             apt_image: AptImage::with_capacity(std::time::Instant::now(), MAX_LINES),
             rotate_180: false,
-        }
+        })
     }
 
     /// Append one APT scan line. The line's per-line-normalized
@@ -522,17 +516,14 @@ pub struct AptImageView {
     paused: Rc<Cell<bool>>,
 }
 
-impl Default for AptImageView {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AptImageView {
     /// Build a fresh view with a blank renderer.
-    #[must_use]
-    pub fn new() -> Self {
-        let renderer = Rc::new(RefCell::new(AptImageRenderer::new()));
+    ///
+    /// # Errors
+    ///
+    /// Propagates the renderer's surface-allocation failure.
+    pub fn try_new() -> Result<Self, ViewerError> {
+        let renderer = Rc::new(RefCell::new(AptImageRenderer::try_new()?));
         let paused = Rc::new(Cell::new(false));
 
         let drawing_area = gtk4::DrawingArea::builder()
@@ -546,11 +537,11 @@ impl AptImageView {
             }
         });
 
-        Self {
+        Ok(Self {
             drawing_area,
             renderer,
             paused,
-        }
+        })
     }
 
     /// The underlying `GtkDrawingArea`. Pack this into a layout
@@ -714,8 +705,8 @@ impl AptImageView {
 pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
     parent: &W,
     title: &str,
-) -> (AptImageView, adw::Window) {
-    let view = AptImageView::new();
+) -> Result<(AptImageView, adw::Window), ViewerError> {
+    let view = AptImageView::try_new()?;
 
     let window = adw::Window::builder()
         .title(title)
@@ -859,7 +850,7 @@ pub fn open_apt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
     window.set_content(Some(&toast_overlay));
     window.present();
 
-    (view, window)
+    Ok((view, window))
 }
 
 /// Default path the Export PNG button writes to:
@@ -876,11 +867,18 @@ fn default_export_path() -> PathBuf {
 /// Walk the window content tree looking for a [`adw::ToastOverlay`]
 /// to display `toast` in. Falls through silently if the layout
 /// changes — toasts are best-effort feedback, not load-bearing UI.
-fn show_toast_in<W: gtk4::prelude::IsA<gtk4::Window>>(window: &W, toast: adw::Toast) {
-    if let Some(child) = window.as_ref().child()
-        && let Some(overlay) = child.downcast_ref::<adw::ToastOverlay>()
+fn show_toast_in(window: &adw::Window, toast: adw::Toast) {
+    // The overlay was installed with `adw::Window::set_content`, so it
+    // is `content()`; `gtk::Window::child()` returns libadwaita's internal
+    // wrapper and the downcast silently failed — no toast ever showed (#765).
+    use adw::prelude::AdwWindowExt;
+    if let Some(overlay) = window
+        .content()
+        .and_then(|c| c.downcast::<adw::ToastOverlay>().ok())
     {
         overlay.add_toast(toast);
+    } else {
+        tracing::warn!("viewer toast dropped: window content is not a ToastOverlay");
     }
 }
 
@@ -934,7 +932,13 @@ pub fn open_apt_viewer_if_needed(
         tracing::warn!("apt-open invoked with no main window available");
         return;
     };
-    let (view, window) = open_apt_viewer_window(&parent, "NOAA APT");
+    let (view, window) = match open_apt_viewer_window(&parent, "NOAA APT") {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!("APT viewer could not be opened: {e}");
+            return;
+        }
+    };
     // Stash a clone in AppState so the DSP→UI handler can find
     // it. The clone is cheap (every field is `Rc`-shared).
     *state.apt_viewer.borrow_mut() = Some(view);
@@ -997,14 +1001,14 @@ mod tests {
 
     #[test]
     fn renderer_starts_empty() {
-        let r = AptImageRenderer::new();
+        let r = AptImageRenderer::try_new().unwrap();
         assert!(r.is_empty());
         assert_eq!(r.n_lines(), 0);
     }
 
     #[test]
     fn push_line_increments_n_lines() {
-        let mut r = AptImageRenderer::new();
+        let mut r = AptImageRenderer::try_new().unwrap();
         r.push_line(&synth_line(0));
         assert_eq!(r.n_lines(), 1);
         r.push_line(&synth_line(1));
@@ -1017,7 +1021,7 @@ mod tests {
         // never has to grow it. Lock that invariant down so a future
         // refactor can't accidentally make it lazy and lose the
         // alloc-free hot-path guarantee.
-        let r = AptImageRenderer::new();
+        let r = AptImageRenderer::try_new().unwrap();
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         {
             assert_eq!(r.surface.width(), LINE_PIXELS as i32);
@@ -1027,7 +1031,7 @@ mod tests {
 
     #[test]
     fn push_line_caps_at_max_lines() {
-        let mut r = AptImageRenderer::new();
+        let mut r = AptImageRenderer::try_new().unwrap();
         for i in 0..MAX_LINES {
             #[allow(clippy::cast_possible_truncation)]
             r.push_line(&synth_line(i as u8));
@@ -1040,7 +1044,7 @@ mod tests {
 
     #[test]
     fn clear_resets_lines_and_zeroes_surface_pixels() {
-        let mut r = AptImageRenderer::new();
+        let mut r = AptImageRenderer::try_new().unwrap();
         for _ in 0..TEST_LINE_COUNT {
             r.push_line(&synth_line(0xAA));
         }
@@ -1059,7 +1063,7 @@ mod tests {
 
     #[test]
     fn pixel_layout_is_argb32_with_grayscale_in_bgr_channels() {
-        let mut r = AptImageRenderer::new();
+        let mut r = AptImageRenderer::try_new().unwrap();
         let mut line = AptLine {
             sync_quality: 0.95,
             ..AptLine::default()
@@ -1075,7 +1079,7 @@ mod tests {
 
     #[test]
     fn export_png_round_trips_to_a_real_file() {
-        let mut r = AptImageRenderer::new();
+        let mut r = AptImageRenderer::try_new().unwrap();
         for i in 0..TEST_LINE_COUNT {
             #[allow(clippy::cast_possible_truncation)]
             r.push_line(&synth_line(i as u8));
@@ -1100,7 +1104,7 @@ mod tests {
 
     #[test]
     fn export_png_refuses_when_buffer_is_empty() {
-        let r = AptImageRenderer::new();
+        let r = AptImageRenderer::try_new().unwrap();
         let path = std::env::temp_dir().join("apt-test-empty-should-not-be-written.png");
         let result = r.export_png(&path);
         assert!(result.is_err());

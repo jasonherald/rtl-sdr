@@ -388,6 +388,27 @@ impl ConfigManager {
         self.auto_save_handle = None;
     }
 
+    /// Write pending changes to disk now, synchronously. Quit paths call
+    /// this instead of relying on the auto-save handle's `Drop`, which
+    /// only runs once every `Arc` clone held by GTK closures and timers
+    /// has died (#762). A no-op when nothing changed or for the
+    /// in-memory fallback.
+    ///
+    /// # Errors
+    ///
+    /// The save error; the config stays marked dirty so a later flush
+    /// retries.
+    pub fn flush(&self) -> Result<(), ConfigError> {
+        if self.path.is_none() || !self.modified.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if let Err(e) = self.save() {
+            self.modified.store(true, Ordering::Release);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Returns the config file path (empty for the in-memory fallback).
     pub fn path(&self) -> &Path {
         self.path.as_deref().unwrap_or_else(|| Path::new(""))
@@ -955,6 +976,39 @@ mod tests {
         let dir = temp_dir("in-memory-flag");
         let mgr = ConfigManager::load(&dir.join("config.json"), &json!({})).unwrap();
         assert!(!mgr.is_in_memory());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #762 — quit paths need a synchronous flush instead of relying on
+    /// the auto-save handle's `Drop` (which needs every `Arc` clone in
+    /// GTK closures to die first).
+    #[test]
+    fn flush_writes_pending_changes_synchronously() {
+        let dir = temp_dir("flush");
+        let path = dir.join("config.json");
+        let mgr = ConfigManager::load(&path, &json!({"volume": 0.5})).unwrap();
+        mgr.write(|v| v["volume"] = json!(0.9));
+        mgr.flush().unwrap();
+        let on_disk: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["volume"], 0.9);
+        assert!(
+            !mgr.modified.load(Ordering::Acquire),
+            "flush clears the dirty flag"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #762 — a clean config does not touch the disk on flush.
+    #[test]
+    fn flush_is_a_noop_when_clean() {
+        let dir = temp_dir("flush-clean");
+        let path = dir.join("config.json");
+        let mgr = ConfigManager::load(&path, &json!({"volume": 0.5})).unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        mgr.flush().unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+        assert!(ConfigManager::in_memory(&json!({})).flush().is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 

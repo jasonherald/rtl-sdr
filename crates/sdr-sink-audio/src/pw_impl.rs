@@ -75,10 +75,47 @@ pub fn list_audio_sinks() -> Vec<AudioDevice> {
 
     // Run a short-lived PipeWire main loop to collect sink names.
     // Must run on a separate thread because PipeWire main loops
-    // are not reentrant and we may already have one running.
-    let result = std::thread::Builder::new()
+    // are not reentrant and we may already have one running. The
+    // caller (the GTK main thread at panel build) waits at most
+    // `ENUMERATE_TIMEOUT`: a wedged or absent daemon must not freeze
+    // startup, and "Default" alone is a usable answer (#771).
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
         .name("pw-enumerate".to_string())
         .spawn(move || {
+            let _ = tx.send(enumerate_sinks());
+        });
+    let result = spawned.and_then(|_| {
+        rx.recv_timeout(ENUMERATE_TIMEOUT).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("PipeWire enumeration: {e}"),
+            )
+        })
+    });
+
+    match result {
+        Ok(found) => {
+            for dev in found {
+                if !sinks.iter().any(|s| s.node_name == dev.node_name) {
+                    sinks.push(dev);
+                }
+            }
+        }
+        Err(e) => tracing::warn!("audio sink enumeration skipped: {e}"),
+    }
+
+    sinks
+}
+
+/// Bound on the PipeWire sink enumeration at panel build.
+const ENUMERATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Collect `Audio/Sink` nodes from a short-lived PipeWire main loop.
+/// Runs on its own thread (see `list_audio_sinks`).
+fn enumerate_sinks() -> Vec<AudioDevice> {
+    {
+        {
             let Ok(main_loop) = pipewire::main_loop::MainLoopRc::new(None) else {
                 return Vec::new();
             };
@@ -136,22 +173,8 @@ pub fn list_audio_sinks() -> Vec<AudioDevice> {
             drop(listener);
             drop(core_listener);
             found_sinks.borrow().clone()
-        })
-        .and_then(|handle| {
-            handle
-                .join()
-                .map_err(|_| std::io::Error::other("join failed"))
-        });
-
-    if let Ok(found) = result {
-        for dev in found {
-            if !sinks.iter().any(|s| s.node_name == dev.node_name) {
-                sinks.push(dev);
-            }
         }
     }
-
-    sinks
 }
 
 impl AudioSink {

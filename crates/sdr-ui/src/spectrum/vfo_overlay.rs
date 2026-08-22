@@ -199,7 +199,15 @@ impl VfoState {
         };
 
         let span = self.display_end_hz - self.display_start_hz;
-        let new_span = (span * factor).clamp(MIN_DISPLAY_SPAN_HZ, self.max_span_hz);
+        // `max_span_hz` is written from `DspToUi::DisplayBandwidth`; a
+        // source reporting 0 / NaN / < 1 kHz must not turn the clamp into
+        // an `assert!(min <= max)` abort on the next scroll wheel (#768).
+        let max_span = if self.max_span_hz.is_finite() && self.max_span_hz >= MIN_DISPLAY_SPAN_HZ {
+            self.max_span_hz
+        } else {
+            DEFAULT_DISPLAY_SPAN_HZ
+        };
+        let new_span = (span * factor).clamp(MIN_DISPLAY_SPAN_HZ, max_span);
 
         // Keep the cursor frequency at the same relative position.
         let frac = if span > 0.0 {
@@ -517,6 +525,24 @@ mod tests {
             span <= vfo.max_span_hz + 1.0, // +1 for float rounding
             "span should not exceed max_span_hz: {span}"
         );
+    }
+
+    /// #768 — `max_span_hz` comes straight from `DspToUi::DisplayBandwidth`;
+    /// a source reporting 0 / NaN / < 1 kHz used to make the next scroll
+    /// wheel abort the process (`clamp` asserts `min <= max`).
+    #[test]
+    fn zoom_survives_an_invalid_max_span() {
+        for bad in [f64::NAN, 0.0, -5.0, 500.0, f64::INFINITY] {
+            let mut vfo = test_vfo();
+            vfo.max_span_hz = bad;
+            vfo.zoom(0.0, -1.0);
+            vfo.zoom(0.0, 1.0);
+            let span = vfo.display_end_hz - vfo.display_start_hz;
+            assert!(
+                span.is_finite() && span >= MIN_DISPLAY_SPAN_HZ,
+                "bad max {bad}: span {span}"
+            );
+        }
     }
 
     #[test]
