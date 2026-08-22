@@ -392,8 +392,12 @@ fn scan_window(
         t = next_t;
     }
 
-    // Pass still open at `to` — emit it with end clamped.
-    if let Some(open_at) = pass_open {
+    // Pass still open at `to` — emit it with end clamped. A rise that
+    // refined to `to` itself (the clamped expiry horizon, typically)
+    // would be a zero-duration pass: skip it.
+    if let Some(open_at) = pass_open
+        && open_at < to
+    {
         passes.push(build_pass(station, satellite, open_at, to)?);
     }
 
@@ -945,5 +949,35 @@ mod tests {
         assert_eq!(passes.len(), 1, "{passes:?}");
         assert_eq!(passes[0].end, to, "LOS must be clamped to the window end");
         assert!((passes[0].start - reference.start).num_seconds().abs() <= 2);
+    }
+
+    /// CR round 2 on PR #799 — a rise that lands exactly on the window
+    /// end (the clamped expiry horizon is the real-world case) must
+    /// not yield a zero-duration `Pass { start: to, end: to }`.
+    #[test]
+    fn rise_at_the_window_end_does_not_emit_a_zero_duration_pass() {
+        let sat = test_satellite();
+        let station = test_station();
+        let day = upcoming_passes(
+            &station,
+            &sat,
+            sat.epoch(),
+            sat.epoch() + Duration::days(1),
+            TEST_MIN_ELEVATION_DEG,
+        )
+        .unwrap();
+        let reference = day.first().expect("a pass within a day");
+        let from = reference.start - Duration::hours(1);
+        let passes = upcoming_passes(
+            &station,
+            &sat,
+            from,
+            reference.start,
+            TEST_MIN_ELEVATION_DEG,
+        )
+        .unwrap();
+        for pass in &passes {
+            assert!(pass.end > pass.start, "zero-duration pass: {pass:?}");
+        }
     }
 }

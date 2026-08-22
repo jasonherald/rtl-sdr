@@ -240,7 +240,10 @@ impl TleCache {
     pub fn cached_tle_for(&self, norad_id: u32) -> Result<(String, String), TleCacheError> {
         let path = self.cache_path(norad_id);
         let cached = read_file(&path)?.ok_or(TleCacheError::NotFound { norad_id })?;
-        if !has_any_tle_pair(&cached) {
+        // Same SGP4-backed validation as the refresh path: a pair the
+        // parser rejects is a miss here, not an `Ok` that
+        // `Satellite::from_tle` then refuses (CR on PR #799).
+        if !has_valid_tle_for(&cached, norad_id) {
             return Err(TleCacheError::NotFound { norad_id });
         }
         parse_tle_text(&cached, norad_id).ok_or(TleCacheError::NotFound { norad_id })
@@ -1311,6 +1314,27 @@ SOMETHING
         let offline = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
         let err = offline.tle_text(99_999).unwrap_err();
         assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CR round 2 on PR #799 — the cache-only path applies the same
+    /// SGP4-backed validation: a malformed pair for the requested id is
+    /// `NotFound`, not an `Ok` that `Satellite::from_tle` then rejects.
+    #[test]
+    fn cached_tle_for_rejects_a_malformed_requested_pair() {
+        const MALFORMED: &str = "\
+1 99999U 09005A   24001.50000000  .00000050  00000-0  50000-4 0  9994
+2 99999  XX.0000 100.0000 0010000  90.0000 270.0000 14.10000000123456
+";
+        let dir = unique_temp_dir("cached-malformed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("99999.tle"), MALFORMED).unwrap();
+        let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
+        let err = cache.cached_tle_for(99_999).unwrap_err();
+        assert!(
+            matches!(err, TleCacheError::NotFound { norad_id: 99_999 }),
+            "got {err:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
