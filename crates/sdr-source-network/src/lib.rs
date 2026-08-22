@@ -32,7 +32,7 @@ use sdr_pipeline::source_manager::Source;
 use sdr_types::{Complex, Protocol, SampleFormat, SourceError};
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Bound on `TcpStream::connect` so a blackholed host cannot park the DSP
 /// thread in `start()` (#744).
@@ -78,6 +78,54 @@ pub struct NetworkSource {
 enum NetworkConnection {
     Tcp(TcpStream),
     Udp(UdpSocket),
+}
+
+/// Run `resolve` on a helper thread and wait at most until `deadline`.
+/// `to_socket_addrs` is a blocking DNS lookup with no timeout of its own;
+/// on the DSP thread that would hold Stop / quit hostage (#744, CR round
+/// 1 on PR #793). A lookup that outlives the deadline is abandoned — the
+/// helper finishes on its own and its result is dropped.
+fn resolve_with_deadline<F>(resolve: F, deadline: Instant) -> std::io::Result<Vec<SocketAddr>>
+where
+    F: FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(resolve());
+    });
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "hostname resolution exceeded the connect timeout",
+        )),
+    }
+}
+
+/// Try each address in turn, giving every attempt only the time left
+/// until `deadline`, so several unreachable addresses cannot stretch
+/// `start()` past one `connect_timeout` in total.
+fn connect_any_with_deadline(
+    addrs: &[SocketAddr],
+    deadline: Instant,
+) -> std::io::Result<TcpStream> {
+    let mut last_err =
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no address to connect to");
+    for addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connect timeout exhausted before every address was tried",
+            ));
+        }
+        match TcpStream::connect_timeout(addr, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 impl NetworkSource {
@@ -257,24 +305,22 @@ impl Source for NetworkSource {
         // that `format!("{host}:{port}")` would mangle into `::1:1234`.
         let conn = match self.protocol {
             Protocol::TcpClient => {
-                let addrs: Vec<SocketAddr> = (self.hostname.as_str(), self.port)
-                    .to_socket_addrs()?
-                    .collect();
-                let mut last_err = std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("no address resolved for {}", self.hostname),
-                );
-                let mut stream = None;
-                for addr in addrs {
-                    match TcpStream::connect_timeout(&addr, self.connect_timeout) {
-                        Ok(s) => {
-                            stream = Some(s);
-                            break;
-                        }
-                        Err(e) => last_err = e,
-                    }
+                // One end-to-end deadline covers resolution AND every
+                // connect attempt.
+                let deadline = Instant::now() + self.connect_timeout;
+                let host = self.hostname.clone();
+                let port = self.port;
+                let addrs = resolve_with_deadline(
+                    move || Ok((host.as_str(), port).to_socket_addrs()?.collect()),
+                    deadline,
+                )?;
+                if addrs.is_empty() {
+                    return Err(SourceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no address resolved for {}", self.hostname),
+                    )));
                 }
-                let stream = stream.ok_or(SourceError::Io(last_err))?;
+                let stream = connect_any_with_deadline(&addrs, deadline)?;
                 stream.set_read_timeout(Some(self.read_timeout))?;
                 NetworkConnection::Tcp(stream)
             }
@@ -361,13 +407,50 @@ mod tests {
         assert!((output[0].im - (-0.25)).abs() < 1e-6);
     }
 
-    /// Free loopback UDP port for the bind tests.
-    fn free_udp_port() -> u16 {
-        UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// #744 (CR round 1 on PR #793) — a slow resolver must not hold
+    /// `start()` past the connect timeout.
+    #[test]
+    fn resolution_is_bounded_by_the_deadline() {
+        const SLOW_RESOLVER: Duration = Duration::from_millis(500);
+        const DEADLINE: Duration = Duration::from_millis(100);
+        let started = Instant::now();
+        let err = resolve_with_deadline(
+            move || {
+                std::thread::sleep(SLOW_RESOLVER);
+                Ok(Vec::new())
+            },
+            Instant::now() + DEADLINE,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < SLOW_RESOLVER,
+            "must not wait for the resolver"
+        );
+    }
+
+    /// #744 (CR round 1 on PR #793) — several unreachable addresses share
+    /// ONE connect timeout instead of each getting the full budget.
+    #[test]
+    fn multiple_unreachable_addresses_share_one_deadline() {
+        // TEST-NET-1 (RFC 5737): never routable, so connects hang until
+        // the timeout on hosts with a default route — and fail fast
+        // without one. Either way the total must stay under one budget.
+        const TOTAL_BUDGET: Duration = Duration::from_millis(300);
+        const SLACK: Duration = Duration::from_millis(250);
+        let addrs = [
+            "192.0.2.1:9".parse::<SocketAddr>().unwrap(),
+            "192.0.2.2:9".parse::<SocketAddr>().unwrap(),
+            "192.0.2.3:9".parse::<SocketAddr>().unwrap(),
+        ];
+        let started = Instant::now();
+        let result = connect_any_with_deadline(&addrs, Instant::now() + TOTAL_BUDGET);
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < TOTAL_BUDGET + SLACK,
+            "three addresses took {:?}; each must only get the remaining budget",
+            started.elapsed()
+        );
     }
 
     /// #744 — a silent TCP peer must not park the DSP thread inside
@@ -409,11 +492,13 @@ mod tests {
         const DATAGRAM_SAMPLES: usize = 30_000;
         const OUTPUT_SAMPLES: usize = 16_384;
         const READ_TIMEOUT: Duration = Duration::from_millis(500);
-        let port = free_udp_port();
-        let mut source = NetworkSource::new("127.0.0.1", port, Protocol::Udp);
+        // Port 0: the OS assigns one and NetworkSource holds it from
+        // bind onward, so nothing can claim it in between.
+        let mut source = NetworkSource::new("127.0.0.1", 0, Protocol::Udp);
         source.set_sample_format(SampleFormat::Int8);
         source.set_timeouts(DEFAULT_NETWORK_CONNECT_TIMEOUT, READ_TIMEOUT);
         source.start().unwrap();
+        let port = source.local_addr().expect("bound").port();
 
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
         let payload: Vec<u8> = (0..DATAGRAM_SAMPLES * 2).map(|i| (i % 251) as u8).collect();
@@ -440,12 +525,11 @@ mod tests {
     /// semantics), not ignored in favour of 0.0.0.0.
     #[test]
     fn udp_binds_to_the_configured_host() {
-        let port = free_udp_port();
-        let mut source = NetworkSource::new("127.0.0.1", port, Protocol::Udp);
+        let mut source = NetworkSource::new("127.0.0.1", 0, Protocol::Udp);
         source.start().unwrap();
         let local = source.local_addr().expect("bound");
         assert_eq!(local.ip().to_string(), "127.0.0.1");
-        assert_eq!(local.port(), port);
+        assert_ne!(local.port(), 0, "the OS assigned a real port");
     }
 
     /// #744 — changing the sample format mid-session must drop stale
