@@ -41,6 +41,11 @@ pub struct ScannerChannel {
 /// tuned to. Two channels with equal tune configs can be swapped
 /// without a retune; dwell / hang / priority are scheduling inputs
 /// and deliberately excluded (#758).
+///
+/// `bandwidth` is compared with exact `f64` equality. Callers must
+/// supply finite, quantized bandwidth values (the UI presets are); a
+/// `NaN` bandwidth never compares equal and would force a retune on
+/// every list update.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TuneConfig {
     pub frequency_hz: u64,
