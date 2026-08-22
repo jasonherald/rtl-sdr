@@ -1010,11 +1010,24 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
     // dispatch. `SstvEvent` is `#[non_exhaustive]`, so a wildcard arm
     // handles future mode additions without a compile break.
     for event in decoder.process(&state.sstv_mono_buf) {
-        // Update per-pass diagnostic counters before dispatch — the
-        // counters tell us at LOS how many VIS were detected, how
-        // many images completed, and how many lines decoded across
-        // all (complete + partial) images. Per #648.
-        state.sstv_pass_stats.record_event(&event);
+        handle_sstv_event(state, dsp_tx, event);
+    }
+}
+
+/// Dispatch one slowrx event: pass-stats bookkeeping, the shared
+/// image buffer, and the UI notifications. Split out of
+/// [`sstv_decode_tap`] so it can be exercised without a decoder.
+fn handle_sstv_event(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    event: slowrx::SstvEvent,
+) {
+    // Update per-pass diagnostic counters before dispatch — the
+    // counters tell us at LOS how many VIS were detected, how
+    // many images completed, and how many lines decoded across
+    // all (complete + partial) images. Per #648.
+    state.sstv_pass_stats.record_event(&event);
+    {
         match event {
             slowrx::SstvEvent::VisDetected {
                 mode,
@@ -1027,6 +1040,15 @@ fn sstv_decode_tap(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, audio_c
                     hedr_shift_hz,
                     "SSTV VIS detected — new image starting"
                 );
+                // A new VIS is a new image. The shared buffer latches
+                // its geometry on the first row and only resets on
+                // `take_completed` / `clear`, so an incomplete image
+                // (fade-out mid-pass) followed by a different mode
+                // would have every row of the new image silently
+                // dropped and the old rows saved as it (#736).
+                if let Some(handle) = state.sstv_image.as_ref() {
+                    handle.clear();
+                }
                 // Surface the mode in the viewer's header so the
                 // user can see which PD-family variant is being
                 // decoded. `&'static str` because the slowrx mode
@@ -5984,6 +6006,40 @@ mod tests {
         assert!(
             image.channel_apids().is_empty(),
             "stale pixels survived the between-pass reset"
+        );
+    }
+
+    /// #736 — a new VIS means a new image: the in-flight buffer must be
+    /// reset so a different-geometry mode after an incomplete image is
+    /// not silently dropped row by row (and the old rows saved as it).
+    #[test]
+    fn sstv_vis_detected_resets_the_in_flight_image() {
+        const STALE_W: u32 = 320;
+        const STALE_H: u32 = 256;
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let image = sdr_radio::sstv_image::SstvImage::new();
+        let handle = image.handle();
+        handle.write_line(0, STALE_W, STALE_H, &[[1, 2, 3]; STALE_W as usize]);
+        assert!(
+            handle.snapshot().is_some(),
+            "test premise: a stale row exists"
+        );
+        state.sstv_image = Some(handle.clone());
+        let _ = drain(&dsp_rx);
+
+        handle_sstv_event(&mut state, &dsp_tx, fake_vis_event());
+
+        assert!(
+            handle.snapshot().is_none(),
+            "VIS must reset the in-flight image buffer"
+        );
+        let events = drain(&dsp_rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, DspToUi::SstvVisDetected { .. })),
+            "the VIS notification must still reach the UI, got {events:?}"
         );
     }
 

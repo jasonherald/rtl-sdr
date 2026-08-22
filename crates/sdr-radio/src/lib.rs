@@ -685,7 +685,22 @@ impl RadioModule {
     /// Returns [`RadioError::Dsp`] if the mode carries a non-
     /// finite or otherwise invalid threshold.
     pub fn set_voice_squelch_mode(&mut self, mode: VoiceSquelchMode) -> Result<(), RadioError> {
-        self.af_chain.set_voice_squelch_mode(mode)?;
+        // Same NFM-only invariant `set_mode` enforces: cache the
+        // user's choice unconditionally, but only arm the detector
+        // live on NFM. Bookmark recall dispatches the demod mode and
+        // then the voice-squelch mode, so applying it live on WFM
+        // muted broadcast audio with the control hidden (#737).
+        //
+        // Validate first: forcing `Off` live on non-NFM would otherwise
+        // let an invalid threshold skip the DSP check, enter the cache
+        // and fail on NFM re-entry (CR round 1 on PR #790).
+        mode.validate()?;
+        let live_mode = if self.mode == DemodMode::Nfm {
+            mode
+        } else {
+            VoiceSquelchMode::Off
+        };
+        self.af_chain.set_voice_squelch_mode(live_mode)?;
         self.voice_squelch_mode = mode;
         Ok(())
     }
@@ -718,17 +733,23 @@ impl RadioModule {
     /// Returns [`RadioError::Dsp`] if the threshold is non-finite
     /// or (for syllabic) non-positive.
     pub fn set_voice_squelch_threshold(&mut self, threshold: f32) -> Result<(), RadioError> {
-        self.af_chain.set_voice_squelch_threshold(threshold)?;
-        // Mirror the update into the cached mode so set_mode's
-        // reapply picks up the tuned value. `Off` variant has no
-        // threshold to update — no-op, matching the AF chain.
-        self.voice_squelch_mode = match self.voice_squelch_mode {
+        // Build and validate the candidate cached mode FIRST: while the
+        // live chain is forced `Off` (non-NFM, #737) the AF-chain
+        // setter below is a no-op and would not reject a bad value,
+        // which would then be replayed on NFM re-entry (CR round 2 on
+        // PR #790). `Off` carries no threshold — nothing to update.
+        let candidate = match self.voice_squelch_mode {
             VoiceSquelchMode::Off => VoiceSquelchMode::Off,
             VoiceSquelchMode::Syllabic { .. } => VoiceSquelchMode::Syllabic { threshold },
             VoiceSquelchMode::Snr { .. } => VoiceSquelchMode::Snr {
                 threshold_db: threshold,
             },
         };
+        candidate.validate()?;
+        self.af_chain.set_voice_squelch_threshold(threshold)?;
+        // Mirror the update into the cached mode so set_mode's
+        // reapply picks up the tuned value.
+        self.voice_squelch_mode = candidate;
         Ok(())
     }
 
@@ -1142,21 +1163,23 @@ mod tests {
         assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
         assert_eq!(radio.current_mode(), DemodMode::Wfm);
 
-        // Set a non-default Syllabic mode via the direct setter.
-        // On the CURRENT (WFM) AF chain the direct setter applies
-        // unconditionally — the NFM-only gate lives only in the
-        // `set_mode` rebuild path, not in the direct setter. This
-        // is deliberate: the user's intent on the direct setter
-        // is "use this mode now if applicable," and if they're
-        // on WFM that's their own choice; the gate keeps stale
-        // cached state from re-arming on non-NFM modes across
-        // rebuilds, not from the user's explicit current action.
+        // Set a non-default Syllabic mode via the direct setter
+        // while on WFM. The setter caches the user's choice but
+        // applies it LIVE only on NFM — the same invariant
+        // `set_mode` enforces. Bookmark recall sends
+        // `SetDemodMode(Wfm)` then `SetVoiceSquelchMode(Syllabic)`;
+        // applying it live muted broadcast audio with the control
+        // hidden (#737).
         let syl = VoiceSquelchMode::Syllabic {
             threshold: VS_SYLLABIC_PERSIST_THRESHOLD,
         };
         radio.set_voice_squelch_mode(syl).unwrap();
         assert_eq!(radio.voice_squelch_mode(), syl);
-        assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
+        assert_eq!(
+            radio.af_chain().voice_squelch_mode(),
+            VoiceSquelchMode::Off,
+            "direct setter must not arm voice squelch live on WFM (#737)"
+        );
 
         // Mode switch to NFM: the AF chain is rebuilt from
         // scratch. The NFM gate passes, so the cached Syllabic
@@ -1217,6 +1240,64 @@ mod tests {
         assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
     }
 
+    /// #737 (CR round 1 on PR #790) — on non-NFM the setter forces the
+    /// live chain to Off, which must not let an invalid threshold skip
+    /// validation, enter the cache, and then fail on NFM re-entry.
+    #[test]
+    fn test_voice_squelch_setter_validates_before_forcing_off_on_non_nfm() {
+        use sdr_dsp::voice_squelch::VoiceSquelchMode;
+        /// Non-positive Syllabic boundary: the detector requires a
+        /// finite, strictly positive envelope ratio, so `-1.0` is the
+        /// simplest value that must be rejected.
+        const INVALID_THRESHOLD: f32 = -1.0;
+
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        assert_eq!(radio.current_mode(), DemodMode::Wfm);
+        let bad = VoiceSquelchMode::Syllabic {
+            threshold: INVALID_THRESHOLD,
+        };
+        assert!(
+            radio.set_voice_squelch_mode(bad).is_err(),
+            "an invalid threshold must be rejected even while non-NFM"
+        );
+        assert_eq!(
+            radio.voice_squelch_mode(),
+            VoiceSquelchMode::Off,
+            "a rejected mode must not be cached"
+        );
+        // NFM re-entry replays the cache — which must still be valid.
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
+    }
+
+    /// #737 (CR round 2 on PR #790) — while the live chain is `Off`
+    /// (non-NFM) the AF-chain threshold setter is a no-op, so the
+    /// cached mode must be validated here or a bad value is replayed
+    /// on NFM re-entry.
+    #[test]
+    fn test_voice_squelch_threshold_validates_cached_mode_on_non_nfm() {
+        use sdr_dsp::voice_squelch::VoiceSquelchMode;
+        /// Non-positive Syllabic boundary: the detector requires a
+        /// finite, strictly positive envelope ratio.
+        const INVALID_THRESHOLD: f32 = -1.0;
+
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        assert_eq!(radio.current_mode(), DemodMode::Wfm);
+        let syl = VoiceSquelchMode::Syllabic {
+            threshold: VS_SYLLABIC_BASELINE_THRESHOLD,
+        };
+        radio.set_voice_squelch_mode(syl).unwrap();
+        assert!(
+            radio
+                .set_voice_squelch_threshold(INVALID_THRESHOLD)
+                .is_err(),
+            "an invalid threshold must be rejected while the live chain is Off"
+        );
+        assert_eq!(radio.voice_squelch_mode(), syl, "cache must be unchanged");
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        assert_eq!(radio.af_chain().voice_squelch_mode(), syl);
+    }
+
     #[test]
     fn test_radio_module_voice_squelch_threshold_updates_cached_mode() {
         // `set_voice_squelch_threshold` has to mirror the new
@@ -1227,6 +1308,10 @@ mod tests {
         use sdr_dsp::voice_squelch::VoiceSquelchMode;
 
         let mut radio = RadioModule::with_default_rate().unwrap();
+        // Start on NFM: the direct setter only arms the detector
+        // live on NFM (#737), and this test is about the live
+        // threshold being mirrored into the cache.
+        radio.set_mode(DemodMode::Nfm).unwrap();
         radio
             .set_voice_squelch_mode(VoiceSquelchMode::Syllabic {
                 threshold: VS_SYLLABIC_BASELINE_THRESHOLD,
