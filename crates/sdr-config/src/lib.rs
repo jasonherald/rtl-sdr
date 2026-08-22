@@ -8,13 +8,98 @@ pub use keyring_store::KeyringStore;
 
 use sdr_types::ConfigError;
 use serde_json::Value;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::thread;
 use std::time::Duration;
 
 /// Auto-save interval in milliseconds.
 const AUTO_SAVE_INTERVAL_MS: u64 = 1000;
+
+/// Process-wide counter so every in-flight atomic write owns its own
+/// temp file (pid disambiguates processes, the counter threads).
+static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Suffix of the backup a corrupt config is renamed to before the reset:
+/// `config.json.corrupt-<unix seconds>`.
+const CORRUPT_BACKUP_INFIX: &str = ".corrupt-";
+
+/// Write `content` to `path` atomically: a per-call temp file in the same
+/// directory, `sync_all` on it, `rename` over the target, then an fsync
+/// of the directory so the rename itself is durable. If `path` is a
+/// symlink the write lands on its target so dotfiles setups keep their
+/// link (#760).
+///
+/// # Errors
+///
+/// Any I/O failure; the temp file is removed on error.
+pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    // Follow a symlink to its final target; rename over the link itself
+    // would replace the link with a regular file.
+    let target = if fs_symlink_metadata_is_symlink(path) {
+        std::fs::canonicalize(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let tmp_id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+    let tmp = target.with_extension(format!("tmp.{}.{tmp_id}", std::process::id()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        // Data must be on disk before the rename publishes it, or a power
+        // loss right after the rename can leave an empty config.
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &target)?;
+        sync_parent_dir(&target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn fs_symlink_metadata_is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// fsync the directory containing `path` so a completed `rename` survives
+/// a crash. Best-effort on platforms where directories can't be opened.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            let dir = std::fs::File::open(parent)?;
+            dir.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+/// Serialize the config for disk. Called with the read lock held only for
+/// the duration of the serialization — never across I/O (#763).
+fn serialize_config(data: &RwLock<Value>) -> Result<String, ConfigError> {
+    let d = data.read().unwrap_or_else(PoisonError::into_inner);
+    serde_json::to_string_pretty(&*d).map_err(|e| ConfigError::Json(e.to_string()))
+}
+
+/// Move a corrupt config aside as `<name>.corrupt-<unix seconds>` so a bad
+/// byte never silently destroys every setting (#761). Best-effort: a
+/// failure to back up is logged and the reset proceeds.
+fn back_up_corrupt_config(path: &Path) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(format!("{CORRUPT_BACKUP_INFIX}{secs}"));
+    let backup = PathBuf::from(backup);
+    match std::fs::rename(path, &backup) {
+        Ok(()) => tracing::warn!(backup = %backup.display(), "corrupt config backed up"),
+        Err(e) => tracing::error!("could not back up corrupt config: {e}"),
+    }
+}
 
 /// Thread-safe JSON configuration manager.
 ///
@@ -23,9 +108,10 @@ const AUTO_SAVE_INTERVAL_MS: u64 = 1000;
 /// - Thread-safe read/write access via `RwLock`
 /// - Auto-save to disk on a background thread when modified
 pub struct ConfigManager {
-    path: PathBuf,
+    /// `None` for the in-memory fallback (nothing persists).
+    path: Option<PathBuf>,
     data: Arc<RwLock<Value>>,
-    modified: Arc<Mutex<bool>>,
+    modified: Arc<AtomicBool>,
     auto_save_handle: Option<AutoSaveHandle>,
 }
 
@@ -52,7 +138,9 @@ impl ConfigManager {
     /// Load configuration from a file, merging with defaults.
     ///
     /// If the file doesn't exist, it's created with the default values.
-    /// If the file exists but is corrupt, it's reset to defaults.
+    /// If the file exists but is corrupt — unparsable, or parsable but not
+    /// a JSON object at the root — it's backed up as
+    /// `<name>.corrupt-<unix seconds>` and reset to defaults (#761).
     ///
     /// # Errors
     ///
@@ -63,10 +151,23 @@ impl ConfigManager {
 
         let data = if path.exists() {
             match std::fs::read(&path) {
-                Ok(bytes) => match serde_json::from_slice(&bytes) {
-                    Ok(parsed) => merge_defaults(parsed, defaults),
+                Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(parsed) if parsed.is_object() => merge_defaults(parsed, defaults),
+                    Ok(other) => {
+                        // `[]`, `5`, `"x"`: parses, but every later
+                        // `config.write(|v| v["key"] = …)` would panic in
+                        // serde_json's IndexMut — treat as corrupt.
+                        tracing::warn!(
+                            "config root is not a JSON object ({}), resetting",
+                            json_kind(&other)
+                        );
+                        back_up_corrupt_config(&path);
+                        should_save = true;
+                        defaults.clone()
+                    }
                     Err(e) => {
                         tracing::warn!("config file corrupt, resetting: {e}");
+                        back_up_corrupt_config(&path);
                         should_save = true;
                         defaults.clone()
                     }
@@ -86,9 +187,9 @@ impl ConfigManager {
         };
 
         let mgr = Self {
-            path,
+            path: Some(path),
             data: Arc::new(RwLock::new(data)),
-            modified: Arc::new(Mutex::new(false)),
+            modified: Arc::new(AtomicBool::new(false)),
             auto_save_handle: None,
         };
 
@@ -106,9 +207,9 @@ impl ConfigManager {
     /// disk full, etc.). The app remains functional with default settings.
     pub fn in_memory(defaults: &Value) -> Self {
         Self {
-            path: PathBuf::new(),
+            path: None,
             data: Arc::new(RwLock::new(defaults.clone())),
-            modified: Arc::new(Mutex::new(false)),
+            modified: Arc::new(AtomicBool::new(false)),
             auto_save_handle: None,
         }
     }
@@ -120,16 +221,12 @@ impl ConfigManager {
     /// Returns `ConfigError::Io` on write failure.
     pub fn save(&self) -> Result<(), ConfigError> {
         // In-memory configs have no path — skip saving.
-        if self.path.as_os_str().is_empty() {
+        let Some(path) = &self.path else {
             return Ok(());
-        }
-        let data = self.data.read().unwrap_or_else(PoisonError::into_inner);
-        let content =
-            serde_json::to_string_pretty(&*data).map_err(|e| ConfigError::Json(e.to_string()))?;
-        // Atomic write: write to temp file, then rename over original
-        let tmp_path = self.path.with_extension("tmp");
-        std::fs::write(&tmp_path, &content)?;
-        std::fs::rename(&tmp_path, &self.path)?;
+        };
+        // Serialize under the lock, then write without it (#763).
+        let content = serialize_config(&self.data)?;
+        write_atomic(path, &content)?;
         Ok(())
     }
 
@@ -154,8 +251,7 @@ impl ConfigManager {
     {
         let mut data = self.data.write().unwrap_or_else(PoisonError::into_inner);
         let result = f(&mut data);
-        let mut m = self.modified.lock().unwrap_or_else(PoisonError::into_inner);
-        *m = true;
+        self.modified.store(true, Ordering::Release);
         result
     }
 
@@ -164,9 +260,9 @@ impl ConfigManager {
     /// Checks for modifications every second and saves if needed.
     pub fn enable_auto_save(&mut self) {
         // In-memory configs have no path — nothing to auto-save.
-        if self.path.as_os_str().is_empty() {
+        let Some(path) = self.path.clone() else {
             return;
-        }
+        };
         if self.auto_save_handle.is_some() {
             return;
         }
@@ -175,7 +271,6 @@ impl ConfigManager {
         let stop_clone = Arc::clone(&stop_flag);
         let data = Arc::clone(&self.data);
         let modified = Arc::clone(&self.modified);
-        let path = self.path.clone();
 
         let thread = thread::spawn(move || {
             auto_save_worker(stop_clone, data, modified, path);
@@ -187,14 +282,34 @@ impl ConfigManager {
         });
     }
 
-    /// Disable auto-save and stop the background thread.
+    /// Disable auto-save and stop the background thread (flushing any
+    /// pending change on the way out).
     pub fn disable_auto_save(&mut self) {
         self.auto_save_handle = None;
     }
 
-    /// Returns the config file path.
+    /// Returns the config file path (empty for the in-memory fallback).
     pub fn path(&self) -> &Path {
-        &self.path
+        self.path.as_deref().unwrap_or_else(|| Path::new(""))
+    }
+
+    /// `true` for the in-memory fallback: nothing persists to disk, so
+    /// the UI can tell the user their settings will not survive a restart.
+    #[must_use]
+    pub fn is_in_memory(&self) -> bool {
+        self.path.is_none()
+    }
+}
+
+/// Short description of a JSON value's kind for log lines.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -203,12 +318,18 @@ fn merge_defaults(mut loaded: Value, defaults: &Value) -> Value {
     if let (Some(loaded_obj), Some(defaults_obj)) = (loaded.as_object_mut(), defaults.as_object()) {
         for (key, default_val) in defaults_obj {
             if let Some(existing) = loaded_obj.get_mut(key) {
-                // Recursively merge nested objects
                 if existing.is_object() && default_val.is_object() {
+                    // Recursively merge nested objects
                     let merged = merge_defaults(existing.take(), default_val);
                     *existing = merged;
+                } else if default_val.is_object() {
+                    // A non-object where a subtree is expected would make
+                    // later `v["a"]["b"]` indexing panic — the default
+                    // subtree wins (#761).
+                    tracing::warn!(key, "config subtree has the wrong type, using defaults");
+                    *existing = default_val.clone();
                 }
-                // Existing non-object value takes precedence
+                // Otherwise the existing scalar value takes precedence
             } else {
                 loaded_obj.insert(key.clone(), default_val.clone());
             }
@@ -222,7 +343,7 @@ fn merge_defaults(mut loaded: Value, defaults: &Value) -> Value {
 fn auto_save_worker(
     stop_flag: Arc<(Mutex<bool>, Condvar)>,
     data: Arc<RwLock<Value>>,
-    modified: Arc<Mutex<bool>>,
+    modified: Arc<AtomicBool>,
     path: PathBuf,
 ) {
     let (lock, cvar) = &*stop_flag;
@@ -240,55 +361,29 @@ fn auto_save_worker(
             }
         }
 
-        // Check if modified
-        let should_save = {
-            let mut m = modified.lock().unwrap_or_else(PoisonError::into_inner);
-            if *m {
-                *m = false;
-                true
-            } else {
-                false
-            }
-        };
-
-        if should_save && !flush_to_disk(&data, &path) {
-            // Re-mark dirty so next cycle retries
-            let mut m = modified.lock().unwrap_or_else(PoisonError::into_inner);
-            *m = true;
-        }
+        flush_if_modified(&modified, &data, &path);
     }
 }
 
-/// Check modified flag and flush to disk if set. Re-marks dirty on failure.
-fn flush_if_modified(modified: &Arc<Mutex<bool>>, data: &Arc<RwLock<Value>>, path: &Path) {
-    let mut m = modified.lock().unwrap_or_else(PoisonError::into_inner);
-    if *m {
-        *m = false;
-        drop(m);
-        if !flush_to_disk(data, path) {
-            // Re-mark dirty so next cycle retries
-            let mut m = modified.lock().unwrap_or_else(PoisonError::into_inner);
-            *m = true;
-        }
+/// Clear the modified flag and flush to disk if it was set. Re-marks
+/// dirty on failure so the next cycle retries.
+fn flush_if_modified(modified: &AtomicBool, data: &RwLock<Value>, path: &Path) {
+    if modified.swap(false, Ordering::AcqRel) && !flush_to_disk(data, path) {
+        modified.store(true, Ordering::Release);
     }
 }
 
-/// Write data to disk, logging any errors. Returns true on success.
-fn flush_to_disk(data: &Arc<RwLock<Value>>, path: &Path) -> bool {
-    let d = data.read().unwrap_or_else(PoisonError::into_inner);
-    match serde_json::to_string_pretty(&*d) {
-        Ok(content) => {
-            // Atomic write: temp file + rename
-            let tmp_path = path.with_extension("tmp");
-            if let Err(e) =
-                std::fs::write(&tmp_path, &content).and_then(|()| std::fs::rename(&tmp_path, path))
-            {
+/// Write data to disk, logging any errors. Returns true on success. The
+/// read lock is held only while serializing, never across the I/O (#763).
+fn flush_to_disk(data: &RwLock<Value>, path: &Path) -> bool {
+    match serialize_config(data) {
+        Ok(content) => match write_atomic(path, &content) {
+            Ok(()) => true,
+            Err(e) => {
                 tracing::error!("auto-save write failed: {e}");
                 false
-            } else {
-                true
             }
-        }
+        },
         Err(e) => {
             tracing::error!("auto-save serialization failed: {e}");
             false
@@ -400,6 +495,157 @@ mod tests {
 
         mgr.disable_auto_save();
         let _ = fs::remove_file(&path);
+    }
+
+    /// Unique temp dir per test so parallel tests never share files.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sdr-config-test-{name}-{}-{}",
+            std::process::id(),
+            NEXT_TMP_ID.load(std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #760 — `save()`, the auto-save worker and a second manager all used
+    /// one fixed `config.tmp`, so concurrent writes interleaved and could
+    /// publish torn JSON (next launch: full reset). Every writer must own
+    /// its own temp file and every save must succeed.
+    #[test]
+    fn concurrent_saves_never_publish_torn_json() {
+        const WRITERS: usize = 8;
+        const SAVES_PER_WRITER: usize = 40;
+        let dir = temp_dir("concurrent");
+        let path = dir.join("config.json");
+        let mgr = Arc::new(ConfigManager::load(&path, &json!({"n": 0})).unwrap());
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let mgr = Arc::clone(&mgr);
+                thread::spawn(move || {
+                    for i in 0..SAVES_PER_WRITER {
+                        mgr.write(|v| v["n"] = json!(w * SAVES_PER_WRITER + i));
+                        mgr.save().expect("every concurrent save succeeds");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let on_disk: Value = serde_json::from_slice(&fs::read(&path).unwrap())
+            .expect("the published file is always complete JSON");
+        assert!(on_disk["n"].is_number());
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp files left behind: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #760 — renaming over a symlinked config replaced the link and
+    /// detached dotfiles setups; the write must land on the link target.
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_a_symlinked_config() {
+        let dir = temp_dir("symlink");
+        let real = dir.join("real.json");
+        let link = dir.join("config.json");
+        fs::write(&real, r#"{"volume": 0.1}"#).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mgr = ConfigManager::load(&link, &json!({"volume": 0.5})).unwrap();
+        mgr.write(|v| v["volume"] = json!(0.9));
+        mgr.save().unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link preserved"
+        );
+        let on_disk: Value = serde_json::from_slice(&fs::read(&real).unwrap()).unwrap();
+        assert_eq!(on_disk["volume"], 0.9, "the target received the write");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #761 — one bad byte used to destroy every setting with only a
+    /// journal warning; the bad file must be kept as a backup first.
+    #[test]
+    fn corrupt_config_is_backed_up_before_reset() {
+        let dir = temp_dir("corrupt-backup");
+        let path = dir.join("config.json");
+        fs::write(&path, "not valid json!!!").unwrap();
+
+        let mgr = ConfigManager::load(&path, &json!({"volume": 0.5})).unwrap();
+        mgr.read(|v| assert_eq!(v["volume"], 0.5));
+
+        let backup = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.corrupt-")
+            })
+            .expect("a .corrupt-<timestamp> backup exists");
+        assert_eq!(
+            fs::read_to_string(backup.path()).unwrap(),
+            "not valid json!!!"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #761 — a valid-but-non-object root (`[]`, `5`, `"x"`) parsed fine,
+    /// skipped the corrupt branch, and the first `write` panicked in a GTK
+    /// signal handler. It must be treated as corrupt.
+    #[test]
+    fn non_object_root_is_treated_as_corrupt() {
+        let dir = temp_dir("non-object");
+        let path = dir.join("config.json");
+        fs::write(&path, "[]").unwrap();
+
+        let mgr = ConfigManager::load(&path, &json!({"volume": 0.5})).unwrap();
+        mgr.read(|v| assert!(v.is_object(), "root must be an object"));
+        mgr.write(|v| v["volume"] = json!(0.7)); // must not panic
+        mgr.read(|v| assert_eq!(v["volume"], 0.7));
+        assert!(
+            fs::read_dir(&dir).unwrap().filter_map(Result::ok).any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("config.json.corrupt-")),
+            "the non-object file is kept as a backup"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #761 — a subtree whose type doesn't match the default (a number
+    /// where an object is expected) would make later indexing panic; the
+    /// default subtree wins.
+    #[test]
+    fn mismatched_subtree_is_replaced_by_the_default() {
+        let loaded = json!({"audio": 5});
+        let defaults = json!({"audio": {"volume": 0.5}});
+        let merged = merge_defaults(loaded, &defaults);
+        assert_eq!(merged["audio"]["volume"], 0.5);
+    }
+
+    /// #761 — callers can tell an in-memory fallback apart so the UI can
+    /// say that settings will not persist.
+    #[test]
+    fn in_memory_is_reported() {
+        assert!(ConfigManager::in_memory(&json!({})).is_in_memory());
+        let dir = temp_dir("in-memory-flag");
+        let mgr = ConfigManager::load(&dir.join("config.json"), &json!({})).unwrap();
+        assert!(!mgr.is_in_memory());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
