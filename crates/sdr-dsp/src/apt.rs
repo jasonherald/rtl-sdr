@@ -2609,6 +2609,11 @@ mod tests {
         const SYNC_PROBE: std::ops::Range<usize> = 4..28;
         const SHIFTED_PROBE: std::ops::Range<usize> = 50..80;
         const VIDEO_PROBE: std::ops::Range<usize> = 60..90;
+        /// The square-wave burst spans nearly the full 0–255 range where
+        /// it sits; the other probe must read at most a quarter of that.
+        const SYNC_SPREAD_RATIO: f32 = 4.0;
+        /// Flat grey video: per-line normalisation noise only.
+        const VIDEO_SPREAD_MAX: f32 = 16.0;
         let rate = TEST_INPUT_RATE_HZ;
         let mut d = AptDecoder::new(rate)?;
         let one_line = synth_line_audio(rate, TEST_GREY_LEVEL);
@@ -2627,14 +2632,14 @@ mod tests {
             f32::from(max - min)
         };
         assert!(
-            spread(SYNC_PROBE) > 4.0 * spread(SHIFTED_PROBE).max(1.0),
+            spread(SYNC_PROBE) > SYNC_SPREAD_RATIO * spread(SHIFTED_PROBE).max(1.0),
             "Sync A burst must sit in the first columns: sync spread {}, shifted spread {}, pixels[..90] = {:?}",
             spread(SYNC_PROBE),
             spread(SHIFTED_PROBE),
             &line.pixels[..90]
         );
         assert!(
-            spread(VIDEO_PROBE) < 16.0,
+            spread(VIDEO_PROBE) < VIDEO_SPREAD_MAX,
             "video body flat by column 60: {:?}",
             &line.pixels[VIDEO_PROBE]
         );
@@ -2659,6 +2664,9 @@ mod tests {
     /// jumping to wherever the noise correlated best.
     #[test]
     fn weak_sync_after_lock_keeps_nominal_line_spacing() -> Result<(), DspError> {
+        /// Sync refinement jitters the slice by a few samples; 5 % of a
+        /// line is far below the 20 % drift bound that the gate enforces.
+        const LINE_SPACING_TOLERANCE: f64 = 0.05;
         let rate = TEST_INPUT_RATE_HZ;
         let mut d = AptDecoder::new(rate)?;
         let one_line = synth_line_audio(rate, TEST_GREY_LEVEL);
@@ -2689,7 +2697,7 @@ mod tests {
                 .input_sample_index
                 .abs_diff(pair[0].input_sample_index) as f64;
             assert!(
-                (delta - nominal).abs() <= nominal * 0.05,
+                (delta - nominal).abs() <= nominal * LINE_SPACING_TOLERANCE,
                 "line spacing {delta} strays from nominal {nominal}: {:?}",
                 out[..produced]
                     .iter()
@@ -2781,14 +2789,22 @@ mod tests {
     /// ~1, and against the Sync A template clearly lower.
     #[test]
     fn quality_at_scores_sync_b_against_its_own_template() {
+        /// A template correlated with itself is 1 up to float rounding.
+        const SELF_MATCH_MIN: f32 = 0.99;
+        /// The Sync A burst (1040 Hz) must score clearly below the Sync B
+        /// (832 Hz) self-match.
+        const CROSS_TEMPLATE_MARGIN: f32 = 0.1;
         let det = SyncDetector::new();
         let (tpl_b, _) = build_square_template(SAMPLES_PER_SYNC_B_CYCLE, SYNC_BURST_CYCLES);
         let own = det.quality_at(&tpl_b, 0, SyncChannel::B).unwrap();
-        assert!(own > 0.99, "Sync B template against itself: {own}");
+        assert!(
+            own > SELF_MATCH_MIN,
+            "Sync B template against itself: {own}"
+        );
         let (tpl_a, _) = build_padded_sync_a_template(SAMPLES_PER_PIXEL);
         let cross = det.quality_at(&tpl_a, 0, SyncChannel::B);
         assert!(
-            cross.is_none_or(|q| q < own - 0.1),
+            cross.is_none_or(|q| q < own - CROSS_TEMPLATE_MARGIN),
             "Sync A content must not score as Sync B: {cross:?} vs {own}"
         );
         assert!(

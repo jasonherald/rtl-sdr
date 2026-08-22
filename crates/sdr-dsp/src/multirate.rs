@@ -829,6 +829,10 @@ mod tests {
     /// chain's group delay in input samples; measure it with an impulse.
     #[test]
     fn rational_resampler_reports_its_group_delay() -> Result<(), DspError> {
+        /// Impulse peak vs. reported delay: the pre-decimator + polyphase
+        /// cascade rounds each stage's half-length, so allow one input
+        /// sample per stage plus one for the output-grid quantisation.
+        const DOWNSAMPLE_DELAY_TOLERANCE_SAMPLES: usize = 3;
         const IN_RATE: f64 = 12_480.0;
         const OUT_RATE: f64 = 4_160.0;
         /// `IN_RATE / OUT_RATE`: input samples per output sample, derived
@@ -859,7 +863,7 @@ mod tests {
         let measured = peak_idx * INPUT_SAMPLES_PER_OUTPUT - IMPULSE_AT;
         let reported = r.group_delay_input_samples();
         assert!(
-            reported.abs_diff(measured) <= 3,
+            reported.abs_diff(measured) <= DOWNSAMPLE_DELAY_TOLERANCE_SAMPLES,
             "reported {reported}, measured {measured} (peak at output {peak_idx})"
         );
         assert!(reported > 0);
@@ -874,6 +878,8 @@ mod tests {
     #[test]
     fn polyphase_group_delay_uses_the_prototype_length_not_the_padded_bank() -> Result<(), DspError>
     {
+        /// The delay is an exact rational; only float rounding is allowed.
+        const DELAY_EPSILON: f64 = 1e-9;
         const INTERP: usize = 6;
         const DECIM: usize = 1;
         const PROTOTYPE_LEN: usize = 457; // not a multiple of INTERP
@@ -881,7 +887,7 @@ mod tests {
         let r = PolyphaseResampler::new(INTERP, DECIM, &prototype)?;
         let expected = (PROTOTYPE_LEN - 1) as f64 / 2.0 / INTERP as f64;
         assert!(
-            (r.group_delay_input_samples() - expected).abs() < 1e-9,
+            (r.group_delay_input_samples() - expected).abs() < DELAY_EPSILON,
             "got {}, expected {expected}",
             r.group_delay_input_samples()
         );
@@ -892,6 +898,9 @@ mod tests {
     /// transcription resampler uses, measured with an impulse.
     #[test]
     fn upsampler_group_delay_matches_an_impulse_measurement() -> Result<(), DspError> {
+        /// Single polyphase stage: the impulse peak may sit one input
+        /// sample off the rounded delay.
+        const UPSAMPLE_DELAY_TOLERANCE_SAMPLES: usize = 1;
         const IN_RATE: f64 = 8_000.0;
         const OUT_RATE: f64 = 48_000.0;
         /// `OUT_RATE / IN_RATE`: output samples per input sample.
@@ -916,7 +925,7 @@ mod tests {
         let measured = peak_idx / OUTPUTS_PER_INPUT - IMPULSE_AT;
         let reported = r.group_delay_input_samples();
         assert!(
-            reported.abs_diff(measured) <= 1,
+            reported.abs_diff(measured) <= UPSAMPLE_DELAY_TOLERANCE_SAMPLES,
             "reported {reported}, measured {measured} (peak at output {peak_idx})"
         );
         Ok(())
