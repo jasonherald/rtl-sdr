@@ -126,6 +126,12 @@ pub const SYNC_A_TRAILING_PAD_PX: usize = 8;
 pub const SYNC_A_TOTAL_PX: usize =
     SYNC_A_LEADING_PAD_PX + SYNC_A_MODULATED_PX + SYNC_A_TRAILING_PAD_PX;
 
+/// Width of the Sync A *field* in the NOAA APT line format (39 px).
+/// Distinct from [`SYNC_A_TOTAL_PX`], which is the matched-filter
+/// template width (38 px); image-layout code must use this one — the
+/// video band starts at `SYNC_A_FIELD_PX + 47` (#774).
+pub const SYNC_A_FIELD_PX: usize = 39;
+
 /// Leading silence in the Sync A matched-filter template, in
 /// intermediate-rate samples. This is part of the template pattern
 /// (mirroring the silence approach to Sync A in real APT signals)
@@ -521,6 +527,12 @@ impl RealResampler {
         self.scratch_out.clear();
     }
 
+    /// See [`RationalResampler::group_delay_input_samples`].
+    #[must_use]
+    pub fn group_delay_input_samples(&self) -> usize {
+        self.inner.group_delay_input_samples()
+    }
+
     /// Resample `input` into `output`, returning the number of output samples
     /// written. Preserves state across calls so chunked streaming is seamless.
     ///
@@ -660,6 +672,19 @@ impl SyncDetector {
             quality: best_ncc.clamp(0.0, 1.0),
         })
     }
+
+    /// Normalised correlation of the template at one specific offset —
+    /// the quality a line would carry if sliced there. `None` when the
+    /// template does not fit.
+    #[must_use]
+    pub fn quality_at(&self, envelope: &[f32], offset: usize, channel: SyncChannel) -> Option<f32> {
+        let (template, template_norm) = match channel {
+            SyncChannel::A => (self.template_a.as_slice(), self.template_a_norm),
+            SyncChannel::B => (self.template_b.as_slice(), self.template_b_norm),
+        };
+        let window = envelope.get(offset..offset + template.len())?;
+        Some(normalized_corr(window, template, template_norm, 1e-9_f32).clamp(0.0, 1.0))
+    }
 }
 
 /// Build a zero-mean ±1 square-wave template plus its L2 norm.
@@ -780,6 +805,23 @@ const DECODER_BUFFER_CAP: usize = SAMPLES_PER_LINE * 3;
 /// the line after the matched sync.
 const MIN_ACCUMULATOR_FOR_DECODE: usize = SAMPLES_PER_LINE * 2;
 
+/// Sync quality at or above which the decoder considers itself locked
+/// onto the line cadence. Real captures sit at 0.7–0.95; pure noise
+/// occasionally reaches 0.6 on a single window but cannot sustain it.
+const SYNC_LOCK_MIN_QUALITY: f32 = 0.4;
+
+/// While locked, a best match further than this from the expected
+/// line start (20 % of a line) is a false peak — video content that
+/// happened to correlate, or the *next* line's sync when this one is
+/// buried in noise. noaa-apt applies the same idea as a "≥ 0.8 row
+/// apart" rule on its sync list; in this streaming decoder the next
+/// sync is expected at offset 0, so the rule is a drift bound (#774).
+const MAX_SYNC_DRIFT_SAMPLES: usize = SAMPLES_PER_LINE / 5;
+
+/// Consecutive nominal-spacing fallbacks before the lock is dropped and
+/// the search becomes unconstrained again (a real gap in reception).
+const MAX_NOMINAL_FALLBACKS: u32 = 8;
+
 /// Maximum number of decoded-but-undelivered `AptLine`s the decoder will
 /// queue internally when the caller's `output` slice is too small to hold
 /// every line that became ready. Bounded so the queue itself can't grow
@@ -862,9 +904,26 @@ pub struct AptDecoder {
     /// average, which had a sinc-shaped response that attenuated the
     /// upper half of the video band by 3 dB.
     final_resampler: RealResampler,
-    /// Per-line scratch buffer for the final-resample stage.
-    /// Holds `LINE_PIXELS` f32 samples plus a sample of slack.
+    /// Per-line scratch buffer for the final-resample stage: the
+    /// primed slice's output (`LINE_PIXELS` plus the warm-up pixels).
     final_resamp_scratch: Vec<f32>,
+    /// `final_resampler` group delay rounded up to a whole pixel, in
+    /// intermediate-rate samples. Each line is resampled from
+    /// `[start − prime, end + prime)` and the output window is shifted
+    /// by `2·prime / SAMPLES_PER_PIXEL`, so the filter is primed with
+    /// the true preceding samples and the line lands on its own pixels
+    /// instead of `prime/3` px late behind a zero ramp (#774).
+    prime: usize,
+    /// The last `prime` intermediate-rate samples drained from the
+    /// accumulator — the context that precedes `accumulator[0]`.
+    history: Vec<f32>,
+    /// Scratch for the primed line slice.
+    line_ctx: Vec<f32>,
+    /// Locked onto the line cadence (see `SYNC_LOCK_MIN_QUALITY`).
+    locked: bool,
+    /// Consecutive lines sliced at nominal spacing because the best
+    /// match drifted too far (see `MAX_SYNC_DRIFT_SAMPLES`).
+    nominal_fallbacks: u32,
 
     resample_scratch: Vec<f32>,
     demod_scratch: Vec<f32>,
@@ -926,24 +985,16 @@ impl AptDecoder {
             / u64::from(input_rate_hz))
             + 4) as usize;
 
-        // Build the input-rate DC-removing bandpass filter. Cutoff /
-        // transition / atten values come from noaa-apt's standard
-        // profile, validated against thousands of real captures:
-        //   cutout       = 4800 Hz (= 2·SUBCARRIER, kills out-of-band
-        //                            noise without touching the AM signal)
-        //   transition   = 1000 Hz
-        //   atten        = 30 dB stopband
-        // The DC notch sits at frequencies below `transition/2` (~500 Hz),
-        // safely below any APT signal content (the 2400 Hz subcarrier
-        // upper sideband bottoms out around 400 Hz from the carrier
-        // when modulated by the video band).
-        let dc_bandpass_taps = taps::low_pass_dc_removal_kaiser(
-            DC_BANDPASS_CUTOUT_HZ,
-            DC_BANDPASS_TRANSITION_HZ,
-            DC_BANDPASS_ATTEN_DB,
-            f64::from(input_rate_hz),
-        )?;
-        let dc_bandpass = FirFilter::new(dc_bandpass_taps)?;
+        let dc_bandpass = build_dc_bandpass(input_rate_hz)?;
+
+        let final_resampler =
+            RealResampler::new(f64::from(INTERMEDIATE_RATE_HZ), PIXELS_PER_SECOND)?;
+        // Round the group delay up to a whole pixel so the output
+        // window shift `2·prime / SAMPLES_PER_PIXEL` is exact.
+        let prime = final_resampler
+            .group_delay_input_samples()
+            .div_ceil(SAMPLES_PER_PIXEL)
+            * SAMPLES_PER_PIXEL;
 
         Ok(Self {
             input_rate_hz,
@@ -955,11 +1006,15 @@ impl AptDecoder {
             )?,
             demod: Apt137Demodulator::new(f64::from(INTERMEDIATE_RATE_HZ), SUBCARRIER_HZ)?,
             sync_detector: SyncDetector::new(),
-            final_resampler: RealResampler::new(
-                f64::from(INTERMEDIATE_RATE_HZ),
-                PIXELS_PER_SECOND,
-            )?,
-            final_resamp_scratch: Vec::with_capacity(LINE_PIXELS + 4),
+            final_resampler,
+            final_resamp_scratch: Vec::with_capacity(
+                LINE_PIXELS + 2 * prime / SAMPLES_PER_PIXEL + 4,
+            ),
+            prime,
+            history: vec![0.0; prime],
+            line_ctx: Vec::with_capacity(SAMPLES_PER_LINE + 2 * prime),
+            locked: false,
+            nominal_fallbacks: 0,
             resample_scratch: Vec::with_capacity(max_subchunk_envelope),
             demod_scratch: Vec::with_capacity(max_subchunk_envelope),
             // Reserve room for the *intentional* overshoot in chunked
@@ -982,6 +1037,9 @@ impl AptDecoder {
         self.accumulator.clear();
         self.ready_lines.clear();
         self.accumulator_start_intermediate_sample = 0;
+        self.history.fill(0.0);
+        self.locked = false;
+        self.nominal_fallbacks = 0;
     }
 
     /// Feed `input` audio samples into the decoder, writing any newly-decoded
@@ -1138,7 +1196,7 @@ impl AptDecoder {
         output: &mut [AptLine],
         mut produced: usize,
     ) -> Result<usize, DspError> {
-        while self.accumulator.len() >= MIN_ACCUMULATOR_FOR_DECODE {
+        while self.accumulator.len() >= MIN_ACCUMULATOR_FOR_DECODE + self.prime {
             // Nowhere to put the next line — leave the accumulator alone
             // so the next `process` call can pick up from here.
             if produced >= output.len() && self.ready_lines.len() >= READY_QUEUE_CAP {
@@ -1155,6 +1213,7 @@ impl AptDecoder {
             else {
                 break;
             };
+            let m = self.gate_sync_match(m);
 
             // The matched offset IS the line start: by NOAA APT spec
             // the line begins at the start of the 39-px Sync A field,
@@ -1169,33 +1228,13 @@ impl AptDecoder {
             // into the right destination. Stack alloc + memcpy avoids
             // heap traffic on the hot path.
             let mut line = AptLine::default();
-            // Resample line samples (SAMPLES_PER_LINE at the work rate)
-            // down to LINE_PIXELS (one sample per pixel). The previous
-            // implementation used a 5-sample boxcar (uniform-window
-            // FIR) whose sinc response attenuated the upper half of
-            // the video band by 3 dB; the proper FIR resample
-            // preserves it. Per A4 / noaa-apt parity. Per-line
-            // resampler reset() ensures no state leaks between lines.
-            self.final_resampler.reset();
-            self.final_resamp_scratch.resize(LINE_PIXELS + 4, 0.0);
             // Final-rate resampler error path propagates: per the
             // sdr-dsp pure-DSP rule (no I/O / no side effects /
             // return Result), we don't log + fabricate a black line
             // here. Callers see the failure and can decide whether
-            // to log, retry, or surface a UI error. The scratch is
-            // sized for the expected output so this should never
-            // fire in practice. Per CR round 1 on PR #571.
-            let n_pix = self.final_resampler.process(
-                &self.accumulator[line_start..line_end],
-                &mut self.final_resamp_scratch,
-            )?;
-            // Copy raw f32 samples for image-wide post-processing
-            // (B1 / `apt_image::finalize_grayscale`). Trailing pixels
-            // beyond the resampler's output are zero-padded by
-            // `AptLine::default()`.
-            let n_copy = n_pix.min(LINE_PIXELS);
-            line.raw_samples[..n_copy].copy_from_slice(&self.final_resamp_scratch[..n_copy]);
-            decimate_into_pixels(&self.final_resamp_scratch[..n_copy], &mut line.pixels);
+            // to log, retry, or surface a UI error. Per CR round 1 on
+            // PR #571.
+            self.resample_line(line_start, line_end, &mut line)?;
             line.sync_quality = m.quality;
             line.sync_channel = SyncChannel::A;
             line.input_sample_index = self.accumulator_to_input_index(line_start);
@@ -1208,10 +1247,102 @@ impl AptDecoder {
                 self.ready_lines.push_back(line);
             }
 
-            self.accumulator.drain(..line_end);
-            self.accumulator_start_intermediate_sample += line_end as u64;
+            self.drain_accumulator(line_end);
         }
         Ok(produced)
+    }
+
+    /// Apply the lock / drift rule to a raw sync match (#774). A
+    /// confident match near the expected position (re)locks; a match
+    /// that drifted more than `MAX_SYNC_DRIFT_SAMPLES` while locked is
+    /// replaced by the nominal line start (offset 0) carrying the
+    /// correlation actually measured there, so a line buried in noise
+    /// becomes one low-quality row instead of a skipped row that
+    /// compresses the image. After `MAX_NOMINAL_FALLBACKS` such rows
+    /// the lock is dropped and the search is unconstrained again.
+    fn gate_sync_match(&mut self, m: SyncMatch) -> SyncMatch {
+        if self.locked && m.offset > MAX_SYNC_DRIFT_SAMPLES {
+            self.nominal_fallbacks += 1;
+            if self.nominal_fallbacks >= MAX_NOMINAL_FALLBACKS {
+                self.locked = false;
+                self.nominal_fallbacks = 0;
+                return m;
+            }
+            let quality = self
+                .sync_detector
+                .quality_at(&self.accumulator, 0, SyncChannel::A)
+                .unwrap_or(0.0);
+            return SyncMatch {
+                offset: 0,
+                channel: SyncChannel::A,
+                quality,
+            };
+        }
+        if m.quality >= SYNC_LOCK_MIN_QUALITY {
+            self.locked = true;
+            self.nominal_fallbacks = 0;
+        }
+        m
+    }
+
+    /// Resample `accumulator[line_start..line_end]` to `LINE_PIXELS`
+    /// pixels with the resampler primed by the true preceding samples
+    /// (from `history` when the line starts near the accumulator head)
+    /// and the output aligned by the filter's group delay (#774).
+    ///
+    /// With delay `D = prime` (input samples) and ratio 1/3, output
+    /// `y[j]` represents the input at `3j − D` relative to the slice
+    /// fed. Feeding `[start − D, end + D)` therefore puts pixel `k` at
+    /// `y[k + 2D/3]`, and the first `2D/3` outputs are the filter's
+    /// warm-up over the primed context.
+    fn resample_line(
+        &mut self,
+        line_start: usize,
+        line_end: usize,
+        line: &mut AptLine,
+    ) -> Result<(), DspError> {
+        let prime = self.prime;
+        self.line_ctx.clear();
+        let from_history = prime.saturating_sub(line_start);
+        if from_history > 0 {
+            self.line_ctx
+                .extend_from_slice(&self.history[self.history.len() - from_history..]);
+        }
+        let ctx_start = line_start - (prime - from_history);
+        let ctx_end = (line_end + prime).min(self.accumulator.len());
+        self.line_ctx
+            .extend_from_slice(&self.accumulator[ctx_start..ctx_end]);
+
+        self.final_resampler.reset();
+        let max_out = self.line_ctx.len().div_ceil(SAMPLES_PER_PIXEL) + 2;
+        self.final_resamp_scratch.resize(max_out, 0.0);
+        let n_out = self
+            .final_resampler
+            .process(&self.line_ctx, &mut self.final_resamp_scratch)?;
+        let skip = 2 * prime / SAMPLES_PER_PIXEL;
+        let available = n_out.saturating_sub(skip).min(LINE_PIXELS);
+        let aligned = &self.final_resamp_scratch[skip..skip + available];
+        // Trailing pixels beyond the resampler's output are zero-padded
+        // by `AptLine::default()`.
+        line.raw_samples[..available].copy_from_slice(aligned);
+        decimate_into_pixels(aligned, &mut line.pixels);
+        Ok(())
+    }
+
+    /// Drop `line_end` samples from the accumulator, keeping the last
+    /// `prime` of them as the priming context for the next line.
+    fn drain_accumulator(&mut self, line_end: usize) {
+        let prime = self.prime;
+        if line_end >= prime {
+            self.history
+                .copy_from_slice(&self.accumulator[line_end - prime..line_end]);
+        } else {
+            self.history.rotate_left(line_end);
+            let keep = prime - line_end;
+            self.history[keep..].copy_from_slice(&self.accumulator[..line_end]);
+        }
+        self.accumulator.drain(..line_end);
+        self.accumulator_start_intermediate_sample += line_end as u64;
     }
 
     /// Convert an offset within the envelope accumulator (intermediate-rate
@@ -1222,6 +1353,28 @@ impl AptDecoder {
         let total_intermediate = self.accumulator_start_intermediate_sample + acc_offset as u64;
         (total_intermediate * u64::from(self.input_rate_hz)) / u64::from(INTERMEDIATE_RATE_HZ)
     }
+}
+
+/// Build the input-rate DC-removing bandpass for [`AptDecoder::new`].
+fn build_dc_bandpass(input_rate_hz: u32) -> Result<FirFilter, DspError> {
+    // Build the input-rate DC-removing bandpass filter. Cutoff /
+    // transition / atten values come from noaa-apt's standard
+    // profile, validated against thousands of real captures:
+    //   cutout       = 4800 Hz (= 2·SUBCARRIER, kills out-of-band
+    //                            noise without touching the AM signal)
+    //   transition   = 1000 Hz
+    //   atten        = 30 dB stopband
+    // The DC notch sits at frequencies below `transition/2` (~500 Hz),
+    // safely below any APT signal content (the 2400 Hz subcarrier
+    // upper sideband bottoms out around 400 Hz from the carrier
+    // when modulated by the video band).
+    let dc_bandpass_taps = taps::low_pass_dc_removal_kaiser(
+        DC_BANDPASS_CUTOUT_HZ,
+        DC_BANDPASS_TRANSITION_HZ,
+        DC_BANDPASS_ATTEN_DB,
+        f64::from(input_rate_hz),
+    )?;
+    FirFilter::new(dc_bandpass_taps)
 }
 
 /// Convert one line's worth of demodulated envelope samples (already
@@ -2416,6 +2569,105 @@ mod tests {
         detector.process(&zeros, &mut out2).unwrap();
         for &v in &out2 {
             assert!(v.abs() < 1e-6, "reset should zero output, got {v}");
+        }
+    }
+
+    /// #774 — the per-line resample used to restart from a zeroed
+    /// delay line, shifting every line right by the filter's group
+    /// delay (~50 px) and zero-ramping its first pixels. The Sync A
+    /// burst must land in the first ~30 columns, and the video body
+    /// must already be flat at its nominal level by column 60.
+    #[test]
+    fn decoded_line_keeps_sync_a_in_the_first_columns() {
+        const SYNC_PROBE: std::ops::Range<usize> = 4..28;
+        const SHIFTED_PROBE: std::ops::Range<usize> = 50..80;
+        const VIDEO_PROBE: std::ops::Range<usize> = 60..90;
+        let rate = TEST_INPUT_RATE_HZ;
+        let mut d = AptDecoder::new(rate).unwrap();
+        let one_line = synth_line_audio(rate, TEST_GREY_LEVEL);
+        let mut audio = Vec::with_capacity(one_line.len() * 4);
+        for _ in 0..4 {
+            audio.extend_from_slice(&one_line);
+        }
+        let mut out = vec![AptLine::default(); TEST_OUTPUT_CAPACITY];
+        let produced = d.process(&audio, &mut out).unwrap();
+        assert!(produced >= 2, "need a settled line, got {produced}");
+        let line = &out[produced - 1];
+        let spread = |r: std::ops::Range<usize>| -> f32 {
+            let px = &line.pixels[r];
+            let max = px.iter().copied().max().unwrap_or(0);
+            let min = px.iter().copied().min().unwrap_or(0);
+            f32::from(max - min)
+        };
+        assert!(
+            spread(SYNC_PROBE) > 4.0 * spread(SHIFTED_PROBE).max(1.0),
+            "Sync A burst must sit in the first columns: sync spread {}, shifted spread {}, pixels[..90] = {:?}",
+            spread(SYNC_PROBE),
+            spread(SHIFTED_PROBE),
+            &line.pixels[..90]
+        );
+        assert!(
+            spread(VIDEO_PROBE) < 16.0,
+            "video body flat by column 60: {:?}",
+            &line.pixels[VIDEO_PROBE]
+        );
+        assert!(
+            line.pixels[..8].iter().any(|&p| p > 0),
+            "no zero ramp at the line start"
+        );
+    }
+
+    /// #774 — `SYNC_A_TOTAL_PX` (38) is the matched-filter template
+    /// width; the spec's Sync A *field* is 39 px and is what the image
+    /// layout must use.
+    #[test]
+    fn sync_a_field_is_39_px_and_the_template_is_38() {
+        assert_eq!(SYNC_A_FIELD_PX, 39);
+        assert_eq!(SYNC_A_TOTAL_PX, 38);
+    }
+
+    /// #774 — after a lock, a line whose best match falls below the
+    /// quality floor keeps the nominal line spacing instead of
+    /// jumping to wherever the noise correlated best.
+    #[test]
+    fn weak_sync_after_lock_keeps_nominal_line_spacing() {
+        let rate = TEST_INPUT_RATE_HZ;
+        let mut d = AptDecoder::new(rate).unwrap();
+        let one_line = synth_line_audio(rate, TEST_GREY_LEVEL);
+        let line_len = one_line.len();
+        let mut audio = Vec::with_capacity(line_len * 9);
+        for _ in 0..4 {
+            audio.extend_from_slice(&one_line);
+        }
+        // One line of deterministic noise (LCG) at a level comparable
+        // to the signal so a false correlation peak is plausible.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..line_len {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let u = ((state >> 40) as f32) / ((1u64 << 24) as f32);
+            audio.push((u * 2.0 - 1.0) * TEST_GREY_LEVEL);
+        }
+        for _ in 0..4 {
+            audio.extend_from_slice(&one_line);
+        }
+        let mut out = vec![AptLine::default(); 16];
+        let produced = d.process(&audio, &mut out).unwrap();
+        assert!(produced >= 6, "got {produced} lines");
+        let nominal = line_len as f64;
+        for pair in out[..produced].windows(2) {
+            let delta = pair[1]
+                .input_sample_index
+                .abs_diff(pair[0].input_sample_index) as f64;
+            assert!(
+                (delta - nominal).abs() <= nominal * 0.05,
+                "line spacing {delta} strays from nominal {nominal}: {:?}",
+                out[..produced]
+                    .iter()
+                    .map(|l| (l.input_sample_index, l.sync_quality))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 }

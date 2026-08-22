@@ -118,6 +118,14 @@ impl PolyphaseResampler {
         self.offset = 0;
     }
 
+    /// Group delay of the prototype lowpass in *input* samples:
+    /// `(N − 1) / 2` prototype taps at `interp ×` the input rate.
+    #[allow(clippy::cast_precision_loss)]
+    fn group_delay_input_samples(&self) -> f64 {
+        let prototype_len = self.bank.taps_per_phase * self.interp;
+        (prototype_len.saturating_sub(1)) as f64 / 2.0 / self.interp as f64
+    }
+
     /// Process complex samples through the resampler.
     ///
     /// Returns the number of output samples written.
@@ -334,6 +342,20 @@ impl PowerDecimator {
         self.ratio
     }
 
+    /// Group delay of the cascade in samples at the decimator's input
+    /// rate: each stage's `(N − 1) / 2` scaled by the decimation that
+    /// precedes it.
+    #[allow(clippy::cast_precision_loss)]
+    fn group_delay_input_samples(&self) -> f64 {
+        let mut scale = 1.0;
+        let mut delay = 0.0;
+        for stage in &self.stages {
+            delay += (stage.taps.len().saturating_sub(1)) as f64 / 2.0 * scale;
+            scale *= stage.decimation as f64;
+        }
+        delay
+    }
+
     /// Reset all stages.
     pub fn reset(&mut self) {
         for stage in &mut self.stages {
@@ -532,6 +554,30 @@ impl RationalResampler {
         if let Some(r) = &mut self.resampler {
             r.reset();
         }
+    }
+
+    /// Total group delay of the resampler chain in *input* samples,
+    /// rounded to the nearest sample. An output sample `y[j]` represents
+    /// the input at time `j · in_rate / out_rate − delay`. Callers that
+    /// resample a slice in isolation use this to prime the delay line
+    /// and align the output (#774).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn group_delay_input_samples(&self) -> usize {
+        let predecimation = self
+            .decimator
+            .as_ref()
+            .map_or(1.0, |d| f64::from(d.ratio()));
+        let decimator_delay = self
+            .decimator
+            .as_ref()
+            .map_or(0.0, PowerDecimator::group_delay_input_samples);
+        let resampler_delay = self
+            .resampler
+            .as_ref()
+            .map_or(0.0, PolyphaseResampler::group_delay_input_samples)
+            * predecimation;
+        (decimator_delay + resampler_delay).round().max(0.0) as usize
     }
 
     /// Process complex samples through the resampler.
@@ -771,5 +817,35 @@ mod tests {
         assert_eq!(gcd(48_000, 8_000), 8_000);
         assert_eq!(gcd(100, 100), 100);
         assert_eq!(gcd(7, 13), 1);
+    }
+
+    /// #774 — callers that align a per-line resample need the filter
+    /// chain's group delay in input samples; measure it with an impulse.
+    #[test]
+    fn rational_resampler_reports_its_group_delay() {
+        const IN_RATE: f64 = 12_480.0;
+        const OUT_RATE: f64 = 4_160.0;
+        const IMPULSE_AT: usize = 600;
+        const LEN: usize = 3_000;
+        let mut r = RationalResampler::new(IN_RATE, OUT_RATE).unwrap();
+        let mut input = vec![Complex::default(); LEN];
+        input[IMPULSE_AT] = Complex::new(1.0, 0.0);
+        let mut output = vec![Complex::default(); LEN];
+        let n = r.process(&input, &mut output).unwrap();
+        let (peak_idx, _) = output[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.re.abs()))
+            .fold(
+                (0, 0.0_f32),
+                |best, cur| if cur.1 > best.1 { cur } else { best },
+            );
+        let measured = peak_idx * 3 - IMPULSE_AT;
+        let reported = r.group_delay_input_samples();
+        assert!(
+            reported.abs_diff(measured) <= 3,
+            "reported {reported}, measured {measured} (peak at output {peak_idx})"
+        );
+        assert!(reported > 0);
     }
 }

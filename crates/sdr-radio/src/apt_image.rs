@@ -526,12 +526,12 @@ const PX_CHANNEL_IMAGE_DATA: usize = 909;
 const PX_PER_CHANNEL: usize = 1040;
 
 pub fn rotate_180_per_channel(image: &mut [u8], height: usize) {
-    use sdr_dsp::apt::SYNC_A_TOTAL_PX;
+    use sdr_dsp::apt::SYNC_A_FIELD_PX;
 
     if image.len() != AptImage::WIDTH * height {
         return; // defensive — caller violated the layout contract
     }
-    let video_start_a = SYNC_A_TOTAL_PX + PX_SPACE_DATA; // 39 + 47 = 86
+    let video_start_a = SYNC_A_FIELD_PX + PX_SPACE_DATA; // 39 + 47 = 86
     rotate_rectangle_180_in_place(
         image,
         height,
@@ -1086,6 +1086,32 @@ mod tests {
             gap_row.iter().all(|&p| p == 0),
             "gap row not all-zero: first nonzero at {:?}",
             gap_row.iter().position(|&p| p != 0),
+        );
+    }
+
+    /// #774 — the video band starts after the 39-px Sync A *field* and
+    /// the 47-px space, i.e. at column 86; rotating from column 85
+    /// dragged the last sync pixel into the video and seamed the image.
+    #[test]
+    fn rotate_180_per_channel_starts_after_the_39px_sync_field() {
+        const HEIGHT: usize = 2;
+        let width = AptImage::WIDTH;
+        let mut image = vec![0_u8; width * HEIGHT];
+        for row in 0..HEIGHT {
+            for col in 0..width {
+                image[row * width + col] = ((row * 7 + col) % 251) as u8;
+            }
+        }
+        let original = image.clone();
+        rotate_180_per_channel(&mut image, HEIGHT);
+        assert_eq!(
+            image[85], original[85],
+            "column 85 is the last Sync A px, untouched"
+        );
+        assert_eq!(
+            image[86],
+            original[width + 994],
+            "column 86 is the first video px, rotated"
         );
     }
 }
