@@ -38,22 +38,24 @@ const CORRUPT_BACKUP_INFIX: &str = ".corrupt-";
 pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     // Follow a symlink to its final target; rename over the link itself
     // would replace the link with a regular file.
-    let target = if fs_symlink_metadata_is_symlink(path) {
-        std::fs::canonicalize(path)?
-    } else {
-        path.to_path_buf()
-    };
+    let target = resolve_link_target(path)?;
     let tmp_id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
     let tmp = target.with_extension(format!("tmp.{}.{tmp_id}", std::process::id()));
     let result = (|| {
         let mut file = std::fs::File::create(&tmp)?;
+        // Keep the replaced file's mode (a 0600 config must not come
+        // back as 0644 after a save).
+        if let Ok(meta) = std::fs::metadata(&target) {
+            file.set_permissions(meta.permissions())?;
+        }
         file.write_all(content.as_bytes())?;
         // Data must be on disk before the rename publishes it, or a power
         // loss right after the rename can leave an empty config.
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, &target)?;
-        sync_parent_dir(&target)
+        sync_parent_dir(&target);
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -61,21 +63,45 @@ pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     result
 }
 
-fn fs_symlink_metadata_is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+/// The real file a config path refers to. A symlink is followed
+/// (`canonicalize`); a *dangling* symlink resolves through `read_link`
+/// so the target can be (re)created and the link kept. A plain path is
+/// returned unchanged.
+fn resolve_link_target(path: &Path) -> std::io::Result<PathBuf> {
+    let is_symlink = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_symlink {
+        return Ok(path.to_path_buf());
+    }
+    if let Ok(real) = std::fs::canonicalize(path) {
+        return Ok(real);
+    }
+    // Dangling: resolve the link text ourselves.
+    let link = std::fs::read_link(path)?;
+    Ok(if link.is_absolute() {
+        link
+    } else {
+        path.parent()
+            .map_or(link.clone(), |parent| parent.join(link))
+    })
 }
 
 /// fsync the directory containing `path` so a completed `rename` survives
-/// a crash. Best-effort on platforms where directories can't be opened.
-fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+/// a crash. Best-effort: the data is already published by the rename, so
+/// a filesystem that refuses a directory fsync must not turn a successful
+/// save into an error (and an auto-save retry loop).
+fn sync_parent_dir(path: &Path) {
     #[cfg(unix)]
     {
-        if let Some(parent) = path.parent() {
-            let dir = std::fs::File::open(parent)?;
-            dir.sync_all()?;
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::File::open(parent).and_then(|dir| dir.sync_all())
+        {
+            tracing::debug!("directory fsync skipped: {e}");
         }
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 /// Serialize the config for disk. Called with the read lock held only for
@@ -92,10 +118,13 @@ fn back_up_corrupt_config(path: &Path) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let mut backup = path.as_os_str().to_owned();
+    // Move the real file, not the link, so a symlinked config keeps its
+    // link (the reset then writes through it).
+    let target = resolve_link_target(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut backup = target.as_os_str().to_owned();
     backup.push(format!("{CORRUPT_BACKUP_INFIX}{secs}"));
     let backup = PathBuf::from(backup);
-    match std::fs::rename(path, &backup) {
+    match std::fs::rename(&target, &backup) {
         Ok(()) => tracing::warn!(backup = %backup.display(), "corrupt config backed up"),
         Err(e) => tracing::error!("could not back up corrupt config: {e}"),
     }
@@ -573,6 +602,82 @@ mod tests {
         );
         let on_disk: Value = serde_json::from_slice(&fs::read(&real).unwrap()).unwrap();
         assert_eq!(on_disk["volume"], 0.9, "the target received the write");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #760 (CR round 1 on PR #794) — a dangling symlink must be written
+    /// through (target recreated, link kept), not fail the save.
+    #[cfg(unix)]
+    #[test]
+    fn save_recreates_the_target_of_a_dangling_symlink() {
+        let dir = temp_dir("dangling");
+        let real = dir.join("real.json");
+        let link = dir.join("config.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(!real.exists(), "test premise: dangling");
+
+        let mgr = ConfigManager::load(&link, &json!({"volume": 0.5})).unwrap();
+        mgr.save().unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let on_disk: Value = serde_json::from_slice(&fs::read(&real).unwrap()).unwrap();
+        assert_eq!(on_disk["volume"], 0.5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #761 (CR round 1 on PR #794) — backing up a corrupt config behind a
+    /// symlink moves the real file and keeps the link.
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_backup_keeps_a_symlinked_config_linked() {
+        let dir = temp_dir("corrupt-symlink");
+        let real = dir.join("real.json");
+        let link = dir.join("config.json");
+        fs::write(&real, "garbage").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let _mgr = ConfigManager::load(&link, &json!({"volume": 0.5})).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link kept"
+        );
+        assert!(
+            fs::read_dir(&dir).unwrap().filter_map(Result::ok).any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("real.json.corrupt-")),
+            "the real file was backed up"
+        );
+        let on_disk: Value = serde_json::from_slice(&fs::read(&real).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["volume"], 0.5,
+            "the reset was written through the link"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #760 (CR round 1 on PR #794) — a save must not loosen the file mode.
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        const PRIVATE_MODE: u32 = 0o600;
+        let dir = temp_dir("mode");
+        let path = dir.join("config.json");
+        let mgr = ConfigManager::load(&path, &json!({"volume": 0.5})).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(PRIVATE_MODE)).unwrap();
+
+        mgr.write(|v| v["volume"] = json!(0.9));
+        mgr.save().unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, PRIVATE_MODE, "mode must survive the atomic replace");
         let _ = fs::remove_dir_all(&dir);
     }
 
