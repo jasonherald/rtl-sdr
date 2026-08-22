@@ -154,6 +154,11 @@ pub trait Source: Send {
     fn rtl_tcp_restore_sticky_snapshot(&mut self, _snapshot: &RtlTcpStickySnapshot) {}
 }
 
+/// Number of tuner IF gain stages addressable by the `rtl_tcp`
+/// `SetIfGain` command (upper 16 bits of the param select the stage,
+/// 1-based; E4000 exposes six). Sticky replay keeps one value per stage.
+pub const RTL_TCP_IF_GAIN_STAGES: usize = 6;
+
 /// Snapshot of `RtlTcpSource`'s sticky-command replay cache,
 /// plain `u32` fields so it can live in `sdr-pipeline` without
 /// forcing a dep on `sdr-source-network`. The atomics inside
@@ -179,7 +184,12 @@ pub struct RtlTcpStickySnapshot {
     pub last_bias_tee: u32,
     pub last_gain_by_index: u32,
     pub last_testmode: u32,
-    pub last_if_gain: u32,
+    /// One full `SetIfGain` param per stage (stage in the upper 16
+    /// bits), indexed by `stage - 1`; only stages flagged in
+    /// `if_gain_mask` are meaningful.
+    pub last_if_gain: [u32; RTL_TCP_IF_GAIN_STAGES],
+    /// Bit `stage - 1` set once that stage's IF gain has been recorded.
+    pub if_gain_mask: u32,
     pub last_rtl_xtal: u32,
     pub last_tuner_xtal: u32,
 }
