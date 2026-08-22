@@ -631,15 +631,18 @@ impl RtlTcpSource {
     /// Callers should prefer the typed setters (`set_center_freq_hz`,
     /// etc.) — this is the low-level escape hatch used by the setters.
     pub fn send_command(&self, cmd: Command) -> Result<(), SourceError> {
-        // Remember the value for reconnect-replay before actually sending
-        // so we don't lose it if the write happens to race a reconnect.
-        self.record_command(cmd);
-
+        // Take the sink lock FIRST, then record: replay state and the
+        // wire write share one serialization point, so two concurrent
+        // gain setters can't update `replay_mask` in one order and hit
+        // the server in the other (CR round 2 on PR #792). Recording
+        // still happens before the write so a value isn't lost if the
+        // write races a reconnect.
         let mut sink = self
             .shared
             .command_sink
             .lock()
             .map_err(|_| SourceError::NotRunning)?;
+        self.record_command(cmd);
         let Some(stream) = sink.as_mut() else {
             // Not connected yet. Not an error — manager will replay on
             // reconnect via `record_command` above.
