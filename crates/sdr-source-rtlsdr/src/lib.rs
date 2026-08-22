@@ -196,7 +196,6 @@ struct RingSlot {
 /// allocations in steady state.
 struct UsbRingBuffer {
     slots: Vec<RingSlot>,
-    slot_count: usize,
     write_idx: AtomicUsize,
     read_idx: AtomicUsize,
     /// Set to true by the reader thread on fatal USB error or panic.
@@ -215,7 +214,6 @@ impl UsbRingBuffer {
             .collect();
         Self {
             slots,
-            slot_count,
             write_idx: AtomicUsize::new(0),
             read_idx: AtomicUsize::new(0),
             error: AtomicBool::new(false),
@@ -305,7 +303,7 @@ fn run_reader_thread(
         // worst-case shutdown latency to one in-flight USB read
         // (~65 ms typical, up to one read timeout on stalled
         // hardware).
-        let idx = ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slot_count;
+        let idx = ring_writer.write_idx.load(Ordering::Relaxed) % ring_writer.slots.len();
         let slot = &ring_writer.slots[idx];
 
         while slot.state.load(Ordering::Acquire) != RING_SLOT_EMPTY {
@@ -782,7 +780,9 @@ impl Source for RtlSdrSource {
     }
 
     fn tune(&mut self, frequency_hz: f64) -> Result<(), SourceError> {
-        self.frequency = frequency_hz;
+        // Commit only once the driver accepted it (the driver resets its
+        // own frequency to 0 on error); with no device open, remember it
+        // for `start()` (#742).
         if let Some(device) = &mut self.device {
             let tuner = device.tuner_type();
             let direct_sampling_mode = self.direct_sampling_mode;
@@ -795,6 +795,7 @@ impl Source for RtlSdrSource {
                 ))
             })?;
         }
+        self.frequency = frequency_hz;
         Ok(())
     }
 
@@ -807,12 +808,14 @@ impl Source for RtlSdrSource {
     }
 
     fn set_sample_rate(&mut self, rate: f64) -> Result<(), SourceError> {
-        self.sample_rate = rate;
+        // Same commit-after-accept rule as `tune`; a live setter
+        // rejection is an invalid parameter, not an open failure (#742).
         if let Some(device) = &mut self.device {
             device
                 .set_sample_rate(rate as u32)
-                .map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+                .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
         }
+        self.sample_rate = rate;
         Ok(())
     }
 
@@ -824,7 +827,7 @@ impl Source for RtlSdrSource {
                 "USB reader thread died".to_string(),
             ));
         }
-        let idx = ring.read_idx.load(Ordering::Relaxed) % ring.slot_count;
+        let idx = ring.read_idx.load(Ordering::Relaxed) % ring.slots.len();
         let slot = &ring.slots[idx];
 
         if slot.state.load(Ordering::Acquire) != RING_SLOT_FULL {
@@ -847,9 +850,15 @@ impl Source for RtlSdrSource {
             Self::convert_samples(&data[consumed..len], output)
         };
 
-        // Each IQ pair = 2 raw bytes. Advance the consumed offset.
+        // Each IQ pair = 2 raw bytes. Advance the consumed offset. A
+        // trailing odd byte can never form a pair, so a slot counts as
+        // drained once every whole pair is out — otherwise it would sit
+        // at `len - 1` forever, the writer would spin on it and reads
+        // would return `Ok(0)` with no error (#742). The reader trims to
+        // pairs at the source (#785); this is the consumer-side guard.
         let new_consumed = consumed + count * IQ_PAIR_BYTES;
-        if new_consumed >= len {
+        let drained = new_consumed + len % IQ_PAIR_BYTES >= len;
+        if drained {
             // Slot fully drained — release back to the writer.
             slot.consumed.store(0, Ordering::Relaxed);
             slot.state.store(RING_SLOT_EMPTY, Ordering::Release);
@@ -1065,7 +1074,7 @@ impl Source for RtlSdrSource {
         // spike that lives at the LO doesn't sit on top of the
         // signal of interest. Most relevant on E4000 tuners; on
         // R820T / R828D the driver in
-        // `crates/sdr-rtlsdr/src/device/frequency.rs` returns
+        // `librtlsdr-rs` (`device/frequency.rs`) returns
         // `InvalidParameter` ("offset tuning not supported for
         // R82XX tuners"), and the call is also rejected while
         // direct sampling is enabled. We surface either rejection
@@ -1137,6 +1146,41 @@ mod tests {
     /// #739 — RTL AGC and gain-by-index are real operations on the USB
     /// dongle, not trait-default no-ops. Without a device they are
     /// remembered / validated; with one they reach the hardware.
+    /// #742 — a slot whose `len` is odd could never be released: the
+    /// consumer only advances by whole IQ pairs, so `consumed` parked at
+    /// `len - 1`, the writer spun on the full slot and `read_samples`
+    /// returned `Ok(0)` forever. The reader now trims to pairs (#785),
+    /// but the consumer must still release such a slot defensively.
+    #[test]
+    fn read_samples_releases_an_odd_length_slot() {
+        const ODD_LEN: usize = 5;
+        let mut source = RtlSdrSource::new(0);
+        let ring = Arc::new(UsbRingBuffer::new(RING_SLOTS, RAW_BUF_SIZE));
+        {
+            let slot = &ring.slots[0];
+            slot.data.lock().expect("slot mutex")[..ODD_LEN].copy_from_slice(&[10, 20, 30, 40, 50]);
+            slot.len.store(ODD_LEN, Ordering::Relaxed);
+            slot.state.store(RING_SLOT_FULL, Ordering::Release);
+        }
+        ring.write_idx.store(1, Ordering::Relaxed);
+        source.ring = Some(Arc::clone(&ring));
+
+        let mut out = vec![Complex::default(); 8];
+        let n = source.read_samples(&mut out).expect("read");
+        assert_eq!(n, ODD_LEN / IQ_PAIR_BYTES, "whole pairs are converted");
+        assert_eq!(
+            ring.slots[0].state.load(Ordering::Acquire),
+            RING_SLOT_EMPTY,
+            "a slot with a trailing odd byte must be released"
+        );
+        assert_eq!(ring.read_idx.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            source.read_samples(&mut out).expect("read"),
+            0,
+            "nothing left"
+        );
+    }
+
     #[test]
     fn set_rtl_agc_is_remembered_without_a_device() {
         let mut source = RtlSdrSource::new(0);
