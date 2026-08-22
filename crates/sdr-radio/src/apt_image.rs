@@ -526,12 +526,12 @@ const PX_CHANNEL_IMAGE_DATA: usize = 909;
 const PX_PER_CHANNEL: usize = 1040;
 
 pub fn rotate_180_per_channel(image: &mut [u8], height: usize) {
-    use sdr_dsp::apt::SYNC_A_TOTAL_PX;
+    use sdr_dsp::apt::SYNC_A_FIELD_PX;
 
     if image.len() != AptImage::WIDTH * height {
         return; // defensive — caller violated the layout contract
     }
-    let video_start_a = SYNC_A_TOTAL_PX + PX_SPACE_DATA; // 39 + 47 = 86
+    let video_start_a = SYNC_A_FIELD_PX + PX_SPACE_DATA; // 39 + 47 = 86
     rotate_rectangle_180_in_place(
         image,
         height,
@@ -1086,6 +1086,46 @@ mod tests {
             gap_row.iter().all(|&p| p == 0),
             "gap row not all-zero: first nonzero at {:?}",
             gap_row.iter().position(|&p| p != 0),
+        );
+    }
+
+    /// #774 — the video band starts after the 39-px Sync A *field* and
+    /// the 47-px space, i.e. at column 86; rotating from column 85
+    /// (38-px template width + 47) dragged the last pre-video space
+    /// pixel into the video band and seamed the image.
+    #[test]
+    fn rotate_180_per_channel_starts_after_the_39px_sync_field() {
+        /// Two rows are the smallest image in which a 180° rotation
+        /// moves pixels across rows, so the boundary is observable.
+        const HEIGHT: usize = 2;
+        /// A small non-zero stride makes the two rows' patterns differ,
+        /// so a moved pixel cannot be mistaken for an untouched one.
+        const TEST_ROTATION_ROW_STRIDE: usize = 7;
+        /// Expected APT geometry, written out independently of the
+        /// production constants so boundary drift is detected:
+        /// 39-px Sync A field + 47-px space → last non-video column 85,
+        /// first video column 86, last video column 86 + 909 − 1.
+        const EXPECTED_LAST_NON_VIDEO_COL: usize = 85;
+        const EXPECTED_FIRST_VIDEO_COL: usize = 86;
+        const EXPECTED_LAST_VIDEO_COL: usize = 994;
+        let width = AptImage::WIDTH;
+        let mut image = vec![0_u8; width * HEIGHT];
+        for row in 0..HEIGHT {
+            for col in 0..width {
+                image[row * width + col] =
+                    ((row * TEST_ROTATION_ROW_STRIDE + col) % TEST_PIXEL_PATTERN_MODULUS) as u8;
+            }
+        }
+        let original = image.clone();
+        rotate_180_per_channel(&mut image, HEIGHT);
+        assert_eq!(
+            image[EXPECTED_LAST_NON_VIDEO_COL], original[EXPECTED_LAST_NON_VIDEO_COL],
+            "column 85 is the last pre-video space px, untouched"
+        );
+        assert_eq!(
+            image[EXPECTED_FIRST_VIDEO_COL],
+            original[width + EXPECTED_LAST_VIDEO_COL],
+            "column 86 is the first video px, rotated"
         );
     }
 }

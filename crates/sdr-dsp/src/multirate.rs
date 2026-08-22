@@ -38,6 +38,11 @@ struct PolyphaseBank {
     phases: Vec<Vec<f32>>,
     /// Number of taps per phase.
     taps_per_phase: usize,
+    /// Length of the prototype before zero-padding to a multiple of
+    /// the phase count. The padding is appended, so it does not move
+    /// the impulse response's centre — the group delay is defined by
+    /// this length, not by `taps_per_phase × phases` (#774).
+    prototype_len: usize,
 }
 
 impl PolyphaseBank {
@@ -58,6 +63,7 @@ impl PolyphaseBank {
         Self {
             phases,
             taps_per_phase,
+            prototype_len: prototype.len(),
         }
     }
 }
@@ -116,6 +122,14 @@ impl PolyphaseResampler {
         self.delay_line.fill(Complex::default());
         self.phase = 0;
         self.offset = 0;
+    }
+
+    /// Group delay of the prototype lowpass in *input* samples:
+    /// `(N − 1) / 2` prototype taps at `interp ×` the input rate, with
+    /// `N` the un-padded prototype length.
+    #[allow(clippy::cast_precision_loss)]
+    fn group_delay_input_samples(&self) -> f64 {
+        (self.bank.prototype_len.saturating_sub(1)) as f64 / 2.0 / self.interp as f64
     }
 
     /// Process complex samples through the resampler.
@@ -334,6 +348,20 @@ impl PowerDecimator {
         self.ratio
     }
 
+    /// Group delay of the cascade in samples at the decimator's input
+    /// rate: each stage's `(N − 1) / 2` scaled by the decimation that
+    /// precedes it.
+    #[allow(clippy::cast_precision_loss)]
+    fn group_delay_input_samples(&self) -> f64 {
+        let mut scale = 1.0;
+        let mut delay = 0.0;
+        for stage in &self.stages {
+            delay += (stage.taps.len().saturating_sub(1)) as f64 / 2.0 * scale;
+            scale *= stage.decimation as f64;
+        }
+        delay
+    }
+
     /// Reset all stages.
     pub fn reset(&mut self) {
         for stage in &mut self.stages {
@@ -532,6 +560,30 @@ impl RationalResampler {
         if let Some(r) = &mut self.resampler {
             r.reset();
         }
+    }
+
+    /// Total group delay of the resampler chain in *input* samples,
+    /// rounded to the nearest sample. An output sample `y[j]` represents
+    /// the input at time `j · in_rate / out_rate − delay`. Callers that
+    /// resample a slice in isolation use this to prime the delay line
+    /// and align the output (#774).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn group_delay_input_samples(&self) -> usize {
+        let predecimation = self
+            .decimator
+            .as_ref()
+            .map_or(1.0, |d| f64::from(d.ratio()));
+        let decimator_delay = self
+            .decimator
+            .as_ref()
+            .map_or(0.0, PowerDecimator::group_delay_input_samples);
+        let resampler_delay = self
+            .resampler
+            .as_ref()
+            .map_or(0.0, PolyphaseResampler::group_delay_input_samples)
+            * predecimation;
+        (decimator_delay + resampler_delay).round().max(0.0) as usize
     }
 
     /// Process complex samples through the resampler.
@@ -771,5 +823,111 @@ mod tests {
         assert_eq!(gcd(48_000, 8_000), 8_000);
         assert_eq!(gcd(100, 100), 100);
         assert_eq!(gcd(7, 13), 1);
+    }
+
+    /// #774 — callers that align a per-line resample need the filter
+    /// chain's group delay in input samples; measure it with an impulse.
+    #[test]
+    fn rational_resampler_reports_its_group_delay() -> Result<(), DspError> {
+        /// Impulse peak vs. reported delay: the pre-decimator + polyphase
+        /// cascade rounds each stage's half-length, so allow one input
+        /// sample per stage plus one for the output-grid quantisation.
+        const DOWNSAMPLE_DELAY_TOLERANCE_SAMPLES: usize = 3;
+        const IN_RATE: f64 = 12_480.0;
+        const OUT_RATE: f64 = 4_160.0;
+        /// `IN_RATE / OUT_RATE`: input samples per output sample, derived
+        /// from the rates and checked to be integral so a rate change
+        /// cannot leave the measurement with a stale factor.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        const INPUT_SAMPLES_PER_OUTPUT: usize = (IN_RATE / OUT_RATE) as usize;
+        #[allow(clippy::float_cmp, clippy::cast_precision_loss)]
+        const _: () = assert!(
+            OUT_RATE * INPUT_SAMPLES_PER_OUTPUT as f64 == IN_RATE,
+            "IN_RATE / OUT_RATE must be integral"
+        );
+        const IMPULSE_AT: usize = 600;
+        const LEN: usize = 3_000;
+        let mut r = RationalResampler::new(IN_RATE, OUT_RATE)?;
+        let mut input = vec![Complex::default(); LEN];
+        input[IMPULSE_AT] = Complex::new(1.0, 0.0);
+        let mut output = vec![Complex::default(); LEN];
+        let n = r.process(&input, &mut output)?;
+        let (peak_idx, _) = output[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.re.abs()))
+            .fold(
+                (0, 0.0_f32),
+                |best, cur| if cur.1 > best.1 { cur } else { best },
+            );
+        let measured = peak_idx * INPUT_SAMPLES_PER_OUTPUT - IMPULSE_AT;
+        let reported = r.group_delay_input_samples();
+        assert!(
+            reported.abs_diff(measured) <= DOWNSAMPLE_DELAY_TOLERANCE_SAMPLES,
+            "reported {reported}, measured {measured} (peak at output {peak_idx})"
+        );
+        assert!(reported > 0);
+        Ok(())
+    }
+
+    /// CR round 3 on PR #801 — `PolyphaseBank::build` zero-pads the
+    /// prototype up to a multiple of `interp`; the appended zeros do
+    /// not move the impulse response's centre, so the delay must come
+    /// from the *prototype* length (457 taps → exactly 38 input
+    /// samples at 6×), not the padded bank (462 → 38.42).
+    #[test]
+    fn polyphase_group_delay_uses_the_prototype_length_not_the_padded_bank() -> Result<(), DspError>
+    {
+        /// The delay is an exact rational; only float rounding is allowed.
+        const DELAY_EPSILON: f64 = 1e-9;
+        const INTERP: usize = 6;
+        const DECIM: usize = 1;
+        const PROTOTYPE_LEN: usize = 457; // not a multiple of INTERP
+        let prototype = vec![1.0_f32; PROTOTYPE_LEN];
+        let r = PolyphaseResampler::new(INTERP, DECIM, &prototype)?;
+        let expected = (PROTOTYPE_LEN - 1) as f64 / 2.0 / INTERP as f64;
+        assert!(
+            (r.group_delay_input_samples() - expected).abs() < DELAY_EPSILON,
+            "got {}, expected {expected}",
+            r.group_delay_input_samples()
+        );
+        Ok(())
+    }
+
+    /// The same check end to end on the 8 kHz → 48 kHz path the
+    /// transcription resampler uses, measured with an impulse.
+    #[test]
+    fn upsampler_group_delay_matches_an_impulse_measurement() -> Result<(), DspError> {
+        /// Single polyphase stage: the impulse peak may sit one input
+        /// sample off the rounded delay.
+        const UPSAMPLE_DELAY_TOLERANCE_SAMPLES: usize = 1;
+        const IN_RATE: f64 = 8_000.0;
+        const OUT_RATE: f64 = 48_000.0;
+        /// `OUT_RATE / IN_RATE`: output samples per input sample.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        const OUTPUTS_PER_INPUT: usize = (OUT_RATE / IN_RATE) as usize;
+        const IMPULSE_AT: usize = 200;
+        const LEN: usize = 1_000;
+        let mut r = RationalResampler::new(IN_RATE, OUT_RATE)?;
+        let mut input = vec![Complex::default(); LEN];
+        input[IMPULSE_AT] = Complex::new(1.0, 0.0);
+        let mut output = vec![Complex::default(); LEN * OUTPUTS_PER_INPUT + 8];
+        let n = r.process(&input, &mut output)?;
+        let (peak_idx, _) = output[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.re.abs()))
+            .fold(
+                (0, 0.0_f32),
+                |best, cur| if cur.1 > best.1 { cur } else { best },
+            );
+        // Peak lands at (IMPULSE_AT + delay) · OUTPUTS_PER_INPUT.
+        let measured = peak_idx / OUTPUTS_PER_INPUT - IMPULSE_AT;
+        let reported = r.group_delay_input_samples();
+        assert!(
+            reported.abs_diff(measured) <= UPSAMPLE_DELAY_TOLERANCE_SAMPLES,
+            "reported {reported}, measured {measured} (peak at output {peak_idx})"
+        );
+        Ok(())
     }
 }

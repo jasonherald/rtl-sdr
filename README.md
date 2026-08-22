@@ -1,5 +1,8 @@
 # SDR-RS
 
+[![Codacy grade](https://app.codacy.com/project/badge/Grade/fe36c440330540af973f0d4bc408026a)](https://app.codacy.com/gh/jasonherald/rtl-sdr/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
+[![Codacy coverage](https://app.codacy.com/project/badge/Coverage/fe36c440330540af973f0d4bc408026a)](https://app.codacy.com/gh/jasonherald/rtl-sdr/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_coverage)
+
 Software-defined radio application in Rust -- a port of [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus) with two native UIs: **GTK4 / libadwaita on Linux** and **SwiftUI on macOS 26+**. Both frontends share a single headless engine written in Rust; the macOS app drives it through a hand-rolled C ABI (`sdr-ffi`) and a Swift package (`SdrCoreKit`).
 
 ![SDR-RS](screenshots/sdr-rs.png)
