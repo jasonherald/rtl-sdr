@@ -53,7 +53,7 @@ pub const MAX_WAV_DATA_BYTES: u64 =
 pub struct WavWriter {
     writer: BufWriter<File>,
     /// Bytes of sample data written so far (`u64` so the accounting can
-    /// never wrap; the WAV cap is enforced by [`Self::reserve`]).
+    /// never wrap; the WAV cap is enforced by [`Self::check_capacity`]).
     bytes_written: u64,
     /// Data-chunk byte cap — [`MAX_WAV_DATA_BYTES`] outside tests.
     max_data_bytes: u64,

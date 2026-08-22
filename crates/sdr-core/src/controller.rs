@@ -1299,6 +1299,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                         let acars_center = state.acars_region.center_hz();
                         match apply_acars_geometry(
                             state,
+                            dsp_tx,
                             crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
                             acars_center,
                             crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
@@ -1345,6 +1346,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                                 let live_restore = match &snapshot_clone {
                                     Some(snap) => apply_acars_geometry(
                                         state,
+                                        dsp_tx,
                                         snap.source_rate_hz,
                                         snap.center_freq_hz,
                                         snap.frontend_decim,
@@ -4677,6 +4679,7 @@ fn process_iq_block(
 /// gets restored on disengage automatically.
 fn apply_acars_geometry(
     state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
     target_source_rate_hz: f64,
     target_center_hz: f64,
     target_frontend_decim: u32,
@@ -4706,7 +4709,8 @@ fn apply_acars_geometry(
         .map_err(|e| AcarsEnableError::FrontendDecimFailed(e.to_string()))?;
 
     rebuild_frontend(state).map_err(AcarsEnableError::FrontendRebuildFailed)?;
-    rebuild_vfo(state).map_err(AcarsEnableError::VfoRebuildFailed)?;
+    // Echo a clamped offset like every other rate transition (#699).
+    rebuild_vfo_echoing(state, dsp_tx).map_err(AcarsEnableError::VfoRebuildFailed)?;
 
     // Reset tune-dependent state. ACARS engage/disengage IS a
     // retune (forced to airband or restored to snapshot), so it
@@ -4847,6 +4851,7 @@ fn handle_acars_engage_failure(
     // Attempt rollback to snapshot tuning.
     let rollback = apply_acars_geometry(
         state,
+        dsp_tx,
         snapshot.source_rate_hz,
         snapshot.center_freq_hz,
         snapshot.frontend_decim,
@@ -5154,6 +5159,7 @@ fn handle_set_acars_enabled(
         // diverged.
         if let Err(err) = apply_acars_geometry(
             state,
+            dsp_tx,
             plan.target_source_rate_hz,
             plan.target_center_hz,
             plan.target_frontend_decim,
@@ -5221,6 +5227,7 @@ fn handle_set_acars_enabled(
         // path actually succeeds.
         if let Err(err) = apply_acars_geometry(
             state,
+            dsp_tx,
             restore.target_source_rate_hz,
             restore.target_center_hz,
             restore.target_frontend_decim,
@@ -5242,6 +5249,7 @@ fn handle_set_acars_enabled(
             let acars_center = state.acars_region.center_hz();
             let relock = apply_acars_geometry(
                 state,
+                dsp_tx,
                 crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
                 acars_center,
                 crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
