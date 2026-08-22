@@ -459,10 +459,12 @@ struct SharedState {
     /// can share it without racing. Replaced on every reconnect.
     command_sink: Mutex<Option<TcpStream>>,
 
-    /// Clone of the raw socket held from connect until the command sink
-    /// is published, so `stop_manager` can unblock a manager parked in
-    /// the handshake reads (a peer that accepts and sends nothing) without
-    /// waiting out the data-read timeout (#745).
+    /// Clone of the raw socket held for the whole session, so
+    /// `stop_manager` has a cancellation handle that does NOT go through
+    /// the `command_sink` mutex: it unblocks a manager parked in the
+    /// handshake reads (a peer that accepts and sends nothing) and a
+    /// replay `write_all` stalled on a non-reading peer while it holds
+    /// the sink lock (#745). Cleared at session end by `run_data_pump`.
     pending_stream: Mutex<Option<TcpStream>>,
 
     /// Latest values for each sticky command op, replayed on reconnect
@@ -868,9 +870,12 @@ impl RtlTcpSource {
 
     fn stop_manager(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
-        // Close the current socket so any blocked read returns fast —
-        // whichever handle is live: the pre-handshake clone or the
-        // command sink (#745).
+        // Close the socket through the session cancel handle FIRST: it is
+        // guarded by its own mutex, so this works even while
+        // `replay_sticky_commands` / `send_command` hold `command_sink`
+        // in a blocked `write_all` against a non-reading peer — the
+        // shutdown makes that write fail, which releases the sink lock
+        // for the teardown below (#745).
         if let Ok(mut pending) = self.shared.pending_stream.lock()
             && let Some(s) = pending.take()
         {
@@ -1399,8 +1404,8 @@ fn attempt_connect(
     if let Ok(mut slot) = shared.command_sink.lock() {
         *slot = Some(sink);
     }
-    // The command sink now owns the unblock duty.
-    clear_pending_stream(shared);
+    // `pending_stream` stays populated for the session as the lock-free
+    // cancellation handle (see its field doc).
 
     Ok(HandshakeOutcome { stream, codec })
 }
@@ -1564,10 +1569,11 @@ fn run_data_pump(
     }
 
     // Drop the command sink so subsequent send_command calls stop
-    // writing into a dead stream.
+    // writing into a dead stream, and the session cancel handle with it.
     if let Ok(mut sink) = shared.command_sink.lock() {
         *sink = None;
     }
+    clear_pending_stream(shared);
     // Clear any buffered I/Q so the next successful session doesn't
     // rewind the consumer with pre-drop samples from the previous
     // server. Stale samples are useless for a live SDR; the user wants
@@ -3743,27 +3749,35 @@ mod tests {
         const LZ4_STALL_MAX_TIMEOUTS: u32 = 10;
         const LZ4_STALL_SERVER_HOLD: Duration = Duration::from_secs(3);
         const LZ4_STALL_LEAVE_DEADLINE: Duration = Duration::from_secs(1);
+        /// The server serves two sessions so the test can observe the
+        /// reconnect, not just the departure from `Connected`.
+        const LZ4_STALL_SESSIONS: usize = 2;
+        const LZ4_STALL_RECONNECT_DEADLINE: Duration = Duration::from_secs(3);
         let (listener, mut config) = rtlx_test_listener_and_config();
         config.max_consecutive_timeouts = LZ4_STALL_MAX_TIMEOUTS;
         let addr = listener.local_addr().unwrap();
         let server_thread = thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("accept");
-            let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
-            sock.read_exact(&mut hello_buf).expect("read hello");
-            let header = DongleInfo {
-                tuner: TunerTypeCode::R820t,
-                gain_count: RTLX_TEST_GAIN_COUNT,
+            let mut socks = Vec::new();
+            for _ in 0..LZ4_STALL_SESSIONS {
+                let (mut sock, _) = listener.accept().expect("accept");
+                let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+                sock.read_exact(&mut hello_buf).expect("read hello");
+                let header = DongleInfo {
+                    tuner: TunerTypeCode::R820t,
+                    gain_count: RTLX_TEST_GAIN_COUNT,
+                }
+                .to_bytes();
+                sock.write_all(&header).unwrap();
+                let ext = ServerExtension {
+                    codec: Codec::Lz4,
+                    granted_role: Some(Role::Control),
+                    status: Status::Ok,
+                    version: PROTOCOL_VERSION,
+                };
+                sock.write_all(&ext.to_bytes()).unwrap();
+                // Silence: the client's next read hits the timeout.
+                socks.push(sock);
             }
-            .to_bytes();
-            sock.write_all(&header).unwrap();
-            let ext = ServerExtension {
-                codec: Codec::Lz4,
-                granted_role: Some(Role::Control),
-                status: Status::Ok,
-                version: PROTOCOL_VERSION,
-            };
-            sock.write_all(&ext.to_bytes()).unwrap();
-            // Silence: the client's next read hits the timeout.
             thread::sleep(LZ4_STALL_SERVER_HOLD);
         });
 
@@ -3795,9 +3809,28 @@ mod tests {
             }
             thread::sleep(RTLX_TEST_POLL_INTERVAL);
         }
+        assert!(left, "LZ4 pump must tear down on the first read timeout");
+
+        // ...and come back: the teardown is a reconnect, not a failure.
+        let reconnect_deadline = Instant::now() + LZ4_STALL_RECONNECT_DEADLINE;
+        let mut reconnected = false;
+        while Instant::now() < reconnect_deadline {
+            if matches!(src.connection_state(), ConnectionState::Connected { .. }) {
+                reconnected = true;
+                break;
+            }
+            assert!(
+                !matches!(src.connection_state(), ConnectionState::Failed { .. }),
+                "a stall must not be terminal"
+            );
+            thread::sleep(RTLX_TEST_POLL_INTERVAL);
+        }
         src.stop_manager();
         let _ = server_thread.join();
-        assert!(left, "LZ4 pump must tear down on the first read timeout");
+        assert!(
+            reconnected,
+            "client must reconnect after the stall teardown"
+        );
     }
 
     /// #745 — `SetTunerGain` and `SetGainByIndex` both drive the same
