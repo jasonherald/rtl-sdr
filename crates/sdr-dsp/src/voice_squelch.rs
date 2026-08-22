@@ -1221,6 +1221,34 @@ mod tests {
         );
     }
 
+    /// Feed `stream` to a fresh syllabic squelch in `block`-sample
+    /// calls and return the gate state after every call that
+    /// completes at least one new RMS window, keyed by the last
+    /// completed window boundary. Verdicts are only taken at
+    /// boundaries, so the state after the call is the boundary state.
+    fn gate_trajectory(stream: &[f32], block: usize) -> Vec<(usize, bool)> {
+        let mut vs = VoiceSquelch::new(
+            VoiceSquelchMode::Syllabic {
+                threshold: VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
+            },
+            VOICE_SQUELCH_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        let mut fed = 0;
+        let mut last_boundary = 0;
+        let mut states = Vec::new();
+        for chunk in stream.chunks(block) {
+            vs.accept_samples(chunk);
+            fed += chunk.len();
+            let boundary = fed - fed % VOICE_SQUELCH_RMS_WINDOW_SAMPLES;
+            if boundary > last_boundary {
+                last_boundary = boundary;
+                states.push((boundary, vs.is_open()));
+            }
+        }
+        states
+    }
+
     /// CR round 1 on PR #797 — the verdict cadence is fixed at one
     /// per RMS window of audio regardless of how the audio is split
     /// across calls: 7-sample, 10 ms, 10 007-sample and one-shot
@@ -1240,38 +1268,11 @@ mod tests {
         ));
         assert_eq!(stream.len() % VOICE_SQUELCH_RMS_WINDOW_SAMPLES, 0);
 
-        // Gate state after every call that completes at least one
-        // new window, keyed by the last completed window boundary.
-        // Verdicts are only taken at boundaries, so the state after
-        // the call is the state at that boundary.
-        let observe = |block: usize| -> Vec<(usize, bool)> {
-            let mut vs = VoiceSquelch::new(
-                VoiceSquelchMode::Syllabic {
-                    threshold: VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
-                },
-                VOICE_SQUELCH_SAMPLE_RATE_HZ,
-            )
-            .unwrap();
-            let mut fed = 0;
-            let mut last_boundary = 0;
-            let mut states = Vec::new();
-            for chunk in stream.chunks(block) {
-                vs.accept_samples(chunk);
-                fed += chunk.len();
-                let boundary = fed - fed % VOICE_SQUELCH_RMS_WINDOW_SAMPLES;
-                if boundary > last_boundary {
-                    last_boundary = boundary;
-                    states.push((boundary, vs.is_open()));
-                }
-            }
-            states
-        };
-
-        let reference = observe(VOICE_SQUELCH_RMS_WINDOW_SAMPLES);
+        let reference = gate_trajectory(&stream, VOICE_SQUELCH_RMS_WINDOW_SAMPLES);
         assert!(reference.iter().any(|&(_, o)| o), "{reference:?}");
         assert!(reference.iter().any(|&(_, o)| !o), "{reference:?}");
         for block in [7, 480, 10_007, stream.len()] {
-            let observed = observe(block);
+            let observed = gate_trajectory(&stream, block);
             // A one-shot delivery can only observe the final boundary;
             // every smaller block size must observe most of them.
             let min_observed = if block >= stream.len() {
