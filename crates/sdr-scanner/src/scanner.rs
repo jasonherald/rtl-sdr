@@ -592,15 +592,18 @@ impl Scanner {
                     // Listening rather than Dwelling — otherwise
                     // we'd sit silent waiting for a second edge
                     // that the squelch detector already fired.
+                    // The part of this block past the settle window is
+                    // post-settle audio: dwell already spent, or
+                    // confirmation of a latched carrier.
+                    let overshoot_us = elapsed_us.saturating_sub(before);
                     if self.squelch_open {
                         Some(Phase::Listening {
                             idx,
-                            provisional_us: Some(ms_to_us(PROVISIONAL_CONFIRM_MS)),
+                            provisional_us: ms_to_us(PROVISIONAL_CONFIRM_MS)
+                                .checked_sub(overshoot_us)
+                                .filter(|&remaining| remaining > 0),
                         })
                     } else {
-                        // The part of this block past the settle
-                        // window is dwell time already spent.
-                        let overshoot_us = elapsed_us.saturating_sub(before);
                         let dwell_us = ms_to_us(self.channels[idx].dwell_ms);
                         Some(Phase::Dwelling {
                             idx,
@@ -1823,5 +1826,27 @@ mod tests {
         // Same rate: the carry is honoured (33.33 + 0.33 carry → 33, then 34).
         assert_eq!(s.tick_elapsed_us(1, rate_30k), 33);
         assert_eq!(s.tick_elapsed_us(1, rate_30k), 34);
+    }
+
+    /// CR round 4 on PR #798 — the settle-expiry block's overshoot is
+    /// post-settle audio and counts toward confirming a latched
+    /// carrier: one 200 ms tick (30 ms settle + 170 ms, beyond the
+    /// 100 ms confirmation) makes the Listening genuine, so a close
+    /// hangs instead of resuming the dwell.
+    #[test]
+    fn settle_overshoot_counts_toward_provisional_confirmation() {
+        let mut s = Scanner::new();
+        s.handle_event(ScannerEvent::ChannelsChanged(vec![
+            ch("A", 146_520_000, 0),
+            ch("B", 162_550_000, 0),
+        ]));
+        s.handle_event(ScannerEvent::SetEnabled(true));
+        s.handle_event(tick(TICK_IN_SETTLE));
+        s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Open));
+        s.handle_event(tick(RATE / 5)); // 200 ms
+        assert_eq!(s.state(), ScannerState::Listening);
+
+        let commands = s.handle_event(ScannerEvent::SquelchEdge(SquelchState::Closed));
+        assert_eq!(s.state(), ScannerState::Hanging, "{commands:?}");
     }
 }
