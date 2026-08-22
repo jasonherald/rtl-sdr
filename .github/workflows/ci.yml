@@ -124,18 +124,15 @@ jobs:
   # Workspace coverage → Codacy (#796). Codacy is on trial as the
   # SonarCloud replacement; this feeds its coverage dashboard. Runs
   # the default (Whisper CPU) feature set — the transcription backend
-  # mutex means exactly one backend per build. Skips the upload when
-  # `CODACY_PROJECT_TOKEN` is not configured (forks, or before the
-  # secret exists) instead of failing the workflow.
+  # mutex means exactly one backend per build. This job executes
+  # workspace code (build scripts, tests) and therefore never sees the
+  # Codacy token: the report travels to a separate upload job as an
+  # artifact, so a compromised build script cannot reach the token
+  # (e.g. by appending `BASH_ENV=` to `$GITHUB_ENV`).
   codacy-coverage:
-    name: Coverage upload (Codacy)
+    name: Coverage report (Codacy)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      # Only a presence flag at job scope (a step's own `env` is not
-      # visible to its own `if`); the token itself is scoped to the
-      # upload step so build scripts and tests never see it.
-      HAS_CODACY_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN != '' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -155,6 +152,30 @@ jobs:
         run: cargo install --locked cargo-llvm-cov
       - name: Workspace coverage (LCOV)
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lcov
+          path: lcov.info
+          retention-days: 7
+
+  # Upload-only job: no checkout, no workspace code — just the LCOV
+  # artifact and a pinned, checksum-verified reporter binary. Skips
+  # the upload when `CODACY_PROJECT_TOKEN` is not configured (forks,
+  # or before the secret exists) instead of failing the workflow.
+  codacy-upload:
+    name: Coverage upload (Codacy)
+    needs: codacy-coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Only a presence flag at job scope (a step's own `env` is not
+      # visible to its own `if`); the token itself is scoped to the
+      # upload step.
+      HAS_CODACY_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN != '' }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: lcov
       # The official action is SHA-pinned only for its action.yml; it
       # then bootstraps `get.sh` from the reporter repo's mutable
       # `master` branch and hands the token to whatever that fetched.
