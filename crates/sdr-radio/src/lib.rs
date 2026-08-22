@@ -690,6 +690,11 @@ impl RadioModule {
         // live on NFM. Bookmark recall dispatches the demod mode and
         // then the voice-squelch mode, so applying it live on WFM
         // muted broadcast audio with the control hidden (#737).
+        //
+        // Validate first: forcing `Off` live on non-NFM would otherwise
+        // let an invalid threshold skip the DSP check, enter the cache
+        // and fail on NFM re-entry (CR round 1 on PR #790).
+        mode.validate()?;
         let live_mode = if self.mode == DemodMode::Nfm {
             mode
         } else {
@@ -1226,6 +1231,33 @@ mod tests {
         radio.set_voice_squelch_mode(VoiceSquelchMode::Off).unwrap();
         radio.set_mode(DemodMode::Wfm).unwrap();
         assert_eq!(radio.voice_squelch_mode(), VoiceSquelchMode::Off);
+        assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
+    }
+
+    /// #737 (CR round 1 on PR #790) — on non-NFM the setter forces the
+    /// live chain to Off, which must not let an invalid threshold skip
+    /// validation, enter the cache, and then fail on NFM re-entry.
+    #[test]
+    fn test_voice_squelch_setter_validates_before_forcing_off_on_non_nfm() {
+        use sdr_dsp::voice_squelch::VoiceSquelchMode;
+        const INVALID_THRESHOLD: f32 = -1.0;
+
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        assert_eq!(radio.current_mode(), DemodMode::Wfm);
+        let bad = VoiceSquelchMode::Syllabic {
+            threshold: INVALID_THRESHOLD,
+        };
+        assert!(
+            radio.set_voice_squelch_mode(bad).is_err(),
+            "an invalid threshold must be rejected even while non-NFM"
+        );
+        assert_eq!(
+            radio.voice_squelch_mode(),
+            VoiceSquelchMode::Off,
+            "a rejected mode must not be cached"
+        );
+        // NFM re-entry replays the cache — which must still be valid.
+        radio.set_mode(DemodMode::Nfm).unwrap();
         assert_eq!(radio.af_chain().voice_squelch_mode(), VoiceSquelchMode::Off);
     }
 

@@ -217,6 +217,38 @@ pub enum VoiceSquelchMode {
 }
 
 impl VoiceSquelchMode {
+    /// Check the mode's threshold without building a detector:
+    /// `Syllabic` needs a finite, positive ratio; `Snr` a finite dB
+    /// value; `Off` carries nothing. [`VoiceSquelch::new`] applies the
+    /// same rule — this is for callers that must reject a bad mode
+    /// before caching it for later (e.g. while it cannot be applied
+    /// live).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DspError::InvalidParameter`] describing the bad value.
+    pub fn validate(&self) -> Result<(), DspError> {
+        match *self {
+            Self::Off => Ok(()),
+            Self::Syllabic { threshold } => {
+                if !threshold.is_finite() || threshold <= 0.0 {
+                    return Err(DspError::InvalidParameter(format!(
+                        "syllabic threshold must be finite and positive, got {threshold}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::Snr { threshold_db } => {
+                if !threshold_db.is_finite() {
+                    return Err(DspError::InvalidParameter(format!(
+                        "SNR threshold must be finite, got {threshold_db}"
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Returns `true` if the mode is anything other than
     /// [`Self::Off`] — convenient for the UI's "should I show
     /// a threshold slider" check.
@@ -564,22 +596,13 @@ impl VoiceSquelch {
             )));
         }
 
+        mode.validate()?;
         let (syllabic, snr) = match mode {
             VoiceSquelchMode::Off => (None, None),
             VoiceSquelchMode::Syllabic { threshold } => {
-                if !threshold.is_finite() || threshold <= 0.0 {
-                    return Err(DspError::InvalidParameter(format!(
-                        "syllabic threshold must be finite and positive, got {threshold}"
-                    )));
-                }
                 (Some(SyllabicDetector::new(threshold, sample_rate_hz)), None)
             }
             VoiceSquelchMode::Snr { threshold_db } => {
-                if !threshold_db.is_finite() {
-                    return Err(DspError::InvalidParameter(format!(
-                        "SNR threshold must be finite, got {threshold_db}"
-                    )));
-                }
                 (None, Some(SnrDetector::new(threshold_db, sample_rate_hz)))
             }
         };
