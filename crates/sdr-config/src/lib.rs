@@ -175,6 +175,10 @@ pub struct ConfigManager {
     path: Option<PathBuf>,
     data: Arc<RwLock<Value>>,
     modified: Arc<AtomicBool>,
+    /// Held across snapshot + `write_atomic` by `save()` and the auto-save
+    /// worker, so two writers can't take snapshots in one order and
+    /// rename them in the other (an older snapshot winning the file).
+    write_lock: Arc<Mutex<()>>,
     auto_save_handle: Option<AutoSaveHandle>,
 }
 
@@ -203,7 +207,9 @@ impl ConfigManager {
     /// If the file doesn't exist, it's created with the default values.
     /// If the file exists but is corrupt — unparsable, or parsable but not
     /// a JSON object at the root — it's backed up as
-    /// `<name>.corrupt-<unix seconds>` and reset to defaults (#761).
+    /// `<name>.corrupt-<unix seconds>-<pid>-<serial>` and reset to defaults
+    /// (#761). If the backup cannot be made, the load fails instead of
+    /// overwriting the only copy.
     ///
     /// # Errors
     ///
@@ -254,6 +260,7 @@ impl ConfigManager {
             path: Some(path),
             data: Arc::new(RwLock::new(data)),
             modified: Arc::new(AtomicBool::new(false)),
+            write_lock: Arc::new(Mutex::new(())),
             auto_save_handle: None,
         };
 
@@ -274,6 +281,7 @@ impl ConfigManager {
             path: None,
             data: Arc::new(RwLock::new(defaults.clone())),
             modified: Arc::new(AtomicBool::new(false)),
+            write_lock: Arc::new(Mutex::new(())),
             auto_save_handle: None,
         }
     }
@@ -288,7 +296,13 @@ impl ConfigManager {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        // Serialize under the lock, then write without it (#763).
+        // Serialize under the data lock, then write without it (#763) —
+        // but hold the write lock across both so snapshot order and
+        // publish order agree (CR round 3 on PR #794).
+        let _writing = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let content = serialize_config(&self.data)?;
         write_atomic(path, &content)?;
         Ok(())
@@ -335,9 +349,10 @@ impl ConfigManager {
         let stop_clone = Arc::clone(&stop_flag);
         let data = Arc::clone(&self.data);
         let modified = Arc::clone(&self.modified);
+        let write_lock = Arc::clone(&self.write_lock);
 
         let thread = thread::spawn(move || {
-            auto_save_worker(stop_clone, data, modified, path);
+            auto_save_worker(stop_clone, data, modified, write_lock, path);
         });
 
         self.auto_save_handle = Some(AutoSaveHandle {
@@ -408,6 +423,7 @@ fn auto_save_worker(
     stop_flag: Arc<(Mutex<bool>, Condvar)>,
     data: Arc<RwLock<Value>>,
     modified: Arc<AtomicBool>,
+    write_lock: Arc<Mutex<()>>,
     path: PathBuf,
 ) {
     let (lock, cvar) = &*stop_flag;
@@ -420,26 +436,34 @@ fn auto_save_worker(
                 .unwrap_or_else(PoisonError::into_inner);
             if *guard {
                 // Flush any pending changes before exiting
-                flush_if_modified(&modified, &data, &path);
+                flush_if_modified(&modified, &data, &write_lock, &path);
                 break;
             }
         }
 
-        flush_if_modified(&modified, &data, &path);
+        flush_if_modified(&modified, &data, &write_lock, &path);
     }
 }
 
 /// Clear the modified flag and flush to disk if it was set. Re-marks
 /// dirty on failure so the next cycle retries.
-fn flush_if_modified(modified: &AtomicBool, data: &RwLock<Value>, path: &Path) {
-    if modified.swap(false, Ordering::AcqRel) && !flush_to_disk(data, path) {
+fn flush_if_modified(
+    modified: &AtomicBool,
+    data: &RwLock<Value>,
+    write_lock: &Mutex<()>,
+    path: &Path,
+) {
+    if modified.swap(false, Ordering::AcqRel) && !flush_to_disk(data, write_lock, path) {
         modified.store(true, Ordering::Release);
     }
 }
 
 /// Write data to disk, logging any errors. Returns true on success. The
-/// read lock is held only while serializing, never across the I/O (#763).
-fn flush_to_disk(data: &RwLock<Value>, path: &Path) -> bool {
+/// read lock is held only while serializing, never across the I/O (#763);
+/// the write lock is held across both so publish order matches snapshot
+/// order with `save()`.
+fn flush_to_disk(data: &RwLock<Value>, write_lock: &Mutex<()>, path: &Path) -> bool {
+    let _writing = write_lock.lock().unwrap_or_else(PoisonError::into_inner);
     match serialize_config(data) {
         Ok(content) => match write_atomic(path, &content) {
             Ok(()) => true,
@@ -742,11 +766,16 @@ mod tests {
 
     /// #761 (CR round 2 on PR #794) — if the corrupt file cannot be backed
     /// up, the reset must not run: the corrupt file is the only copy.
-    #[cfg(unix)]
+    /// Linux-only: the root check below reads `/proc/self`, and root
+    /// ignores directory permissions.
+    #[cfg(target_os = "linux")]
     #[test]
     fn failed_backup_aborts_the_reset() {
         use std::os::unix::fs::PermissionsExt;
+        /// Directory mode with no write bit: the rename must fail.
         const READ_EXEC_ONLY: u32 = 0o500;
+        /// Restored afterwards so the temp dir can be removed.
+        const OWNER_FULL: u32 = 0o700;
         if is_root() {
             return; // root ignores directory permissions
         }
@@ -756,7 +785,7 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(READ_EXEC_ONLY)).unwrap();
 
         let result = ConfigManager::load(&path, &json!({"volume": 0.5}));
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(OWNER_FULL)).unwrap();
         assert!(result.is_err(), "load must fail rather than overwrite");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -766,7 +795,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn is_root() -> bool {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
