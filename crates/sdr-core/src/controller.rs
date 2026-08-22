@@ -5996,6 +5996,42 @@ mod tests {
     /// #700 — the shared LRPT canvas must be cleared between passes even
     /// when no decoder is alive to do it as a side effect (e.g. after a
     /// modulation change dropped it), or pass 2 composites onto pass 1.
+    /// #725 (Codacy on PR #802) — the harvest holds back the
+    /// in-progress row group; a modulation change drops the decoder,
+    /// so the pending group must be flushed to the shared image first.
+    #[test]
+    fn lrpt_modulation_change_flushes_the_pending_row_group() {
+        use sdr_dsp::lrpt::LrptMode;
+        use sdr_radio::lrpt_decoder::LrptDecoder;
+        const APID: u16 = 64;
+        /// One JPEG MCU is 8 × 8 px; a row group is `MCU_SIDE` lines.
+        const MCU_SIDE: usize = 8;
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let image = sdr_radio::lrpt_image::LrptImage::new();
+        let mut decoder = LrptDecoder::new(image.clone(), LrptMode::Oqpsk).unwrap();
+        decoder
+            .assembler_mut()
+            .place_mcu(APID, 0, 0, &[[200_u8; MCU_SIDE]; MCU_SIDE]);
+        state.lrpt_modulation = LrptMode::Oqpsk;
+        state.lrpt_image = Some(image.clone());
+        state.lrpt_decoder = Some(decoder);
+        assert!(
+            image.snapshot_channel(APID).is_none(),
+            "held back until flushed"
+        );
+
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetLrptModulation(LrptMode::Qpsk),
+        );
+
+        assert!(state.lrpt_decoder.is_none(), "decoder dropped for re-init");
+        let snap = image.snapshot_channel(APID).expect("pending group flushed");
+        assert_eq!(snap.lines, MCU_SIDE);
+    }
+
     #[test]
     fn reset_imaging_decoders_clears_lrpt_image_without_a_decoder() {
         const APID: u16 = 64;

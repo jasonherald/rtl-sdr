@@ -110,6 +110,12 @@ impl LrptDecoder {
         self.harvest(false);
     }
 
+    /// Mutable access to the pipeline's image assembler — for tests
+    /// that inject decoded blocks without a full IQ → CADU path.
+    pub fn assembler_mut(&mut self) -> &mut sdr_lrpt::image::ImageAssembler {
+        self.pipeline.assembler_mut()
+    }
+
     /// Push every line the assembler holds, including the row group
     /// still in progress. For LOS / end of pass, when no further MCUs
     /// will complete it.
