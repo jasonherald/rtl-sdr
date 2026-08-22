@@ -63,26 +63,51 @@ pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     result
 }
 
+/// Upper bound on symlink hops while resolving a dangling chain (matches
+/// the kernel's `MAXSYMLINKS`).
+const MAX_SYMLINK_HOPS: usize = 40;
+
 /// The real file a config path refers to. A symlink is followed
-/// (`canonicalize`); a *dangling* symlink resolves through `read_link`
-/// so the target can be (re)created and the link kept. A plain path is
+/// (`canonicalize`); a *dangling* chain is walked link by link with
+/// `read_link` until the missing final target, with cycle detection, so
+/// the target can be (re)created and every link kept. A plain path is
 /// returned unchanged.
 fn resolve_link_target(path: &Path) -> std::io::Result<PathBuf> {
-    let is_symlink = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
-    if !is_symlink {
+    let is_symlink =
+        |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_symlink(path) {
         return Ok(path.to_path_buf());
     }
     if let Ok(real) = std::fs::canonicalize(path) {
         return Ok(real);
     }
-    // Dangling: resolve the link text ourselves.
-    let link = std::fs::read_link(path)?;
-    Ok(if link.is_absolute() {
-        link
-    } else {
-        path.parent()
-            .map_or(link.clone(), |parent| parent.join(link))
-    })
+    // Dangling somewhere along the chain: resolve the link text hop by
+    // hop until the first path that is not itself a symlink.
+    let mut current = path.to_path_buf();
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        if !visited.insert(current.clone()) {
+            return Err(std::io::Error::other(format!(
+                "symlink cycle while resolving {}",
+                path.display()
+            )));
+        }
+        let link = std::fs::read_link(&current)?;
+        current = if link.is_absolute() {
+            link
+        } else {
+            current
+                .parent()
+                .map_or(link.clone(), |parent| parent.join(link))
+        };
+        if !is_symlink(&current) {
+            return Ok(current);
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "too many symlink hops while resolving {}",
+        path.display()
+    )))
 }
 
 /// fsync the directory containing `path` so a completed `rename` survives
@@ -111,23 +136,32 @@ fn serialize_config(data: &RwLock<Value>) -> Result<String, ConfigError> {
     serde_json::to_string_pretty(&*d).map_err(|e| ConfigError::Json(e.to_string()))
 }
 
-/// Move a corrupt config aside as `<name>.corrupt-<unix seconds>` so a bad
-/// byte never silently destroys every setting (#761). Best-effort: a
-/// failure to back up is logged and the reset proceeds.
-fn back_up_corrupt_config(path: &Path) {
+/// Move a corrupt config aside as `<name>.corrupt-<unix seconds>-<pid>-<n>`
+/// so a bad byte never silently destroys every setting (#761). The name
+/// carries the pid and a counter so two recoveries in the same second
+/// cannot overwrite each other.
+///
+/// # Errors
+///
+/// The rename's I/O error. The caller must NOT reset the config in that
+/// case — the corrupt file is the only recoverable copy.
+fn back_up_corrupt_config(path: &Path) -> std::io::Result<PathBuf> {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     // Move the real file, not the link, so a symlinked config keeps its
     // link (the reset then writes through it).
-    let target = resolve_link_target(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = resolve_link_target(path)?;
+    let serial = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
     let mut backup = target.as_os_str().to_owned();
-    backup.push(format!("{CORRUPT_BACKUP_INFIX}{secs}"));
+    backup.push(format!(
+        "{CORRUPT_BACKUP_INFIX}{secs}-{}-{serial}",
+        std::process::id()
+    ));
     let backup = PathBuf::from(backup);
-    match std::fs::rename(&target, &backup) {
-        Ok(()) => tracing::warn!(backup = %backup.display(), "corrupt config backed up"),
-        Err(e) => tracing::error!("could not back up corrupt config: {e}"),
-    }
+    std::fs::rename(&target, &backup)?;
+    tracing::warn!(backup = %backup.display(), "corrupt config backed up");
+    Ok(backup)
 }
 
 /// Thread-safe JSON configuration manager.
@@ -190,13 +224,14 @@ impl ConfigManager {
                             "config root is not a JSON object ({}), resetting",
                             json_kind(&other)
                         );
-                        back_up_corrupt_config(&path);
+                        // No backup → no reset: never overwrite the only copy.
+                        back_up_corrupt_config(&path)?;
                         should_save = true;
                         defaults.clone()
                     }
                     Err(e) => {
                         tracing::warn!("config file corrupt, resetting: {e}");
-                        back_up_corrupt_config(&path);
+                        back_up_corrupt_config(&path)?;
                         should_save = true;
                         defaults.clone()
                     }
@@ -660,6 +695,99 @@ mod tests {
             on_disk["volume"], 0.5,
             "the reset was written through the link"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #760 (CR round 2 on PR #794) — a chain of symlinks whose final
+    /// target is missing must be written through to that target; no
+    /// intermediate link may be replaced by a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn save_follows_a_chained_dangling_symlink() {
+        let dir = temp_dir("chained");
+        let real = dir.join("real.json");
+        let mid = dir.join("mid.json");
+        let link = dir.join("config.json");
+        std::os::unix::fs::symlink(&real, &mid).unwrap();
+        std::os::unix::fs::symlink(&mid, &link).unwrap();
+
+        let mgr = ConfigManager::load(&link, &json!({"volume": 0.5})).unwrap();
+        mgr.save().unwrap();
+        for l in [&link, &mid] {
+            assert!(
+                fs::symlink_metadata(l).unwrap().file_type().is_symlink(),
+                "{l:?} kept"
+            );
+        }
+        let on_disk: Value = serde_json::from_slice(&fs::read(&real).unwrap()).unwrap();
+        assert_eq!(on_disk["volume"], 0.5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #760 (CR round 2 on PR #794) — a symlink cycle is an error, not a
+    /// hang or a replaced link.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cycle_is_an_error() {
+        let dir = temp_dir("cycle");
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let err = resolve_link_target(&a).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(err.to_string().contains("cycle"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #761 (CR round 2 on PR #794) — if the corrupt file cannot be backed
+    /// up, the reset must not run: the corrupt file is the only copy.
+    #[cfg(unix)]
+    #[test]
+    fn failed_backup_aborts_the_reset() {
+        use std::os::unix::fs::PermissionsExt;
+        const READ_EXEC_ONLY: u32 = 0o500;
+        if is_root() {
+            return; // root ignores directory permissions
+        }
+        let dir = temp_dir("backup-fails");
+        let path = dir.join("config.json");
+        fs::write(&path, "garbage").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(READ_EXEC_ONLY)).unwrap();
+
+        let result = ConfigManager::load(&path, &json!({"volume": 0.5}));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "load must fail rather than overwrite");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "garbage",
+            "the corrupt file is untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn is_root() -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
+    }
+
+    /// #761 (CR round 2 on PR #794) — two recoveries in the same second
+    /// produce two backups.
+    #[test]
+    fn repeated_recoveries_keep_every_backup() {
+        let dir = temp_dir("two-backups");
+        let path = dir.join("config.json");
+        for _ in 0..2 {
+            fs::write(&path, "garbage").unwrap();
+            let _ = ConfigManager::load(&path, &json!({"volume": 0.5})).unwrap();
+        }
+        let backups = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(backups, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
