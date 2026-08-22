@@ -1584,14 +1584,18 @@ fn run_data_pump(
 }
 
 fn replay_sticky_commands(shared: &Arc<SharedState>) {
-    let mask = shared.replay_mask.load(Ordering::Relaxed);
-    let replay_bit = |bit: u32| mask & (1u32 << bit) != 0;
     let Ok(mut sink) = shared.command_sink.lock() else {
         return;
     };
     let Some(stream) = sink.as_mut() else {
         return;
     };
+    // Snapshot the masks only while holding the sink lock: setters record
+    // under the same lock, so a gain written while replay waited for it
+    // cannot leave a stale sibling in the mask we act on (CR round 3 on
+    // PR #792).
+    let mask = shared.replay_mask.load(Ordering::Relaxed);
+    let replay_bit = |bit: u32| mask & (1u32 << bit) != 0;
 
     let if_gain_mask = shared.if_gain_mask.load(Ordering::Relaxed);
     let if_gain_ops = (0..IF_GAIN_STAGES)
