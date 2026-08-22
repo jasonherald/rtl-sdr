@@ -67,6 +67,7 @@ pub struct NetworkSource {
     connection: Option<NetworkConnection>,
     connect_timeout: Duration,
     read_timeout: Duration,
+    resolver: DeadlineResolver,
     // Pre-allocated receive buffer (reused across calls)
     recv_buf: Vec<u8>,
     /// Bytes received but not yet converted: a partial sample from a TCP
@@ -80,30 +81,76 @@ enum NetworkConnection {
     Udp(UdpSocket),
 }
 
-/// Run `resolve` on a helper thread and wait at most until `deadline`.
+/// Hostname resolution bounded by a deadline, single-flight per source.
+///
 /// `to_socket_addrs` is a blocking DNS lookup with no timeout of its own;
-/// on the DSP thread that would hold Stop / quit hostage (#744, CR round
-/// 1 on PR #793). A lookup that outlives the deadline is abandoned — the
-/// helper finishes on its own and its result is dropped.
-fn resolve_with_deadline<F>(resolve: F, deadline: Instant) -> std::io::Result<Vec<SocketAddr>>
-where
-    F: FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(resolve());
-    });
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match rx.recv_timeout(remaining) {
-        Ok(result) => result,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "hostname resolution exceeded the connect timeout",
-        )),
+/// on the DSP thread that would hold Stop / quit hostage (#744). The lookup
+/// runs on a helper thread and the caller waits only until the deadline.
+/// A lookup that outlives the deadline is NOT abandoned and re-spawned on
+/// the next `start()`: it stays in flight and the next call for the same
+/// target waits on it, so repeated starts against a slow resolver hold at
+/// most one helper thread per source (CR round 2 on PR #793). A different
+/// target drops the stale receiver; the old helper finishes on its own.
+#[derive(Default)]
+struct DeadlineResolver {
+    in_flight: Option<(
+        String,
+        std::sync::mpsc::Receiver<std::io::Result<Vec<SocketAddr>>>,
+    )>,
+}
+
+impl DeadlineResolver {
+    fn resolve<F>(
+        &mut self,
+        target: &str,
+        resolve: F,
+        deadline: Instant,
+    ) -> std::io::Result<Vec<SocketAddr>>
+    where
+        F: FnOnce() -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+    {
+        if self
+            .in_flight
+            .as_ref()
+            .is_none_or(|(pending, _)| pending != target)
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            // `Builder::spawn` reports thread-creation failure instead of
+            // panicking like `thread::spawn` (library code: no panics).
+            std::thread::Builder::new()
+                .name("sdr-net-resolve".into())
+                .spawn(move || {
+                    let _ = tx.send(resolve());
+                })
+                .map_err(|e| {
+                    std::io::Error::other(format!("could not start the resolver thread: {e}"))
+                })?;
+            self.in_flight = Some((target.to_string(), rx));
+        }
+        let Some((_, rx)) = self.in_flight.as_ref() else {
+            return Err(std::io::Error::other("resolver state lost"));
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(result) => {
+                self.in_flight = None;
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "hostname resolution exceeded the connect timeout",
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.in_flight = None;
+                Err(std::io::Error::other(
+                    "resolver thread ended without a result",
+                ))
+            }
+        }
     }
 }
 
-/// Try each address in turn, giving every attempt only the time left
+/// Try each address in turn/// Try each address in turn, giving every attempt only the time left
 /// until `deadline`, so several unreachable addresses cannot stretch
 /// `start()` past one `connect_timeout` in total.
 fn connect_any_with_deadline(
@@ -141,6 +188,7 @@ impl NetworkSource {
             connection: None,
             connect_timeout: DEFAULT_NETWORK_CONNECT_TIMEOUT,
             read_timeout: DEFAULT_NETWORK_READ_TIMEOUT,
+            resolver: DeadlineResolver::default(),
             recv_buf: Vec::new(),
             carry_buf: Vec::new(),
         }
@@ -308,9 +356,11 @@ impl Source for NetworkSource {
                 // One end-to-end deadline covers resolution AND every
                 // connect attempt.
                 let deadline = Instant::now() + self.connect_timeout;
+                let target = format!("{}:{}", self.hostname, self.port);
                 let host = self.hostname.clone();
                 let port = self.port;
-                let addrs = resolve_with_deadline(
+                let addrs = self.resolver.resolve(
+                    &target,
                     move || Ok((host.as_str(), port).to_socket_addrs()?.collect()),
                     deadline,
                 )?;
@@ -326,13 +376,28 @@ impl Source for NetworkSource {
             }
             Protocol::Udp => {
                 // The hostname is the LOCAL bind address (SDR++ semantics);
-                // empty means every interface.
+                // empty means every interface. A name (not a literal) is
+                // resolved under the same deadline as the TCP path.
+                let deadline = Instant::now() + self.connect_timeout;
                 let bind_host = if self.hostname.is_empty() {
-                    "0.0.0.0"
+                    "0.0.0.0".to_string()
                 } else {
-                    self.hostname.as_str()
+                    self.hostname.clone()
                 };
-                let socket = UdpSocket::bind((bind_host, self.port))?;
+                let target = format!("{bind_host}:{}", self.port);
+                let port = self.port;
+                let addrs = self.resolver.resolve(
+                    &target,
+                    move || Ok((bind_host.as_str(), port).to_socket_addrs()?.collect()),
+                    deadline,
+                )?;
+                let Some(bind_addr) = addrs.first() else {
+                    return Err(SourceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no address resolved for {}", self.hostname),
+                    )));
+                };
+                let socket = UdpSocket::bind(bind_addr)?;
                 socket.set_read_timeout(Some(self.read_timeout))?;
                 NetworkConnection::Udp(socket)
             }
@@ -413,19 +478,61 @@ mod tests {
     fn resolution_is_bounded_by_the_deadline() {
         const SLOW_RESOLVER: Duration = Duration::from_millis(500);
         const DEADLINE: Duration = Duration::from_millis(100);
+        let mut resolver = DeadlineResolver::default();
         let started = Instant::now();
-        let err = resolve_with_deadline(
-            move || {
-                std::thread::sleep(SLOW_RESOLVER);
-                Ok(Vec::new())
-            },
-            Instant::now() + DEADLINE,
-        )
-        .unwrap_err();
+        let err = resolver
+            .resolve(
+                "slow:1",
+                move || {
+                    std::thread::sleep(SLOW_RESOLVER);
+                    Ok(Vec::new())
+                },
+                Instant::now() + DEADLINE,
+            )
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(
             started.elapsed() < SLOW_RESOLVER,
             "must not wait for the resolver"
+        );
+    }
+
+    /// #744 (CR round 2 on PR #793) — a lookup that timed out is reused by
+    /// the next call for the same target instead of spawning another
+    /// thread, so repeated starts cannot accumulate resolver threads.
+    #[test]
+    fn resolver_is_single_flight_per_target() {
+        const SLOW_RESOLVER: Duration = Duration::from_millis(300);
+        const FIRST_DEADLINE: Duration = Duration::from_millis(50);
+        const SECOND_DEADLINE: Duration = Duration::from_secs(2);
+        let first_result: Vec<SocketAddr> = vec!["192.0.2.1:1".parse().unwrap()];
+        let second_result: Vec<SocketAddr> = vec!["192.0.2.2:2".parse().unwrap()];
+        let mut resolver = DeadlineResolver::default();
+        let expected = first_result.clone();
+        let err = resolver
+            .resolve(
+                "same:1",
+                move || {
+                    std::thread::sleep(SLOW_RESOLVER);
+                    Ok(first_result)
+                },
+                Instant::now() + FIRST_DEADLINE,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        // Same target: the in-flight lookup's answer comes back, and the
+        // new closure is never run.
+        let got = resolver
+            .resolve(
+                "same:1",
+                move || Ok(second_result),
+                Instant::now() + SECOND_DEADLINE,
+            )
+            .unwrap();
+        assert_eq!(got, expected, "the first (in-flight) lookup must be reused");
+        assert!(
+            resolver.in_flight.is_none(),
+            "completed lookups are released"
         );
     }
 
