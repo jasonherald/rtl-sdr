@@ -506,6 +506,9 @@ impl AfChain {
     )]
     pub fn process(&mut self, input: &[Stereo], output: &mut [Stereo]) -> Result<usize, DspError> {
         if input.is_empty() {
+            // Keep the `ungated_output` length contract: nothing was
+            // produced, so nothing may be read back as "current".
+            self.ungated_buf.clear();
             return Ok(0);
         }
 
@@ -702,6 +705,13 @@ impl AfChain {
     /// length as that call's return value; empty before the first call.
     pub fn ungated_output(&self) -> &[Stereo] {
         &self.ungated_buf
+    }
+
+    /// Drop the retained ungated block (used by callers that short-
+    /// circuit before calling [`Self::process`], so the length contract
+    /// of [`Self::ungated_output`] still holds).
+    pub fn clear_ungated_output(&mut self) {
+        self.ungated_buf.clear();
     }
 }
 
@@ -1193,6 +1203,26 @@ mod tests {
         assert!(
             ungated.iter().any(|s| s.l.abs() > 0.0),
             "ungated copy must keep the tone"
+        );
+    }
+
+    /// #734 (CR round 1 on PR #791) — an empty-input call returns 0 and
+    /// must not leave the previous block readable as "current" audio.
+    #[test]
+    fn test_ungated_output_is_cleared_by_empty_input() {
+        let mut chain = AfChain::new(VS_TEST_SAMPLE_RATE, VS_TEST_SAMPLE_RATE).unwrap();
+        let input = stereo_tone(VS_SHORT_BLOCK_SAMPLES, VS_NORMAL_AMPLITUDE);
+        let mut output = vec![Stereo::default(); VS_SHORT_BLOCK_SAMPLES];
+        let n = chain.process(&input, &mut output).unwrap();
+        assert_eq!(
+            chain.ungated_output().len(),
+            n,
+            "test premise: a block is retained"
+        );
+        assert_eq!(chain.process(&[], &mut output).unwrap(), 0);
+        assert!(
+            chain.ungated_output().is_empty(),
+            "empty input must clear the retained block"
         );
     }
 

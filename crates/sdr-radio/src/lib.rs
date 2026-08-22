@@ -389,6 +389,9 @@ impl RadioModule {
         output: &mut [Stereo],
     ) -> Result<usize, RadioError> {
         if input.is_empty() {
+            // Nothing produced: `pre_gate_audio` must not hand back the
+            // previous block as if it were this call's output.
+            self.af_chain.clear_ungated_output();
             return Ok(0);
         }
 
@@ -1098,6 +1101,27 @@ mod tests {
         assert!(
             peak(radio.pre_gate_audio()) > 0.0,
             "pre-gate audio keeps the tone"
+        );
+    }
+
+    /// #734 (CR round 1 on PR #791) — same contract at the module level.
+    #[test]
+    fn pre_gate_audio_is_cleared_by_empty_input() {
+        const BLOCK: usize = 2_000;
+        let mut radio = RadioModule::with_default_rate().unwrap();
+        radio.set_mode(DemodMode::Nfm).unwrap();
+        let input = fm_tone_iq(BLOCK, 1.0);
+        let mut output = vec![Stereo::default(); radio.max_output_samples(BLOCK)];
+        let count = radio.process(&input, &mut output).unwrap();
+        assert_eq!(
+            radio.pre_gate_audio().len(),
+            count,
+            "test premise: a block is retained"
+        );
+        assert_eq!(radio.process(&[], &mut output).unwrap(), 0);
+        assert!(
+            radio.pre_gate_audio().is_empty(),
+            "empty input must clear the retained block"
         );
     }
 
