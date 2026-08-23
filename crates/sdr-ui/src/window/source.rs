@@ -377,6 +377,10 @@ struct DiscoveredRowDeps {
     expander_weak: glib::WeakRef<adw::ExpanderRow>,
 }
 
+/// Long-term idle subtitle when mDNS startup failed or the browser
+/// thread exited.
+const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
+
 /// Grace period before a discovered-server row is pruned when the
 /// responder stops re-announcing (crashed or partitioned peers never
 /// send `ServerWithdrawn`).
@@ -429,8 +433,6 @@ pub(super) fn connect_rtl_tcp_discovery(
     /// the browser thread exited at runtime). Distinguishes "nothing
     /// to see yet" from "we gave up listening" — without this the UI
     /// would lie by showing the idle "No servers discovered…" state.
-    const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
-
     // "Manage favorites…" button inside the discovered-servers
     // expander — a second entry point into the same popover as
     // the header-bar star button. Wired here because the
@@ -636,55 +638,71 @@ pub(super) fn connect_rtl_tcp_discovery(
         // a healthy responder's re-announce keeps its row alive.
         prune_stale_discovery_rows(&displayed_rows, &expander);
 
-        loop {
-            let event = match disc_rx.try_recv() {
-                Ok(event) => event,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Browser thread exited — `disc_tx` dropped. Stop
-                    // polling and surface the degraded state; without
-                    // the Break this timeout would spin forever and
-                    // the UI would keep claiming "No servers
-                    // discovered yet" when we've in fact given up.
-                    tracing::warn!(
-                        "mDNS discovery channel disconnected — stopping discovery poller"
-                    );
-                    // Drain any previously announced rows before we
-                    // break out. Without this, they'd linger in the
-                    // expander indefinitely — no more
-                    // `ServerWithdrawn` events will arrive, and the
-                    // stale-age pruner at the top of the tick is
-                    // also about to stop firing. Users would see
-                    // rows that look Connect-able for endpoints
-                    // the UI has already declared unavailable.
-                    let mut rows = displayed_rows.borrow_mut();
-                    for (_, (row, _)) in rows.drain() {
-                        expander.remove(&row);
-                    }
-                    drop(rows);
-                    expander.set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
-                    return glib::ControlFlow::Break;
+        drain_discovery_events(&disc_rx, &displayed_rows, &expander, &favorites, &row_deps)
+    });
+}
+
+/// Drain the mDNS discovery channel for one poll tick. Returns
+/// `Break` when the browser thread has exited (rows drained and the
+/// degraded-state subtitle set). Split out per the 50-NLOC gate
+/// (#817).
+fn drain_discovery_events(
+    disc_rx: &mpsc::Receiver<DiscoveryEvent>,
+    displayed_rows: &Rc<
+        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
+    >,
+    expander: &adw::ExpanderRow,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    row_deps: &Rc<DiscoveredRowDeps>,
+) -> glib::ControlFlow {
+    loop {
+        let event = match disc_rx.try_recv() {
+            Ok(event) => event,
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Browser thread exited — `disc_tx` dropped. Stop
+                // polling and surface the degraded state; without
+                // the Break this timeout would spin forever and
+                // the UI would keep claiming "No servers
+                // discovered yet" when we've in fact given up.
+                tracing::warn!("mDNS discovery channel disconnected — stopping discovery poller");
+                // Drain any previously announced rows before we
+                // break out. Without this, they'd linger in the
+                // expander indefinitely — no more
+                // `ServerWithdrawn` events will arrive, and the
+                // stale-age pruner at the top of the tick is
+                // also about to stop firing. Users would see
+                // rows that look Connect-able for endpoints
+                // the UI has already declared unavailable.
+                let mut rows = displayed_rows.borrow_mut();
+                for (_, (row, _)) in rows.drain() {
+                    expander.remove(&row);
                 }
-            };
-            match event {
-                DiscoveryEvent::ServerAnnounced(server) => {
-                    on_server_announced(server, &displayed_rows, &expander, &favorites, &row_deps);
+                drop(rows);
+                expander.set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
+                return glib::ControlFlow::Break;
+            }
+        };
+        match event {
+            DiscoveryEvent::ServerAnnounced(server) => {
+                on_server_announced(server, &displayed_rows, &expander, &favorites, &row_deps);
+            }
+            DiscoveryEvent::ServerWithdrawn { instance_name } => {
+                let mut rows = displayed_rows.borrow_mut();
+                if let Some((row, _)) = rows.remove(&instance_name) {
+                    expander.remove(&row);
                 }
-                DiscoveryEvent::ServerWithdrawn { instance_name } => {
-                    let mut rows = displayed_rows.borrow_mut();
-                    if let Some((row, _)) = rows.remove(&instance_name) {
-                        expander.remove(&row);
-                    }
-                    if rows.is_empty() {
-                        expander.set_subtitle("No servers discovered on the local network yet.");
-                    } else {
-                        expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
-                    }
+                if rows.is_empty() {
+                    expander.set_subtitle("No servers discovered on the local network yet.");
+                } else {
+                    expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
                 }
             }
         }
-        glib::ControlFlow::Continue
-    });
+    }
+    glib::ControlFlow::Continue
 }
 
 /// `ServerAnnounced` arm of the discovery poller: build or refresh the
