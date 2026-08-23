@@ -752,6 +752,17 @@ pub(super) fn connect_transcript_panel(
     engine
 }
 
+/// Widget handles for an in-flight sherpa model reload: the status
+/// area plus weak refs to the two rows that get locked while the
+/// swap runs. Weak upgrades no-op when the window is closing.
+#[cfg(feature = "sherpa")]
+struct ReloadUi {
+    status: gtk4::Label,
+    progress: gtk4::ProgressBar,
+    model_row: glib::WeakRef<adw::ComboRow>,
+    enable_row: glib::WeakRef<adw::SwitchRow>,
+}
+
 /// Sherpa model-selector reload wiring: on selection change, disable
 /// the model + enable rows, kick `reload_sherpa_host`, and drain its
 /// `InitEvent`s on a 100 ms tick. `KEY_SHERPA_MODEL` persists only
@@ -814,22 +825,22 @@ fn wire_sherpa_model_reload(
         let config_for_this_reload = std::sync::Arc::clone(&config_for_reload_persist);
         let persist_idx = idx;
         glib::timeout_add_local(Duration::from_millis(100), move || {
-            let Some(status) = status_weak.upgrade() else {
-                // Widgets are gone (window closing); model row is too,
-                // so no need to re-enable it.
+            // Widgets gone (window closing) → the model row is gone
+            // too, so no need to re-enable it.
+            let (Some(status), Some(progress)) = (status_weak.upgrade(), progress_weak.upgrade())
+            else {
                 return glib::ControlFlow::Break;
             };
-            let Some(progress) = progress_weak.upgrade() else {
-                return glib::ControlFlow::Break;
+            let ui = ReloadUi {
+                status,
+                progress,
+                model_row: model_row_reload_weak.clone(),
+                enable_row: enable_row_reload_weak.clone(),
             };
-
             if let Some(flow) = drain_sherpa_reload_events(
                 &event_rx,
-                &status,
-                &progress,
+                &ui,
                 &mut current_component,
-                &model_row_reload_weak,
-                &enable_row_reload_weak,
                 &config_for_this_reload,
                 persist_idx,
             ) {
@@ -848,53 +859,38 @@ fn wire_sherpa_model_reload(
 #[allow(clippy::too_many_arguments)]
 fn drain_sherpa_reload_events(
     event_rx: &std::sync::mpsc::Receiver<sdr_transcription::InitEvent>,
-    status: &gtk4::Label,
-    progress: &gtk4::ProgressBar,
+    ui: &ReloadUi,
     current_component: &mut String,
-    model_row_reload_weak: &glib::WeakRef<adw::ComboRow>,
-    enable_row_reload_weak: &glib::WeakRef<adw::SwitchRow>,
-    config_for_this_reload: &std::sync::Arc<sdr_config::ConfigManager>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
     persist_idx: usize,
 ) -> Option<glib::ControlFlow> {
     loop {
         match event_rx.try_recv() {
             Ok(sdr_transcription::InitEvent::DownloadStart { component }) => {
                 component.clone_into(current_component);
-                status.set_text(&format!("Downloading {component}..."));
-                progress.set_fraction(0.0);
+                ui.status.set_text(&format!("Downloading {component}..."));
+                ui.progress.set_fraction(0.0);
             }
             Ok(sdr_transcription::InitEvent::DownloadProgress { pct }) => {
-                status.set_text(&format!("Downloading {current_component}... {pct}%"));
-                progress.set_fraction(f64::from(pct) / 100.0);
+                ui.status
+                    .set_text(&format!("Downloading {current_component}... {pct}%"));
+                ui.progress.set_fraction(f64::from(pct) / 100.0);
             }
             Ok(sdr_transcription::InitEvent::Extracting { component }) => {
                 component.clone_into(current_component);
-                status.set_text(&format!("Extracting {component}..."));
+                ui.status.set_text(&format!("Extracting {component}..."));
             }
             Ok(sdr_transcription::InitEvent::CreatingRecognizer) => {
-                status.set_text("Creating recognizer...");
-                progress.set_visible(false);
+                ui.status.set_text("Creating recognizer...");
+                ui.progress.set_visible(false);
             }
             Ok(sdr_transcription::InitEvent::Ready) => {
-                finish_reload_success(
-                    status,
-                    progress,
-                    &model_row_reload_weak,
-                    &enable_row_reload_weak,
-                    config_for_this_reload,
-                    persist_idx,
-                );
+                finish_reload_success(ui, config, persist_idx);
                 return Some(glib::ControlFlow::Break);
             }
             Ok(sdr_transcription::InitEvent::Failed { message }) => {
                 tracing::warn!(%message, "sherpa host reload failed");
-                show_reload_failure(
-                    status,
-                    progress,
-                    &format!("Reload failed: {message}"),
-                    &model_row_reload_weak,
-                    &enable_row_reload_weak,
-                );
+                show_reload_failure(ui, &format!("Reload failed: {message}"));
                 return Some(glib::ControlFlow::Break);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -905,13 +901,7 @@ fn drain_sherpa_reload_events(
                 // as an error and re-enable the controls so the
                 // user can try a different model.
                 tracing::warn!("sherpa host reload event channel disconnected unexpectedly");
-                show_reload_failure(
-                    status,
-                    progress,
-                    "Reload failed: recognizer worker disconnected",
-                    &model_row_reload_weak,
-                    &enable_row_reload_weak,
-                );
+                show_reload_failure(ui, "Reload failed: recognizer worker disconnected");
                 return Some(glib::ControlFlow::Break);
             }
         }
@@ -925,18 +915,15 @@ fn drain_sherpa_reload_events(
 /// that would wedge the next startup's `init_sherpa_host`.
 #[cfg(feature = "sherpa")]
 fn finish_reload_success(
-    status: &gtk4::Label,
-    progress: &gtk4::ProgressBar,
-    model_row: &glib::WeakRef<adw::ComboRow>,
-    enable_row: &glib::WeakRef<adw::SwitchRow>,
+    ui: &ReloadUi,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     persist_idx: usize,
 ) {
     tracing::info!("sherpa host reload complete");
-    status.set_text("");
-    status.set_visible(false);
-    progress.set_visible(false);
-    reenable_reload_rows(model_row, enable_row);
+    ui.status.set_text("");
+    ui.status.set_visible(false);
+    ui.progress.set_visible(false);
+    reenable_reload_rows(ui);
     config.write(|v| {
         v[crate::sidebar::transcript_panel::KEY_SHERPA_MODEL] = serde_json::json!(persist_idx);
     });
@@ -946,32 +933,23 @@ fn finish_reload_success(
 /// label, progress hidden, and the model/enable rows re-enabled so
 /// the user can try a different model.
 #[cfg(feature = "sherpa")]
-fn show_reload_failure(
-    status: &gtk4::Label,
-    progress: &gtk4::ProgressBar,
-    msg: &str,
-    model_row: &glib::WeakRef<adw::ComboRow>,
-    enable_row: &glib::WeakRef<adw::SwitchRow>,
-) {
-    status.set_text(msg);
-    status.set_css_classes(&["error"]);
-    status.set_visible(true);
-    progress.set_visible(false);
-    reenable_reload_rows(model_row, enable_row);
+fn show_reload_failure(ui: &ReloadUi, msg: &str) {
+    ui.status.set_text(msg);
+    ui.status.set_css_classes(&["error"]);
+    ui.status.set_visible(true);
+    ui.progress.set_visible(false);
+    reenable_reload_rows(ui);
 }
 
 /// Re-enable the model + enable rows after a reload finishes (Ready,
 /// Failed, or worker disconnect). Weak upgrades no-op when the window
 /// is closing.
 #[cfg(feature = "sherpa")]
-fn reenable_reload_rows(
-    model_row: &glib::WeakRef<adw::ComboRow>,
-    enable_row: &glib::WeakRef<adw::SwitchRow>,
-) {
-    if let Some(model_row) = model_row.upgrade() {
+fn reenable_reload_rows(ui: &ReloadUi) {
+    if let Some(model_row) = ui.model_row.upgrade() {
         model_row.set_sensitive(true);
     }
-    if let Some(enable_row) = enable_row.upgrade() {
+    if let Some(enable_row) = ui.enable_row.upgrade() {
         enable_row.set_sensitive(true);
     }
 }
