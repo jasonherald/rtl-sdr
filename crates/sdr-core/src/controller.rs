@@ -201,6 +201,7 @@ mod acars;
 mod apt;
 mod audio;
 mod lrpt;
+mod radio;
 mod scanner;
 mod source;
 mod sstv;
@@ -217,9 +218,8 @@ use audio::{iq_recording_rejects_rate_change, recording_write_error_message, sto
 use lrpt::lrpt_decode_tap;
 use scanner::{apply_scanner_commands, scanner_carrier_present};
 use source::{
-    apply_persisted_frontend_settings, auto_decimation_ratio, on_tune_change, open_source,
-    poll_rtl_tcp_connection_state, rebuild_frontend, rebuild_rtl_tcp_source, rebuild_vfo_echoing,
-    vfo_reachable_offset_hz,
+    auto_decimation_ratio, on_tune_change, poll_rtl_tcp_connection_state, rebuild_frontend,
+    rebuild_vfo_echoing,
 };
 use sstv::{SstvPassStats, sstv_decode_tap};
 use transcription::stop_transcription;
@@ -755,444 +755,23 @@ impl DspState {
 fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiToDsp) {
     match cmd {
         UiToDsp::Start => {
-            if state.running {
-                tracing::warn!("start requested but already running");
-                return;
-            }
-            tracing::info!("starting DSP pipeline");
-            state.audio_frames_written = 0;
-            state.iq_samples_read = 0;
-            state.diag_log_at = std::time::Instant::now();
-            match open_source(state, dsp_tx) {
-                Ok(()) => {
-                    // Start the audio sink -- if it fails, log but continue
-                    // so the spectrum display still works. Discriminate the
-                    // error path by sink type so the network status row in
-                    // the UI sees a real `NetworkSinkStatus::Error` event
-                    // instead of a generic toast.
-                    let start_result = state.audio_sink.start();
-                    // Re-arm or latch the write path based on
-                    // the start outcome. See the
-                    // `audio_sink_offline` docstring for the
-                    // full one-shot rationale — failed starts
-                    // must latch, otherwise the next DSP block
-                    // would re-fire the same terminal error
-                    // when `write_samples` hits the stopped
-                    // sink. Per CodeRabbit round 6 on PR #351.
-                    state.audio_sink_offline = start_result.is_err();
-                    let is_network = matches!(state.audio_sink_type, AudioSinkType::Network);
-                    if let Err(e) = start_result {
-                        tracing::warn!(
-                            sink_type = ?state.audio_sink_type,
-                            "audio sink failed to start (spectrum still works): {e}"
-                        );
-                        if is_network {
-                            let _ =
-                                dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
-                                    message: format!("{e}"),
-                                }));
-                        } else {
-                            let _ =
-                                dsp_tx.send(DspToUi::Error(format!("Audio output failed: {e}")));
-                        }
-                    } else if is_network {
-                        // Successful start of a network sink — this is the
-                        // moment the panel's status row should flip to
-                        // "Streaming to ...". Driving status from real
-                        // start/stop transitions (rather than the
-                        // sink-type swap) keeps the UI honest about what's
-                        // actually on the wire. Per CodeRabbit round 1 on
-                        // PR #351.
-                        let _ =
-                            dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Active {
-                                endpoint: format!(
-                                    "{}:{}",
-                                    state.network_sink_host, state.network_sink_port
-                                ),
-                                protocol: state.network_sink_protocol,
-                            }));
-                    }
-                    state.running = true;
-                    tracing::info!("DSP pipeline started");
-
-                    // ACARS bank coherence (epic #474). open_source
-                    // may have:
-                    //   - updated state.sample_rate to the hardware-
-                    //     rounded value, AND
-                    //   - auto-selected `frontend.set_decimation(>1)`
-                    //     based on the current demod IF (per the
-                    //     auto_decimation_ratio call inside the
-                    //     Start path).
-                    // The latter breaks the ACARS contract that the
-                    // tap reads post-IqFrontend IQ at SOURCE rate
-                    // (decim=1). Reassert the full airband geometry
-                    // via `apply_acars_geometry` so frontend decim,
-                    // configured_sample_rate, rebuild_frontend,
-                    // rebuild_vfo, and on_tune_change all snap back
-                    // into the locked state. Then drop the bank for
-                    // lazy-rebuild at the now-coherent live rate.
-                    // Per CR rounds 4+8 on PR #584.
-                    if state.acars_pre_lock.is_some() {
-                        // Use the active region's center, not
-                        // the US-6 default — for non-US regions
-                        // the post-Start reassert would otherwise
-                        // retune to the wrong source center and
-                        // desynchronize channel geometry. Issue
-                        // #581 / CR round 1 on PR #593.
-                        let acars_center = state.acars_region.center_hz();
-                        match apply_acars_geometry(
-                            state,
-                            dsp_tx,
-                            crate::acars_airband_lock::ACARS_SOURCE_RATE_HZ,
-                            acars_center,
-                            crate::acars_airband_lock::ACARS_FRONTEND_DECIM,
-                        ) {
-                            Ok(()) => {
-                                state.acars_bank = None;
-                                state.acars_init_failed = false;
-                                state.acars_stats_emitted_at = std::time::Instant::now();
-                                // Writer thread auto-opens JSONL / UDP
-                                // on the next message based on the
-                                // config lock; no per-Start reopen
-                                // needed. Issue #596.
-                                tracing::debug!(
-                                    sample_rate = state.sample_rate,
-                                    center_freq = state.center_freq,
-                                    "ACARS geometry reasserted post-Start; bank lazy-rebuild pending"
-                                );
-                            }
-                            Err(err) => {
-                                // Reassertion failed. The DSP graph
-                                // is in an indeterminate state — the
-                                // partial mutation inside
-                                // `apply_acars_geometry` may have
-                                // already pushed source rate or
-                                // frontend toward airband before
-                                // returning Err, so we can't trust
-                                // the live pipeline matches anything
-                                // coherent.
-                                //
-                                // Best-effort: try to push the live
-                                // graph back to the snapshot tuning
-                                // via a second apply_acars_geometry
-                                // call. If that succeeds, the live
-                                // graph + controller state are both
-                                // at the user's pre-engage values
-                                // and we can continue running with
-                                // ACARS off. If it ALSO fails, the
-                                // graph is unrecoverable: tear down
-                                // the source so the user gets a
-                                // clean re-Start path. CR round 10
-                                // on PR #584.
-                                tracing::error!("ACARS geometry reassert failed post-Start: {err}");
-                                let snapshot_clone = state.acars_pre_lock.clone();
-                                let live_restore = match &snapshot_clone {
-                                    Some(snap) => {
-                                        // Restore the pre-engage offset BEFORE
-                                        // the geometry rebuild so `rebuild_vfo`
-                                        // clamps it against the restored rate
-                                        // and echoes the applied value once
-                                        // (#699, CR round 3 on PR #787).
-                                        state.vfo_offset = snap.vfo_offset_hz;
-                                        apply_acars_geometry(
-                                            state,
-                                            dsp_tx,
-                                            snap.source_rate_hz,
-                                            snap.center_freq_hz,
-                                            snap.frontend_decim,
-                                        )
-                                    }
-                                    None => Ok(()),
-                                };
-
-                                if let Err(restore_err) = &live_restore {
-                                    // Live restore failed too. Patch
-                                    // in-memory state from snapshot
-                                    // anyway so configured_sample_rate
-                                    // reflects user intent for the
-                                    // post-stop re-Start, even though
-                                    // the current live graph won't
-                                    // honor it. (apply_acars_geometry
-                                    // may have left those fields
-                                    // mid-update on its way to Err.)
-                                    if let Some(snap) = &snapshot_clone {
-                                        state.configured_sample_rate = snap.source_rate_hz;
-                                        state.center_freq = snap.center_freq_hz;
-                                        state.vfo_offset = snap.vfo_offset_hz;
-                                    }
-                                    tracing::error!(
-                                        "ACARS live-graph restore ALSO failed: {restore_err}"
-                                    );
-                                }
-
-                                state.acars_bank = None;
-                                state.acars_init_failed = false;
-                                state.acars_pre_lock = None;
-                                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
-                                // Also send a definitive Ok(false)
-                                // so the UI (which preserves state
-                                // on Err per CR round 1) snaps the
-                                // toggle off — same pattern as
-                                // cleanup's forced-off ack (round 7).
-                                let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
-
-                                if live_restore.is_err() {
-                                    // Tear down the source so the
-                                    // user gets a clean re-Start.
-                                    // pre_lock is None at this point,
-                                    // so cleanup()'s top-of-function
-                                    // ACARS-disengage guard skips
-                                    // (no infinite recursion through
-                                    // handle_set_acars_enabled).
-                                    tracing::error!(
-                                        "tearing down source after unrecoverable ACARS reassert failure"
-                                    );
-                                    cleanup(state, dsp_tx);
-                                    state.running = false;
-                                    let _ = dsp_tx.send(DspToUi::SourceStopped);
-                                    // Early return out of `handle_command`
-                                    // so the Start success epilogue
-                                    // (DisplayBandwidth / DeviceInfo /
-                                    // GainList) doesn't fire on a
-                                    // controller that's no longer
-                                    // running. CR round 11 on PR #584.
-                                    return;
-                                }
-                            }
-                        }
-                    }
-
-                    // Send display bandwidth (raw sample rate) so
-                    // the spectrum display shows the full tuner
-                    // bandwidth. The FFT is computed on the pre-
-                    // decimation stream (see
-                    // `crates/sdr-pipeline/src/iq_frontend.rs:156`),
-                    // so bins span `sample_rate()`, not
-                    // `effective_sample_rate()`.
-                    let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
-
-                    // Send the source's display name + supported gain
-                    // values to the UI.
-                    if let Some(source) = &state.source {
-                        let _ = dsp_tx.send(DspToUi::DeviceInfo(source.name().to_string()));
-                        let gains: Vec<f64> = source
-                            .gains()
-                            .iter()
-                            .map(|&g| f64::from(g) / 10.0) // tenths of dB → dB
-                            .collect();
-                        if !gains.is_empty() {
-                            let _ = dsp_tx.send(DspToUi::GainList(gains));
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("failed to start source: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Start failed: {e}")));
-                    let _ = dsp_tx.send(DspToUi::SourceStopped);
-                }
-            }
+            source::handle_start(state, dsp_tx);
         }
 
         UiToDsp::Stop => {
-            if !state.running {
-                tracing::warn!("stop requested but not running");
-                return;
-            }
-            tracing::info!("stopping DSP pipeline");
-            // Disconnect transcription tap so the worker stops receiving audio.
-            state.transcription_tx = None;
-            // Same treatment for the generic audio tap — the DSP pipeline
-            // is tearing down and any registered FFI consumer is about to
-            // see a `Disconnected` on their next pull regardless.
-            state.audio_tap_tx = None;
-            // `cleanup` now emits `NetworkSinkStatus::Inactive` itself
-            // when the active sink was Network — same path used by the
-            // file-EOF, fatal-source-error, and source-type restart
-            // sites so every real stop transition reports Inactive.
-            cleanup(state, dsp_tx);
-            state.running = false;
-            let _ = dsp_tx.send(DspToUi::SourceStopped);
+            source::handle_stop(state, dsp_tx);
         }
 
         UiToDsp::Tune(freq) => {
-            if acars_lock_rejects_geometry_change(state, dsp_tx, "Tune") {
-                return;
-            }
-            // INFO-level so silent-fail demod regressions can be diagnosed
-            // by grepping the log alone. Pairs with `tune_to_target`'s
-            // TUNE_REQUEST line on the UI side.
-            tracing::info!(target: "tune", requested_hz = freq, "DSP_APPLY_REQUEST");
-            on_tune_change(state);
-            state.center_freq = freq;
-            // A centre-frequency tune is a fresh start for the VFO: the
-            // UI already zeroes its overlay offset on every tune path
-            // (`set_center_frequency`), but the engine kept demodulating
-            // at `center + old_offset`. Reset here and echo so the
-            // header / status bar / overlay all agree. Per #764.
-            if state.vfo_offset != 0.0 {
-                state.vfo_offset = 0.0;
-                if let Some(vfo) = &mut state.vfo {
-                    vfo.set_offset(0.0);
-                }
-                let _ = dsp_tx.send(DspToUi::VfoOffsetChanged(0.0));
-            }
-            if let Some(source) = &mut state.source
-                && let Err(e) = source.tune(freq)
-            {
-                tracing::warn!("tune failed: {e}");
-                let _ = dsp_tx.send(DspToUi::Error(format!("Tune failed: {e}")));
-            } else {
-                tracing::info!(
-                    target: "tune",
-                    applied_hz = state.center_freq,
-                    "DSP_APPLIED"
-                );
-            }
+            source::handle_tune(state, dsp_tx, freq);
         }
 
         UiToDsp::SetDemodMode(mode) => {
-            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDemodMode") {
-                return;
-            }
-            // INFO-level so silent-fail demod regressions can be diagnosed
-            // by grepping the log alone. Pairs with `tune_to_target`'s
-            // TUNE_REQUEST line on the UI side.
-            tracing::info!(target: "set_demod_mode", ?mode, "DSP_APPLY_REQUEST");
-            on_tune_change(state);
-            let old_mode = state.radio.current_mode();
-            if let Err(e) = state.radio.set_mode(mode) {
-                tracing::warn!("set demod mode failed: {e}");
-                let _ = dsp_tx.send(DspToUi::Error(format!("Mode switch failed: {e}")));
-            } else {
-                // Reset bandwidth to the new mode's default.
-                state.bandwidth = state.radio.demod_config().default_bandwidth;
-
-                // Auto-adjust decimation for the new demod's IF rate.
-                let if_rate = state.radio.demod_config().if_sample_rate;
-                let auto_decim = auto_decimation_ratio(state.sample_rate, if_rate);
-                if auto_decim != state.frontend.decim_ratio() {
-                    tracing::info!(auto_decim, if_rate, "auto-adjusting decimation for mode");
-                    if let Err(e) = state.frontend.set_decimation(auto_decim) {
-                        tracing::warn!("auto-decimation on mode switch failed: {e}");
-                    }
-                }
-
-                // Rebuild the RxVfo for the new demod's IF rate and bandwidth.
-                if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
-                    tracing::warn!("VFO rebuild on mode switch failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
-                }
-                let _ = dsp_tx.send(DspToUi::SampleRateChanged(
-                    state.frontend.effective_sample_rate(),
-                ));
-                let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
-                // The bandwidth was just reset to the new mode's default;
-                // echo it so the Radio-panel row, status bar and spectrum
-                // VFO width track the engine instead of keeping the old
-                // mode's value whenever it happens to fall inside the new
-                // range. Same echo `SetBandwidth` already emits. Per #697.
-                let _ = dsp_tx.send(DspToUi::BandwidthChanged(state.bandwidth));
-
-                // Notify the UI of the mode transition (edge detection — only
-                // when the mode actually changed so idempotent refreshes do not
-                // trigger the transcript-session boundary logic).
-                //
-                // The UI layer's response to `DemodModeChanged` is to toggle
-                // the transcription enable row off, which eventually drops
-                // the transcription channel via `DisableTranscription`. That
-                // round-trip is async — until it completes the DSP thread
-                // would otherwise keep pushing post-switch audio into the old
-                // session, violating the "band change = hard session
-                // boundary" contract in the Auto Break design spec. Drop the
-                // tap locally FIRST so no post-switch samples leak into the
-                // old backend, then notify the UI. The UI's eventual
-                // `DisableTranscription` is idempotent on an already-cleared
-                // tap.
-                // Pin the post-apply DSP state so we can confirm the
-                // mode + bandwidth + IF rate the engine actually
-                // committed to. Pairs with the DSP_APPLY_REQUEST log
-                // above for diagnose-from-log. Note: bandwidth has
-                // just been reset to the new mode's default; an
-                // upcoming SetBandwidth from the UI / recorder will
-                // override it with the desired value.
-                tracing::info!(
-                    target: "set_demod_mode",
-                    applied_mode = ?mode,
-                    applied_bandwidth_hz = state.bandwidth,
-                    applied_if_sample_rate = state.radio.demod_config().if_sample_rate,
-                    "DSP_APPLIED"
-                );
-                if old_mode != mode {
-                    state.transcription_tx = None;
-                    // Same hard-boundary treatment for the generic
-                    // audio tap. A recognizer session downstream
-                    // treats every mode change as an utterance
-                    // boundary — letting post-switch
-                    // audio leak into the old session until the
-                    // UI round-trip sends DisableAudioTap would
-                    // corrupt the transcript across the mode
-                    // transition. Per CodeRabbit round 1 on PR
-                    // #349.
-                    state.audio_tap_tx = None;
-                    // Reset the decimation phase so a subsequent
-                    // EnableAudioTap starts at a clean 3:1
-                    // alignment instead of carrying a stale phase
-                    // from before the mode switch.
-                    state.audio_tap_phase = 0;
-                    state.squelch_was_open = false;
-                    state.transcription_squelch_was_open = false;
-                    // Mode switch rebuilds the AF chain + CTCSS
-                    // detector + voice squelch — edge trackers
-                    // must match the new closed state.
-                    state.ctcss_was_sustained = false;
-                    // Voice squelch reset to closed in an active
-                    // mode; in Off mode it's still "open" so the
-                    // tracker should track whatever the AF chain
-                    // reports after the rebuild. Simpler to just
-                    // snapshot it here and let the next process
-                    // iteration emit an edge if anything changed.
-                    state.voice_squelch_was_open = state.radio.voice_squelch_open();
-                    let _ = dsp_tx.send(DspToUi::DemodModeChanged(mode));
-                }
-            }
+            radio::handle_set_demod_mode(state, dsp_tx, mode);
         }
 
         UiToDsp::SetBandwidth(bw) => {
-            // INFO-level so silent-fail demod regressions can be diagnosed
-            // by grepping the log alone. Pairs with `tune_to_target`'s
-            // TUNE_REQUEST line on the UI side.
-            tracing::info!(target: "set_bandwidth", requested_hz = bw, "DSP_APPLY_REQUEST");
-            on_tune_change(state);
-            // Update the VFO channel filter first; only persist on success.
-            if let Some(vfo) = &mut state.vfo {
-                match vfo.set_bandwidth(bw) {
-                    Ok(()) => state.bandwidth = bw,
-                    Err(e) => {
-                        tracing::warn!("VFO bandwidth update failed: {e}");
-                        let _ = dsp_tx.send(DspToUi::Error(format!("Bandwidth failed: {e}")));
-                    }
-                }
-            } else {
-                state.bandwidth = bw;
-            }
-            // Also pass to the radio module (some demods use it internally).
-            state.radio.set_bandwidth(bw);
-            // Companion log to DSP_APPLY_REQUEST above. If `requested`
-            // and `applied` differ, the VFO clamped the value to its
-            // valid range — visible from a single line.
-            tracing::info!(
-                target: "set_bandwidth",
-                requested_hz = bw,
-                applied_hz = state.bandwidth,
-                "DSP_APPLIED"
-            );
-            // Notify UI so widgets that initiate bandwidth changes
-            // via a different path (VFO drag handles on the
-            // spectrum) can reflect the new value in the Radio
-            // panel's bandwidth spin row. The `bandwidth_row`'s
-            // own `set_value` path guards against feedback loops
-            // via a `suppress_notify` flag on the UI side.
-            let _ = dsp_tx.send(DspToUi::BandwidthChanged(state.bandwidth));
+            radio::handle_set_bandwidth(state, dsp_tx, bw);
         }
 
         UiToDsp::SetSquelch(level) => {
@@ -1224,80 +803,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetSampleRate(rate) => {
-            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetSampleRate") {
-                return;
-            }
-            if iq_recording_rejects_rate_change(state, dsp_tx, "SetSampleRate") {
-                return;
-            }
-            tracing::debug!(sample_rate = rate, "set sample rate");
-            state.configured_sample_rate = rate;
-            if let Some(source) = &mut state.source {
-                if let Err(e) = source.set_sample_rate(rate) {
-                    tracing::warn!("set sample rate failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Sample rate failed: {e}")));
-                    return;
-                }
-                // Use the source's actual rate (may differ due to hardware rounding)
-                state.sample_rate = source.sample_rate();
-            } else {
-                state.sample_rate = rate;
-            }
-
-            // Auto-select decimation ratio so the effective rate is close to
-            // the demod IF rate. This prevents the VFO from having to process
-            // all raw samples when the sample rate is much higher than needed.
-            let if_rate = state.radio.demod_config().if_sample_rate;
-            let auto_decim = auto_decimation_ratio(rate, if_rate);
-            if auto_decim != state.frontend.decim_ratio() {
-                tracing::info!(
-                    sample_rate = rate,
-                    auto_decim,
-                    effective = rate / f64::from(auto_decim),
-                    "auto-adjusting decimation for sample rate"
-                );
-                if let Err(e) = state.frontend.set_decimation(auto_decim) {
-                    tracing::warn!("auto-decimation failed: {e}");
-                }
-            }
-
-            match rebuild_frontend(state) {
-                Ok(()) => {
-                    if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
-                        tracing::warn!("VFO rebuild on sample rate change failed: {e}");
-                        let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
-                    }
-                    let _ = dsp_tx.send(DspToUi::SampleRateChanged(
-                        state.frontend.effective_sample_rate(),
-                    ));
-                    let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
-                }
-                Err(e) => {
-                    tracing::warn!("frontend rebuild failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Frontend rebuild: {e}")));
-                }
-            }
+            source::handle_set_sample_rate(state, dsp_tx, rate);
         }
 
         UiToDsp::SetDecimation(ratio) => {
-            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDecimation") {
-                return;
-            }
-            tracing::debug!(ratio, "set decimation");
-            if let Err(e) = state.frontend.set_decimation(ratio) {
-                tracing::warn!("set decimation failed: {e}");
-                let _ = dsp_tx.send(DspToUi::Error(format!("Decimation failed: {e}")));
-            } else {
-                // Rebuild VFO for the new effective sample rate.
-                if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
-                    tracing::warn!("VFO rebuild on decimation change failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("VFO rebuild failed: {e}")));
-                }
-                let _ = dsp_tx.send(DspToUi::SampleRateChanged(
-                    state.frontend.effective_sample_rate(),
-                ));
-                let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
-            }
+            source::handle_set_decimation(state, dsp_tx, ratio);
         }
 
         UiToDsp::SetDcBlocking(enabled) => {
@@ -1315,24 +825,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetFftSize(size) => {
-            tracing::debug!(fft_size = size, "set FFT size");
-            match IqFrontend::new(
-                state.frontend.sample_rate(),
-                state.frontend.decim_ratio(),
-                size,
-                state.window_fn,
-                state.dc_blocking,
-            ) {
-                Ok(mut new_frontend) => {
-                    apply_persisted_frontend_settings(state, &mut new_frontend);
-                    state.frontend = new_frontend;
-                    state.fft_buf = vec![0.0; size];
-                }
-                Err(e) => {
-                    tracing::warn!("set FFT size failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("FFT size failed: {e}")));
-                }
-            }
+            source::handle_set_fft_size(state, dsp_tx, size);
         }
 
         UiToDsp::SetNbEnabled(enabled) => {
@@ -1346,26 +839,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetGain(gain_db) => {
-            tracing::debug!(gain_db, "set gain");
-            #[allow(clippy::cast_possible_truncation)]
-            // Source gain is in tenths of dB (e.g., 49.6 dB = 496)
-            let gain_tenths = (gain_db * 10.0) as i32;
-            // Persist FIRST so a dispatch with no live source
-            // survives until `open_source` runs. Per #551.
-            state.tuner_gain_tenths_db = gain_tenths;
-            // Clear the indexed-gain cache so this dB value is
-            // authoritative on the next reopen. The replay
-            // helper applies dB then index, so a leftover
-            // `Some(index)` from a prior `SetGainByIndex`
-            // dispatch would otherwise overwrite the newer dB
-            // value. Per CR round 2 on PR #553.
-            state.tuner_gain_index = None;
-            if let Some(source) = &mut state.source
-                && let Err(e) = source.set_gain(gain_tenths)
-            {
-                tracing::warn!("set gain failed: {e}");
-                let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
-            }
+            source::handle_set_gain(state, dsp_tx, gain_db);
         }
 
         UiToDsp::SetAgc(enabled) => {
@@ -1402,76 +876,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetWindowFunction(window) => {
-            tracing::debug!(?window, "set window function");
-            state.window_fn = window;
-            match IqFrontend::new(
-                state.frontend.sample_rate(),
-                state.frontend.decim_ratio(),
-                state.frontend.fft_size(),
-                window,
-                state.dc_blocking,
-            ) {
-                Ok(mut new_frontend) => {
-                    apply_persisted_frontend_settings(state, &mut new_frontend);
-                    state.fft_buf = vec![0.0; new_frontend.fft_size()];
-                    state.frontend = new_frontend;
-                }
-                Err(e) => {
-                    tracing::warn!("set window function failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Window function failed: {e}")));
-                }
-            }
+            source::handle_set_window_function(state, dsp_tx, window);
         }
 
         UiToDsp::SetVfoOffset(offset) => {
-            if acars_lock_rejects_geometry_change(state, dsp_tx, "SetVfoOffset") {
-                return;
-            }
-            // Expanded tracing for the #337 click-to-tune-no-audio
-            // investigation: the #337 hypotheses point at a
-            // display-span vs. VFO-input-sample-rate mismatch
-            // (decim > 1) and/or clicks landing outside the AA-
-            // filter-safe subset, so surface BOTH rates + whether
-            // the VFO chain exists so the next smoke-test trace
-            // shows the offset's relationship to the filterable
-            // range at a glance.
-            let raw_rate = state.frontend.sample_rate();
-            let effective_rate = state.frontend.effective_sample_rate();
-            let vfo_exists = state.vfo.is_some();
-            // The spectrum spans the RAW rate but the VFO mixes at the
-            // post-decimation rate: an offset beyond ±effective/2
-            // wraps (`hz_to_rads` aliases it) and the user hears a
-            // different station than the readout claims — the #337
-            // symptom. Clamp to the reachable span and echo the
-            // clamped value so every readout agrees (#699).
-            let reachable = vfo_reachable_offset_hz(effective_rate);
-            let clamped = offset.clamp(-reachable, reachable);
-            if (clamped - offset).abs() > f64::EPSILON {
-                tracing::warn!(
-                    requested_hz = offset,
-                    clamped_hz = clamped,
-                    effective_sample_rate_hz = effective_rate,
-                    "VFO offset outside ±effective/2; clamped"
-                );
-            }
-            let offset = clamped;
-            tracing::debug!(
-                offset_hz = offset,
-                raw_sample_rate_hz = raw_rate,
-                effective_sample_rate_hz = effective_rate,
-                vfo_exists,
-                "set VFO offset"
-            );
-            state.vfo_offset = offset;
-            if let Some(vfo) = &mut state.vfo {
-                vfo.set_offset(offset);
-            }
-            // Echo so UI paths that trigger this indirectly
-            // (reset-to-defaults button, future scanner / scripting
-            // hooks) reflect the new offset in their overlay /
-            // frequency readout without optimistically guessing
-            // locally. Matches the `BandwidthChanged` echo above.
-            let _ = dsp_tx.send(DspToUi::VfoOffsetChanged(offset));
+            source::handle_set_vfo_offset(state, dsp_tx, offset);
         }
 
         UiToDsp::SetNbLevel(level) => {
@@ -1562,107 +971,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetAudioSinkType(new_type) => {
-            tracing::info!(?new_type, "set audio sink type");
-            if state.audio_sink_type == new_type {
-                return;
-            }
-            // Snapshot the previous type so the post-swap
-            // status logic can emit the correct "transitioning
-            // away from network" event even when the
-            // replacement local sink fails to start. Per
-            // CodeRabbit round 2 on PR #351.
-            let prev_type = state.audio_sink_type;
-            // Stop the current sink so it releases its underlying
-            // resource (audio device handle / socket) before we
-            // construct the replacement.
-            if let Err(e) = state.audio_sink.stop() {
-                tracing::warn!("audio sink stop during type swap failed: {e}");
-            }
-            // Build the new sink.
-            state.audio_sink = match new_type {
-                AudioSinkType::Local => AudioSinkSlot::local_default(),
-                AudioSinkType::Network => AudioSinkSlot::network(
-                    &state.network_sink_host,
-                    state.network_sink_port,
-                    state.network_sink_protocol,
-                ),
-            };
-            state.audio_sink_type = new_type;
-            // Re-apply the persisted local-device pick so the
-            // post-swap Local sink routes to the user's last
-            // choice instead of the system default. No-op for
-            // Network.
-            if matches!(new_type, AudioSinkType::Local)
-                && let Err(e) = state.audio_sink.set_target(&state.audio_device_uid)
-            {
-                tracing::warn!("post-swap set_target failed: {e}");
-            }
-            // Bring the new sink online if the engine is already
-            // running. Otherwise it'll start on the next Start
-            // command — and we emit `Inactive` rather than
-            // `Active` because the sink isn't really on the wire
-            // yet. Per CodeRabbit round 1 on PR #351, status
-            // events must reflect REAL lifecycle, not just the
-            // user's selected type.
-            if state.running {
-                match state.audio_sink.start() {
-                    Ok(()) => {
-                        // Successful start clears the offline
-                        // latch so the audio write path resumes.
-                        state.audio_sink_offline = false;
-                        if matches!(new_type, AudioSinkType::Network) {
-                            let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
-                                NetworkSinkStatus::Active {
-                                    endpoint: format!(
-                                        "{}:{}",
-                                        state.network_sink_host, state.network_sink_port
-                                    ),
-                                    protocol: state.network_sink_protocol,
-                                },
-                            ));
-                        } else {
-                            // Switched away from network → that
-                            // sink is no longer streaming. Emit
-                            // Inactive so the panel's status row
-                            // clears.
-                            let _ = dsp_tx
-                                .send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
-                        }
-                    }
-                    Err(e) => {
-                        // Latch so the next DSP block doesn't re-fire
-                        // the same terminal error against a stopped
-                        // sink. Per CodeRabbit round 6 on PR #351.
-                        state.audio_sink_offline = true;
-                        tracing::warn!("audio sink start after type swap failed: {e}");
-                        if matches!(new_type, AudioSinkType::Network) {
-                            let _ =
-                                dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
-                                    message: format!("{e}"),
-                                }));
-                        } else {
-                            let _ = dsp_tx
-                                .send(DspToUi::Error(format!("Audio sink failed to start: {e}")));
-                            // Even on failure, the network sink
-                            // is gone — emit Inactive so the
-                            // panel's status row clears its
-                            // "Active" state. Per CodeRabbit
-                            // round 2 on PR #351.
-                            if matches!(prev_type, AudioSinkType::Network) {
-                                let _ = dsp_tx
-                                    .send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Engine not running — nothing is on the wire.
-                // Always emit Inactive so the panel doesn't
-                // misreport a not-yet-bound sink as Active. The
-                // matching Active will fire from the Start
-                // handler if/when the user starts the engine.
-                let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
-            }
+            audio::handle_set_audio_sink_type(state, dsp_tx, new_type);
         }
 
         UiToDsp::SetNetworkSinkConfig {
@@ -1670,211 +979,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             port,
             protocol,
         } => {
-            tracing::info!(%hostname, port, ?protocol, "set network sink config");
-            // Persist on state so a future SetAudioSinkType swap
-            // picks the new values up.
-            state.network_sink_host.clone_from(&hostname);
-            state.network_sink_port = port;
-            state.network_sink_protocol = protocol;
-            // If the network sink is currently selected, rebuild
-            // it inline so the new endpoint takes effect now.
-            // Status events fire only on the real start
-            // outcome (Active on success, Error on failure,
-            // Inactive when the engine isn't running yet) — per
-            // CodeRabbit round 1 on PR #351.
-            if matches!(state.audio_sink_type, AudioSinkType::Network) {
-                if let Err(e) = state.audio_sink.stop() {
-                    tracing::warn!("network sink stop during reconfig failed: {e}");
-                }
-                state.audio_sink = AudioSinkSlot::network(&hostname, port, protocol);
-                if state.running {
-                    match state.audio_sink.start() {
-                        Ok(()) => {
-                            state.audio_sink_offline = false;
-                            let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
-                                NetworkSinkStatus::Active {
-                                    endpoint: format!("{hostname}:{port}"),
-                                    protocol,
-                                },
-                            ));
-                        }
-                        Err(e) => {
-                            // Latch — per CodeRabbit round 6 on PR #351.
-                            state.audio_sink_offline = true;
-                            tracing::warn!("network sink restart after reconfig failed: {e}");
-                            let _ =
-                                dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Error {
-                                    message: format!("{e}"),
-                                }));
-                        }
-                    }
-                } else {
-                    // Engine not running — sink rebuilt but not
-                    // bound. Status stays Inactive.
-                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(NetworkSinkStatus::Inactive));
-                }
-            }
+            audio::handle_set_network_sink_config(state, dsp_tx, &hostname, port, protocol);
         }
 
         UiToDsp::SetSourceType(source_type) => {
-            tracing::info!(?source_type, "switching source type");
-            // ACARS source-type gate (epic #474). MUST run BEFORE
-            // cleanup() — cleanup() drops state.acars_bank, which
-            // would make the `is_some()` check below trivially
-            // false and skip the synthetic disengage entirely
-            // (CR round 2 on PR #584). Running first means the
-            // disengage operates on the live old source: it can
-            // physically retune rate/center back to the snapshot
-            // values, drop the bank, and emit the
-            // AcarsEnabledChanged(Ok(false)) ack the UI is
-            // waiting on. cleanup() then stops the source as
-            // usual; the post-cleanup acars_bank=None becomes a
-            // harmless re-set since handle_set_acars_enabled
-            // already cleared it.
-            // Use `acars_pre_lock.is_some()` (the canonical
-            // "ACARS engaged" signal), NOT `acars_bank.is_some()`.
-            // The Start path intentionally invalidates the bank
-            // for the lazy-rebuild window — bank can be None
-            // while ACARS is still engaged. CR round 5 on PR #584.
-            // While an IQ recording is open on a live source, leave the
-            // disengage to `cleanup()` below: it stops the recording first
-            // and then performs the forced ACARS teardown, whereas the
-            // user-path disengage would be refused by the recording mutex
-            // (#695) and emit a misleading failure for a switch that is
-            // about to succeed.
-            let defer_to_cleanup = state.iq_writer.is_some() && state.running;
-            let acars_outcome = if state.acars_pre_lock.is_some()
-                && source_type != SourceType::RtlSdr
-                && !defer_to_cleanup
-            {
-                tracing::info!(
-                    ?source_type,
-                    "ACARS auto-disabling: source type changing to non-RTL-SDR"
-                );
-                handle_set_acars_enabled(state, false, dsp_tx)
-            } else {
-                AcarsHandlerOutcome::Normal
-            };
-            let was_running = state.running;
-            if was_running {
-                cleanup(state, dsp_tx);
-                state.running = false;
-            }
-            // Honor TeardownNeeded from the auto-disable: if the
-            // disengage hit double-failure AND we didn't already
-            // tear down via the `was_running` branch above, do it
-            // now. The `was_running` guard handles the common case
-            // where ACARS is engaged on a live source — cleanup
-            // already ran. The fallback is for an engaged-but-
-            // somehow-not-running scenario (defensive, shouldn't
-            // happen in practice). CR round 18.
-            if matches!(acars_outcome, AcarsHandlerOutcome::TeardownNeeded) && !was_running {
-                tracing::error!(
-                    "ACARS auto-disable double-failure with !running; tearing down source"
-                );
-                cleanup(state, dsp_tx);
-                state.running = false;
-                let _ = dsp_tx.send(DspToUi::SourceStopped);
-            }
-            state.source_type = source_type;
-            // Force the rtl_tcp status row to reset when switching
-            // away from RTL-TCP. Without this, a user mid-session
-            // who switches to a different source would see the
-            // stale "Connected — R820T" text linger until the next
-            // poll tick (which won't fire if running=false). Only
-            // emits on an actual edge.
-            if source_type != SourceType::RtlTcp
-                && !matches!(
-                    state.last_rtl_tcp_state,
-                    RtlTcpConnectionState::Disconnected
-                )
-            {
-                state.last_rtl_tcp_state = RtlTcpConnectionState::Disconnected;
-                let _ = dsp_tx.send(DspToUi::RtlTcpConnectionState(
-                    RtlTcpConnectionState::Disconnected,
-                ));
-            }
-            // Restart with the new source type if was playing
-            if was_running {
-                match open_source(state, dsp_tx) {
-                    Ok(()) => {
-                        // Clear the audio-sink offline latch on
-                        // a successful restart, same as the
-                        // other successful-start paths (engine
-                        // Start, SetAudioSinkType,
-                        // SetNetworkSinkConfig). Without this,
-                        // a prior-session terminal write
-                        // failure could leave the latch set
-                        // through a source-type swap and gate
-                        // writes off until the next explicit
-                        // Start command. Per `CodeRabbit`
-                        // round 3 on PR #351.
-                        // Mirror the network-specific lifecycle
-                        // events the other start paths emit
-                        // (engine Start, SetAudioSinkType,
-                        // SetNetworkSinkConfig). Without these,
-                        // a source-type swap could leave the
-                        // GTK network status row stuck on a
-                        // stale Active or Error from before the
-                        // swap. Per `CodeRabbit` round 5 on
-                        // PR #351.
-                        let is_network = matches!(state.audio_sink_type, AudioSinkType::Network);
-                        match state.audio_sink.start() {
-                            Ok(()) => {
-                                state.audio_sink_offline = false;
-                                if is_network {
-                                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
-                                        NetworkSinkStatus::Active {
-                                            endpoint: format!(
-                                                "{}:{}",
-                                                state.network_sink_host, state.network_sink_port
-                                            ),
-                                            protocol: state.network_sink_protocol,
-                                        },
-                                    ));
-                                }
-                            }
-                            Err(e) => {
-                                // Latch — per CodeRabbit round 6 on PR #351.
-                                state.audio_sink_offline = true;
-                                tracing::warn!("audio sink restart failed: {e}");
-                                if is_network {
-                                    let _ = dsp_tx.send(DspToUi::NetworkSinkStatus(
-                                        NetworkSinkStatus::Error {
-                                            message: format!("{e}"),
-                                        },
-                                    ));
-                                } else {
-                                    let _ = dsp_tx
-                                        .send(DspToUi::Error(format!("Audio output failed: {e}")));
-                                }
-                            }
-                        }
-                        state.running = true;
-                        // Refresh UI with new source capabilities
-                        if let Some(source) = &state.source {
-                            let gains: Vec<f64> = source
-                                .gains()
-                                .iter()
-                                .map(|&g| f64::from(g) / 10.0)
-                                .collect();
-                            if !gains.is_empty() {
-                                let _ = dsp_tx.send(DspToUi::GainList(gains));
-                            }
-                        }
-                        let _ = dsp_tx.send(DspToUi::SampleRateChanged(
-                            state.frontend.effective_sample_rate(),
-                        ));
-                        let _ =
-                            dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
-                    }
-                    Err(e) => {
-                        tracing::warn!("source switch failed: {e}");
-                        let _ = dsp_tx.send(DspToUi::Error(format!("Source switch failed: {e}")));
-                        let _ = dsp_tx.send(DspToUi::SourceStopped);
-                    }
-                }
-            }
+            source::handle_set_source_type(state, dsp_tx, source_type);
         }
 
         UiToDsp::SetNetworkConfig {
@@ -1892,21 +1001,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             requested_role,
             auth_key,
         } => {
-            // Role-only updates log the role; auth-key updates
-            // log the has/not-has state, not the bytes.
-            tracing::debug!(
-                ?requested_role,
-                auth_key_set = auth_key.is_some(),
-                "set rtl_tcp client config"
-            );
-            state.rtl_tcp_requested_role = requested_role;
-            state.rtl_tcp_auth_key = auth_key;
-            // Takes effect on the NEXT connect. An already-
-            // running rtl_tcp session keeps its admitted role
-            // until it disconnects — changing role mid-stream
-            // would require the server to re-admit the client,
-            // which the wire protocol doesn't support (the
-            // role byte is part of the hello). Per issue #396.
+            source::handle_set_rtl_tcp_client_config(state, requested_role, auth_key);
         }
 
         UiToDsp::SetFilePath(path) => {
@@ -1915,79 +1010,15 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetFileLooping(looping) => {
-            // Store on the state so a source rebuild (e.g. after
-            // a file-path change) picks up the latest setting,
-            // and also apply to the live source so an already-
-            // playing file starts / stops looping at its next
-            // EOF. Non-file sources silently accept per the
-            // trait default. Per issue #236.
-            tracing::debug!(looping, "set file looping");
-            state.file_looping = looping;
-            if let Some(source) = &mut state.source
-                && let Err(e) = source.set_looping(looping)
-            {
-                tracing::warn!("set file looping failed: {e}");
-                let _ = dsp_tx.send(DspToUi::Error(format!("File looping failed: {e}")));
-            }
+            source::handle_set_file_looping(state, dsp_tx, looping);
         }
 
         UiToDsp::SetBiasTee(enabled) => {
-            tracing::debug!(enabled, "set bias tee");
-            // Persist FIRST so a dispatch with no live source
-            // (e.g. startup before the user hits Play) survives
-            // until `open_source` runs. Per CR on PR #550.
-            state.bias_tee_enabled = enabled;
-            if let Some(source) = &mut state.source {
-                // Live-stream path: dongle is open and held by the
-                // running source.
-                if let Err(e) = source.set_bias_tee(enabled) {
-                    tracing::warn!("set bias tee failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Bias tee failed: {e}")));
-                }
-            } else if state.source_type == SourceType::RtlSdr {
-                // Idle path (#652): no live source, but the user has
-                // selected RTL-SDR. Briefly open the dongle, set the
-                // GPIO, and drop. Lets a user toggle bias-T between
-                // sessions to power their SAWbird+ on/off without
-                // having to start playback first. The RTL-SDR Blog v3
-                // GPIO latches state across device close, so the
-                // change persists until the next toggle (or until a
-                // streaming session reapplies via
-                // `rtl_sdr_replay_persisted_settings`).
-                if let Err(e) = apply_bias_tee_idle(DEVICE_INDEX, enabled) {
-                    tracing::warn!("idle bias-T toggle failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!(
-                        "Bias tee toggle failed (device busy or unavailable): {e}"
-                    )));
-                }
-            }
-            // For non-RTL-SDR source types (file / network), bias-T
-            // doesn't apply — silent no-op consistent with
-            // `RtlSdrSource::set_bias_tee`'s default trait fallback.
+            source::handle_set_bias_tee(state, dsp_tx, enabled);
         }
 
         UiToDsp::SetDirectSampling(mode) => {
-            tracing::debug!(mode, "set direct sampling");
-            if (DIRECT_SAMPLING_MIN..=DIRECT_SAMPLING_MAX).contains(&mode) {
-                // Persist FIRST so a dispatch with no live source
-                // survives until `open_source` runs. Per #551.
-                state.direct_sampling_mode = mode;
-                if let Some(source) = &mut state.source
-                    && let Err(e) = source.set_direct_sampling(mode)
-                {
-                    tracing::warn!("set direct sampling failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Direct sampling failed: {e}")));
-                }
-            } else {
-                tracing::warn!(
-                    "set direct sampling rejected: mode {mode} out of range \
-                     ({DIRECT_SAMPLING_MIN}..={DIRECT_SAMPLING_MAX})"
-                );
-                let _ = dsp_tx.send(DspToUi::Error(format!(
-                    "Direct sampling mode {mode} out of range \
-                     ({DIRECT_SAMPLING_MIN}..={DIRECT_SAMPLING_MAX})"
-                )));
-            }
+            source::handle_set_direct_sampling(state, dsp_tx, mode);
         }
 
         UiToDsp::SetOffsetTuning(enabled) => {
@@ -2017,59 +1048,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetGainByIndex(index) => {
-            tracing::debug!(index, "set gain by index");
-            // Persist FIRST so a dispatch with no live source
-            // survives until `open_source` runs. The bounds
-            // check below depends on the live source's gain
-            // table, so we can only validate when a source is
-            // present — replay also bounds-checks against the
-            // freshly-opened source. Per #551.
-            state.tuner_gain_index = Some(index);
-            if let Some(source) = &mut state.source {
-                // Bounds-check the index. Two sources of truth for
-                // the legal count:
-                //
-                //   1. `source.gains()` — populated for local
-                //      RTL-SDR USB (the tuner's discrete gain
-                //      table).
-                //   2. The rtl_tcp `Connected` connection state's
-                //      `gain_count` field — servers publish the
-                //      count but not the values, and
-                //      `RtlTcpSource::gains()` returns an empty
-                //      slice.
-                //
-                // Prefer (1) when it's non-empty; fall back to
-                // (2) for the rtl_tcp case. If neither is
-                // available we dispatch the command unchecked —
-                // the source may no-op (default trait impl) or
-                // surface a wire-level error later. Per
-                // `CodeRabbit` round 1 on PR #360.
-                let max_count = {
-                    let gains_len = source.gains().len();
-                    if gains_len > 0 {
-                        Some(gains_len)
-                    } else {
-                        match source.rtl_tcp_connection_state() {
-                            Some(sdr_types::RtlTcpConnectionState::Connected {
-                                gain_count,
-                                ..
-                            }) => Some(gain_count as usize),
-                            _ => None,
-                        }
-                    }
-                };
-                if let Some(max) = max_count
-                    && (index as usize) >= max
-                {
-                    tracing::warn!("set gain by index rejected: {index} >= {max}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!(
-                        "Gain index {index} out of range (source has {max} gains)"
-                    )));
-                } else if let Err(e) = source.set_gain_by_index(index) {
-                    tracing::warn!("set gain by index failed: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
-                }
-            }
+            source::handle_set_gain_by_index(state, dsp_tx, index);
         }
 
         UiToDsp::SetPpmCorrection(ppm) => {
@@ -2086,41 +1065,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::StartAudioRecording(path) => {
-            tracing::info!(?path, "start audio recording");
-            // Open the writer FIRST. If it fails we want to leave
-            // the scanner untouched — sending `ScannerMutexStopped`
-            // before knowing the recording actually started would
-            // visibly kill the scanner in the UI and misleadingly
-            // tell the user recording started.
-            match WavWriter::new(&path, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS) {
-                Ok(writer) => {
-                    // Recording committed — now apply the mutex.
-                    // Scanner, per-hit recording, and transcription
-                    // are mutually exclusive in Phase 1.
-                    if state.scanner.is_enabled() {
-                        let cmds = state
-                            .scanner
-                            .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
-                        apply_scanner_commands(state, dsp_tx, cmds);
-                        let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                            ScannerMutexReason::ScannerStoppedForRecording,
-                        ));
-                    }
-                    // Recording ↔ transcription leg: stop any active
-                    // transcription tap so the two don't run concurrently.
-                    // `stop_transcription` is silent (no DspToUi event) —
-                    // the transcription lifecycle has no feedback channel
-                    // today, matching the existing DisableTranscription
-                    // path. UI-switch resync is a known follow-up.
-                    stop_transcription(state);
-                    state.audio_writer = Some(writer);
-                    let _ = dsp_tx.send(DspToUi::AudioRecordingStarted(path));
-                }
-                Err(e) => {
-                    tracing::warn!("failed to start audio recording: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("Audio record failed: {e}")));
-                }
-            }
+            audio::handle_start_audio_recording(state, dsp_tx, path);
         }
 
         UiToDsp::StopAudioRecording => {
@@ -2131,39 +1076,11 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::SetLrptImage(image) => {
-            tracing::info!("LRPT image handle attached — decoder tap will push lines");
-            state.lrpt_image = Some(image);
-            // Decoder state intentionally NOT dropped here.
-            // `AppState::lrpt_image` is a long-lived singleton
-            // — every `SetLrptImage` carries the same handle —
-            // so reattach is logically a no-op for the decoder.
-            // Earlier draft dropped it defensively, but that
-            // turned the round-11 (`CodeRabbit` PR #543)
-            // defensive re-send in `open_lrpt_viewer_if_needed`
-            // into a mid-pass decoder reset that lost Viterbi /
-            // sync state on every viewer reuse. Decoder
-            // lifecycle stays owned by source-stop cleanup —
-            // same contract `ClearLrptImage` codifies (round 1).
+            lrpt::handle_set_lrpt_image(state, image);
         }
 
         UiToDsp::SetLrptDownlink(downlink) => {
-            tracing::info!("LRPT downlink profile set to {downlink:?}");
-            // Drop the existing decoder iff the profile actually
-            // changed — re-init lazily on the next IQ chunk with
-            // the new chains. A no-op repeat (auto-record
-            // re-sending the same profile across overlapping
-            // passes) won't cost a Viterbi reset.
-            if state.lrpt_downlink != downlink {
-                state.lrpt_downlink = downlink;
-                // The harvest holds back the in-progress row group
-                // (#725); hand it to the viewer before the decoder
-                // goes away.
-                if let Some(decoder) = state.lrpt_decoder.as_mut() {
-                    decoder.flush_pending_lines();
-                }
-                state.lrpt_decoder = None;
-                state.lrpt_init_failed = false;
-            }
+            lrpt::handle_set_lrpt_downlink(state, downlink);
         }
 
         UiToDsp::ClearLrptImageContents(image) => {
@@ -2174,19 +1091,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::ClearLrptImage => {
-            tracing::info!("LRPT image handle cleared — decoder tap is silent");
-            state.lrpt_image = None;
-            // Decoder state stays alive — the tap is already
-            // disabled because `lrpt_image` is None, and
-            // teardown / reset belong to the source-stop
-            // cleanup path. Mirrors the APT decoder, which
-            // also keeps its state across stop-listening /
-            // resume-listening cycles so resumed listening
-            // doesn't pay re-init cost. The `messages.rs`
-            // doc-comment for `ClearLrptImage` codifies this
-            // contract; an earlier draft contradicted it by
-            // dropping the decoder here. Per CodeRabbit
-            // round 1 on PR #543.
+            lrpt::handle_clear_lrpt_image(state);
         }
 
         UiToDsp::SetSstvImage(handle) => {
@@ -2224,46 +1129,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::StartIqRecording(path) => {
-            tracing::info!(?path, "start IQ recording");
-            // The header bakes in `state.sample_rate`, which is only
-            // authoritative while a source is open (it is read back
-            // from the hardware in `open_source`). With no source
-            // there is no IQ to record anyway, and a writer opened
-            // now would get whatever stale rate the last session
-            // left behind (#695).
-            if state.source.is_none() {
-                tracing::warn!("IQ recording rejected: no source is running");
-                let _ = dsp_tx.send(DspToUi::Error(
-                    "IQ record failed: press Play before recording IQ".to_string(),
-                ));
-                return;
-            }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let iq_rate = state.sample_rate as u32;
-            // Open-first, apply-mutex-on-success — same rationale
-            // as `StartAudioRecording` above.
-            match WavWriter::new(&path, iq_rate, IQ_CHANNELS) {
-                Ok(writer) => {
-                    if state.scanner.is_enabled() {
-                        let cmds = state
-                            .scanner
-                            .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
-                        apply_scanner_commands(state, dsp_tx, cmds);
-                        let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                            ScannerMutexReason::ScannerStoppedForRecording,
-                        ));
-                    }
-                    // Recording ↔ transcription mutex — see
-                    // StartAudioRecording for rationale.
-                    stop_transcription(state);
-                    state.iq_writer = Some(writer);
-                    let _ = dsp_tx.send(DspToUi::IqRecordingStarted(path));
-                }
-                Err(e) => {
-                    tracing::warn!("failed to start IQ recording: {e}");
-                    let _ = dsp_tx.send(DspToUi::Error(format!("IQ record failed: {e}")));
-                }
-            }
+            audio::handle_start_iq_recording(state, dsp_tx, path);
         }
 
         UiToDsp::StopIqRecording => {
@@ -2273,196 +1139,30 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         }
 
         UiToDsp::EnableTranscription(tx) => {
-            // Scanner ↔ transcription mutex was REMOVED — the two
-            // are designed to coexist (issue #517 emits per-channel
-            // markers in the transcript log when the scanner hops).
-            // Recording ↔ transcription mutex still applies because
-            // a running WAV writer + concurrent transcription tap
-            // produced inconsistent audio flow in earlier rounds.
-            // Recording ↔ transcription leg of the mutex. Both
-            // `stop_any_recording` sends cover the UI (it emits
-            // `AudioRecordingStopped` / `IqRecordingStopped`), so
-            // the recording buttons flip off automatically.
-            stop_any_recording(state, dsp_tx);
-            // Reset the TRANSCRIPTION-side squelch edge tracker when a
-            // new tap is wired up. Without this, a previous session
-            // that ended with squelch open leaves the tracker `true`,
-            // so the first chunk of the new session sees `now_open ==
-            // was_open` and no SquelchOpened edge is emitted — the
-            // offline Auto Break state machine would stay in Idle and
-            // drop the entire current transmission until the next
-            // open/close cycle. The SCANNER tracker
-            // (`squelch_was_open`) is intentionally NOT reset here:
-            // doing so used to fire a spurious `ScannerEvent::SquelchEdge`
-            // on the next block once the mutex was removed (the two
-            // are now designed to coexist). Per CodeRabbit round 1 on
-            // PR #558.
-            state.transcription_squelch_was_open = false;
-            state.transcription_tx = Some(tx);
-            tracing::info!("transcription audio tap enabled");
+            transcription::handle_enable_transcription(state, dsp_tx, tx);
         }
         UiToDsp::DisableTranscription => {
-            state.transcription_tx = None;
-            // Mirror the reset on disable so a subsequent
-            // EnableTranscription always starts from a known state.
-            // Scanner tracker is independent and stays intact.
-            state.transcription_squelch_was_open = false;
-            tracing::info!("transcription audio tap disabled");
+            transcription::handle_disable_transcription(state);
         }
 
         UiToDsp::EnableAudioTap(tx) => {
-            // Generic audio tap — post-demod, pre-volume, resampled to
-            // 16 kHz mono and dropped into `tx`. Distinct from the
-            // transcription tap above so embedders receive
-            // recognizer-ready samples without pulling in the
-            // sdr-transcription dep.
-            state.audio_tap_tx = Some(tx);
-            // Reset the decimation phase so a new tap session starts
-            // at clean 3:1 alignment — otherwise a stale phase from
-            // a previous session (disabled, then re-enabled) would
-            // desynchronize the 16 kHz timebase until the phase
-            // wraps.
-            state.audio_tap_phase = 0;
-            tracing::info!("audio tap enabled");
+            audio::handle_enable_audio_tap(state, tx);
         }
         UiToDsp::DisableAudioTap => {
-            state.audio_tap_tx = None;
-            tracing::info!("audio tap disabled");
+            audio::handle_disable_audio_tap(state);
         }
         UiToDsp::DisconnectRtlTcp => {
-            // Only meaningful while `RtlTcp` is the active source
-            // type. For any other source we log-and-drop so
-            // misrouted commands from buggy UI paths don't panic.
-            if state.source_type != SourceType::RtlTcp {
-                tracing::debug!(
-                    active = ?state.source_type,
-                    "DisconnectRtlTcp ignored — active source is not RtlTcp"
-                );
-                return;
-            }
-            // Same teardown as every other stop path: `cleanup()`
-            // stops the source AND the audio sink, finalizes WAV
-            // writers, emits `NetworkSinkStatus::Inactive`, disengages
-            // ACARS and flushes the imaging decoders. Dropping the
-            // source by hand skipped all of that, so the next Play
-            // hit `AlreadyRunning` on the sink and latched audio
-            // offline for the rest of the session (#693). `cleanup()`
-            // leaves `state.source = None`, so
-            // `rtl_tcp_connection_state` reports Disconnected on the
-            // next poll and the UI row reflects reality.
-            cleanup(state, dsp_tx);
-            state.running = false;
-            let _ = dsp_tx.send(DspToUi::SourceStopped);
+            source::handle_disconnect_rtl_tcp(state, dsp_tx);
         }
         UiToDsp::RetryRtlTcpNow => {
-            // "Retry now" REBUILDS the `RtlTcpSource` from the
-            // latest `DspState` (role + auth_key) instead of just
-            // stopping + starting the existing instance. Rebuild
-            // is required because the role / auth-key config is
-            // baked into `RtlTcpSource` at construction via
-            // `with_config(...)`; a subsequent `start()` on the
-            // same instance replays its original `ClientHello`,
-            // which means a newly-entered key or flipped role
-            // from the UI would never land on the wire until the
-            // user forced a full source tear-down (Stop + Play,
-            // source-type switch). After an `AuthRequired` /
-            // `AuthFailed` / `ControllerBusy` denial those retry
-            // semantics are explicitly user-driven, so the
-            // rebuild is the correct behavior.
-            //
-            // The sticky-command replay cache (gain, AGC, PPM,
-            // bias tee, direct sampling, etc.) is carried across
-            // the rebuild via the Source-trait snapshot hooks so
-            // the reconnect lands with the pre-retry device state.
-            // Per `CodeRabbit` round 3 on PR #408.
-            if state.source_type != SourceType::RtlTcp {
-                tracing::debug!(
-                    active = ?state.source_type,
-                    "RetryRtlTcpNow ignored — active source is not RtlTcp"
-                );
-                return;
-            }
-            if state.source.is_none() {
-                tracing::debug!("RetryRtlTcpNow ignored — no live source (was disconnected)");
-                return;
-            }
-            rebuild_rtl_tcp_source(state, dsp_tx, /* request_takeover */ false);
+            source::handle_retry_rtl_tcp_now(state, dsp_tx);
         }
         UiToDsp::RetryRtlTcpWithTakeover => {
-            // One-shot Take-control reconnect per #396. Same
-            // rebuild machinery as `RetryRtlTcpNow`, but with
-            // `request_takeover = true` set on the rebuilt
-            // config's `ClientHello`. The flag doesn't persist on
-            // `DspState` — the next non-takeover retry or a
-            // fresh `open_source` (Play after Stop, source-type
-            // switch) rebuilds without it. Keeping takeover
-            // "one-shot per action" matches the #393 spec:
-            // takeover is an explicit user decision, not a
-            // persistent preference.
-            if state.source_type != SourceType::RtlTcp {
-                tracing::debug!(
-                    active = ?state.source_type,
-                    "RetryRtlTcpWithTakeover ignored — active source is not RtlTcp"
-                );
-                return;
-            }
-            // Gate on a live source. After `DisconnectRtlTcp`
-            // the source is gone (`state.source = None`) but
-            // `state.source_type` remains `RtlTcp`, so a stale
-            // "Take control" toast action could otherwise
-            // recreate + start a fresh source here — breaking
-            // the disconnect contract (reopen path after an
-            // explicit disconnect is Play/Start, not a retry
-            // command). Mirrors the `RetryRtlTcpNow` gate above.
-            if state.source.is_none() {
-                tracing::debug!(
-                    "RetryRtlTcpWithTakeover ignored — no live source (was disconnected)"
-                );
-                return;
-            }
-            rebuild_rtl_tcp_source(state, dsp_tx, /* request_takeover */ true);
+            source::handle_retry_rtl_tcp_with_takeover(state, dsp_tx);
         }
         // --- Scanner (#317) ---
         UiToDsp::SetScannerEnabled(enabled) => {
-            // Reject scanner enable while ACARS is engaged. The
-            // reverse direction (refusing ACARS engage while
-            // scanner is running) was added in CR round 16; this
-            // closes the symmetric hole. Without it, enabling
-            // scanner mid-engagement would retune the source via
-            // apply_scanner_commands and violate the airband-lock
-            // invariants the round 14-15 UiToDsp guards protect.
-            // CR round 17 on PR #584.
-            if enabled && state.acars_pre_lock.is_some() {
-                tracing::warn!("scanner enable rejected: ACARS airband lock is active");
-                let _ = dsp_tx.send(DspToUi::Error(
-                    "Scanner enable ignored: ACARS airband lock is active. \
-                     Disable ACARS first."
-                        .to_string(),
-                ));
-                return;
-            }
-            if enabled && stop_any_recording(state, dsp_tx) {
-                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                    ScannerMutexReason::RecordingStoppedForScanner,
-                ));
-            }
-            // Without a gating squelch there is no carrier detection,
-            // so the scanner can only hop on dwell timeouts and never
-            // stop on activity. Tell the user instead of looking
-            // broken. Per #755.
-            if enabled && !state.radio.if_chain().squelch_active() {
-                let _ = dsp_tx.send(DspToUi::Error(
-                    "Scanner: enable manual or auto squelch so it can detect activity; \
-                     without it the scanner will only cycle through channels."
-                        .to_string(),
-                ));
-            }
-            // Scanner ↔ transcription mutex was REMOVED — the two
-            // are designed to coexist (issue #517).
-            let cmds = state
-                .scanner
-                .handle_event(sdr_scanner::ScannerEvent::SetEnabled(enabled));
-            apply_scanner_commands(state, dsp_tx, cmds);
+            scanner::handle_set_scanner_enabled(state, dsp_tx, enabled);
         }
         UiToDsp::UpdateScannerChannels(channels) => {
             state.scanner_channels.clone_from(&channels);
@@ -2500,29 +1200,7 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             }
         }
         UiToDsp::SetAcarsRegion(region) => {
-            // Issue #581. Region is consulted at engage time;
-            // mutating it while engaged would create a state
-            // mismatch (live channels still tuned to the old
-            // region's freqs but `state.acars_region` says
-            // otherwise). Reject mid-engage and let the UI
-            // surface the constraint — the existing airband-
-            // lock invariant says geometry-affecting commands
-            // are user-disabled while engaged anyway, but the
-            // engaged-rejection path here is the belt to that
-            // suspenders.
-            if state.acars_pre_lock.is_some() {
-                tracing::warn!(
-                    requested = ?region,
-                    "ignoring SetAcarsRegion while ACARS engaged; disengage first",
-                );
-            } else {
-                tracing::info!(
-                    from = ?state.acars_region,
-                    to = ?region,
-                    "ACARS region changed",
-                );
-                state.acars_region = region;
-            }
+            acars::handle_set_acars_region(state, region);
         }
         // --- ACARS output commands (#578) ---
         UiToDsp::SetAcarsJsonlEnabled(enabled) => {
