@@ -335,34 +335,16 @@ fn wire_acars_output_rows(
     // handlers only fire on user-initiated changes, so we
     // need to seed the subtitle explicitly. CR round 1 on
     // PR #595.
-    {
-        let path = panel.jsonl_path_row.text();
-        let active = panel.jsonl_enable_row.is_active();
-        let subtitle = if active {
-            if path.is_empty() {
-                "~/sdr-recordings/acars.jsonl".to_string()
-            } else {
-                path.to_string()
-            }
-        } else {
-            "Off".to_string()
-        };
-        panel.jsonl_enable_row.set_subtitle(&subtitle);
-    }
-    {
-        let addr = panel.network_addr_row.text();
-        let active = panel.network_enable_row.is_active();
-        let subtitle = if active {
-            if addr.is_empty() {
-                "feed.airframes.io:5550".to_string()
-            } else {
-                addr.to_string()
-            }
-        } else {
-            "Off".to_string()
-        };
-        panel.network_enable_row.set_subtitle(&subtitle);
-    }
+    seed_output_toggle_subtitle(
+        &panel.jsonl_enable_row,
+        &panel.jsonl_path_row.text(),
+        "~/sdr-recordings/acars.jsonl",
+    );
+    seed_output_toggle_subtitle(
+        &panel.network_enable_row,
+        &panel.network_addr_row.text(),
+        "feed.airframes.io:5550",
+    );
 
     // Wire station_id_row — per-keystroke save + dispatch.
     // Station ID changes are cheap on the DSP side (just
@@ -385,6 +367,22 @@ fn wire_acars_output_rows(
     wire_jsonl_output_rows(panel, state, config);
 
     wire_network_output_rows(panel, state, config);
+}
+
+/// Seed an output-toggle row's subtitle to match its current state:
+/// the configured value (or the default when empty) while active,
+/// "Off" otherwise. Shared by the JSONL and network rows.
+fn seed_output_toggle_subtitle(enable_row: &adw::SwitchRow, value: &str, default_value: &str) {
+    let subtitle = if enable_row.is_active() {
+        if value.is_empty() {
+            default_value.to_string()
+        } else {
+            value.to_string()
+        }
+    } else {
+        "Off".to_string()
+    };
+    enable_row.set_subtitle(&subtitle);
 }
 
 /// Custom-channels CSV apply row (Enter / focus-out): parse, validate, persist + dispatch.
