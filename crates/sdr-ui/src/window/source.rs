@@ -593,75 +593,16 @@ pub(super) fn connect_rtl_tcp_discovery(
         });
     }
 
-    // Populate the hostname / port fields on startup from the last
-    // connected server, if any. Runs once before the poller starts
-    // so the user sees "the server they were last on" immediately
-    // instead of having to wait for a fresh mDNS beacon. No-op on
-    // first launch / after a config reset.
-    //
-    // Protocol row is forced to TCP *before* the hostname / port
-    // writes. Those writes fire `connect_changed` / `connect_value_
-    // notify` handlers that re-read `protocol_row.selected()` and
-    // dispatch `SetNetworkConfig { protocol: ... }`. If the shared
-    // protocol row was restored to UDP from a prior raw-Network
-    // session, the restore path would otherwise push a UDP
-    // `SetNetworkConfig` against the RTL-TCP endpoint on the very
-    // first tick. Pinning TCP first keeps the restore both silent
-    // to the user and correct end-to-end.
-    // Only hydrate the shared host / port / protocol row triple
-    // with the last-connected RTL-TCP server when the persisted
-    // source type is actually RTL-TCP. If the user was last on
-    // raw Network, the values restored by `connect_source_panel`
-    // a moment earlier (KEY_SOURCE_NETWORK_*) are the right ones
-    // to keep visible — overwriting them with an unrelated
-    // RTL-TCP endpoint just because one was once connected would
-    // surprise the user on every restart. Per `CodeRabbit` round
-    // 2 on PR #558.
-    let restored_source_is_rtl_tcp =
-        sidebar::source_panel::load_source_device_index(&config_for_discovery)
-            == sidebar::source_panel::DEVICE_RTLTCP;
-    if restored_source_is_rtl_tcp
-        && let Some(last) = crate::sidebar::source_panel::load_last_connected(&config_for_discovery)
-    {
-        // Same guarded-rewrite idiom as `apply_rtl_tcp_connect`:
-        // hydrating the last-connected RTL-TCP server must not
-        // overwrite `KEY_SOURCE_NETWORK_*` (the raw-Network
-        // triple). The persistence handlers for those rows
-        // observe the flag and skip the disk-write, AND skip
-        // the `SetNetworkConfig` dispatch so the three row
-        // mutations don't kick three intermediate reconnects
-        // against a partially-rewritten triple. Per `CodeRabbit`
-        // rounds 1 and 2 on PR #558.
-        state.rtl_tcp_hydration_in_progress.set(true);
-        protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
-        hostname_row.set_text(&last.host);
-        port_row.set_value(f64::from(last.port));
-        state.rtl_tcp_hydration_in_progress.set(false);
-        // Emit the canonical `SetNetworkConfig` for the restored
-        // RTL-TCP endpoint *after* the flag clears, mirroring
-        // `apply_rtl_tcp_connect`'s own post-hydration dispatch.
-        // Without this, the only `SetNetworkConfig` the DSP saw
-        // came from `connect_source_panel`'s raw-Network restore
-        // a moment earlier — so first Play on a persisted
-        // RTL-TCP session would dial the stale raw-Network
-        // endpoint until the user nudged a row by hand. Per
-        // `CodeRabbit` round 4 on PR #558.
-        state.send_dsp(UiToDsp::SetNetworkConfig {
-            hostname: last.host.clone(),
-            port: last.port,
-            protocol: sdr_types::Protocol::TcpClient,
-        });
-    }
+    restore_last_connected_endpoint(
+        state,
+        config,
+        favorites,
+        &config_for_discovery,
+        &hostname_row,
+        &port_row,
+        &protocol_row,
+    );
 
-    // Poll the discovery channel from the main thread. Cheap enough
-    // to be always-on; discovery events are bursty at start and then
-    // idle.
-    //
-    // Gated on `Some(browser)` so we don't spawn a poller against a
-    // dead `disc_rx` when mDNS startup failed. The
-    // `DISCOVERY_UNAVAILABLE_SUBTITLE` set in the `Err` branch
-    // stays on the expander as the long-term idle state; the
-    // restore / favorites paths above already ran unconditionally.
     let row_deps = Rc::new(DiscoveredRowDeps {
         hostname_row: hostname_row.clone(),
         port_row: port_row.clone(),
@@ -4095,4 +4036,88 @@ fn refresh_favorite_metadata(
             rebuild_favorites_popover(&favorite_row_ctx, &favs);
         }
     }
+}
+
+/// Startup hydration of hostname/port from the persisted last-connected server (RTL-TCP only).
+/// Split out per the 50-NLOC gate (#817).
+fn restore_last_connected_endpoint(
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    config_for_discovery: &std::sync::Arc<sdr_config::ConfigManager>,
+    hostname_row: &adw::EntryRow,
+    port_row: &adw::SpinRow,
+    protocol_row: &adw::ComboRow,
+) {
+    // Populate the hostname / port fields on startup from the last
+    // connected server, if any. Runs once before the poller starts
+    // so the user sees "the server they were last on" immediately
+    // instead of having to wait for a fresh mDNS beacon. No-op on
+    // first launch / after a config reset.
+    //
+    // Protocol row is forced to TCP *before* the hostname / port
+    // writes. Those writes fire `connect_changed` / `connect_value_
+    // notify` handlers that re-read `protocol_row.selected()` and
+    // dispatch `SetNetworkConfig { protocol: ... }`. If the shared
+    // protocol row was restored to UDP from a prior raw-Network
+    // session, the restore path would otherwise push a UDP
+    // `SetNetworkConfig` against the RTL-TCP endpoint on the very
+    // first tick. Pinning TCP first keeps the restore both silent
+    // to the user and correct end-to-end.
+    // Only hydrate the shared host / port / protocol row triple
+    // with the last-connected RTL-TCP server when the persisted
+    // source type is actually RTL-TCP. If the user was last on
+    // raw Network, the values restored by `connect_source_panel`
+    // a moment earlier (KEY_SOURCE_NETWORK_*) are the right ones
+    // to keep visible — overwriting them with an unrelated
+    // RTL-TCP endpoint just because one was once connected would
+    // surprise the user on every restart. Per `CodeRabbit` round
+    // 2 on PR #558.
+    let restored_source_is_rtl_tcp =
+        sidebar::source_panel::load_source_device_index(&config_for_discovery)
+            == sidebar::source_panel::DEVICE_RTLTCP;
+    if restored_source_is_rtl_tcp
+        && let Some(last) = crate::sidebar::source_panel::load_last_connected(&config_for_discovery)
+    {
+        // Same guarded-rewrite idiom as `apply_rtl_tcp_connect`:
+        // hydrating the last-connected RTL-TCP server must not
+        // overwrite `KEY_SOURCE_NETWORK_*` (the raw-Network
+        // triple). The persistence handlers for those rows
+        // observe the flag and skip the disk-write, AND skip
+        // the `SetNetworkConfig` dispatch so the three row
+        // mutations don't kick three intermediate reconnects
+        // against a partially-rewritten triple. Per `CodeRabbit`
+        // rounds 1 and 2 on PR #558.
+        state.rtl_tcp_hydration_in_progress.set(true);
+        protocol_row.set_selected(NETWORK_PROTOCOL_TCPCLIENT_IDX);
+        hostname_row.set_text(&last.host);
+        port_row.set_value(f64::from(last.port));
+        state.rtl_tcp_hydration_in_progress.set(false);
+        // Emit the canonical `SetNetworkConfig` for the restored
+        // RTL-TCP endpoint *after* the flag clears, mirroring
+        // `apply_rtl_tcp_connect`'s own post-hydration dispatch.
+        // Without this, the only `SetNetworkConfig` the DSP saw
+        // came from `connect_source_panel`'s raw-Network restore
+        // a moment earlier — so first Play on a persisted
+        // RTL-TCP session would dial the stale raw-Network
+        // endpoint until the user nudged a row by hand. Per
+        // `CodeRabbit` round 4 on PR #558.
+        state.send_dsp(UiToDsp::SetNetworkConfig {
+            hostname: last.host.clone(),
+            port: last.port,
+            protocol: sdr_types::Protocol::TcpClient,
+        });
+    }
+
+    // Poll the discovery channel from the main thread. Cheap enough
+    // to be always-on; discovery events are bursty at start and then
+    // idle.
+    //
+    // Gated on `Some(browser)` so we don't spawn a poller against a
+    // dead `disc_rx` when mDNS startup failed. The
+    // `DISCOVERY_UNAVAILABLE_SUBTITLE` set in the `Err` branch
+    // stays on the expander as the long-term idle state; the
+    // restore / favorites paths above already ran unconditionally.
 }
