@@ -4610,7 +4610,7 @@ fn process_iq_block(
                             state.audio_buf[..audio_count].fill(sdr_types::Stereo::default());
                         }
 
-                        // Send to the audio sink (PipeWire).
+                        // Send to the selected audio sink.
                         if audio_count > 0 {
                             state.audio_frames_written = state
                                 .audio_frames_written
