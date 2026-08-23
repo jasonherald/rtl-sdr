@@ -207,150 +207,7 @@ pub(super) fn connect_transcript_panel(
     let live_line_weak = live_line_label.downgrade();
 
     #[cfg(feature = "sherpa")]
-    {
-        let status_label_reload = status_label.clone();
-        let progress_bar_reload = progress_bar.clone();
-        let enable_row_reload = transcript.enable_row.clone();
-        // Config handle for the deferred-persistence path. We write
-        // KEY_SHERPA_MODEL only after InitEvent::Ready fires so a
-        // failed recognizer swap can't leave a broken model idx in
-        // config that would wedge next startup's init_sherpa_host.
-        let config_for_reload_persist = std::sync::Arc::clone(config);
-        transcript.model_row.connect_selected_notify(move |row| {
-            let idx = row.selected() as usize;
-            let Some(new_model) = sdr_transcription::SherpaModel::ALL.get(idx).copied() else {
-                return;
-            };
-
-            tracing::info!(?new_model, "user changed model — triggering runtime reload");
-
-            // Disable BOTH rows while the reload is in flight:
-            // - model_row so the user can't queue up multiple reloads
-            //   via rapid switching
-            // - enable_row so the user can't start/stop transcription
-            //   on top of an in-flight recognizer swap. Without this,
-            //   the stop-path teardown would re-enable model_row before
-            //   the reload finishes, reopening the queued-reload window
-            //   this block is closing.
-            // Both are re-enabled from the timeout closure on Ready /
-            // Failed / channel disconnect.
-            row.set_sensitive(false);
-            enable_row_reload.set_sensitive(false);
-            let model_row_reload_weak = row.downgrade();
-            let enable_row_reload_weak = enable_row_reload.downgrade();
-
-            // Show the status area.
-            status_label_reload.set_text(&format!("Reloading {}...", new_model.label()));
-            status_label_reload.set_css_classes(&["dim-label"]);
-            status_label_reload.set_visible(true);
-            progress_bar_reload.set_fraction(0.0);
-            progress_bar_reload.set_visible(true);
-
-            let event_rx = sdr_transcription::reload_sherpa_host(new_model);
-
-            // Drain progress events on the main thread via a periodic timeout.
-            let status_weak = status_label_reload.downgrade();
-            let progress_weak = progress_bar_reload.downgrade();
-            let mut current_component: String = new_model.label().to_owned();
-            // Capture an Arc clone + the new idx for the deferred
-            // persistence path — written to config on Ready, dropped
-            // silently on Failed/Disconnected.
-            let config_for_this_reload = std::sync::Arc::clone(&config_for_reload_persist);
-            let persist_idx = idx;
-            glib::timeout_add_local(Duration::from_millis(100), move || {
-                let Some(status) = status_weak.upgrade() else {
-                    // Widgets are gone (window closing); model row is too,
-                    // so no need to re-enable it.
-                    return glib::ControlFlow::Break;
-                };
-                let Some(progress) = progress_weak.upgrade() else {
-                    return glib::ControlFlow::Break;
-                };
-
-                loop {
-                    match event_rx.try_recv() {
-                        Ok(sdr_transcription::InitEvent::DownloadStart { component }) => {
-                            component.clone_into(&mut current_component);
-                            status.set_text(&format!("Downloading {component}..."));
-                            progress.set_fraction(0.0);
-                        }
-                        Ok(sdr_transcription::InitEvent::DownloadProgress { pct }) => {
-                            status.set_text(&format!("Downloading {current_component}... {pct}%"));
-                            progress.set_fraction(f64::from(pct) / 100.0);
-                        }
-                        Ok(sdr_transcription::InitEvent::Extracting { component }) => {
-                            component.clone_into(&mut current_component);
-                            status.set_text(&format!("Extracting {component}..."));
-                        }
-                        Ok(sdr_transcription::InitEvent::CreatingRecognizer) => {
-                            status.set_text("Creating recognizer...");
-                            progress.set_visible(false);
-                        }
-                        Ok(sdr_transcription::InitEvent::Ready) => {
-                            tracing::info!("sherpa host reload complete");
-                            status.set_text("");
-                            status.set_visible(false);
-                            progress.set_visible(false);
-                            if let Some(model_row) = model_row_reload_weak.upgrade() {
-                                model_row.set_sensitive(true);
-                            }
-                            if let Some(enable_row) = enable_row_reload_weak.upgrade() {
-                                enable_row.set_sensitive(true);
-                            }
-                            // Deferred persistence: the recognizer swap
-                            // succeeded, so it's now safe to save the
-                            // new selection to config. If this Ready
-                            // arm never fires (reload failed), config
-                            // keeps the previous model idx and next
-                            // startup gets a known-working recognizer.
-                            config_for_this_reload.write(|v| {
-                                v[crate::sidebar::transcript_panel::KEY_SHERPA_MODEL] =
-                                    serde_json::json!(persist_idx);
-                            });
-                            return glib::ControlFlow::Break;
-                        }
-                        Ok(sdr_transcription::InitEvent::Failed { message }) => {
-                            tracing::warn!(%message, "sherpa host reload failed");
-                            status.set_text(&format!("Reload failed: {message}"));
-                            status.set_css_classes(&["error"]);
-                            status.set_visible(true);
-                            progress.set_visible(false);
-                            if let Some(model_row) = model_row_reload_weak.upgrade() {
-                                model_row.set_sensitive(true);
-                            }
-                            if let Some(enable_row) = enable_row_reload_weak.upgrade() {
-                                enable_row.set_sensitive(true);
-                            }
-                            return glib::ControlFlow::Break;
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            // Worker dropped its sender without sending Ready
-                            // or Failed — unusual but don't strand the UI in
-                            // a "Reloading..." state. Surface the disconnect
-                            // as an error and re-enable the controls so the
-                            // user can try a different model.
-                            tracing::warn!(
-                                "sherpa host reload event channel disconnected unexpectedly"
-                            );
-                            status.set_text("Reload failed: recognizer worker disconnected");
-                            status.set_css_classes(&["error"]);
-                            status.set_visible(true);
-                            progress.set_visible(false);
-                            if let Some(model_row) = model_row_reload_weak.upgrade() {
-                                model_row.set_sensitive(true);
-                            }
-                            if let Some(enable_row) = enable_row_reload_weak.upgrade() {
-                                enable_row.set_sensitive(true);
-                            }
-                            return glib::ControlFlow::Break;
-                        }
-                    }
-                }
-                glib::ControlFlow::Continue
-            });
-        });
-    }
+    wire_sherpa_model_reload(transcript, &status_label, &progress_bar, config);
 
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
@@ -893,4 +750,160 @@ pub(super) fn connect_transcript_panel(
     });
 
     engine
+}
+
+/// Sherpa model-selector reload wiring: on selection change, disable
+/// the model + enable rows, kick `reload_sherpa_host`, and drain its
+/// `InitEvent`s on a 100 ms tick. `KEY_SHERPA_MODEL` persists only
+/// after `Ready` so a failed swap can't wedge the next startup.
+/// Split out per the 50-NLOC gate (#817).
+#[cfg(feature = "sherpa")]
+fn wire_sherpa_model_reload(
+    transcript: &sidebar::transcript_panel::TranscriptPanel,
+    status_label: &gtk4::Label,
+    progress_bar: &gtk4::ProgressBar,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let status_label_reload = status_label.clone();
+    let progress_bar_reload = progress_bar.clone();
+    let enable_row_reload = transcript.enable_row.clone();
+    // Config handle for the deferred-persistence path. We write
+    // KEY_SHERPA_MODEL only after InitEvent::Ready fires so a
+    // failed recognizer swap can't leave a broken model idx in
+    // config that would wedge next startup's init_sherpa_host.
+    let config_for_reload_persist = std::sync::Arc::clone(config);
+    transcript.model_row.connect_selected_notify(move |row| {
+        let idx = row.selected() as usize;
+        let Some(new_model) = sdr_transcription::SherpaModel::ALL.get(idx).copied() else {
+            return;
+        };
+
+        tracing::info!(?new_model, "user changed model — triggering runtime reload");
+
+        // Disable BOTH rows while the reload is in flight:
+        // - model_row so the user can't queue up multiple reloads
+        //   via rapid switching
+        // - enable_row so the user can't start/stop transcription
+        //   on top of an in-flight recognizer swap. Without this,
+        //   the stop-path teardown would re-enable model_row before
+        //   the reload finishes, reopening the queued-reload window
+        //   this block is closing.
+        // Both are re-enabled from the timeout closure on Ready /
+        // Failed / channel disconnect.
+        row.set_sensitive(false);
+        enable_row_reload.set_sensitive(false);
+        let model_row_reload_weak = row.downgrade();
+        let enable_row_reload_weak = enable_row_reload.downgrade();
+
+        // Show the status area.
+        status_label_reload.set_text(&format!("Reloading {}...", new_model.label()));
+        status_label_reload.set_css_classes(&["dim-label"]);
+        status_label_reload.set_visible(true);
+        progress_bar_reload.set_fraction(0.0);
+        progress_bar_reload.set_visible(true);
+
+        let event_rx = sdr_transcription::reload_sherpa_host(new_model);
+
+        // Drain progress events on the main thread via a periodic timeout.
+        let status_weak = status_label_reload.downgrade();
+        let progress_weak = progress_bar_reload.downgrade();
+        let mut current_component: String = new_model.label().to_owned();
+        // Capture an Arc clone + the new idx for the deferred
+        // persistence path — written to config on Ready, dropped
+        // silently on Failed/Disconnected.
+        let config_for_this_reload = std::sync::Arc::clone(&config_for_reload_persist);
+        let persist_idx = idx;
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            let Some(status) = status_weak.upgrade() else {
+                // Widgets are gone (window closing); model row is too,
+                // so no need to re-enable it.
+                return glib::ControlFlow::Break;
+            };
+            let Some(progress) = progress_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+
+            loop {
+                match event_rx.try_recv() {
+                    Ok(sdr_transcription::InitEvent::DownloadStart { component }) => {
+                        component.clone_into(&mut current_component);
+                        status.set_text(&format!("Downloading {component}..."));
+                        progress.set_fraction(0.0);
+                    }
+                    Ok(sdr_transcription::InitEvent::DownloadProgress { pct }) => {
+                        status.set_text(&format!("Downloading {current_component}... {pct}%"));
+                        progress.set_fraction(f64::from(pct) / 100.0);
+                    }
+                    Ok(sdr_transcription::InitEvent::Extracting { component }) => {
+                        component.clone_into(&mut current_component);
+                        status.set_text(&format!("Extracting {component}..."));
+                    }
+                    Ok(sdr_transcription::InitEvent::CreatingRecognizer) => {
+                        status.set_text("Creating recognizer...");
+                        progress.set_visible(false);
+                    }
+                    Ok(sdr_transcription::InitEvent::Ready) => {
+                        tracing::info!("sherpa host reload complete");
+                        status.set_text("");
+                        status.set_visible(false);
+                        progress.set_visible(false);
+                        if let Some(model_row) = model_row_reload_weak.upgrade() {
+                            model_row.set_sensitive(true);
+                        }
+                        if let Some(enable_row) = enable_row_reload_weak.upgrade() {
+                            enable_row.set_sensitive(true);
+                        }
+                        // Deferred persistence: the recognizer swap
+                        // succeeded, so it's now safe to save the
+                        // new selection to config. If this Ready
+                        // arm never fires (reload failed), config
+                        // keeps the previous model idx and next
+                        // startup gets a known-working recognizer.
+                        config_for_this_reload.write(|v| {
+                            v[crate::sidebar::transcript_panel::KEY_SHERPA_MODEL] =
+                                serde_json::json!(persist_idx);
+                        });
+                        return glib::ControlFlow::Break;
+                    }
+                    Ok(sdr_transcription::InitEvent::Failed { message }) => {
+                        tracing::warn!(%message, "sherpa host reload failed");
+                        status.set_text(&format!("Reload failed: {message}"));
+                        status.set_css_classes(&["error"]);
+                        status.set_visible(true);
+                        progress.set_visible(false);
+                        if let Some(model_row) = model_row_reload_weak.upgrade() {
+                            model_row.set_sensitive(true);
+                        }
+                        if let Some(enable_row) = enable_row_reload_weak.upgrade() {
+                            enable_row.set_sensitive(true);
+                        }
+                        return glib::ControlFlow::Break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        // Worker dropped its sender without sending Ready
+                        // or Failed — unusual but don't strand the UI in
+                        // a "Reloading..." state. Surface the disconnect
+                        // as an error and re-enable the controls so the
+                        // user can try a different model.
+                        tracing::warn!(
+                            "sherpa host reload event channel disconnected unexpectedly"
+                        );
+                        status.set_text("Reload failed: recognizer worker disconnected");
+                        status.set_css_classes(&["error"]);
+                        status.set_visible(true);
+                        progress.set_visible(false);
+                        if let Some(model_row) = model_row_reload_weak.upgrade() {
+                            model_row.set_sensitive(true);
+                        }
+                        if let Some(enable_row) = enable_row_reload_weak.upgrade() {
+                            enable_row.set_sensitive(true);
+                        }
+                        return glib::ControlFlow::Break;
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    });
 }
