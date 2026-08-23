@@ -109,6 +109,14 @@ fn render_paints_only_background_when_composite_active_but_cache_empty() {
 
 #[test]
 fn export_png_uses_composite_cache_when_active() {
+    const COMPOSITE_R: u8 = 0x10;
+    const COMPOSITE_G: u8 = 0x20;
+    const COMPOSITE_B: u8 = 0x30;
+    /// Not part of any recipe; its distinct grey value would show up
+    /// in the decoded pixels if the export regressed to the active
+    /// per-APID surface.
+    const UNRELATED_APID: u16 = 63;
+    const UNRELATED_GREY: u8 = 0x77;
     // Per CR round 2 on PR #575: when composite mode is
     // active and the cache is populated, `export_png` must
     // export the composite surface — not the active per-APID
@@ -120,21 +128,31 @@ fn export_png_uses_composite_cache_when_active() {
     // Push one line into each source APID so the composite
     // cache populates. The recipe is from the catalog, so
     // those APIDs are well-defined.
-    image.push_line(recipe.r_apid, &vec![0x10; IMAGE_WIDTH]);
-    image.push_line(recipe.g_apid, &vec![0x20; IMAGE_WIDTH]);
-    image.push_line(recipe.b_apid, &vec![0x30; IMAGE_WIDTH]);
-    // Also feed one line to a per-APID surface that ISN'T in
-    // the recipe — this is what the previous greyscale fallback
-    // would have written. If the export silently wrote that
-    // surface instead of the composite, the test below would
-    // still pass the PNG header check; we only confirm here
-    // that export succeeds end-to-end, not which pixels it
-    // wrote (the byte-level guarantee is covered by
-    // `build_argb32_from_rgb_writes_bgra_byte_order`).
+    image.push_line(recipe.r_apid, &vec![COMPOSITE_R; IMAGE_WIDTH]);
+    image.push_line(recipe.g_apid, &vec![COMPOSITE_G; IMAGE_WIDTH]);
+    image.push_line(recipe.b_apid, &vec![COMPOSITE_B; IMAGE_WIDTH]);
+    // Feed a per-APID surface that ISN'T in the recipe — pushing it
+    // auto-selects it as the active channel, which is exactly what
+    // the pre-#575 greyscale fallback would have exported.
+    r.push_line(UNRELATED_APID, &synth_line(UNRELATED_GREY));
     assert!(r.set_composite(recipe, &image));
     let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-comp.png");
     r.export_png(&path).expect("export composite PNG");
     crate::test_util::assert_png_file(&path);
+    // Decode the PNG and check the first pixel is the composite RGB
+    // triple (ARGB32 little-endian: B, G, R, A), not the grey APID.
+    let mut f = std::fs::File::open(&path).expect("open exported PNG");
+    let mut surface = cairo::ImageSurface::create_from_png(&mut f).expect("decode exported PNG");
+    assert_eq!(
+        surface.width(),
+        i32::try_from(IMAGE_WIDTH).expect("width fits i32")
+    );
+    let data = surface.data().expect("surface data");
+    assert_eq!(
+        &data[0..4],
+        &[COMPOSITE_B, COMPOSITE_G, COMPOSITE_R, 0xFF],
+        "first pixel must be the composite RGB, not the {UNRELATED_GREY:#x} greyscale APID"
+    );
 }
 
 #[test]
