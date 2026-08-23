@@ -753,3 +753,34 @@ fn disengage_restore_failed(
     let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Err(err)));
     AcarsHandlerOutcome::Normal
 }
+
+/// Handler for `UiToDsp::SetAcarsRegion`, extracted from `handle_command`
+/// (#816 PR B).
+pub(super) fn handle_set_acars_region(
+    state: &mut DspState,
+    region: crate::acars_airband_lock::AcarsRegion,
+) {
+    // Issue #581. Region is consulted at engage time;
+    // mutating it while engaged would create a state
+    // mismatch (live channels still tuned to the old
+    // region's freqs but `state.acars_region` says
+    // otherwise). Reject mid-engage and let the UI
+    // surface the constraint — the existing airband-
+    // lock invariant says geometry-affecting commands
+    // are user-disabled while engaged anyway, but the
+    // engaged-rejection path here is the belt to that
+    // suspenders.
+    if state.acars_pre_lock.is_some() {
+        tracing::warn!(
+            requested = ?region,
+            "ignoring SetAcarsRegion while ACARS engaged; disengage first",
+        );
+    } else {
+        tracing::info!(
+            from = ?state.acars_region,
+            to = ?region,
+            "ACARS region changed",
+        );
+        state.acars_region = region;
+    }
+}

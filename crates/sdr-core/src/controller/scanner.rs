@@ -1,7 +1,10 @@
 //! Scanner engine bridge — applies `sdr_scanner` command outputs to the
 //! DSP state and reports the active channel to the UI.
 
-use super::{DspState, DspToUi, auto_decimation_ratio, mpsc, on_tune_change, rebuild_vfo_echoing};
+use super::{
+    DspState, DspToUi, ScannerMutexReason, auto_decimation_ratio, mpsc, on_tune_change,
+    rebuild_vfo_echoing, stop_any_recording,
+};
 
 /// Apply scanner-emitted commands to the DSP state.
 pub(super) fn apply_scanner_commands(
@@ -270,4 +273,52 @@ pub(super) fn emit_scanner_active_channel(
 /// actually gating can signal activity.
 pub(super) fn scanner_carrier_present(gating: bool, open: bool) -> bool {
     gating && open
+}
+
+/// Handler for `UiToDsp::SetScannerEnabled`, extracted from `handle_command`
+/// (#816 PR B).
+pub(super) fn handle_set_scanner_enabled(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    enabled: bool,
+) {
+    // Reject scanner enable while ACARS is engaged. The
+    // reverse direction (refusing ACARS engage while
+    // scanner is running) was added in CR round 16; this
+    // closes the symmetric hole. Without it, enabling
+    // scanner mid-engagement would retune the source via
+    // apply_scanner_commands and violate the airband-lock
+    // invariants the round 14-15 UiToDsp guards protect.
+    // CR round 17 on PR #584.
+    if enabled && state.acars_pre_lock.is_some() {
+        tracing::warn!("scanner enable rejected: ACARS airband lock is active");
+        let _ = dsp_tx.send(DspToUi::Error(
+            "Scanner enable ignored: ACARS airband lock is active. \
+             Disable ACARS first."
+                .to_string(),
+        ));
+        return;
+    }
+    if enabled && stop_any_recording(state, dsp_tx) {
+        let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+            ScannerMutexReason::RecordingStoppedForScanner,
+        ));
+    }
+    // Without a gating squelch there is no carrier detection,
+    // so the scanner can only hop on dwell timeouts and never
+    // stop on activity. Tell the user instead of looking
+    // broken. Per #755.
+    if enabled && !state.radio.if_chain().squelch_active() {
+        let _ = dsp_tx.send(DspToUi::Error(
+            "Scanner: enable manual or auto squelch so it can detect activity; \
+             without it the scanner will only cycle through channels."
+                .to_string(),
+        ));
+    }
+    // Scanner ↔ transcription mutex was REMOVED — the two
+    // are designed to coexist (issue #517).
+    let cmds = state
+        .scanner
+        .handle_event(sdr_scanner::ScannerEvent::SetEnabled(enabled));
+    apply_scanner_commands(state, dsp_tx, cmds);
 }
