@@ -847,12 +847,7 @@ fn wire_sherpa_model_reload(
                         status.set_text("");
                         status.set_visible(false);
                         progress.set_visible(false);
-                        if let Some(model_row) = model_row_reload_weak.upgrade() {
-                            model_row.set_sensitive(true);
-                        }
-                        if let Some(enable_row) = enable_row_reload_weak.upgrade() {
-                            enable_row.set_sensitive(true);
-                        }
+                        reenable_reload_rows(&model_row_reload_weak, &enable_row_reload_weak);
                         // Deferred persistence: the recognizer swap
                         // succeeded, so it's now safe to save the
                         // new selection to config. If this Ready
@@ -871,12 +866,7 @@ fn wire_sherpa_model_reload(
                         status.set_css_classes(&["error"]);
                         status.set_visible(true);
                         progress.set_visible(false);
-                        if let Some(model_row) = model_row_reload_weak.upgrade() {
-                            model_row.set_sensitive(true);
-                        }
-                        if let Some(enable_row) = enable_row_reload_weak.upgrade() {
-                            enable_row.set_sensitive(true);
-                        }
+                        reenable_reload_rows(&model_row_reload_weak, &enable_row_reload_weak);
                         return glib::ControlFlow::Break;
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -893,12 +883,7 @@ fn wire_sherpa_model_reload(
                         status.set_css_classes(&["error"]);
                         status.set_visible(true);
                         progress.set_visible(false);
-                        if let Some(model_row) = model_row_reload_weak.upgrade() {
-                            model_row.set_sensitive(true);
-                        }
-                        if let Some(enable_row) = enable_row_reload_weak.upgrade() {
-                            enable_row.set_sensitive(true);
-                        }
+                        reenable_reload_rows(&model_row_reload_weak, &enable_row_reload_weak);
                         return glib::ControlFlow::Break;
                     }
                 }
@@ -906,4 +891,20 @@ fn wire_sherpa_model_reload(
             glib::ControlFlow::Continue
         });
     });
+}
+
+/// Re-enable the model + enable rows after a reload finishes (Ready,
+/// Failed, or worker disconnect). Weak upgrades no-op when the window
+/// is closing.
+#[cfg(feature = "sherpa")]
+fn reenable_reload_rows(
+    model_row: &glib::WeakRef<adw::ComboRow>,
+    enable_row: &glib::WeakRef<adw::SwitchRow>,
+) {
+    if let Some(model_row) = model_row.upgrade() {
+        model_row.set_sensitive(true);
+    }
+    if let Some(enable_row) = enable_row.upgrade() {
+        enable_row.set_sensitive(true);
+    }
 }
