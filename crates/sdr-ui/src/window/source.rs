@@ -385,8 +385,14 @@ struct DiscoveredRowDeps {
 const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
 
 /// Grace period before a discovered-server row is pruned when the
-/// responder stops re-announcing (crashed or partitioned peers never
-/// send `ServerWithdrawn`).
+/// responder stops re-announcing. A healthy mDNS responder
+/// re-announces well before its TTL (default 120 s on most daemons)
+/// expires; 3 minutes without a refresh means the responder is either
+/// dead or network-partitioned. Defense-in-depth: mdns-sd's daemon
+/// SHOULD fire `ServiceRemoved` on TTL expiry, but a crashed server
+/// that vanishes without a goodbye may leave the cache entry around
+/// longer than the client wants — expiring client-side keeps the
+/// Connect button from offering a dead endpoint.
 const STALE_ROW_GRACE: std::time::Duration = std::time::Duration::from_mins(3);
 
 /// Connect source panel controls to DSP commands.
@@ -412,24 +418,6 @@ pub(super) fn connect_rtl_tcp_discovery(
     >,
 ) {
     use std::collections::HashMap;
-
-    /// Grace window after which a server that has stopped
-    /// re-announcing gets pruned from the UI list. A healthy mDNS
-    /// responder re-announces well before its TTL (default 120 s on
-    /// most daemons) expires; 3 minutes without a refresh means the
-    /// responder is either dead or network-partitioned.
-    ///
-    /// Defense-in-depth: mdns-sd's daemon SHOULD fire
-    /// `ServiceRemoved` on TTL expiry, but a crashed server that
-    /// vanishes without a goodbye may leave the cache entry around
-    /// longer than the client wants. Expiring client-side keeps the
-    /// Connect button from offering a dead endpoint.
-
-    /// Poll cadence for the mDNS discovery event channel. 200 ms is
-    /// fast enough that newly-announced servers appear "instantly" to
-    /// the user and cheap enough to be always-on even when RTL-TCP is
-    /// not the selected source type.
-    const DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
     wire_manage_favorites_button(panels, favorites_header);
 
