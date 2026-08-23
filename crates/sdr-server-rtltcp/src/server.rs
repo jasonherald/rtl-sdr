@@ -95,6 +95,28 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
 /// the broadcaster is starving (dongle unplug, no data incoming).
 const WRITER_RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// `SO_SNDTIMEO` on each client's data socket: how long one `write`
+/// may block on a closed receive window before the writer gets
+/// control back to shed its backlog. Separate from
+/// [`WRITER_RECV_TIMEOUT`] (#709): a stall is a signal to drop
+/// queued chunks, not the client.
+const DATA_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Consecutive send timeouts (each [`DATA_WRITE_TIMEOUT`] long) a
+/// client may accumulate on one chunk before it is dropped — about
+/// 10 s, enough for an AP roam or a laptop waking from power-save,
+/// which upstream rtl_tcp's 1 s `select` loop also rides out by
+/// dropping buffers rather than the connection (#709).
+const MAX_CONSECUTIVE_WRITE_STALLS: u32 = 10;
+
+/// Consecutive failed USB bulk reads before the broadcaster gives
+/// up and stops the server. Mirrors librtlsdr's `xfer_errors`
+/// budget of `xfer_buf_num` (`DEFAULT_BUF_NUMBER` = 15) consecutive
+/// failed transfers: one `Overflow` / `Pipe` / `Io` under EMI or a
+/// `set_sample_rate` race is retried, not fatal (#711). A
+/// `NoDevice` still stops immediately.
+const MAX_CONSECUTIVE_USB_ERRORS: u32 = 15;
+
 /// Timeout on each USB bulk read in the broadcaster thread. Matches
 /// upstream's 1-second poll interval in the `rtlsdr_read_async` loop.
 /// The broadcaster re-checks the shutdown flag between reads.
@@ -1236,6 +1258,10 @@ fn spawn_client_workers(
     // the "is there room?" check across two values. Per issue #395.
     let cap = listener_cap.load(Ordering::Relaxed);
     let decision = registry.register_with_role(slot.clone(), cap, request_takeover);
+    let displaced_id = match decision {
+        RoleDecision::GrantedViaTakeover { displaced_id } => Some(displaced_id),
+        _ => None,
+    };
     match decision {
         RoleDecision::Granted => {
             tracing::info!(
@@ -1411,7 +1437,7 @@ fn spawn_client_workers(
     // encoder — the encoder's `write()` delegates to the inner
     // stream's `write()`, which in turn enforces `SO_SNDTIMEO`.
     // Setting after-wrap would lose visibility into the inner stream.
-    if let Err(e) = writer.set_write_timeout(Some(WRITER_RECV_TIMEOUT)) {
+    if let Err(e) = writer.set_write_timeout(Some(DATA_WRITE_TIMEOUT)) {
         tracing::warn!(
             %peer,
             %e,
@@ -1429,7 +1455,12 @@ fn spawn_client_workers(
     // `lifetime_accepted` stays tied to sessions that actually
     // began serving. Per `CodeRabbit` round 1 on PR #403.
     let writer_slot = slot.clone();
+    let writer_registry = registry.clone();
     let writer_shutdown = shutdown.clone();
+    // Only a pass-through stream can resume a chunk mid-way after a
+    // send stall; a compressed stream's encoder state cannot be
+    // rewound (#709, CR on PR #807).
+    let retry_stalls = codec == Codec::None;
     let tracked_writer = StatsTrackingWrite {
         inner: writer,
         slot: slot.clone(),
@@ -1439,7 +1470,14 @@ fn spawn_client_workers(
     let writer_handle = match thread::Builder::new()
         .name(format!("rtl_tcp-writer-{id}"))
         .spawn(move || {
-            tcp_writer(encoded_writer, rx, writer_slot, writer_shutdown);
+            tcp_writer(
+                encoded_writer,
+                rx,
+                writer_slot,
+                writer_registry,
+                writer_shutdown,
+                retry_stalls,
+            );
         }) {
         Ok(h) => h,
         Err(e) => {
@@ -1495,6 +1533,20 @@ fn spawn_client_workers(
     // (shutdown join) + round 5 (runtime reap).
     registry.register_worker_handle(writer_handle);
     registry.register_worker_handle(command_handle);
+
+    // Takeover phase 2 (#710): only now that the newcomer is fully
+    // viable — header sent, timeout installed, both workers running
+    // — is the incumbent controller displaced. Every early return
+    // above left it in place.
+    if let Some(displaced_id) = displaced_id
+        && !registry.commit_takeover(displaced_id)
+    {
+        tracing::debug!(
+            client_id = id,
+            displaced_client_id = displaced_id,
+            "takeover commit found the displaced controller already gone"
+        );
+    }
 
     // Fire and forget — neither the writer nor the command handle is
     // joined here. Both exit independently when they observe the
@@ -2081,10 +2133,12 @@ fn tcp_writer<W: Write + Send>(
     mut stream: W,
     rx: Receiver<Vec<u8>>,
     slot: Arc<ClientSlot>,
+    registry: Arc<ClientRegistry>,
     shutdown: Arc<AtomicBool>,
+    retry_stalls: bool,
 ) {
-    // Write timeout installed by the caller on the underlying
-    // `TcpStream` before wrapping in the codec — see
+    // Write timeout (`DATA_WRITE_TIMEOUT`) installed by the caller on
+    // the underlying `TcpStream` before wrapping in the codec — see
     // `spawn_client_workers` where the timeout is set up.
     //
     // `recv_timeout` lets us notice shutdown even when the
@@ -2095,24 +2149,15 @@ fn tcp_writer<W: Write + Send>(
         }
         match rx.recv_timeout(WRITER_RECV_TIMEOUT) {
             Ok(buf) => {
-                if let Err(e) = stream.write_all(&buf) {
-                    tracing::debug!(%e, client_id = slot.id, "rtl_tcp client socket write failed, closing");
-                    slot.mark_disconnected();
-                    return;
-                }
-                // Flush after every chunk so the LZ4 frame encoder
-                // (when active) doesn't hold a partial block in its
-                // internal buffer waiting for the next USB chunk to
-                // fill it out to the 64 KiB frame-block size. On
-                // low-rate streams that buffering adds minutes of
-                // audio latency and can trip the client's stall-
-                // detection timeout. Pass-through `Codec::None`
-                // flushes to `TcpStream::flush()`, which is a no-op
-                // on Linux (writes go direct to the kernel send
-                // buffer), so the legacy path pays nothing. Per
-                // CodeRabbit round 1 on PR #399.
-                if let Err(e) = stream.flush() {
-                    tracing::debug!(%e, client_id = slot.id, "rtl_tcp client socket flush failed, closing");
+                let outcome = write_chunk_shedding_backlog(
+                    &mut stream,
+                    &buf,
+                    &rx,
+                    &slot,
+                    &registry,
+                    retry_stalls,
+                );
+                if outcome == ChunkOutcome::Closed {
                     slot.mark_disconnected();
                     return;
                 }
@@ -2129,6 +2174,107 @@ fn tcp_writer<W: Write + Send>(
             }
         }
     }
+}
+
+/// Result of pushing one chunk to a client socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkOutcome {
+    /// The whole chunk (and the flush) went out.
+    Sent,
+    /// The socket is gone, or it stalled past the budget.
+    Closed,
+}
+
+/// Is this the stall signal `SO_SNDTIMEO` raises when the peer's
+/// receive window is closed?
+fn is_stall(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Write `chunk` to `stream`, riding out send stalls the way
+/// upstream rtl_tcp does (#709): a timed-out write sheds the chunks
+/// that queued up behind it (counted as drops), then resumes the
+/// *same* chunk at the byte where it stopped so the I/Q byte
+/// alignment on the wire survives. [`MAX_CONSECUTIVE_WRITE_STALLS`]
+/// stalls in a row (the count resets on any progress), a zero-length
+/// write, or any other error close the client.
+///
+/// `retry_stalls` is `false` for compressed streams: the LZ4 frame
+/// encoder may have emitted part of a block before the inner socket
+/// timed out, and its state cannot be rewound, so a stall there is
+/// terminal rather than retried (CR on PR #807).
+///
+/// Every chunk is flushed so the LZ4 frame encoder (when active)
+/// doesn't hold a partial block waiting for the next USB chunk to
+/// fill it out to the 64 KiB frame-block size — on low-rate streams
+/// that buffering adds minutes of latency and can trip the client's
+/// stall-detection timeout. Pass-through `Codec::None` flushes to
+/// `TcpStream::flush()`, a no-op on Linux. Per CodeRabbit round 1 on
+/// PR #399.
+fn write_chunk_shedding_backlog<W: Write>(
+    stream: &mut W,
+    chunk: &[u8],
+    rx: &Receiver<Vec<u8>>,
+    slot: &ClientSlot,
+    registry: &ClientRegistry,
+    retry_stalls: bool,
+) -> ChunkOutcome {
+    let mut offset = 0;
+    let mut stalls: u32 = 0;
+    let mut flushed = false;
+    while !flushed {
+        let step = if offset < chunk.len() {
+            stream.write(&chunk[offset..]).inspect(|n| offset += n)
+        } else {
+            stream.flush().map(|()| {
+                flushed = true;
+                1
+            })
+        };
+        match step {
+            Ok(0) => {
+                tracing::debug!(client_id = slot.id, "rtl_tcp client socket closed by peer");
+                return ChunkOutcome::Closed;
+            }
+            Ok(_) => stalls = 0,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if is_stall(&e) && retry_stalls => {
+                stalls += 1;
+                if stalls > MAX_CONSECUTIVE_WRITE_STALLS {
+                    tracing::debug!(
+                        client_id = slot.id,
+                        stalls,
+                        "rtl_tcp client stalled past the write budget, closing"
+                    );
+                    return ChunkOutcome::Closed;
+                }
+                shed_backlog(rx, slot, registry, stalls);
+            }
+            Err(e) => {
+                tracing::debug!(%e, client_id = slot.id, "rtl_tcp client socket write failed, closing");
+                return ChunkOutcome::Closed;
+            }
+        }
+    }
+    ChunkOutcome::Sent
+}
+
+/// Discard every chunk queued behind a stalled write and count the
+/// drops against the client (#709).
+fn shed_backlog(rx: &Receiver<Vec<u8>>, slot: &ClientSlot, registry: &ClientRegistry, stalls: u32) {
+    let shed = u64::try_from(rx.try_iter().count()).unwrap_or(u64::MAX);
+    if shed > 0 {
+        registry.record_buffers_dropped(slot, shed);
+    }
+    tracing::trace!(
+        client_id = slot.id,
+        stalls,
+        shed,
+        "rtl_tcp client send stalled; backlog shed, retrying"
+    );
 }
 
 fn command_worker(
@@ -2204,6 +2350,16 @@ fn command_worker(
             slot.mark_disconnected();
             return;
         };
+        // A takeover may have displaced this controller while it
+        // waited for the device lock; its command must not land on
+        // the new controller's dongle state (#710).
+        if slot.is_disconnected() {
+            tracing::debug!(
+                client_id = slot.id,
+                "rtl_tcp command dropped — client displaced while waiting for the device"
+            );
+            return;
+        }
         dispatch(&mut dev, cmd);
         drop(dev);
         if let Ok(mut s) = slot.stats.lock() {
@@ -2244,77 +2400,123 @@ fn broadcaster_worker(
     registry: Arc<ClientRegistry>,
     shutdown: Arc<AtomicBool>,
 ) {
-    // Pull the USB handle once so we don't lock the device mutex on
-    // every bulk read. The handle is Arc-cloneable and thread-safe
-    // for bulk reads; the mutex-guarded device is still required for
-    // command dispatch and configuration changes, which run on
-    // per-client command workers.
-    let handle = {
-        let Ok(dev) = device.lock() else {
-            tracing::error!(
-                "device mutex poisoned, broadcaster aborting and signalling server shutdown"
-            );
-            shutdown.store(true, Ordering::SeqCst);
-            return;
-        };
-        dev.usb_handle()
+    let Some(handle) = usb_handle_or_shutdown(&device, &shutdown) else {
+        return;
     };
     // Scratch buffer reused across iterations — only the Vec<u8>
     // that the registry clones per-client gets a fresh allocation,
     // sized to the data the USB read actually returned.
     let mut scratch = vec![0u8; READ_BUFFER_LEN as usize];
     let mut ticks_since_prune: u32 = 0;
+    let mut usb_errors: u32 = 0;
 
     while !shutdown.load(Ordering::Relaxed) {
         match handle.read_bulk(RtlSdrDevice::BULK_ENDPOINT, &mut scratch, USB_READ_TIMEOUT) {
             Ok(n) if n > 0 => {
+                usb_errors = 0;
                 registry.broadcast(&scratch[..n]);
                 ticks_since_prune = ticks_since_prune.saturating_add(1);
                 if ticks_since_prune >= BROADCASTER_PRUNE_EVERY_N_TICKS {
-                    let removed = registry.prune_disconnected();
-                    if removed > 0 {
-                        tracing::debug!(removed, "rtl_tcp pruned disconnected client slots");
-                    }
-                    // Reap finished per-client worker handles on
-                    // the same cadence — otherwise a long-lived
-                    // server with connection churn would keep
-                    // every completed writer/command handle alive
-                    // until shutdown (OS thread resources + TLS
-                    // linger). Per `CodeRabbit` round 5 on PR #402.
-                    let reaped = registry.reap_finished_worker_handles();
-                    if reaped > 0 {
-                        tracing::debug!(
-                            reaped,
-                            "rtl_tcp reaped finished per-client worker threads"
-                        );
-                    }
+                    prune_and_reap(&registry);
                     ticks_since_prune = 0;
                 }
             }
             Ok(_) | Err(rusb::Error::Timeout) => {
                 // No data — loop and re-check shutdown.
             }
-            Err(rusb::Error::NoDevice) => {
-                // Dongle unplug is unrecoverable at the server level.
-                // Escalate to a global shutdown so the accept thread
-                // exits, the CLI sees `has_stopped() == true`, and
-                // connected clients' command / writer loops observe
-                // the flag and tear down.
-                tracing::error!("rtl_tcp: USB device lost mid-stream, stopping server");
-                shutdown.store(true, Ordering::SeqCst);
-                return;
-            }
-            Err(e) => {
-                tracing::error!(%e, "rtl_tcp bulk read error — stopping server");
-                shutdown.store(true, Ordering::SeqCst);
-                return;
-            }
+            Err(e) => match usb_read_failure_verdict(&mut usb_errors, e) {
+                UsbReadVerdict::Retry => {
+                    tracing::warn!(
+                        %e,
+                        consecutive = usb_errors,
+                        "rtl_tcp bulk read error — retrying"
+                    );
+                }
+                UsbReadVerdict::Stop => {
+                    // Dongle unplug (or a sustained run of failed
+                    // transfers) is unrecoverable at the server
+                    // level. Escalate to a global shutdown so the
+                    // accept thread exits, the CLI sees
+                    // `has_stopped() == true`, and connected
+                    // clients' command / writer loops observe the
+                    // flag and tear down.
+                    tracing::error!(
+                        %e,
+                        consecutive = usb_errors,
+                        "rtl_tcp: USB read failure is terminal, stopping server"
+                    );
+                    shutdown.store(true, Ordering::SeqCst);
+                    return;
+                }
+            },
         }
     }
     // Final prune on exit so the pruned-slots metric doesn't
     // indefinitely lag behind truth when the server stops with
     // dead slots still registered.
     registry.prune_disconnected();
+}
+
+/// Pull the USB handle once so the broadcaster doesn't lock the
+/// device mutex on every bulk read. The handle is Arc-cloneable and
+/// thread-safe for bulk reads; the mutex-guarded device is still
+/// required for command dispatch and configuration changes, which
+/// run on per-client command workers. A poisoned mutex is
+/// unrecoverable: signal server shutdown and return `None`.
+fn usb_handle_or_shutdown(
+    device: &Mutex<RtlSdrDevice>,
+    shutdown: &AtomicBool,
+) -> Option<Arc<rusb::DeviceHandle<rusb::GlobalContext>>> {
+    let Ok(dev) = device.lock() else {
+        tracing::error!(
+            "device mutex poisoned, broadcaster aborting and signalling server shutdown"
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        return None;
+    };
+    Some(dev.usb_handle())
+}
+
+/// Broadcaster housekeeping on its prune cadence: drop disconnected
+/// slots and reap finished per-client worker handles — otherwise a
+/// long-lived server with connection churn would keep every
+/// completed writer/command handle alive until shutdown (OS thread
+/// resources + TLS linger). Per `CodeRabbit` round 5 on PR #402.
+fn prune_and_reap(registry: &ClientRegistry) {
+    let removed = registry.prune_disconnected();
+    if removed > 0 {
+        tracing::debug!(removed, "rtl_tcp pruned disconnected client slots");
+    }
+    let reaped = registry.reap_finished_worker_handles();
+    if reaped > 0 {
+        tracing::debug!(reaped, "rtl_tcp reaped finished per-client worker threads");
+    }
+}
+
+/// What the broadcaster does after a failed USB bulk read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsbReadVerdict {
+    /// Transient: count it and read again.
+    Retry,
+    /// Device gone, or [`MAX_CONSECUTIVE_USB_ERRORS`] failures in a
+    /// row: stop the server.
+    Stop,
+}
+
+/// librtlsdr's `xfer_errors` rule (#711): `NoDevice` is terminal at
+/// once; anything else is retried until `consecutive_errors` (reset
+/// by the caller on a successful read) reaches
+/// [`MAX_CONSECUTIVE_USB_ERRORS`].
+fn usb_read_failure_verdict(consecutive_errors: &mut u32, e: rusb::Error) -> UsbReadVerdict {
+    if matches!(e, rusb::Error::NoDevice) {
+        return UsbReadVerdict::Stop;
+    }
+    *consecutive_errors = consecutive_errors.saturating_add(1);
+    if *consecutive_errors >= MAX_CONSECUTIVE_USB_ERRORS {
+        UsbReadVerdict::Stop
+    } else {
+        UsbReadVerdict::Retry
+    }
 }
 
 enum ReadResult {
@@ -3227,6 +3429,207 @@ mod tests {
             result.is_err(),
             "malformed hello body (magic matched, unknown role) must surface as Err — \
              got {result:?}"
+        );
+    }
+
+    // --- #709 / #711 (Aug 2026 deep review) ---
+
+    /// Data-socket stand-in that times out `stalls_remaining` times
+    /// before accepting bytes, like a peer whose receive window is
+    /// closed.
+    struct StallingWriter {
+        stalls_remaining: u32,
+        written: Vec<u8>,
+    }
+
+    impl Write for StallingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.stalls_remaining > 0 {
+                self.stalls_remaining -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const STALL_TEST_PORT: u16 = 42_010;
+
+    fn test_peer(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+    const STALL_TEST_CHUNK: [u8; 4] = [1, 2, 3, 4];
+
+    /// A brief stall drops queued chunks, not the client: the chunk in
+    /// progress is retried, the chunks that queued up behind it are
+    /// discarded (counted as drops), and the slot stays live.
+    #[test]
+    fn tcp_writer_drops_queued_chunks_before_dropping_a_stalled_client() {
+        /// How long the test waits for the writer to drain the stall.
+        const SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+        let registry = Arc::new(ClientRegistry::new());
+        let (slot, rx) = ClientSlot::new(
+            registry.allocate_id(),
+            test_peer(STALL_TEST_PORT),
+            Codec::None,
+            Role::Control,
+            TEST_CLIENT_CHANNEL_DEPTH,
+        );
+        for _ in 0..3 {
+            slot.tx.send(STALL_TEST_CHUNK.to_vec()).expect("queue");
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let writer_thread = {
+            let (slot, registry, shutdown, written) = (
+                slot.clone(),
+                registry.clone(),
+                shutdown.clone(),
+                written.clone(),
+            );
+            thread::spawn(move || {
+                let mut w = StallingWriter {
+                    stalls_remaining: 2,
+                    written: Vec::new(),
+                };
+                tcp_writer(&mut w, rx, slot, registry, shutdown, true);
+                *written.lock().expect("written") = w.written;
+            })
+        };
+        // The slot's own sender keeps the channel open, so the writer
+        // idles after the stall; stop it once the drops are visible.
+        let deadline = Instant::now() + SETTLE_TIMEOUT;
+        while registry.total_buffers_dropped() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        shutdown.store(true, Ordering::SeqCst);
+        writer_thread.join().expect("writer thread");
+        assert!(
+            !slot.is_disconnected(),
+            "a brief stall must not kick the client"
+        );
+        assert_eq!(*written.lock().expect("written"), STALL_TEST_CHUNK.to_vec());
+        let dropped = slot.stats.lock().expect("stats").buffers_dropped;
+        assert_eq!(
+            dropped, 2,
+            "the two chunks queued behind the stall were dropped"
+        );
+        assert_eq!(registry.total_buffers_dropped(), 2);
+    }
+
+    /// A stall that outlasts the budget does drop the client.
+    #[test]
+    fn tcp_writer_gives_up_after_the_stall_budget() {
+        let registry = Arc::new(ClientRegistry::new());
+        let (slot, rx) = ClientSlot::new(
+            registry.allocate_id(),
+            test_peer(STALL_TEST_PORT),
+            Codec::None,
+            Role::Control,
+            TEST_CLIENT_CHANNEL_DEPTH,
+        );
+        slot.tx.send(STALL_TEST_CHUNK.to_vec()).expect("queue");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut w = StallingWriter {
+            stalls_remaining: MAX_CONSECUTIVE_WRITE_STALLS + 1,
+            written: Vec::new(),
+        };
+        tcp_writer(&mut w, rx, slot.clone(), registry, shutdown, true);
+        assert!(slot.is_disconnected());
+        assert!(w.written.is_empty());
+    }
+
+    /// A compressed stream cannot resume mid-block: its first stall
+    /// closes the client instead of being retried.
+    #[test]
+    fn tcp_writer_closes_a_compressed_stream_on_its_first_stall() {
+        let registry = Arc::new(ClientRegistry::new());
+        let (slot, rx) = ClientSlot::new(
+            registry.allocate_id(),
+            test_peer(STALL_TEST_PORT),
+            Codec::None,
+            Role::Control,
+            TEST_CLIENT_CHANNEL_DEPTH,
+        );
+        slot.tx.send(STALL_TEST_CHUNK.to_vec()).expect("queue");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut w = StallingWriter {
+            stalls_remaining: 1,
+            written: Vec::new(),
+        };
+        tcp_writer(&mut w, rx, slot.clone(), registry, shutdown, false);
+        assert!(slot.is_disconnected());
+        assert!(w.written.is_empty());
+    }
+
+    /// Socket stand-in that alternates one byte of progress with a
+    /// stall: never two stalls in a row, so the consecutive budget
+    /// must never trip no matter how long the chunk is.
+    struct TricklingWriter {
+        stall_next: bool,
+        written: Vec<u8>,
+    }
+
+    impl Write for TricklingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.stall_next = !self.stall_next;
+            if !self.stall_next {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            self.written.push(buf[0]);
+            Ok(1)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The stall budget counts consecutive stalls: progress resets it.
+    #[test]
+    fn stall_budget_resets_on_progress() {
+        let registry = ClientRegistry::new();
+        let (slot, rx) = ClientSlot::new(
+            registry.allocate_id(),
+            test_peer(STALL_TEST_PORT),
+            Codec::None,
+            Role::Control,
+            TEST_CLIENT_CHANNEL_DEPTH,
+        );
+        // Longer than the budget, so an accumulating counter would
+        // close the client part-way through.
+        let chunk = vec![0xA5_u8; (MAX_CONSECUTIVE_WRITE_STALLS as usize) * 3];
+        let mut w = TricklingWriter {
+            stall_next: false,
+            written: Vec::new(),
+        };
+        let outcome = write_chunk_shedding_backlog(&mut w, &chunk, &rx, &slot, &registry, true);
+        assert_eq!(outcome, ChunkOutcome::Sent);
+        assert_eq!(w.written, chunk);
+        assert!(!slot.is_disconnected());
+    }
+
+    /// USB read failures are tolerated up to librtlsdr's consecutive
+    /// transfer-error budget; a device loss stops immediately.
+    #[test]
+    fn usb_read_failures_stop_only_after_the_consecutive_budget() {
+        let mut errors = 0_u32;
+        for _ in 1..MAX_CONSECUTIVE_USB_ERRORS {
+            assert_eq!(
+                usb_read_failure_verdict(&mut errors, rusb::Error::Overflow),
+                UsbReadVerdict::Retry
+            );
+        }
+        assert_eq!(
+            usb_read_failure_verdict(&mut errors, rusb::Error::Pipe),
+            UsbReadVerdict::Stop
+        );
+        let mut fresh = 0_u32;
+        assert_eq!(
+            usb_read_failure_verdict(&mut fresh, rusb::Error::NoDevice),
+            UsbReadVerdict::Stop
         );
     }
 }
