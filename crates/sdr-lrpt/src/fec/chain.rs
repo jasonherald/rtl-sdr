@@ -42,7 +42,7 @@
 //! itself stays unit-testable on synthetic byte streams.
 
 use crate::fec::{
-    Derandomizer, DiffDecoder, ReedSolomon, Rotation, SoftSyncDetector, SyncCorrelator,
+    ASM_BITS, Derandomizer, DiffDecoder, ReedSolomon, Rotation, SoftSyncDetector, SyncCorrelator,
     ViterbiDecoder,
 };
 
@@ -69,6 +69,23 @@ const RS_MESSAGE_LEN: usize = 223;
 /// [`super::super::ccsds::Demux`] expects per VCDU.
 const VCDU_LEN: usize = RS_INTERLEAVE * RS_MESSAGE_LEN; // 892
 
+/// Total bits in a CADU including the 32-bit ASM (8192).
+const CADU_TOTAL_BITS: usize = ASM_BITS + CADU_PAYLOAD_LEN * 8;
+
+/// Consecutive RS-failed CADUs after which the rotation lock is
+/// abandoned and the chain re-hunts (#727). A genuine fade fails a
+/// few CADUs and recovers; eight in a row (~1 s at 72 kbit/s) with
+/// frame sync still hitting means the orientation — not the SNR —
+/// is wrong, e.g. a 90° Costas slip whose ASM happens to correlate.
+const REHUNT_AFTER_FAILED_CADUS: u32 = 8;
+
+/// Post-Viterbi bits without a frame-sync hit after which the
+/// rotation lock is abandoned (#727): four CADU lengths (~0.45 s).
+/// After a ±90° slip Viterbi emits garbage and the per-CADU
+/// correlator never hits (only a 180° residual is recoverable via
+/// the inverted ASM), so silence is the only symptom.
+const REHUNT_AFTER_SILENT_BITS: usize = 4 * CADU_TOTAL_BITS;
+
 /// Per-symbol chain state. Two-phase lock:
 ///
 /// 1. [`State::HuntingRotation`]: feeding raw soft pairs to the
@@ -82,12 +99,12 @@ const VCDU_LEN: usize = RS_INTERLEAVE * RS_MESSAGE_LEN; // 892
 ///    chain, but now operating on a known-canonical bit stream
 ///    that actually produces matches.
 ///
-/// Once Locked, we stay Locked for the whole pass. Costas can
-/// drift through quarter-turns during a low-SNR pass, but
-/// re-detecting per-CADU would only re-lock at the same
-/// (correct) rotation in the steady state. If we ever observe
-/// pathological mid-pass rotation drift, a "if last K CADUs all
-/// failed RS, re-hunt rotation" fallback can be added later.
+/// Locked is held for as long as it keeps producing: Costas can
+/// slip a quarter-turn mid-pass, after which Viterbi emits garbage
+/// and nothing downstream recovers ±90°. The chain falls back to
+/// `HuntingRotation` when [`REHUNT_AFTER_FAILED_CADUS`] CADUs fail
+/// RS in a row or [`REHUNT_AFTER_SILENT_BITS`] bits pass without a
+/// frame-sync hit (#727).
 #[derive(Debug)]
 enum State {
     /// No rotation lock yet. Soft pairs feed
@@ -113,7 +130,21 @@ enum State {
         bytes: Vec<u8>,
         partial: u8,
         partial_count: u8,
+        /// RS-failed CADUs since the last successful decode.
+        failed_run: u32,
+        /// Post-Viterbi bits since the last frame-sync hit (or
+        /// since lock) while hunting for the next ASM.
+        silent_bits: usize,
     },
+}
+
+/// Why a rotation lock was abandoned (#727).
+#[derive(Debug, Clone, Copy)]
+enum RehuntCause {
+    /// No frame-sync hit within [`REHUNT_AFTER_SILENT_BITS`].
+    Silence,
+    /// [`REHUNT_AFTER_FAILED_CADUS`] consecutive RS failures.
+    FailedCadus,
 }
 
 /// Streaming FEC chain — push one soft i8 symbol pair per call,
@@ -145,6 +176,11 @@ pub struct FecStats {
     pub cadus_decoded: u64,
     /// CADUs whose RS decode failed (dropped).
     pub cadus_failed: u64,
+    /// Times the locked chain went [`REHUNT_AFTER_SILENT_BITS`]
+    /// bits without a frame-sync hit (#727).
+    pub sync_timeouts: u64,
+    /// Times a rotation lock was abandoned to re-hunt (#727).
+    pub rotation_rehunts: u64,
 }
 
 impl Default for FecChain {
@@ -225,6 +261,8 @@ impl FecChain {
                         bytes: Vec::with_capacity(CADU_PAYLOAD_LEN),
                         partial: 0,
                         partial_count: 0,
+                        failed_run: 0,
+                        silent_bits: 0,
                     };
                     let mut emitted: Option<Vec<u8>> = None;
                     for pair_chunk in window.as_chunks::<2>().0 {
@@ -287,6 +325,36 @@ impl FecChain {
         }
     }
 
+    /// Abandon the rotation lock and return to hunting: the
+    /// detector, Viterbi and frame-sync state all restart so the
+    /// next ASM in the soft stream re-establishes the orientation
+    /// (#727). Decode statistics are kept.
+    fn rehunt(&mut self, cause: RehuntCause) {
+        tracing::debug!("LRPT FEC chain abandoning rotation lock ({cause:?}); re-hunting");
+        self.detector.reset();
+        self.viterbi = ViterbiDecoder::new();
+        self.sync = SyncCorrelator::new();
+        self.state = State::HuntingRotation;
+        self.stats.rotation_rehunts += 1;
+    }
+
+    /// Track the outcome of a captured CADU: a success clears the
+    /// failure run, a failure extends it and re-hunts once the run
+    /// reaches [`REHUNT_AFTER_FAILED_CADUS`].
+    fn note_cadu_outcome(&mut self, decoded: bool) {
+        let State::Locked { failed_run, .. } = &mut self.state else {
+            return;
+        };
+        if decoded {
+            *failed_run = 0;
+            return;
+        }
+        *failed_run += 1;
+        if *failed_run >= REHUNT_AFTER_FAILED_CADUS {
+            self.rehunt(RehuntCause::FailedCadus);
+        }
+    }
+
     fn process_bit(&mut self, bit: u8) -> Option<Vec<u8>> {
         let State::Locked {
             is_capturing,
@@ -294,6 +362,7 @@ impl FecChain {
             bytes,
             partial,
             partial_count,
+            silent_bits,
             ..
         } = &mut self.state
         else {
@@ -314,6 +383,13 @@ impl FecChain {
             if let Some(hit) = self.sync.push(bit) {
                 *is_capturing = true;
                 *inverted = hit.inverted;
+                *silent_bits = 0;
+            } else {
+                *silent_bits += 1;
+                if *silent_bits >= REHUNT_AFTER_SILENT_BITS {
+                    self.stats.sync_timeouts += 1;
+                    self.rehunt(RehuntCause::Silence);
+                }
             }
             return None;
         }
@@ -348,7 +424,9 @@ impl FecChain {
             *partial = 0;
             *partial_count = 0;
             self.sync = SyncCorrelator::new();
-            return self.decode_cadu(cadu);
+            let decoded = self.decode_cadu(cadu);
+            self.note_cadu_outcome(decoded.is_some());
+            return decoded;
         }
         None
     }
@@ -391,10 +469,6 @@ impl FecChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Total bits in a CADU including the 32-bit ASM. Used by
-    /// the tests below to size the synthetic bit streams.
-    const CADU_TOTAL_BITS: usize = 32 + CADU_PAYLOAD_LEN * 8;
 
     #[test]
     fn fec_chain_constructible_and_resets() {
@@ -624,6 +698,135 @@ mod tests {
     /// VCDU at every rotation. Before the `SoftSyncDetector`
     /// fix, this test would have failed for 7 of 8 rotations —
     /// the chain only decoded at the upright phase.
+    fn patterned_vcdu() -> Vec<u8> {
+        let mut vcdu = vec![0_u8; VCDU_LEN];
+        for (i, b) in vcdu.iter_mut().enumerate() {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "modulo 256 fits in u8 by definition"
+            )]
+            let byte = ((i * 7 + 11) % 256) as u8;
+            *b = byte;
+        }
+        vcdu
+    }
+
+    /// Push a soft stream through the chain at a forward rotation,
+    /// returning the VCDUs it emitted.
+    fn push_rotated(chain: &mut FecChain, soft: &[i8], rot_idx: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for pair_chunk in soft.as_chunks::<2>().0 {
+            let pair = forward_rotation(rot_idx, [pair_chunk[0], pair_chunk[1]]);
+            if let Some(vcdu) = chain.push_symbol(pair) {
+                out.push(vcdu);
+            }
+        }
+        out
+    }
+
+    // --- #727 (Aug 2026 deep review) ---
+
+    /// After a Costas quarter-turn slip the locked rotation is wrong,
+    /// Viterbi emits garbage and the per-CADU correlator never hits
+    /// (only a 180° residual is recoverable via `ASM_INVERTED`). The
+    /// chain must notice the silence and re-hunt the rotation instead
+    /// of yielding nothing for the rest of the pass.
+    #[test]
+    fn rehunts_rotation_after_a_silent_quarter_turn() {
+        let vcdu = patterned_vcdu();
+        let soft = synthesise_cadu_soft(&vcdu);
+        let mut chain = FecChain::new();
+        assert_eq!(push_rotated(&mut chain, &soft, 0), vec![vcdu.clone()]);
+        assert_eq!(chain.locked_rotation(), Some(Rotation::Zero));
+        // The constellation slips by 90°: feed enough CADUs at the
+        // new orientation to exceed the silence limit.
+        // REHUNT_AFTER_FAILED_CADUS copies trigger the re-hunt; the
+        // remaining copies re-acquire and decode at the new rotation.
+        let mut decoded_after_slip = Vec::new();
+        for _ in 0..(REHUNT_AFTER_FAILED_CADUS + 4) {
+            decoded_after_slip.extend(push_rotated(&mut chain, &soft, 1));
+        }
+        // (A 90°-rotated ASM still frame-syncs within the bit-error
+        // limit, so this slip is caught by the failed-CADU run; the
+        // silence limit is exercised separately below.)
+        let st = chain.stats();
+        assert_eq!(st.rotation_rehunts, 1, "{st:?}");
+        assert_eq!(chain.locked_rotation(), Some(Rotation::Rot90));
+        assert!(
+            decoded_after_slip.contains(&vcdu),
+            "decoding resumed at the new rotation"
+        );
+    }
+
+    /// A lock that stops producing frame-sync hits altogether (the
+    /// orientation is wrong and nothing correlates) is abandoned
+    /// after `REHUNT_AFTER_SILENT_BITS` post-Viterbi bits.
+    #[test]
+    fn rehunts_rotation_after_frame_sync_silence() {
+        let vcdu = patterned_vcdu();
+        let clean = synthesise_cadu_soft(&vcdu);
+        let mut chain = FecChain::new();
+        assert_eq!(push_rotated(&mut chain, &clean, 0), vec![vcdu]);
+        // Constant soft pairs carry no ASM: Viterbi keeps emitting
+        // bits, the frame-sync correlator never hits.
+        let silent_pairs = REHUNT_AFTER_SILENT_BITS + 2 * CADU_TOTAL_BITS;
+        for _ in 0..silent_pairs {
+            assert!(chain.push_symbol([40, -40]).is_none());
+        }
+        let st = chain.stats();
+        assert_eq!(st.sync_timeouts, 1, "{st:?}");
+        assert_eq!(st.rotation_rehunts, 1, "{st:?}");
+        assert_eq!(st.cadus_failed, 0, "{st:?}");
+        assert_eq!(chain.locked_rotation(), None, "back to hunting");
+    }
+
+    /// CADUs that frame-sync but fail Reed-Solomon `REHUNT_AFTER_FAILED_CADUS`
+    /// times in a row also abandon the lock (the module doc's deferred
+    /// "last K CADUs all failed RS" fallback).
+    #[test]
+    fn rehunts_rotation_after_consecutive_rs_failures() {
+        let vcdu = patterned_vcdu();
+        let clean = synthesise_cadu_soft(&vcdu);
+        let mut chain = FecChain::new();
+        assert_eq!(push_rotated(&mut chain, &clean, 0), vec![vcdu.clone()]);
+        // ASM + uncorrectable payload: syncs, RS fails every time.
+        let garbage = synthesise_garbage_cadu_soft();
+        for _ in 0..REHUNT_AFTER_FAILED_CADUS {
+            assert!(push_rotated(&mut chain, &garbage, 0).is_empty());
+        }
+        let st = chain.stats();
+        assert_eq!(
+            st.cadus_failed,
+            u64::from(REHUNT_AFTER_FAILED_CADUS),
+            "{st:?}"
+        );
+        assert_eq!(st.rotation_rehunts, 1, "{st:?}");
+        // A clean CADU re-acquires the rotation and decodes again.
+        assert_eq!(push_rotated(&mut chain, &clean, 0), vec![vcdu]);
+        assert_eq!(chain.stats().rotation_locks, 2);
+    }
+
+    /// ASM followed by a payload RS cannot correct (no codeword
+    /// structure at all), encoded like a real CADU.
+    fn synthesise_garbage_cadu_soft() -> Vec<i8> {
+        let mut bits: Vec<u8> = Vec::with_capacity(CADU_TOTAL_BITS + 500);
+        for i in 0..32 {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "ASM is u32, shift index 0..32 is safe"
+            )]
+            let bit = ((crate::fec::ASM >> (31 - i)) & 1) as u8;
+            bits.push(bit);
+        }
+        for i in 0..(CADU_PAYLOAD_LEN * 8) {
+            #[allow(clippy::cast_possible_truncation, reason = "masked to one bit")]
+            let bit = ((i * 7 + i / 13) & 1) as u8;
+            bits.push(bit);
+        }
+        bits.extend(std::iter::repeat_n(0_u8, 500));
+        crate::fec::viterbi::ccsds_encode(&bits)
+    }
+
     #[test]
     fn fec_chain_decodes_through_each_of_eight_rotations() {
         // Distinct, non-uniform VCDU content so any byte-order

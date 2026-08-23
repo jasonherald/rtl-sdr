@@ -24,7 +24,8 @@ pub use derand::Derandomizer;
 pub use diffcode::DiffDecoder;
 pub use reed_solomon::{K as RS_K, N as RS_N, ReedSolomon, RsError, T as RS_T};
 pub use soft_sync::{
-    ASM_ENCODED, ASM_ENCODED_BITS, ROTATION_COUNT, Rotation, SOFT_SYNC_THRESHOLD, SoftSyncDetector,
+    ASM_ENCODED, ASM_ENCODED_BITS, ROTATION_COUNT, Rotation, SOFT_SYNC_AGREEMENT_DEN,
+    SOFT_SYNC_AGREEMENT_NUM, SOFT_SYNC_MIN_ENERGY, SoftSyncDetector,
 };
 pub use sync::{ASM, ASM_BITS, SYNC_THRESHOLD, SyncCorrelator};
 pub use viterbi::{POLYA, POLYB, TRACEBACK_DEPTH, ViterbiDecoder};

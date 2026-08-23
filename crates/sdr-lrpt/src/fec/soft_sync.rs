@@ -56,19 +56,32 @@ pub const ASM_ENCODED: u64 = 0x035D_49C2_4FF2_686B;
 /// (= bits in [`ASM_ENCODED`]).
 pub const ASM_ENCODED_BITS: usize = 64;
 
-/// Soft-correlation threshold for declaring lock. The maximum
-/// possible score is `127 * 64 = 8128` (every soft sample
-/// saturated and matching the expected sign). The threshold
-/// must be high enough to reject false locks on noise but low
-/// enough to allow a moderately weak signal to acquire.
+/// Minimum sign agreement for declaring lock, as the fraction
+/// `SOFT_SYNC_AGREEMENT_NUM / SOFT_SYNC_AGREEMENT_DEN` of the
+/// window's energy: `Σ sample·sign ≥ 55/64 · Σ |sample|`. This is
+/// medet's `corr_limit = 55` of 64 hard bits, carried over to
+/// magnitude-weighted soft samples, and it is independent of the
+/// soft scale.
 ///
-/// `4000` ≈ 49 % of the theoretical maximum — equivalent to an
-/// average soft magnitude of 62.5 across all 64 samples with
-/// every sign correct, or 127 with ~30 sign errors out of 64.
-/// Mirrors medet's `corr_limit=55` threshold (which uses a
-/// different 0/1 hard-correlation scoring; same meaning of
-/// "majority of bits agree").
-pub const SOFT_SYNC_THRESHOLD: i32 = 4_000;
+/// The scale matters: real passes never approach the `127 · 64 =
+/// 8128` saturated maximum. The demod AGC targets |sample| = 190,
+/// the QPSK rails sit at ~134 and `soft_pair` halves that, so a
+/// nominal pass delivers |soft| ≈ 67 and a clean ASM scores about
+/// 4288. The previous absolute threshold of 4000 was therefore
+/// ~93 % of what a nominal pass can reach (not the 49 % its comment
+/// claimed), leaving almost no acquisition margin below ~8 dB
+/// Es/N0 (#731).
+pub const SOFT_SYNC_AGREEMENT_NUM: i32 = 55;
+
+/// Denominator of the agreement fraction (window length in
+/// samples, as in medet's 64-bit correlator).
+pub const SOFT_SYNC_AGREEMENT_DEN: i32 = 64;
+
+/// Energy floor below which no lock is declared: a mean soft
+/// magnitude under 8 (`8 · 64 = 512` total over the window) is
+/// noise-floor silence, where a high agreement fraction is
+/// meaningless.
+pub const SOFT_SYNC_MIN_ENERGY: i32 = 8 * SOFT_SYNC_AGREEMENT_DEN;
 
 /// Number of rotated patterns to check. 4 base rotations
 /// (0°/90°/180°/270°) × 2 (with / without I/Q axis swap) = 8.
@@ -180,7 +193,7 @@ impl Rotation {
 /// resolution. Push one soft i8 sample at a time (one axis
 /// component, not a pair); on any push that completes a 64-sample
 /// window where one of 8 rotated ASM patterns scores above
-/// [`SOFT_SYNC_THRESHOLD`], returns `Some(rotation)` and resets
+/// the agreement limit, returns `Some(rotation)` and resets
 /// for the next hunt.
 ///
 /// Cost: 8 × 64 = 512 multiply-adds per pushed sample during
@@ -261,7 +274,7 @@ impl SoftSyncDetector {
     /// Push one QPSK soft symbol pair `[I, Q]` (the same shape
     /// `Viterbi` consumes). Returns `Some(rotation)` on the push
     /// that completes a window where one of the 8 rotated ASM
-    /// patterns scores above [`SOFT_SYNC_THRESHOLD`].
+    /// patterns reaches the agreement limit.
     ///
     /// **Why pairs, not single samples.** The encoded ASM is 32
     /// QPSK symbols long, naturally aligned to symbol boundaries.
@@ -290,8 +303,9 @@ impl SoftSyncDetector {
     }
 
     /// Score every pattern against the current window. Returns
-    /// the rotation with the best score if it exceeds
-    /// [`SOFT_SYNC_THRESHOLD`].
+    /// the rotation with the best score if it reaches the
+    /// agreement fraction of the window's energy (and the window
+    /// is above [`SOFT_SYNC_MIN_ENERGY`]).
     ///
     /// **Window orientation**: `head` points to the next slot
     /// to write, so the OLDEST sample is at `window[head]` and
@@ -301,6 +315,12 @@ impl SoftSyncDetector {
     fn best_match(&self) -> Option<Rotation> {
         let mut best_idx: usize = 0;
         let mut best_score: i32 = i32::MIN;
+        let energy: i32 = (0..ASM_ENCODED_BITS)
+            .map(|j| i32::from(self.window[(self.head + j) % ASM_ENCODED_BITS]).abs())
+            .sum();
+        if energy < SOFT_SYNC_MIN_ENERGY {
+            return None;
+        }
         for (idx, pattern) in self.patterns.iter().enumerate() {
             let mut score: i32 = 0;
             for (j, &expected) in pattern.iter().enumerate() {
@@ -316,7 +336,7 @@ impl SoftSyncDetector {
                 best_idx = idx;
             }
         }
-        if best_score >= SOFT_SYNC_THRESHOLD {
+        if best_score * SOFT_SYNC_AGREEMENT_DEN >= energy * SOFT_SYNC_AGREEMENT_NUM {
             Rotation::from_index(best_idx)
         } else {
             None
@@ -479,6 +499,74 @@ mod tests {
                 Some(*expected_rot),
                 "pattern at index {idx} should match {expected_rot:?}",
             );
+        }
+    }
+
+    /// Real passes run far below saturation: the AGC targets
+    /// |sample| = 190, the rails sit at ~134 and `soft_pair` halves
+    /// that to ~67; a weaker pass sits lower still. A clean ASM at
+    /// ±40 (score 2560) must lock — the old absolute threshold of
+    /// 4000 was 93 % of the ~4288 a nominal pass can reach (#731).
+    #[test]
+    fn detects_clean_asm_at_weak_soft_magnitude() {
+        const WEAK_MAGNITUDE: i8 = 40;
+        let mut det = SoftSyncDetector::new();
+        let signs = bits_to_signs(ASM_ENCODED);
+        for _ in 0..(ASM_ENCODED_BITS / 2) {
+            let _ = det.push_symbol([0, 0]);
+        }
+        let mut hit: Option<Rotation> = None;
+        for pair in signs_to_pairs(signs) {
+            let weak = [
+                pair[0].signum() * WEAK_MAGNITUDE,
+                pair[1].signum() * WEAK_MAGNITUDE,
+            ];
+            if let Some(r) = det.push_symbol(weak) {
+                hit = Some(r);
+            }
+        }
+        assert_eq!(hit, Some(Rotation::Zero));
+    }
+
+    /// Agreement is judged relative to the window's energy, like
+    /// medet's 55-of-64 hard-bit limit: a saturated window with 10
+    /// sign errors (54 agree, 10 disagree → 44/64 net) scores 5588
+    /// in absolute terms but must not lock.
+    #[test]
+    fn rejects_saturated_window_with_too_many_sign_errors() {
+        const SIGN_ERRORS: usize = 10;
+        let mut det = SoftSyncDetector::new();
+        let mut signs = bits_to_signs(ASM_ENCODED);
+        for sign in signs.iter_mut().take(SIGN_ERRORS) {
+            *sign = -*sign;
+        }
+        for _ in 0..(ASM_ENCODED_BITS / 2) {
+            let _ = det.push_symbol([0, 0]);
+        }
+        for pair in signs_to_pairs(signs) {
+            assert!(
+                det.push_symbol(pair).is_none(),
+                "44/64 agreement must not lock"
+            );
+        }
+    }
+
+    /// A perfectly agreeing but near-silent window (mean |soft| of
+    /// 2) is below the energy floor and must not lock either.
+    #[test]
+    fn rejects_near_silent_window() {
+        const SILENT_MAGNITUDE: i8 = 2;
+        let mut det = SoftSyncDetector::new();
+        let signs = bits_to_signs(ASM_ENCODED);
+        for _ in 0..(ASM_ENCODED_BITS / 2) {
+            let _ = det.push_symbol([0, 0]);
+        }
+        for pair in signs_to_pairs(signs) {
+            let quiet = [
+                pair[0].signum() * SILENT_MAGNITUDE,
+                pair[1].signum() * SILENT_MAGNITUDE,
+            ];
+            assert!(det.push_symbol(quiet).is_none());
         }
     }
 
