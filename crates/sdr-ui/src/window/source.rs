@@ -1683,7 +1683,7 @@ pub(super) fn connect_source_panel(
 
     wire_source_type_guard(panels, state, toast_overlay, server_running);
 
-    wire_network_source_rows(panels, state, config, favorites);
+    wire_network_source_rows(panels, state, config);
 
     wire_role_and_server_key_rows(panels, state, config, favorites, &last_good_auth_key);
 }
@@ -3121,94 +3121,12 @@ fn wire_sample_rate_and_device_rows(
     // already has RTL-TCP + a high sample rate selected.
     apply_source_bandwidth_advisory();
 
-    // Sample rate selector. Restore-then-wire (#552).
-    {
-        let persisted_idx = sidebar::source_panel::load_source_sample_rate_index(config);
-        if (persisted_idx as usize) < SAMPLE_RATES.len() {
-            panels.source.sample_rate_row.set_selected(persisted_idx);
-            if let Some(&rate) = SAMPLE_RATES.get(persisted_idx as usize) {
-                state.send_dsp(UiToDsp::SetSampleRate(rate));
-            }
-        }
-    }
-    let state_sr = Rc::clone(state);
-    let config_sr = std::sync::Arc::clone(config);
-    let apply_on_sr = apply_source_bandwidth_advisory.clone();
-    panels
-        .source
-        .sample_rate_row
-        .connect_selected_notify(move |row| {
-            let idx = row.selected();
-            // Validate before persisting. GTK can briefly emit
-            // out-of-range values during widget-model churn (e.g.
-            // teardown / rebuild on style changes); persisting
-            // those would corrupt the config file across restart.
-            // Mirror the protocol_row pattern further down: bail
-            // when the index doesn't map to a real sample rate.
-            // Per CodeRabbit round 1 on PR #558.
-            let Some(&rate) = SAMPLE_RATES.get(idx as usize) else {
-                return;
-            };
-            sidebar::source_panel::save_source_sample_rate_index(&config_sr, idx);
-            state_sr.send_dsp(UiToDsp::SetSampleRate(rate));
-            apply_on_sr();
-        });
-    // Source-type (device) selector. Restore-then-wire (#552).
-    // The restore SETs the row's selected index, which fires
-    // `connect_selected_notify` and thus re-applies the bandwidth
-    // advisory; that's intentional (it wires up the correct
-    // visibility for the persisted source type at startup). The
-    // source-type swap itself is handled by an UPSTREAM
-    // `connect_selected_notify` (around the per-source-type
-    // visibility block); this handler only wires the persistence
-    // save + bandwidth-advisory refresh. The dedicated swap
-    // dispatch lives at the end of `connect_source_panel`.
-    {
-        let persisted_idx = sidebar::source_panel::load_source_device_index(config);
-        // Bound check via `DEVICE_RTLTCP` (the highest valid
-        // index) — fails closed if a stale config carries an
-        // out-of-range value (e.g. a future build added more
-        // source types and the user rolled back).
-        if persisted_idx <= sidebar::source_panel::DEVICE_RTLTCP {
-            panels.source.device_row.set_selected(persisted_idx);
-            // Dispatch the restored source type to the DSP so a
-            // saved Network / File / RTL-TCP selection takes
-            // effect at startup. The change-notify handler that
-            // dispatches `SetSourceType` from user clicks is
-            // wired AFTER this restore block runs, and even if it
-            // were wired first, programmatic `set_selected` to a
-            // value that already matches the row's default (0 =
-            // RTL-SDR) wouldn't fire it. Explicit dispatch closes
-            // both gaps. Per CodeRabbit round 1 on PR #558.
-            let source_type = match persisted_idx {
-                sidebar::source_panel::DEVICE_RTLSDR => Some(SourceType::RtlSdr),
-                sidebar::source_panel::DEVICE_NETWORK => Some(SourceType::Network),
-                sidebar::source_panel::DEVICE_FILE => Some(SourceType::File),
-                sidebar::source_panel::DEVICE_RTLTCP => Some(SourceType::RtlTcp),
-                _ => None,
-            };
-            if let Some(source_type) = source_type {
-                state.send_dsp(UiToDsp::SetSourceType(source_type));
-            }
-        }
-    }
-    let config_device = std::sync::Arc::clone(config);
-    let apply_on_device = apply_source_bandwidth_advisory;
-    panels
-        .source
-        .device_row
-        .connect_selected_notify(move |row| {
-            let idx = row.selected();
-            // Validate before persisting (same rationale as the
-            // sample-rate row above). `DEVICE_RTLTCP` is the
-            // highest valid index. Per CodeRabbit round 1 on
-            // PR #558.
-            if idx > sidebar::source_panel::DEVICE_RTLTCP {
-                return;
-            }
-            sidebar::source_panel::save_source_device_index(&config_device, idx);
-            apply_on_device();
-        });
+    wire_sample_rate_selector(
+        panels,
+        state,
+        config,
+        apply_source_bandwidth_advisory.clone(),
+    );
 }
 
 /// DC blocking / bias-T / direct sampling / offset tuning / IQ inversion / decimation rows (restore-then-wire).
@@ -3273,139 +3191,9 @@ fn wire_rtl_frontend_toggles(
             state_bias_tee.send_dsp(UiToDsp::SetBiasTee(enabled));
         });
 
-    // Direct sampling combo (#538). Same restore-then-wire idiom
-    // as bias-T above. The persisted value is the combo index
-    // (0/1/2), which is also the `rtlsdr_set_direct_sampling`
-    // mode argument — cast straight to `i32` for the dispatch.
-    {
-        let persisted = sidebar::source_panel::load_source_rtl_direct_sampling_mode(config);
-        if persisted <= sidebar::source_panel::DIRECT_SAMPLING_MAX_IDX {
-            panels.source.direct_sampling_row.set_selected(persisted);
-            #[allow(clippy::cast_possible_wrap, reason = "u32 <= 2 fits in i32 trivially")]
-            state.send_dsp(UiToDsp::SetDirectSampling(persisted as i32));
-        }
-    }
-    let state_direct = Rc::clone(state);
-    let config_direct = std::sync::Arc::clone(config);
-    let toast_overlay_direct = toast_overlay.downgrade();
-    panels
-        .source
-        .direct_sampling_row
-        .connect_selected_notify(move |row| {
-            let idx = row.selected();
-            // Validate before persisting (mirrors the
-            // protocol_row / sample-rate / device / decimation
-            // early-return-on-invalid pattern). GTK can briefly
-            // emit out-of-range values during widget-model
-            // churn; persisting them would leave the next
-            // restart pinned to a non-existent direct-sampling
-            // mode. Per `CodeRabbit` round 3 on PR #558.
-            if idx > sidebar::source_panel::DIRECT_SAMPLING_MAX_IDX {
-                return;
-            }
-            sidebar::source_panel::save_source_rtl_direct_sampling_mode(&config_direct, idx);
-            #[allow(clippy::cast_possible_wrap, reason = "idx <= 2 fits in i32 trivially")]
-            state_direct.send_dsp(UiToDsp::SetDirectSampling(idx as i32));
-            // Surface a tune-guidance toast: enabling direct
-            // sampling routes the antenna straight to the ADC,
-            // which silences VHF/UHF (the R820T tuner is now
-            // bypassed); disabling it puts the tuner back in
-            // path, which silences HF. Either direction needs a
-            // manual retune to be useful, and a toast saves the
-            // user from staring at noise wondering why. Per
-            // `CodeRabbit` round 1 on PR #559 / closes #538
-            // objective.
-            if let Some(overlay) = toast_overlay_direct.upgrade() {
-                let msg = if idx == sidebar::source_panel::DIRECT_SAMPLING_DISABLED_IDX {
-                    "Direct Sampling off — retune to VHF/UHF."
-                } else {
-                    // No `<` here: `adw::Toast` titles are Pango markup and
-                    // "(< 28 MHz)" failed to parse (GTK-WARNING, blank toast).
-                    "Direct Sampling on — retune to an HF frequency (below 28 MHz)."
-                };
-                overlay.add_toast(plain_toast(msg));
-            }
-        });
+    wire_sampling_mode_rows(panels, state, toast_overlay, config);
 
-    // Offset tuning toggle (#539). Same restore-then-wire idiom
-    // as bias-T above. The controller bridge
-    // (`UiToDsp::SetOffsetTuning`) was already plumbed; only
-    // wiring is new here.
-    //
-    // Only DISPATCH the persisted value when it's `true`. The
-    // librtlsdr R820T-family branch returns `InvalidParameter`
-    // for every `set_offset_tuning` call regardless of value —
-    // dispatching `false` at startup (the default for users
-    // who've never touched the toggle) generates a spurious
-    // "Offset tuning failed" toast on the vast majority of
-    // dongles. The driver default already matches `false`, so
-    // skipping the dispatch is semantically a no-op. Per issue
-    // #564.
-    {
-        let persisted = sidebar::source_panel::load_source_rtl_offset_tuning(config);
-        panels.source.offset_tuning_row.set_active(persisted);
-        if persisted {
-            state.send_dsp(UiToDsp::SetOffsetTuning(true));
-        }
-    }
-    let state_offset = Rc::clone(state);
-    let config_offset = std::sync::Arc::clone(config);
-    panels
-        .source
-        .offset_tuning_row
-        .connect_active_notify(move |row| {
-            let enabled = row.is_active();
-            sidebar::source_panel::save_source_rtl_offset_tuning(&config_offset, enabled);
-            state_offset.send_dsp(UiToDsp::SetOffsetTuning(enabled));
-        });
-
-    // IQ inversion toggle. Restore-then-wire (#552).
-    {
-        let persisted = sidebar::source_panel::load_source_iq_inversion(config);
-        panels.source.iq_inversion_row.set_active(persisted);
-        state.send_dsp(UiToDsp::SetIqInversion(persisted));
-    }
-    let state_iq_inv = Rc::clone(state);
-    let config_iq_inv = std::sync::Arc::clone(config);
-    panels
-        .source
-        .iq_inversion_row
-        .connect_active_notify(move |row| {
-            let enabled = row.is_active();
-            sidebar::source_panel::save_source_iq_inversion(&config_iq_inv, enabled);
-            state_iq_inv.send_dsp(UiToDsp::SetIqInversion(enabled));
-        });
-
-    // Decimation selector. Restore-then-wire (#552). The
-    // decimation index also feeds the bandwidth-advisory
-    // recompute via `apply_source_bandwidth_advisory`, so
-    // restoring here BEFORE wiring keeps the advisory pristine
-    // on first launch.
-    {
-        let persisted_idx = sidebar::source_panel::load_source_decimation_index(config);
-        if (persisted_idx as usize) < DECIMATION_FACTORS.len() {
-            panels.source.decimation_row.set_selected(persisted_idx);
-            if let Some(&factor) = DECIMATION_FACTORS.get(persisted_idx as usize) {
-                state.send_dsp(UiToDsp::SetDecimation(factor));
-            }
-        }
-    }
-    let state_decim = Rc::clone(state);
-    let config_decim = std::sync::Arc::clone(config);
-    panels
-        .source
-        .decimation_row
-        .connect_selected_notify(move |row| {
-            let idx = row.selected();
-            // Validate before persisting (same rationale as the
-            // sample-rate row above). Per CodeRabbit round 1 on
-            // PR #558.
-            let Some(&factor) = DECIMATION_FACTORS.get(idx as usize) else {
-                return;
-            };
-            sidebar::source_panel::save_source_decimation_index(&config_decim, idx);
-            state_decim.send_dsp(UiToDsp::SetDecimation(factor));
-        });
+    wire_iq_inversion_and_decimation(panels, state, config);
 }
 
 /// Gain row + AGC type selector with mutex + restore ordering (#551).
@@ -3459,126 +3247,7 @@ fn wire_gain_and_agc_rows(
         state_gain.send_dsp(UiToDsp::SetGain(row.value()));
     });
 
-    // AGC type selector (Off / Hardware / Software). Dispatches
-    // the right `UiToDsp::SetAgc` / `UiToDsp::SetSoftwareAgc`
-    // pair on every selection and also fires two mutexes so
-    // the UI doesn't lie about controls that EITHER AGC type
-    // disables:
-    //
-    // 1. Gain row — `rtlsdr_set_tuner_gain` silently no-ops on
-    //    most RTL variants when hardware AGC is on; software
-    //    AGC makes manual gain pointless because the DSP stage
-    //    would renormalize it immediately.
-    // 2. Squelch rows — both AGC types auto-normalize IF
-    //    amplitude, so amplitude-based squelch can't distinguish
-    //    signal from noise and the gate just stays open. Without
-    //    this mutex users see "all static all the time" the
-    //    moment they enable AGC with squelch on.
-    //
-    // Register the AGC notify handler BEFORE restoring the
-    // persisted selection. `set_selected` only fires
-    // `selected-notify` when the new index differs from the
-    // current one, so the startup-restore path relies on the
-    // handler being registered first to dispatch the persisted
-    // mode. Without this ordering, fresh installs (persisted
-    // matches build-time default) or config match would leave
-    // DSP stuck in its all-off default state until the user
-    // touched the selector.
-    //
-    // Handler drops transient out-of-range indices —
-    // `agc_type_from_selected` now returns `Option<AgcType>`
-    // and we early-return on `None` rather than coercing them
-    // to a fallback and persisting a bogus config write during
-    // widget-teardown churn.
-    let state_agc = Rc::clone(state);
-    let config_for_agc = std::sync::Arc::clone(config);
-    let gain_row_for_agc = panels.source.gain_row.clone();
-    let squelch_enabled_for_agc = panels.radio.squelch_enabled_row.clone();
-    let squelch_level_for_agc = panels.radio.squelch_level_row.clone();
-    let auto_squelch_for_agc = panels.radio.auto_squelch_row.clone();
-    panels.source.agc_row.connect_selected_notify(move |row| {
-        let Some(agc_type) = sidebar::source_panel::agc_type_from_selected(row.selected()) else {
-            // Transient GTK value (e.g., `INVALID_LIST_POSITION`
-            // during model swap). Skip dispatch AND persistence
-            // — we'll pick up the next real selection from the
-            // follow-up notify event.
-            tracing::trace!(
-                selected = row.selected(),
-                "AGC combo notify with out-of-range index, ignoring"
-            );
-            return;
-        };
-
-        // Dispatch both messages every time so exactly one
-        // enable path is active and the other is cleanly off.
-        // The engine treats hardware and software AGC as
-        // independent flags; the UI is the policy layer that
-        // mutually excludes them.
-        let (hw, sw) = match agc_type {
-            sidebar::source_panel::AgcType::Off => (false, false),
-            sidebar::source_panel::AgcType::Hardware => (true, false),
-            sidebar::source_panel::AgcType::Software => (false, true),
-        };
-        state_agc.send_dsp(UiToDsp::SetAgc(hw));
-        state_agc.send_dsp(UiToDsp::SetSoftwareAgc(sw));
-
-        // Persist the new selection so the choice sticks
-        // across restarts. Cheap — `ConfigManager::write` is an
-        // in-memory update with a debounced flush to disk.
-        sidebar::source_panel::save_agc_type(&config_for_agc, agc_type);
-
-        let agc_active = !matches!(agc_type, sidebar::source_panel::AgcType::Off);
-        apply_agc_gain_mutex(&gain_row_for_agc, agc_active);
-        apply_agc_squelch_mutex(
-            &squelch_enabled_for_agc,
-            &squelch_level_for_agc,
-            &auto_squelch_for_agc,
-            agc_active,
-        );
-    });
-
-    // Restore persisted AGC type from config now that the
-    // notify handler is wired up. Two scenarios:
-    //
-    // 1. Persisted index differs from the combo's build-time
-    //    default (Software) — `set_selected` fires
-    //    `selected-notify`, the handler runs, DSP is
-    //    dispatched, mutexes applied.
-    // 2. Persisted index matches the default (fresh install
-    //    or user previously selected Software) —
-    //    `set_selected` is a no-op and `selected-notify`
-    //    does NOT fire. We explicitly dispatch so DSP still
-    //    gets the initial-state sync and mutexes are applied
-    //    against the seeded selection.
-    //
-    // Both paths run the same dispatch logic; the explicit
-    // post-`set_selected` call is idempotent with the notify
-    // handler (both `SetAgc` and `SetSoftwareAgc` are
-    // idempotent at the controller), so the double-dispatch
-    // in scenario 1 is cheap and correct.
-    {
-        let persisted = sidebar::source_panel::load_agc_type(config);
-        panels
-            .source
-            .agc_row
-            .set_selected(sidebar::source_panel::selected_from_agc_type(persisted));
-
-        let (hw, sw) = match persisted {
-            sidebar::source_panel::AgcType::Off => (false, false),
-            sidebar::source_panel::AgcType::Hardware => (true, false),
-            sidebar::source_panel::AgcType::Software => (false, true),
-        };
-        state.send_dsp(UiToDsp::SetAgc(hw));
-        state.send_dsp(UiToDsp::SetSoftwareAgc(sw));
-        let agc_active = !matches!(persisted, sidebar::source_panel::AgcType::Off);
-        apply_agc_gain_mutex(&panels.source.gain_row, agc_active);
-        apply_agc_squelch_mutex(
-            &panels.radio.squelch_enabled_row,
-            &panels.radio.squelch_level_row,
-            &panels.radio.auto_squelch_row,
-            agc_active,
-        );
-    }
+    wire_agc_type_selector(panels, state, config);
 }
 
 /// rtl_tcp client role + auth-key rows with last-good-bytes cache and per-server restore (#396).
@@ -3589,102 +3258,7 @@ fn wire_rtl_tcp_client_rows(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     last_good_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
 ) {
-    // Restore the rtl_tcp client's last-used role + auth key
-    // (#396). Role resolution uses the standard two-tier
-    // lookup: per-favorite `requested_role` first (if the
-    // LastConnectedServer matches a favorite entry), falling
-    // back to the global `KEY_RTL_TCP_CLIENT_LAST_ROLE` default,
-    // and finally to `Control` (legacy-safe). The auth key is
-    // loaded directly from the per-server keyring using the
-    // LastConnectedServer's `host:port`. Pre-CodeRabbit round 2
-    // on PR #408 this path hard-set `auth_key: None` and
-    // ignored per-favorite role, so pressing Play right after
-    // launch against a previously-auth-configured server would
-    // drop the saved key and force a redundant `AuthRequired`
-    // bounce before reconnecting. With the keyring preload the
-    // DSP carries the right bytes from the first Play.
-    {
-        use crate::sidebar::source_panel::{
-            FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
-            RTL_TCP_ROLE_LISTEN_IDX, load_favorites, load_last_connected,
-        };
-        let last_connected = load_last_connected(config);
-        let favorite_entry = last_connected.as_ref().and_then(|srv| {
-            let key = format!("{}:{}", srv.host, srv.port);
-            load_favorites(config).into_iter().find(|f| f.key == key)
-        });
-        let persisted_role: FavoriteRole = favorite_entry
-            .as_ref()
-            .and_then(|f| f.requested_role)
-            .or_else(|| {
-                config.read(|v| {
-                    v.get(KEY_RTL_TCP_CLIENT_LAST_ROLE)
-                        .and_then(|val| serde_json::from_value(val.clone()).ok())
-                })
-            })
-            .unwrap_or(FavoriteRole::Control);
-        let idx = match persisted_role {
-            FavoriteRole::Control => RTL_TCP_ROLE_CONTROL_IDX,
-            FavoriteRole::Listen => RTL_TCP_ROLE_LISTEN_IDX,
-        };
-        panels.source.rtl_tcp_role_row.set_selected(idx);
-        // Load the saved per-server auth key for the last-
-        // connected endpoint, if any. Also cache that server's
-        // stable id on `AppState` so the first post-Play
-        // `AuthRequired` / `AuthFailed` / `Connected` arm
-        // already has it and the keyring save / clear paths
-        // target the right entry without waiting on the first
-        // `apply_rtl_tcp_connect` call.
-        //
-        // Auth-row visibility + text is resolved deterministically
-        // using the same two-input rule as `apply_rtl_tcp_connect`
-        // (per `CodeRabbit` round 5 on PR #408): reveal the row
-        // when EITHER the favorite advertises `auth_required ==
-        // Some(true)` (server requires a key; user should see the
-        // field up-front even on a fresh session with no saved
-        // key) OR a saved key exists in the keyring (we want to
-        // show the pre-loaded value so the user knows the
-        // session will auto-auth). Set text from the saved key,
-        // or clear when none — so a prior-session auth-required
-        // server whose key the user later cleared doesn't leak
-        // stale text into the field on the next launch.
-        let mut auth_key: Option<Vec<u8>> = None;
-        if let Some(srv) = last_connected.as_ref() {
-            *state.rtl_tcp_active_server.borrow_mut() = format!("{}:{}", srv.host, srv.port);
-            auth_key = load_client_auth_key_from_keyring(&srv.host, srv.port);
-            // Seed the round-9 last-good cache with the
-            // startup-restored bytes so a subsequent malformed-
-            // hex role flip (round 9's fallback path) preserves
-            // the auth DSP just received. Without this the
-            // cache would stay `None` until the user first
-            // edited the auth field, opening a window where a
-            // role flip with malformed text in the row silently
-            // clears DSP auth. Per `CodeRabbit` round 10 on
-            // PR #408.
-            last_good_auth_key.borrow_mut().clone_from(&auth_key);
-            let has_auth_required = matches!(
-                favorite_entry.as_ref().and_then(|f| f.auth_required),
-                Some(true)
-            );
-            let should_reveal = has_auth_required || auth_key.is_some();
-            panels
-                .source
-                .rtl_tcp_auth_key_row
-                .set_visible(should_reveal);
-            if let Some(bytes) = auth_key.as_ref() {
-                panels
-                    .source
-                    .rtl_tcp_auth_key_row
-                    .set_text(&crate::sidebar::server_panel::auth_key_to_hex(bytes));
-            } else {
-                panels.source.rtl_tcp_auth_key_row.set_text("");
-            }
-        }
-        state.send_dsp(UiToDsp::SetRtlTcpClientConfig {
-            requested_role: persisted_role.as_wire_role(),
-            auth_key,
-        });
-    }
+    restore_rtl_tcp_client_state(panels, state, config, last_good_auth_key);
 }
 
 /// IQ correction, PPM, and the stop/start buttons.
@@ -3815,9 +3389,6 @@ fn wire_network_source_rows(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
 ) {
     // Raw-Network source config (hostname / port / protocol).
     // Restore all three widgets atomically BEFORE wiring the
@@ -3852,160 +3423,7 @@ fn wire_network_source_rows(
         });
     }
 
-    // Network hostname — send on every edit so Play always has current value
-    let state_host = Rc::clone(state);
-    let config_host = std::sync::Arc::clone(config);
-    let port_for_host = panels.source.port_row.clone();
-    let proto_for_host = panels.source.protocol_row.clone();
-    let hostname_for_host = panels.source.hostname_row.clone();
-    let auth_key_for_host = panels.source.rtl_tcp_auth_key_row.clone();
-    panels.source.hostname_row.connect_changed(move |row| {
-        // Invalidate the cached `rtl_tcp_active_server` when
-        // the widget no longer matches the cached stable id
-        // (typically a manual edit; harmless no-op for
-        // `apply_rtl_tcp_connect`'s programmatic writes when
-        // those match the cache). Per CodeRabbit round 4 on
-        // PR #408.
-        //
-        // Skip the invalidation during RTL-TCP hydration: the
-        // startup hydration in `connect_rtl_tcp_discovery`
-        // rewrites this row from the last-connected RTL-TCP
-        // server (only when the persisted source type is
-        // RTL-TCP), and `apply_rtl_tcp_connect` writes the
-        // cache *after* the row writes — so an unguarded
-        // invalidate would clear the cache the hydration just
-        // restored AND blank the auth row before the auth-row
-        // handler had a chance to push the saved key. The
-        // `apply_rtl_tcp_connect` path handles cache and auth
-        // row deterministically itself; we just need to stay
-        // out of its way here. Per `CodeRabbit` round 3 on PR
-        // #558.
-        if !state_host.rtl_tcp_hydration_in_progress.get() {
-            invalidate_rtl_tcp_active_server_on_edit(
-                &state_host,
-                &hostname_for_host,
-                &port_for_host,
-                &auth_key_for_host,
-            );
-        }
-        let hostname = row.text().to_string();
-        // Skip the raw-Network disk-write when this change came
-        // from an RTL-TCP hydration. The user's independent
-        // raw-Network hostname stays in `KEY_SOURCE_NETWORK_*`
-        // and round-trips across restart on its own. Per
-        // CodeRabbit round 1 on PR #558.
-        if !state_host.rtl_tcp_hydration_in_progress.get() {
-            sidebar::source_panel::save_source_network_hostname(&config_host, &hostname);
-        }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let port = port_for_host.value() as u16;
-        let protocol = if proto_for_host.selected() == NETWORK_PROTOCOL_UDP_IDX {
-            sdr_types::Protocol::Udp
-        } else {
-            sdr_types::Protocol::TcpClient
-        };
-        // Suppress per-edit `SetNetworkConfig` dispatch while a
-        // hydration is rewriting all three rows in sequence. The
-        // sequence would otherwise cause three intermediate
-        // reconnect attempts (one per row), each against a
-        // partially-rewritten triple. `apply_rtl_tcp_connect`
-        // dispatches a single canonical `SetNetworkConfig` after
-        // clearing the flag, so the final state still reaches
-        // the DSP. Per `CodeRabbit` round 2 on PR #558.
-        if !state_host.rtl_tcp_hydration_in_progress.get() {
-            state_host.send_dsp(UiToDsp::SetNetworkConfig {
-                hostname,
-                port,
-                protocol,
-            });
-        }
-    });
-
-    // Network port
-    let state_port = Rc::clone(state);
-    let config_port = std::sync::Arc::clone(config);
-    let host_for_port = panels.source.hostname_row.clone();
-    let proto_for_port = panels.source.protocol_row.clone();
-    let port_row_for_port = panels.source.port_row.clone();
-    let auth_key_for_port = panels.source.rtl_tcp_auth_key_row.clone();
-    panels.source.port_row.connect_value_notify(move |row| {
-        // Skip the invalidation during RTL-TCP hydration; see
-        // hostname handler above for the rationale. Per
-        // `CodeRabbit` round 3 on PR #558.
-        if !state_port.rtl_tcp_hydration_in_progress.get() {
-            invalidate_rtl_tcp_active_server_on_edit(
-                &state_port,
-                &host_for_port,
-                &port_row_for_port,
-                &auth_key_for_port,
-            );
-        }
-        let hostname = host_for_port.text().to_string();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let port = row.value() as u16;
-        // Skip the raw-Network disk-write during RTL-TCP
-        // hydration; see hostname handler above. Per CodeRabbit
-        // round 1 on PR #558.
-        if !state_port.rtl_tcp_hydration_in_progress.get() {
-            sidebar::source_panel::save_source_network_port(&config_port, port);
-        }
-        let protocol = if proto_for_port.selected() == NETWORK_PROTOCOL_UDP_IDX {
-            sdr_types::Protocol::Udp
-        } else {
-            sdr_types::Protocol::TcpClient
-        };
-        // Suppress per-edit dispatch during hydration; see
-        // hostname handler above. Per `CodeRabbit` round 2 on
-        // PR #558.
-        if !state_port.rtl_tcp_hydration_in_progress.get() {
-            state_port.send_dsp(UiToDsp::SetNetworkConfig {
-                hostname,
-                port,
-                protocol,
-            });
-        }
-    });
-
-    // Network protocol
-    let state_proto = Rc::clone(state);
-    let config_proto = std::sync::Arc::clone(config);
-    let host_for_proto = panels.source.hostname_row.clone();
-    let port_for_proto = panels.source.port_row.clone();
-    panels
-        .source
-        .protocol_row
-        .connect_selected_notify(move |row| {
-            let hostname = host_for_proto.text().to_string();
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let port = port_for_proto.value() as u16;
-            let selected = row.selected();
-            // Validate the selected index BEFORE persisting so a
-            // transient out-of-range value during widget churn
-            // can't land in config (matches the sample-rate /
-            // device / decimation handlers' early-return pattern).
-            // Per `CodeRabbit` round 3 on PR #558.
-            let protocol = match selected {
-                NETWORK_PROTOCOL_TCPCLIENT_IDX => sdr_types::Protocol::TcpClient,
-                NETWORK_PROTOCOL_UDP_IDX => sdr_types::Protocol::Udp,
-                _ => return, // ignore transient indices
-            };
-            // Skip the raw-Network disk-write during RTL-TCP
-            // hydration; see hostname handler above. Per
-            // `CodeRabbit` round 1 on PR #558.
-            if !state_proto.rtl_tcp_hydration_in_progress.get() {
-                sidebar::source_panel::save_source_network_protocol_index(&config_proto, selected);
-            }
-            // Suppress per-edit dispatch during hydration; see
-            // hostname handler above. Per `CodeRabbit` round 2 on
-            // PR #558.
-            if !state_proto.rtl_tcp_hydration_in_progress.get() {
-                state_proto.send_dsp(UiToDsp::SetNetworkConfig {
-                    hostname,
-                    port,
-                    protocol,
-                });
-            }
-        });
+    wire_network_hostname_row(panels, state, config);
 }
 
 /// Connection-role picker + server-key entry (#394/#396).
@@ -4155,6 +3573,193 @@ fn wire_role_and_server_key_rows(
             }
         });
 
+    wire_server_key_entry(panels, state, config, last_good_auth_key);
+}
+
+/// Direct-sampling combo + offset-tuning toggle (#538/#539).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_sampling_mode_rows(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    toast_overlay: &adw::ToastOverlay,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // Direct sampling combo (#538). Same restore-then-wire idiom
+    // as bias-T above. The persisted value is the combo index
+    // (0/1/2), which is also the `rtlsdr_set_direct_sampling`
+    // mode argument — cast straight to `i32` for the dispatch.
+    {
+        let persisted = sidebar::source_panel::load_source_rtl_direct_sampling_mode(config);
+        if persisted <= sidebar::source_panel::DIRECT_SAMPLING_MAX_IDX {
+            panels.source.direct_sampling_row.set_selected(persisted);
+            #[allow(clippy::cast_possible_wrap, reason = "u32 <= 2 fits in i32 trivially")]
+            state.send_dsp(UiToDsp::SetDirectSampling(persisted as i32));
+        }
+    }
+    let state_direct = Rc::clone(state);
+    let config_direct = std::sync::Arc::clone(config);
+    let toast_overlay_direct = toast_overlay.downgrade();
+    panels
+        .source
+        .direct_sampling_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected();
+            // Validate before persisting (mirrors the
+            // protocol_row / sample-rate / device / decimation
+            // early-return-on-invalid pattern). GTK can briefly
+            // emit out-of-range values during widget-model
+            // churn; persisting them would leave the next
+            // restart pinned to a non-existent direct-sampling
+            // mode. Per `CodeRabbit` round 3 on PR #558.
+            if idx > sidebar::source_panel::DIRECT_SAMPLING_MAX_IDX {
+                return;
+            }
+            sidebar::source_panel::save_source_rtl_direct_sampling_mode(&config_direct, idx);
+            #[allow(clippy::cast_possible_wrap, reason = "idx <= 2 fits in i32 trivially")]
+            state_direct.send_dsp(UiToDsp::SetDirectSampling(idx as i32));
+            // Surface a tune-guidance toast: enabling direct
+            // sampling routes the antenna straight to the ADC,
+            // which silences VHF/UHF (the R820T tuner is now
+            // bypassed); disabling it puts the tuner back in
+            // path, which silences HF. Either direction needs a
+            // manual retune to be useful, and a toast saves the
+            // user from staring at noise wondering why. Per
+            // `CodeRabbit` round 1 on PR #559 / closes #538
+            // objective.
+            if let Some(overlay) = toast_overlay_direct.upgrade() {
+                let msg = if idx == sidebar::source_panel::DIRECT_SAMPLING_DISABLED_IDX {
+                    "Direct Sampling off — retune to VHF/UHF."
+                } else {
+                    // No `<` here: `adw::Toast` titles are Pango markup and
+                    // "(< 28 MHz)" failed to parse (GTK-WARNING, blank toast).
+                    "Direct Sampling on — retune to an HF frequency (below 28 MHz)."
+                };
+                overlay.add_toast(plain_toast(msg));
+            }
+        });
+
+    wire_offset_tuning_toggle(panels, state, config);
+}
+
+/// IQ inversion toggle + decimation selector (restore-then-wire).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_iq_inversion_and_decimation(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // IQ inversion toggle. Restore-then-wire (#552).
+    {
+        let persisted = sidebar::source_panel::load_source_iq_inversion(config);
+        panels.source.iq_inversion_row.set_active(persisted);
+        state.send_dsp(UiToDsp::SetIqInversion(persisted));
+    }
+    let state_iq_inv = Rc::clone(state);
+    let config_iq_inv = std::sync::Arc::clone(config);
+    panels
+        .source
+        .iq_inversion_row
+        .connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            sidebar::source_panel::save_source_iq_inversion(&config_iq_inv, enabled);
+            state_iq_inv.send_dsp(UiToDsp::SetIqInversion(enabled));
+        });
+
+    // Decimation selector. Restore-then-wire (#552). The
+    // decimation index also feeds the bandwidth-advisory
+    // recompute via `apply_source_bandwidth_advisory`, so
+    // restoring here BEFORE wiring keeps the advisory pristine
+    // on first launch.
+    {
+        let persisted_idx = sidebar::source_panel::load_source_decimation_index(config);
+        if (persisted_idx as usize) < DECIMATION_FACTORS.len() {
+            panels.source.decimation_row.set_selected(persisted_idx);
+            if let Some(&factor) = DECIMATION_FACTORS.get(persisted_idx as usize) {
+                state.send_dsp(UiToDsp::SetDecimation(factor));
+            }
+        }
+    }
+    let state_decim = Rc::clone(state);
+    let config_decim = std::sync::Arc::clone(config);
+    panels
+        .source
+        .decimation_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected();
+            // Validate before persisting (same rationale as the
+            // sample-rate row above). Per CodeRabbit round 1 on
+            // PR #558.
+            let Some(&factor) = DECIMATION_FACTORS.get(idx as usize) else {
+                return;
+            };
+            sidebar::source_panel::save_source_decimation_index(&config_decim, idx);
+            state_decim.send_dsp(UiToDsp::SetDecimation(factor));
+        });
+}
+
+/// Network port + protocol rows.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_network_port_and_protocol(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // Network port
+    let state_port = Rc::clone(state);
+    let config_port = std::sync::Arc::clone(config);
+    let host_for_port = panels.source.hostname_row.clone();
+    let proto_for_port = panels.source.protocol_row.clone();
+    let port_row_for_port = panels.source.port_row.clone();
+    let auth_key_for_port = panels.source.rtl_tcp_auth_key_row.clone();
+    panels.source.port_row.connect_value_notify(move |row| {
+        // Skip the invalidation during RTL-TCP hydration; see
+        // hostname handler above for the rationale. Per
+        // `CodeRabbit` round 3 on PR #558.
+        if !state_port.rtl_tcp_hydration_in_progress.get() {
+            invalidate_rtl_tcp_active_server_on_edit(
+                &state_port,
+                &host_for_port,
+                &port_row_for_port,
+                &auth_key_for_port,
+            );
+        }
+        let hostname = host_for_port.text().to_string();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let port = row.value() as u16;
+        // Skip the raw-Network disk-write during RTL-TCP
+        // hydration; see hostname handler above. Per CodeRabbit
+        // round 1 on PR #558.
+        if !state_port.rtl_tcp_hydration_in_progress.get() {
+            sidebar::source_panel::save_source_network_port(&config_port, port);
+        }
+        let protocol = if proto_for_port.selected() == NETWORK_PROTOCOL_UDP_IDX {
+            sdr_types::Protocol::Udp
+        } else {
+            sdr_types::Protocol::TcpClient
+        };
+        // Suppress per-edit dispatch during hydration; see
+        // hostname handler above. Per `CodeRabbit` round 2 on
+        // PR #558.
+        if !state_port.rtl_tcp_hydration_in_progress.get() {
+            state_port.send_dsp(UiToDsp::SetNetworkConfig {
+                hostname,
+                port,
+                protocol,
+            });
+        }
+    });
+
+    wire_network_protocol_row(panels, state, config);
+}
+
+/// Server key entry (#394/#396): per-edit config rebuild + last-good cache.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_server_key_entry(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    last_good_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
+) {
     // Server key entry (#394 + #396). On every edit we rebuild
     // the `SetRtlTcpClientConfig` message with the current role
     // + the new key bytes, so the NEXT connect carries the
@@ -4239,6 +3844,396 @@ fn wire_role_and_server_key_rows(
             });
         });
 
+    wire_file_path_row(panels, state, config);
+}
+
+/// Source-type (device) selector (restore-then-wire, #552).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_device_selector(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    apply_source_bandwidth_advisory: impl Fn() + 'static,
+) {
+    // Source-type (device) selector. Restore-then-wire (#552).
+    // The restore SETs the row's selected index, which fires
+    // `connect_selected_notify` and thus re-applies the bandwidth
+    // advisory; that's intentional (it wires up the correct
+    // visibility for the persisted source type at startup). The
+    // source-type swap itself is handled by an UPSTREAM
+    // `connect_selected_notify` (around the per-source-type
+    // visibility block); this handler only wires the persistence
+    // save + bandwidth-advisory refresh. The dedicated swap
+    // dispatch lives at the end of `connect_source_panel`.
+    {
+        let persisted_idx = sidebar::source_panel::load_source_device_index(config);
+        // Bound check via `DEVICE_RTLTCP` (the highest valid
+        // index) — fails closed if a stale config carries an
+        // out-of-range value (e.g. a future build added more
+        // source types and the user rolled back).
+        if persisted_idx <= sidebar::source_panel::DEVICE_RTLTCP {
+            panels.source.device_row.set_selected(persisted_idx);
+            // Dispatch the restored source type to the DSP so a
+            // saved Network / File / RTL-TCP selection takes
+            // effect at startup. The change-notify handler that
+            // dispatches `SetSourceType` from user clicks is
+            // wired AFTER this restore block runs, and even if it
+            // were wired first, programmatic `set_selected` to a
+            // value that already matches the row's default (0 =
+            // RTL-SDR) wouldn't fire it. Explicit dispatch closes
+            // both gaps. Per CodeRabbit round 1 on PR #558.
+            let source_type = match persisted_idx {
+                sidebar::source_panel::DEVICE_RTLSDR => Some(SourceType::RtlSdr),
+                sidebar::source_panel::DEVICE_NETWORK => Some(SourceType::Network),
+                sidebar::source_panel::DEVICE_FILE => Some(SourceType::File),
+                sidebar::source_panel::DEVICE_RTLTCP => Some(SourceType::RtlTcp),
+                _ => None,
+            };
+            if let Some(source_type) = source_type {
+                state.send_dsp(UiToDsp::SetSourceType(source_type));
+            }
+        }
+    }
+    let config_device = std::sync::Arc::clone(config);
+    let apply_on_device = apply_source_bandwidth_advisory;
+    panels
+        .source
+        .device_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected();
+            // Validate before persisting (same rationale as the
+            // sample-rate row above). `DEVICE_RTLTCP` is the
+            // highest valid index. Per CodeRabbit round 1 on
+            // PR #558.
+            if idx > sidebar::source_panel::DEVICE_RTLTCP {
+                return;
+            }
+            sidebar::source_panel::save_source_device_index(&config_device, idx);
+            apply_on_device();
+        });
+}
+
+/// AGC type selector (Off/Hardware/Software) with restore ordering.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_agc_type_selector(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // AGC type selector (Off / Hardware / Software). Dispatches
+    // the right `UiToDsp::SetAgc` / `UiToDsp::SetSoftwareAgc`
+    // pair on every selection and also fires two mutexes so
+    // the UI doesn't lie about controls that EITHER AGC type
+    // disables:
+    //
+    // 1. Gain row — `rtlsdr_set_tuner_gain` silently no-ops on
+    //    most RTL variants when hardware AGC is on; software
+    //    AGC makes manual gain pointless because the DSP stage
+    //    would renormalize it immediately.
+    // 2. Squelch rows — both AGC types auto-normalize IF
+    //    amplitude, so amplitude-based squelch can't distinguish
+    //    signal from noise and the gate just stays open. Without
+    //    this mutex users see "all static all the time" the
+    //    moment they enable AGC with squelch on.
+    //
+    wire_agc_notify_handler(panels, state, config);
+}
+
+/// Offset-tuning toggle (#539), restore-then-wire; only a persisted true dispatches.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_offset_tuning_toggle(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // Offset tuning toggle (#539). Same restore-then-wire idiom
+    // as bias-T above. The controller bridge
+    // (`UiToDsp::SetOffsetTuning`) was already plumbed; only
+    // wiring is new here.
+    //
+    // Only DISPATCH the persisted value when it's `true`. The
+    // librtlsdr R820T-family branch returns `InvalidParameter`
+    // for every `set_offset_tuning` call regardless of value —
+    // dispatching `false` at startup (the default for users
+    // who've never touched the toggle) generates a spurious
+    // "Offset tuning failed" toast on the vast majority of
+    // dongles. The driver default already matches `false`, so
+    // skipping the dispatch is semantically a no-op. Per issue
+    // #564.
+    {
+        let persisted = sidebar::source_panel::load_source_rtl_offset_tuning(config);
+        panels.source.offset_tuning_row.set_active(persisted);
+        if persisted {
+            state.send_dsp(UiToDsp::SetOffsetTuning(true));
+        }
+    }
+    let state_offset = Rc::clone(state);
+    let config_offset = std::sync::Arc::clone(config);
+    panels
+        .source
+        .offset_tuning_row
+        .connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            sidebar::source_panel::save_source_rtl_offset_tuning(&config_offset, enabled);
+            state_offset.send_dsp(UiToDsp::SetOffsetTuning(enabled));
+        });
+}
+
+/// AGC notify handler (registered before the restore so the seed dispatches).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_agc_notify_handler(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // Register the AGC notify handler BEFORE restoring the
+    // persisted selection. `set_selected` only fires
+    // `selected-notify` when the new index differs from the
+    // current one, so the startup-restore path relies on the
+    // handler being registered first to dispatch the persisted
+    // mode. Without this ordering, fresh installs (persisted
+    // matches build-time default) or config match would leave
+    // DSP stuck in its all-off default state until the user
+    // touched the selector.
+    //
+    // Handler drops transient out-of-range indices —
+    // `agc_type_from_selected` now returns `Option<AgcType>`
+    // and we early-return on `None` rather than coercing them
+    // to a fallback and persisting a bogus config write during
+    // widget-teardown churn.
+    let state_agc = Rc::clone(state);
+    let config_for_agc = std::sync::Arc::clone(config);
+    let gain_row_for_agc = panels.source.gain_row.clone();
+    let squelch_enabled_for_agc = panels.radio.squelch_enabled_row.clone();
+    let squelch_level_for_agc = panels.radio.squelch_level_row.clone();
+    let auto_squelch_for_agc = panels.radio.auto_squelch_row.clone();
+    panels.source.agc_row.connect_selected_notify(move |row| {
+        let Some(agc_type) = sidebar::source_panel::agc_type_from_selected(row.selected()) else {
+            // Transient GTK value (e.g., `INVALID_LIST_POSITION`
+            // during model swap). Skip dispatch AND persistence
+            // — we'll pick up the next real selection from the
+            // follow-up notify event.
+            tracing::trace!(
+                selected = row.selected(),
+                "AGC combo notify with out-of-range index, ignoring"
+            );
+            return;
+        };
+
+        // Dispatch both messages every time so exactly one
+        // enable path is active and the other is cleanly off.
+        // The engine treats hardware and software AGC as
+        // independent flags; the UI is the policy layer that
+        // mutually excludes them.
+        let (hw, sw) = match agc_type {
+            sidebar::source_panel::AgcType::Off => (false, false),
+            sidebar::source_panel::AgcType::Hardware => (true, false),
+            sidebar::source_panel::AgcType::Software => (false, true),
+        };
+        state_agc.send_dsp(UiToDsp::SetAgc(hw));
+        state_agc.send_dsp(UiToDsp::SetSoftwareAgc(sw));
+
+        // Persist the new selection so the choice sticks
+        // across restarts. Cheap — `ConfigManager::write` is an
+        // in-memory update with a debounced flush to disk.
+        sidebar::source_panel::save_agc_type(&config_for_agc, agc_type);
+
+        let agc_active = !matches!(agc_type, sidebar::source_panel::AgcType::Off);
+        apply_agc_gain_mutex(&gain_row_for_agc, agc_active);
+        apply_agc_squelch_mutex(
+            &squelch_enabled_for_agc,
+            &squelch_level_for_agc,
+            &auto_squelch_for_agc,
+            agc_active,
+        );
+    });
+
+    restore_agc_type_selection(panels, state, config);
+}
+
+/// Sample-rate selector, restore-then-wire (#552), advisory re-render on change.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_sample_rate_selector(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    apply_source_bandwidth_advisory: impl Fn() + Clone + 'static,
+) {
+    // Sample rate selector. Restore-then-wire (#552).
+    {
+        let persisted_idx = sidebar::source_panel::load_source_sample_rate_index(config);
+        if (persisted_idx as usize) < SAMPLE_RATES.len() {
+            panels.source.sample_rate_row.set_selected(persisted_idx);
+            if let Some(&rate) = SAMPLE_RATES.get(persisted_idx as usize) {
+                state.send_dsp(UiToDsp::SetSampleRate(rate));
+            }
+        }
+    }
+    let state_sr = Rc::clone(state);
+    let config_sr = std::sync::Arc::clone(config);
+    let apply_on_sr = apply_source_bandwidth_advisory.clone();
+    panels
+        .source
+        .sample_rate_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected();
+            // Validate before persisting. GTK can briefly emit
+            // out-of-range values during widget-model churn (e.g.
+            // teardown / rebuild on style changes); persisting
+            // those would corrupt the config file across restart.
+            // Mirror the protocol_row pattern further down: bail
+            // when the index doesn't map to a real sample rate.
+            // Per CodeRabbit round 1 on PR #558.
+            let Some(&rate) = SAMPLE_RATES.get(idx as usize) else {
+                return;
+            };
+            sidebar::source_panel::save_source_sample_rate_index(&config_sr, idx);
+            state_sr.send_dsp(UiToDsp::SetSampleRate(rate));
+            apply_on_sr();
+        });
+    wire_device_selector(
+        panels,
+        state,
+        config,
+        apply_source_bandwidth_advisory.clone(),
+    );
+}
+
+/// Network hostname — per-edit dispatch so Play always has the current value.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_network_hostname_row(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // Network hostname — send on every edit so Play always has current value
+    let state_host = Rc::clone(state);
+    let config_host = std::sync::Arc::clone(config);
+    let port_for_host = panels.source.port_row.clone();
+    let proto_for_host = panels.source.protocol_row.clone();
+    let hostname_for_host = panels.source.hostname_row.clone();
+    let auth_key_for_host = panels.source.rtl_tcp_auth_key_row.clone();
+    panels.source.hostname_row.connect_changed(move |row| {
+        // Invalidate the cached `rtl_tcp_active_server` when
+        // the widget no longer matches the cached stable id
+        // (typically a manual edit; harmless no-op for
+        // `apply_rtl_tcp_connect`'s programmatic writes when
+        // those match the cache). Per CodeRabbit round 4 on
+        // PR #408.
+        //
+        // Skip the invalidation during RTL-TCP hydration: the
+        // startup hydration in `connect_rtl_tcp_discovery`
+        // rewrites this row from the last-connected RTL-TCP
+        // server (only when the persisted source type is
+        // RTL-TCP), and `apply_rtl_tcp_connect` writes the
+        // cache *after* the row writes — so an unguarded
+        // invalidate would clear the cache the hydration just
+        // restored AND blank the auth row before the auth-row
+        // handler had a chance to push the saved key. The
+        // `apply_rtl_tcp_connect` path handles cache and auth
+        // row deterministically itself; we just need to stay
+        // out of its way here. Per `CodeRabbit` round 3 on PR
+        // #558.
+        if !state_host.rtl_tcp_hydration_in_progress.get() {
+            invalidate_rtl_tcp_active_server_on_edit(
+                &state_host,
+                &hostname_for_host,
+                &port_for_host,
+                &auth_key_for_host,
+            );
+        }
+        let hostname = row.text().to_string();
+        // Skip the raw-Network disk-write when this change came
+        // from an RTL-TCP hydration. The user's independent
+        // raw-Network hostname stays in `KEY_SOURCE_NETWORK_*`
+        // and round-trips across restart on its own. Per
+        // CodeRabbit round 1 on PR #558.
+        if !state_host.rtl_tcp_hydration_in_progress.get() {
+            sidebar::source_panel::save_source_network_hostname(&config_host, &hostname);
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let port = port_for_host.value() as u16;
+        let protocol = if proto_for_host.selected() == NETWORK_PROTOCOL_UDP_IDX {
+            sdr_types::Protocol::Udp
+        } else {
+            sdr_types::Protocol::TcpClient
+        };
+        // Suppress per-edit `SetNetworkConfig` dispatch while a
+        // hydration is rewriting all three rows in sequence. The
+        // sequence would otherwise cause three intermediate
+        // reconnect attempts (one per row), each against a
+        // partially-rewritten triple. `apply_rtl_tcp_connect`
+        // dispatches a single canonical `SetNetworkConfig` after
+        // clearing the flag, so the final state still reaches
+        // the DSP. Per `CodeRabbit` round 2 on PR #558.
+        if !state_host.rtl_tcp_hydration_in_progress.get() {
+            state_host.send_dsp(UiToDsp::SetNetworkConfig {
+                hostname,
+                port,
+                protocol,
+            });
+        }
+    });
+
+    wire_network_port_and_protocol(panels, state, config);
+}
+
+/// Network protocol selector.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_network_protocol_row(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // Network protocol
+    let state_proto = Rc::clone(state);
+    let config_proto = std::sync::Arc::clone(config);
+    let host_for_proto = panels.source.hostname_row.clone();
+    let port_for_proto = panels.source.port_row.clone();
+    panels
+        .source
+        .protocol_row
+        .connect_selected_notify(move |row| {
+            let hostname = host_for_proto.text().to_string();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let port = port_for_proto.value() as u16;
+            let selected = row.selected();
+            // Validate the selected index BEFORE persisting so a
+            // transient out-of-range value during widget churn
+            // can't land in config (matches the sample-rate /
+            // device / decimation handlers' early-return pattern).
+            // Per `CodeRabbit` round 3 on PR #558.
+            let protocol = match selected {
+                NETWORK_PROTOCOL_TCPCLIENT_IDX => sdr_types::Protocol::TcpClient,
+                NETWORK_PROTOCOL_UDP_IDX => sdr_types::Protocol::Udp,
+                _ => return, // ignore transient indices
+            };
+            // Skip the raw-Network disk-write during RTL-TCP
+            // hydration; see hostname handler above. Per
+            // `CodeRabbit` round 1 on PR #558.
+            if !state_proto.rtl_tcp_hydration_in_progress.get() {
+                sidebar::source_panel::save_source_network_protocol_index(&config_proto, selected);
+            }
+            // Suppress per-edit dispatch during hydration; see
+            // hostname handler above. Per `CodeRabbit` round 2 on
+            // PR #558.
+            if !state_proto.rtl_tcp_hydration_in_progress.get() {
+                state_proto.send_dsp(UiToDsp::SetNetworkConfig {
+                    hostname,
+                    port,
+                    protocol,
+                });
+            }
+        });
+}
+
+/// File path — per-edit dispatch.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_file_path_row(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // File path — send on every edit so Play always has current
     // value. Restore-then-wire (#552). Empty saved string is the
     // default and means "no file selected" — re-set the widget
@@ -4271,4 +4266,161 @@ fn wire_role_and_server_key_rows(
                 state_iq_rec.send_dsp(UiToDsp::StopIqRecording);
             }
         });
+}
+
+/// Persisted AGC-type restore (runs after the handler registration so the seed dispatches).
+/// Split out per the 50-NLOC gate (#817).
+fn restore_agc_type_selection(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // Restore persisted AGC type from config now that the
+    // notify handler is wired up. Two scenarios:
+    //
+    // 1. Persisted index differs from the combo's build-time
+    //    default (Software) — `set_selected` fires
+    //    `selected-notify`, the handler runs, DSP is
+    //    dispatched, mutexes applied.
+    // 2. Persisted index matches the default (fresh install
+    //    or user previously selected Software) —
+    //    `set_selected` is a no-op and `selected-notify`
+    //    does NOT fire. We explicitly dispatch so DSP still
+    //    gets the initial-state sync and mutexes are applied
+    //    against the seeded selection.
+    //
+    // Both paths run the same dispatch logic; the explicit
+    // post-`set_selected` call is idempotent with the notify
+    // handler (both `SetAgc` and `SetSoftwareAgc` are
+    // idempotent at the controller), so the double-dispatch
+    // in scenario 1 is cheap and correct.
+    {
+        let persisted = sidebar::source_panel::load_agc_type(config);
+        panels
+            .source
+            .agc_row
+            .set_selected(sidebar::source_panel::selected_from_agc_type(persisted));
+
+        let (hw, sw) = match persisted {
+            sidebar::source_panel::AgcType::Off => (false, false),
+            sidebar::source_panel::AgcType::Hardware => (true, false),
+            sidebar::source_panel::AgcType::Software => (false, true),
+        };
+        state.send_dsp(UiToDsp::SetAgc(hw));
+        state.send_dsp(UiToDsp::SetSoftwareAgc(sw));
+        let agc_active = !matches!(persisted, sidebar::source_panel::AgcType::Off);
+        apply_agc_gain_mutex(&panels.source.gain_row, agc_active);
+        apply_agc_squelch_mutex(
+            &panels.radio.squelch_enabled_row,
+            &panels.radio.squelch_level_row,
+            &panels.radio.auto_squelch_row,
+            agc_active,
+        );
+    }
+}
+
+/// Startup restore of the rtl_tcp client role + auth key (#396).
+/// Split out per the 50-NLOC gate (#817).
+fn restore_rtl_tcp_client_state(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    last_good_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
+) {
+    // Restore the rtl_tcp client's last-used role + auth key
+    // (#396). Role resolution uses the standard two-tier
+    // lookup: per-favorite `requested_role` first (if the
+    // LastConnectedServer matches a favorite entry), falling
+    // back to the global `KEY_RTL_TCP_CLIENT_LAST_ROLE` default,
+    // and finally to `Control` (legacy-safe). The auth key is
+    // loaded directly from the per-server keyring using the
+    // LastConnectedServer's `host:port`. Pre-CodeRabbit round 2
+    // on PR #408 this path hard-set `auth_key: None` and
+    // ignored per-favorite role, so pressing Play right after
+    // launch against a previously-auth-configured server would
+    // drop the saved key and force a redundant `AuthRequired`
+    // bounce before reconnecting. With the keyring preload the
+    // DSP carries the right bytes from the first Play.
+    {
+        use crate::sidebar::source_panel::{
+            FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
+            RTL_TCP_ROLE_LISTEN_IDX, load_favorites, load_last_connected,
+        };
+        let last_connected = load_last_connected(config);
+        let favorite_entry = last_connected.as_ref().and_then(|srv| {
+            let key = format!("{}:{}", srv.host, srv.port);
+            load_favorites(config).into_iter().find(|f| f.key == key)
+        });
+        let persisted_role: FavoriteRole = favorite_entry
+            .as_ref()
+            .and_then(|f| f.requested_role)
+            .or_else(|| {
+                config.read(|v| {
+                    v.get(KEY_RTL_TCP_CLIENT_LAST_ROLE)
+                        .and_then(|val| serde_json::from_value(val.clone()).ok())
+                })
+            })
+            .unwrap_or(FavoriteRole::Control);
+        let idx = match persisted_role {
+            FavoriteRole::Control => RTL_TCP_ROLE_CONTROL_IDX,
+            FavoriteRole::Listen => RTL_TCP_ROLE_LISTEN_IDX,
+        };
+        panels.source.rtl_tcp_role_row.set_selected(idx);
+        // Load the saved per-server auth key for the last-
+        // connected endpoint, if any. Also cache that server's
+        // stable id on `AppState` so the first post-Play
+        // `AuthRequired` / `AuthFailed` / `Connected` arm
+        // already has it and the keyring save / clear paths
+        // target the right entry without waiting on the first
+        // `apply_rtl_tcp_connect` call.
+        //
+        // Auth-row visibility + text is resolved deterministically
+        // using the same two-input rule as `apply_rtl_tcp_connect`
+        // (per `CodeRabbit` round 5 on PR #408): reveal the row
+        // when EITHER the favorite advertises `auth_required ==
+        // Some(true)` (server requires a key; user should see the
+        // field up-front even on a fresh session with no saved
+        // key) OR a saved key exists in the keyring (we want to
+        // show the pre-loaded value so the user knows the
+        // session will auto-auth). Set text from the saved key,
+        // or clear when none — so a prior-session auth-required
+        // server whose key the user later cleared doesn't leak
+        // stale text into the field on the next launch.
+        let mut auth_key: Option<Vec<u8>> = None;
+        if let Some(srv) = last_connected.as_ref() {
+            *state.rtl_tcp_active_server.borrow_mut() = format!("{}:{}", srv.host, srv.port);
+            auth_key = load_client_auth_key_from_keyring(&srv.host, srv.port);
+            // Seed the round-9 last-good cache with the
+            // startup-restored bytes so a subsequent malformed-
+            // hex role flip (round 9's fallback path) preserves
+            // the auth DSP just received. Without this the
+            // cache would stay `None` until the user first
+            // edited the auth field, opening a window where a
+            // role flip with malformed text in the row silently
+            // clears DSP auth. Per `CodeRabbit` round 10 on
+            // PR #408.
+            last_good_auth_key.borrow_mut().clone_from(&auth_key);
+            let has_auth_required = matches!(
+                favorite_entry.as_ref().and_then(|f| f.auth_required),
+                Some(true)
+            );
+            let should_reveal = has_auth_required || auth_key.is_some();
+            panels
+                .source
+                .rtl_tcp_auth_key_row
+                .set_visible(should_reveal);
+            if let Some(bytes) = auth_key.as_ref() {
+                panels
+                    .source
+                    .rtl_tcp_auth_key_row
+                    .set_text(&crate::sidebar::server_panel::auth_key_to_hex(bytes));
+            } else {
+                panels.source.rtl_tcp_auth_key_row.set_text("");
+            }
+        }
+        state.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+            requested_role: persisted_role.as_wire_role(),
+            auth_key,
+        });
+    }
 }
