@@ -148,9 +148,11 @@ impl Demux {
 }
 
 impl Demux {
-    /// Spacecraft-id admission: unlocked frames pass, and the lock is
-    /// taken once two consecutive frames agree; a locked demux drops
-    /// frames carrying any other id.
+    /// Spacecraft-id admission. The lock is taken once two consecutive
+    /// frames agree; until then nothing is admitted — an uncorroborated
+    /// candidate frame must not start a partial packet that a genuine
+    /// no-header frame could then complete (CR on PR #803). A locked
+    /// demux drops frames carrying any other id.
     fn admit_spacecraft_id(&mut self, scid: u16) -> bool {
         if let Some(locked) = self.locked_scid {
             if locked != scid {
@@ -163,10 +165,10 @@ impl Demux {
         }
         if self.scid_candidate == Some(scid) {
             self.locked_scid = Some(scid);
-        } else {
-            self.scid_candidate = Some(scid);
+            return true;
         }
-        true
+        self.scid_candidate = Some(scid);
+        false
     }
 }
 
@@ -252,11 +254,25 @@ mod tests {
         p
     }
 
+    /// A demux already locked onto the fixture SCID (140): the lock
+    /// needs two agreeing frames, so a priming no-header frame whose
+    /// counter precedes 0 is pushed twice and the tests' counter
+    /// sequences start at 0 as before.
+    fn locked_demux() -> Demux {
+        let mut d = Demux::new();
+        let prime = synthetic_vcdu(VCID_AVHRR, VCDU_COUNTER_MASK, FHP_NO_HEADER, &[]);
+        assert!(d.push(&prime).is_empty(), "candidate frame emits nothing");
+        assert!(d.push(&prime).is_empty(), "no-header frame has no packet");
+        assert_eq!(d.locked_scid, Some(0x008C));
+        d.last_counter.clear();
+        d
+    }
+
     #[test]
     fn routes_avhrr_vc_packet() {
         let pkt = make_packet(0x100, b"meteor-image-pixels");
         let vcdu = synthetic_vcdu(VCID_AVHRR, 0, 0, &pkt);
-        let mut d = Demux::new();
+        let mut d = locked_demux();
         let out = d.push(&vcdu);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].vcid, VCID_AVHRR);
@@ -287,10 +303,10 @@ mod tests {
 
     #[test]
     fn counter_jump_loses_sync_for_that_vc() {
-        let mut d = Demux::new();
+        let mut d = locked_demux();
         let pkt = make_packet(0x100, b"first");
         let v0 = synthetic_vcdu(VCID_AVHRR, 0, 0, &pkt);
-        d.push(&v0);
+        assert_eq!(d.push(&v0).len(), 1);
         // Jump from counter 0 to 5. The reassembler for AVHRR
         // should lose sync; an immediate FHP_NO_HEADER VCDU then
         // emits nothing (we discard the no-header continuation
@@ -307,7 +323,7 @@ mod tests {
         let pkt = make_packet(0x100, b"x");
         let mut vcdu = synthetic_vcdu(VCID_AVHRR, 0, 0, &pkt);
         vcdu.extend_from_slice(&[0xAA; 16]); // junk past VCDU
-        let mut d = Demux::new();
+        let mut d = locked_demux();
         let out = d.push(&vcdu);
         assert_eq!(out.len(), 1);
     }
@@ -329,10 +345,10 @@ mod tests {
     fn scid_mismatch_is_dropped_after_lock() {
         let mut d = Demux::new();
         let pkt = make_packet(0x100, b"first");
-        assert_eq!(
+        assert!(
             d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 0, 0, &pkt))
-                .len(),
-            1
+                .is_empty(),
+            "uncorroborated candidate frame is not reassembled"
         );
         assert_eq!(
             d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 1, 0, &pkt))
@@ -355,16 +371,14 @@ mod tests {
     fn scid_lock_needs_two_consecutive_agreeing_frames() {
         let mut d = Demux::new();
         let pkt = make_packet(0x100, b"frame");
-        assert_eq!(
+        assert!(
             d.push(&synthetic_vcdu_scid(141, VCID_AVHRR, 0, 0, &pkt))
-                .len(),
-            1
+                .is_empty()
         );
         assert_eq!(d.locked_scid, None, "one frame is only a candidate");
-        assert_eq!(
+        assert!(
             d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 1, 0, &pkt))
-                .len(),
-            1
+                .is_empty()
         );
         assert_eq!(d.locked_scid, None, "candidate replaced, still unlocked");
         assert_eq!(
@@ -394,7 +408,7 @@ mod tests {
     /// MPDU timestamp only when it is actually present.
     #[test]
     fn secondary_header_flag_is_carried() {
-        let mut d = Demux::new();
+        let mut d = locked_demux();
         let mut with = make_packet(0x100, b"with-timestamp");
         with[0] |= 0x08;
         let out = d.push(&synthetic_vcdu(VCID_AVHRR, 0, 0, &with));

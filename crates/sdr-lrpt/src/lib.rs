@@ -78,6 +78,12 @@ const MAX_FORWARD_GAP_PACKETS: i32 = 8 * PACKETS_PER_ROW_GROUP;
 /// the discontinuity to be believed (two row groups).
 const CORROBORATION_WINDOW_PACKETS: i32 = 2 * PACKETS_PER_ROW_GROUP;
 
+/// Wrap count saturates here: `8 · 16384 / 43` ≈ 3048 rows, already
+/// past [`MAX_MCU_ROWS_PER_PASS`], so every further packet is rejected
+/// by the row bound regardless, and `wraps · SEQUENCE_COUNT_MODULUS`
+/// can never overflow `i32` (CR on PR #803).
+const MAX_WRAPS_PER_PASS: i32 = 8;
+
 /// Does `pkt` corroborate `pending` — land within the window after it?
 fn corroborates(pending: PendingJump, pkt: i32) -> bool {
     pkt >= pending.pkt && pkt - pending.pkt <= CORROBORATION_WINDOW_PACKETS
@@ -170,7 +176,7 @@ impl ChannelDecoder {
         match self.pending.take() {
             Some(pending) if corroborates(pending, pkt) => {
                 if pending.wrap {
-                    self.wraps += 1;
+                    self.wraps = (self.wraps + 1).min(MAX_WRAPS_PER_PASS);
                 }
             }
             _ if candidate_wrap || forward_jump => {
@@ -331,7 +337,7 @@ impl LrptPipeline {
         // a packet from just before the anchor (previous row group)
         // is simply pre-anchor and is dropped below (CR on PR #802).
         if first_on_channel && row_pkt <= -WRAP_MIN_BACKWARD_DELTA {
-            decoder.wraps += 1;
+            decoder.wraps = (decoder.wraps + 1).min(MAX_WRAPS_PER_PASS);
             row_pkt += SEQUENCE_COUNT_MODULUS;
         }
         // Pre-anchor packets are dropped, not clamped onto row 0, and
@@ -1065,5 +1071,24 @@ mod tests {
         // The last placed row is the third cycle's post-wrap packet 11:
         // (11 + 3·16384) / 43 = row 1143.
         assert_eq!(lines, 1144 * MCU_SIDE);
+    }
+
+    /// Past the row bound the wrap count saturates, so an endless
+    /// corrupt wrap cycle can never overflow the unwrapped position
+    /// and fold back onto row 0.
+    #[test]
+    fn wrap_count_saturates_past_the_row_bound() {
+        const LATE_IN_CYCLE: u16 = 16_000;
+        let mut p = LrptPipeline::new();
+        p.consume_packet(&packet_with_mcu_id(64, 0, 0));
+        for _ in 0..(MAX_WRAPS_PER_PASS + 4) {
+            p.consume_packet(&packet_with_mcu_id(64, LATE_IN_CYCLE, 0));
+            p.consume_packet(&packet_with_mcu_id(64, LATE_IN_CYCLE + 1, 14));
+            p.consume_packet(&packet_with_mcu_id(64, 10, 0));
+            p.consume_packet(&packet_with_mcu_id(64, 11, 14));
+        }
+        assert_eq!(p.decoders[&64].wraps, MAX_WRAPS_PER_PASS);
+        let lines = p.assembler.channel(64).expect("exists").lines;
+        assert!(lines < MAX_MCU_ROWS_PER_PASS * MCU_SIDE, "bounded: {lines}");
     }
 }
