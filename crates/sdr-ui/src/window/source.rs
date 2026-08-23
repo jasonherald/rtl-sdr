@@ -455,7 +455,6 @@ pub(super) fn connect_rtl_tcp_discovery(
     // the same closure-cycle pattern the #329 / #335 lessons
     // taught us to avoid — per-callback atomic upgrade + drop
     // keeps the popover widgets releasable on window close.
-    let favorites_popover_weak = FavoritesPopoverWeak::from_header(favorites_header);
     // Bundle of per-row action dependencies. Built once, cloned
     // into the three rebuild call sites (startup seed, star
     // toggle, re-announce refresh). `rebuild_favorites_popover`
@@ -463,7 +462,7 @@ pub(super) fn connect_rtl_tcp_discovery(
     // closure, so each button ends up with a single `Rc` clone
     // instead of nine weak-ref captures.
     let favorite_row_ctx = build_favorite_row_ctx(
-        &favorites_popover_weak,
+        &FavoritesPopoverWeak::from_header(favorites_header),
         &favorites,
         &config_for_discovery,
         &state,
