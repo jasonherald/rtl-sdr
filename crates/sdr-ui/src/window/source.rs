@@ -359,6 +359,29 @@ fn dispatch_rtl_tcp_connect(
     );
 }
 
+/// Widget/state dependencies the discovery poller needs to build a
+/// discovered-server row. Bundled so the `ServerAnnounced` arm can
+/// live in its own function (#817).
+struct DiscoveredRowDeps {
+    hostname_row: adw::EntryRow,
+    port_row: adw::SpinRow,
+    protocol_row: adw::ComboRow,
+    device_row: adw::ComboRow,
+    role_row: adw::ComboRow,
+    auth_key_row: adw::PasswordEntryRow,
+    state: Rc<AppState>,
+    config: std::sync::Arc<sdr_config::ConfigManager>,
+    favorite_row_ctx: Rc<FavoriteRowContext>,
+    discovered_star_buttons:
+        Rc<RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>>,
+    expander_weak: glib::WeakRef<adw::ExpanderRow>,
+}
+
+/// Grace period before a discovered-server row is pruned when the
+/// responder stops re-announcing (crashed or partitioned peers never
+/// send `ServerWithdrawn`).
+const STALE_ROW_GRACE: std::time::Duration = std::time::Duration::from_mins(3);
+
 /// Connect source panel controls to DSP commands.
 #[allow(clippy::too_many_lines)]
 /// Spawn an mDNS browser for `_rtl_tcp._tcp.local.` services and wire
@@ -382,7 +405,6 @@ pub(super) fn connect_rtl_tcp_discovery(
     >,
 ) {
     use std::collections::HashMap;
-    use std::time::Instant;
 
     /// Grace window after which a server that has stopped
     /// re-announcing gets pruned from the UI list. A healthy mDNS
@@ -395,7 +417,6 @@ pub(super) fn connect_rtl_tcp_discovery(
     /// vanishes without a goodbye may leave the cache entry around
     /// longer than the client wants. Expiring client-side keeps the
     /// Connect button from offering a dead endpoint.
-    const STALE_ROW_GRACE: std::time::Duration = std::time::Duration::from_mins(3);
 
     /// Poll cadence for the mDNS discovery event channel. 200 ms is
     /// fast enough that newly-announced servers appear "instantly" to
@@ -641,6 +662,19 @@ pub(super) fn connect_rtl_tcp_discovery(
     // `DISCOVERY_UNAVAILABLE_SUBTITLE` set in the `Err` branch
     // stays on the expander as the long-term idle state; the
     // restore / favorites paths above already ran unconditionally.
+    let row_deps = Rc::new(DiscoveredRowDeps {
+        hostname_row: hostname_row.clone(),
+        port_row: port_row.clone(),
+        protocol_row: protocol_row.clone(),
+        device_row: device_row.clone(),
+        role_row: role_row.clone(),
+        auth_key_row: auth_key_row.clone(),
+        state: Rc::clone(&state),
+        config: config_for_discovery.clone(),
+        favorite_row_ctx: Rc::clone(&favorite_row_ctx),
+        discovered_star_buttons: Rc::clone(&discovered_star_buttons),
+        expander_weak: expander_weak.clone(),
+    });
     let Some(browser) = browser else {
         return;
     };
@@ -661,39 +695,7 @@ pub(super) fn connect_rtl_tcp_discovery(
         // for a dead server keeps showing until mDNS cache TTL fires
         // (if it fires at all). 3-minute grace is long enough that
         // a healthy responder's re-announce keeps its row alive.
-        {
-            let mut rows = displayed_rows.borrow_mut();
-            let now = Instant::now();
-            let stale_names: Vec<String> = rows
-                .iter()
-                .filter(|(_, (_, server))| {
-                    now.saturating_duration_since(server.last_seen) > STALE_ROW_GRACE
-                })
-                .map(|(name, _)| name.clone())
-                .collect();
-            for name in stale_names {
-                if let Some((row, _)) = rows.remove(&name) {
-                    tracing::debug!(instance = %name, "pruning stale rtl_tcp discovery row");
-                    expander.remove(&row);
-                }
-            }
-            // Refresh each surviving row's subtitle with a fresh
-            // "seen N ago" stamp. Without this per-tick refresh the
-            // age text would freeze at whatever it said when the row
-            // was built (or last re-announced) and silently mislead
-            // the user about how recent a server is. GTK short-
-            // circuits the set_subtitle call when the string is
-            // unchanged, so this is nearly free on quiescent rows.
-            for (row, server) in rows.values() {
-                let elapsed = now.saturating_duration_since(server.last_seen);
-                row.set_subtitle(&format_discovery_subtitle(server, elapsed));
-            }
-            if rows.is_empty() {
-                expander.set_subtitle("No servers discovered on the local network yet.");
-            } else {
-                expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
-            }
-        }
+        prune_stale_discovery_rows(&displayed_rows, &expander);
 
         loop {
             let event = match disc_rx.try_recv() {
@@ -727,320 +729,7 @@ pub(super) fn connect_rtl_tcp_discovery(
             };
             match event {
                 DiscoveryEvent::ServerAnnounced(server) => {
-                    let mut rows = displayed_rows.borrow_mut();
-                    let title = if server.txt.nickname.is_empty() {
-                        server.instance_name.clone()
-                    } else {
-                        server.txt.nickname.clone()
-                    };
-                    // Identity host — the advertised mDNS
-                    // hostname, matching `favorite_key(&server)`.
-                    // `apply_rtl_tcp_connect` uses its `host`
-                    // argument as the stable id for
-                    // `rtl_tcp_active_server`, keyring lookups,
-                    // favorite matches, and
-                    // `LastConnectedServer`. Pre-`CodeRabbit`
-                    // round 6 on PR #408 this preferred
-                    // `server.addresses.first()` (a resolved
-                    // IPv4/IPv6 literal when mDNS had resolved
-                    // one), which split per-server state
-                    // between `shack-pi.local.:1234` (what
-                    // favorites store) and `192.168.1.17:1234`
-                    // (what the discovery connect path
-                    // persisted) — role / auth round-tripping
-                    // through discovery + favorites + startup
-                    // restore broke silently. The DSP's actual
-                    // dial path (`RtlTcpSource::with_config` →
-                    // `(host, port).to_socket_addrs()`) resolves
-                    // the hostname at connect time, so keeping
-                    // identity on the advertised name is
-                    // strictly better: stable across IP
-                    // changes AND correct by the
-                    // favorite-key contract.
-                    let host = server.hostname.clone();
-                    // Age is effectively 0 here — `server.last_seen` was
-                    // stamped by the browser thread a few ms ago —
-                    // `format_age` will render "just now". Subsequent
-                    // poll ticks refresh this with the actual age.
-                    let elapsed = Instant::now().saturating_duration_since(server.last_seen);
-                    let subtitle = format_discovery_subtitle(&server, elapsed);
-
-                    // Re-announce for a known instance_name: remove the
-                    // old row and fall through to build a fresh one.
-                    // Rebuilding captures the current (host, port) in
-                    // the new Connect closure; otherwise the stale
-                    // values from first-announce would stick. See the
-                    // displayed_rows docstring above.
-                    if let Some((existing_row, _)) = rows.remove(&server.instance_name) {
-                        expander.remove(&existing_row);
-                    }
-
-                    let row = adw::ActionRow::builder()
-                        .title(&title)
-                        .subtitle(&subtitle)
-                        .build();
-
-                    // Star toggle — prefix icon, pinning this
-                    // server to the top of the discovered list and
-                    // persisting the choice across app launches.
-                    // Using the outlined / filled star icon pair
-                    // so the toggle state reads clearly without
-                    // extra CSS.
-                    let star_btn = gtk4::ToggleButton::builder()
-                        .icon_name(FAVORITE_ICON_OUTLINE)
-                        .valign(gtk4::Align::Center)
-                        .css_classes(["flat"])
-                        .tooltip_text("Pin as favorite")
-                        .build();
-                    // Use the stable hostname+port key, not
-                    // `instance_name`. `instance_name` comes from
-                    // the server's TXT nickname, which the operator
-                    // can edit — keying favorites off it would
-                    // silently drop the star on any rename.
-                    let star_key = favorite_key(&server);
-                    let starred_initially = favorites.borrow().contains_key(&star_key);
-                    star_btn.set_active(starred_initially);
-                    if starred_initially {
-                        star_btn.set_icon_name(FAVORITE_ICON_FILLED);
-                    }
-                    // Initial accessible name — state-dependent so
-                    // screen readers announce the action the click
-                    // will take, not the icon's current appearance.
-                    // Updated again inside the toggle closure when
-                    // the user flips the state.
-                    set_favorite_toggle_accessible_name(&star_btn, starred_initially);
-                    // Register the star_btn against its
-                    // favorite_key so the favorites-popover
-                    // Unstar handler can find and flip this
-                    // exact toggle when the user unstars from
-                    // the popover. `insert` overwrites any
-                    // prior (stale) weak ref under the same key
-                    // — e.g. from a re-announce rebuild of the
-                    // row, where the old button was dropped.
-                    let star_key_for_map = favorite_key(&server);
-                    discovered_star_buttons
-                        .borrow_mut()
-                        .insert(star_key_for_map, star_btn.downgrade());
-                    // Capture the display metadata into move-able
-                    // values so the toggle closure can build a
-                    // `FavoriteEntry` without holding onto
-                    // `server` (which is consumed by the HashMap
-                    // insert further down).
-                    let star_nickname = if server.txt.nickname.is_empty() {
-                        server.instance_name.clone()
-                    } else {
-                        server.txt.nickname.clone()
-                    };
-                    let star_tuner_name = Some(server.txt.tuner.clone());
-                    let star_gain_count = Some(server.txt.gains);
-                    // Capture the announce-derived auth flag so
-                    // a fresh star persists it alongside the
-                    // rest of the metadata. Pre-`CodeRabbit`
-                    // round 6 on PR #408 this was hard-set to
-                    // `None` at star time, which meant a newly-
-                    // starred auth-required server looked
-                    // "unknown" until the next mDNS refresh —
-                    // `apply_rtl_tcp_connect` + the startup
-                    // restore wouldn't reveal the key row
-                    // ahead of the first `AuthRequired` bounce.
-                    // The discovery-refresh path below already
-                    // writes `server.txt.auth_required` on re-
-                    // announce; this keeps the two entry points
-                    // consistent so freshly-starred favorites
-                    // carry the same hint as refreshed ones.
-                    let star_auth_required = server.txt.auth_required;
-                    let star_favorites = Rc::clone(&favorites);
-                    let star_config = std::sync::Arc::clone(&config_for_discovery);
-                    let star_expander_weak = expander_weak.clone();
-                    // Closure captures `star_row_ctx` only — reaches
-                    // `displayed_rows` via its `Weak` field inside.
-                    // A separate `Rc::clone(&displayed_rows)` capture
-                    // here would reintroduce the retain cycle the
-                    // `FavoriteRowContext.displayed_rows` docstring
-                    // describes (map → row → signal → ctx → map).
-                    let star_row_ctx = Rc::clone(&favorite_row_ctx);
-                    star_btn.connect_toggled(move |btn| {
-                        let active = btn.is_active();
-                        btn.set_icon_name(if active {
-                            FAVORITE_ICON_FILLED
-                        } else {
-                            FAVORITE_ICON_OUTLINE
-                        });
-                        // Keep the accessible name in sync with
-                        // the new state so AT announces the next
-                        // action ("Unpin from favorites" after the
-                        // user just pinned it, and vice versa).
-                        set_favorite_toggle_accessible_name(btn, active);
-                        {
-                            let mut favs = star_favorites.borrow_mut();
-                            if active {
-                                // Build a fresh entry with the
-                                // current metadata. Replaces any
-                                // older entry with the same key
-                                // (= metadata refresh on re-star).
-                                favs.insert(
-                                    star_key.clone(),
-                                    sidebar::source_panel::FavoriteEntry {
-                                        key: star_key.clone(),
-                                        nickname: star_nickname.clone(),
-                                        tuner_name: star_tuner_name.clone(),
-                                        gain_count: star_gain_count,
-                                        last_seen_unix: Some(
-                                            sidebar::source_panel::now_unix_seconds(),
-                                        ),
-                                        // Fresh star — no role preference
-                                        // yet; `auth_required` is captured
-                                        // from the current mDNS announce's
-                                        // TXT record above so
-                                        // `apply_rtl_tcp_connect` + the
-                                        // startup restore can pre-reveal
-                                        // the key row immediately, without
-                                        // waiting on a mDNS re-announce.
-                                        // Per `CodeRabbit` round 6 on
-                                        // PR #408 and issue #396.
-                                        requested_role: None,
-                                        auth_required: star_auth_required,
-                                    },
-                                );
-                            } else {
-                                favs.remove(&star_key);
-                            }
-                            // Persist immediately. Order within
-                            // the persisted list is unspecified —
-                            // the slide-out sorts on read.
-                            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
-                                favs.values().cloned().collect();
-                            crate::sidebar::source_panel::save_favorites(&star_config, &snapshot);
-                        }
-                        // Rebuild the expander so the row moves
-                        // to/from the top per the new favorite
-                        // state. Reuses the `displayed_rows` map
-                        // (strong refs on the AdwActionRow
-                        // widgets) — ordering is the only thing
-                        // that changes. The map is held Weak via
-                        // `FavoriteRowContext`; upgrade fails
-                        // silently if the discovery timer has
-                        // already torn down, which means there's
-                        // nothing to reorder anyway.
-                        if let (Some(expander), Some(rows)) = (
-                            star_expander_weak.upgrade(),
-                            star_row_ctx.displayed_rows.upgrade(),
-                        ) {
-                            reorder_discovered_rows(
-                                &expander,
-                                &rows.borrow(),
-                                &star_favorites.borrow(),
-                            );
-                        }
-                        // Refresh the header-bar favorites popover
-                        // so the star-toggle reflects there too.
-                        // Upgrade-and-drop inside the rebuild keeps
-                        // the closure leak-free per the #329
-                        // weak-ref pattern.
-                        rebuild_favorites_popover(&star_row_ctx, &star_favorites.borrow());
-                    });
-                    row.add_prefix(&star_btn);
-
-                    let connect_btn = gtk4::Button::with_label("Connect");
-                    connect_btn.add_css_class("suggested-action");
-                    connect_btn.set_valign(gtk4::Align::Center);
-
-                    let click_host = host.clone();
-                    let click_port = server.port;
-                    let hr = hostname_row.clone();
-                    let pr = port_row.clone();
-                    let protor = protocol_row.clone();
-                    let dr = device_row.clone();
-                    let rr = role_row.clone();
-                    let akr = auth_key_row.clone();
-                    let st = Rc::clone(&state);
-                    let cfg = std::sync::Arc::clone(&config_for_discovery);
-                    // Friendly nickname for the persisted snapshot.
-                    // Prefer the TXT nickname if the responder set
-                    // one, fall back to the DNS-SD instance name.
-                    let click_nickname = if server.txt.nickname.is_empty() {
-                        server.instance_name.clone()
-                    } else {
-                        server.txt.nickname.clone()
-                    };
-                    connect_btn.connect_clicked(move |_| {
-                        // Shared ordering-sensitive flow lives in
-                        // `apply_rtl_tcp_connect` — see its doc for
-                        // why `protocol_row` gets set to TCP before
-                        // the host/port writes and why
-                        // `SetSourceType` only fires conditionally.
-                        apply_rtl_tcp_connect(
-                            &click_host,
-                            click_port,
-                            &click_nickname,
-                            &hr,
-                            &pr,
-                            &protor,
-                            &dr,
-                            &rr,
-                            &akr,
-                            &st,
-                            &cfg,
-                        );
-                    });
-                    row.add_suffix(&connect_btn);
-                    expander.add_row(&row);
-                    // If this server is already favorited, refresh
-                    // the persisted metadata (tuner name, gain
-                    // count, nickname, last-seen) off the fresh
-                    // announce. Keeps the favorites slide-out's
-                    // display honest when the user revisits it
-                    // after the server has been renamed /
-                    // re-announced with updated TXT records.
-                    let fav_key = favorite_key(&server);
-                    {
-                        let mut favs = favorites.borrow_mut();
-                        if favs.contains_key(&fav_key) {
-                            let refreshed_nickname = if server.txt.nickname.is_empty() {
-                                server.instance_name.clone()
-                            } else {
-                                server.txt.nickname.clone()
-                            };
-                            // Preserve any saved `requested_role`
-                            // from the previous favorites entry (the
-                            // user's last pick sticks across
-                            // re-announces); refresh the
-                            // `auth_required` hint from the incoming
-                            // TXT so the UI reveals the key field
-                            // BEFORE the user clicks Connect. Per #396.
-                            let preserved_role = favs.get(&fav_key).and_then(|f| f.requested_role);
-                            favs.insert(
-                                fav_key.clone(),
-                                sidebar::source_panel::FavoriteEntry {
-                                    key: fav_key.clone(),
-                                    nickname: refreshed_nickname,
-                                    tuner_name: Some(server.txt.tuner.clone()),
-                                    gain_count: Some(server.txt.gains),
-                                    last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
-                                    requested_role: preserved_role,
-                                    auth_required: server.txt.auth_required,
-                                },
-                            );
-                            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
-                                favs.values().cloned().collect();
-                            crate::sidebar::source_panel::save_favorites(
-                                &config_for_discovery,
-                                &snapshot,
-                            );
-                            // Refresh the header-bar popover's
-                            // rendering of this entry (age + tuner
-                            // metadata). Cheap — it rebuilds the
-                            // whole list but at favorites scale
-                            // that's trivial.
-                            rebuild_favorites_popover(&favorite_row_ctx, &favs);
-                        }
-                    }
-                    rows.insert(server.instance_name.clone(), (row, server));
-                    // Reorder after insert so favorites float to
-                    // the top of the new view.
-                    reorder_discovered_rows(&expander, &rows, &favorites.borrow());
-
-                    expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+                    on_server_announced(server, &displayed_rows, &expander, &favorites, &row_deps);
                 }
                 DiscoveryEvent::ServerWithdrawn { instance_name } => {
                     let mut rows = displayed_rows.borrow_mut();
@@ -1057,6 +746,387 @@ pub(super) fn connect_rtl_tcp_discovery(
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// `ServerAnnounced` arm of the discovery poller: build or refresh the
+/// row for this instance, wire its Connect/copy/star actions, and keep
+/// favorites-first ordering. Split out per the 50-NLOC gate (#817).
+fn on_server_announced(
+    server: DiscoveredServer,
+    displayed_rows: &Rc<
+        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
+    >,
+    expander: &adw::ExpanderRow,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    deps: &Rc<DiscoveredRowDeps>,
+) {
+    use std::time::Instant;
+
+    let DiscoveredRowDeps {
+        hostname_row,
+        port_row,
+        protocol_row,
+        device_row,
+        role_row,
+        auth_key_row,
+        state,
+        config: config_for_discovery,
+        favorite_row_ctx,
+        discovered_star_buttons,
+        expander_weak,
+    } = deps.as_ref();
+
+    let mut rows = displayed_rows.borrow_mut();
+    let title = if server.txt.nickname.is_empty() {
+        server.instance_name.clone()
+    } else {
+        server.txt.nickname.clone()
+    };
+    // Identity host — the advertised mDNS
+    // hostname, matching `favorite_key(&server)`.
+    // `apply_rtl_tcp_connect` uses its `host`
+    // argument as the stable id for
+    // `rtl_tcp_active_server`, keyring lookups,
+    // favorite matches, and
+    // `LastConnectedServer`. Pre-`CodeRabbit`
+    // round 6 on PR #408 this preferred
+    // `server.addresses.first()` (a resolved
+    // IPv4/IPv6 literal when mDNS had resolved
+    // one), which split per-server state
+    // between `shack-pi.local.:1234` (what
+    // favorites store) and `192.168.1.17:1234`
+    // (what the discovery connect path
+    // persisted) — role / auth round-tripping
+    // through discovery + favorites + startup
+    // restore broke silently. The DSP's actual
+    // dial path (`RtlTcpSource::with_config` →
+    // `(host, port).to_socket_addrs()`) resolves
+    // the hostname at connect time, so keeping
+    // identity on the advertised name is
+    // strictly better: stable across IP
+    // changes AND correct by the
+    // favorite-key contract.
+    let host = server.hostname.clone();
+    // Age is effectively 0 here — `server.last_seen` was
+    // stamped by the browser thread a few ms ago —
+    // `format_age` will render "just now". Subsequent
+    // poll ticks refresh this with the actual age.
+    let elapsed = Instant::now().saturating_duration_since(server.last_seen);
+    let subtitle = format_discovery_subtitle(&server, elapsed);
+
+    // Re-announce for a known instance_name: remove the
+    // old row and fall through to build a fresh one.
+    // Rebuilding captures the current (host, port) in
+    // the new Connect closure; otherwise the stale
+    // values from first-announce would stick. See the
+    // displayed_rows docstring above.
+    if let Some((existing_row, _)) = rows.remove(&server.instance_name) {
+        expander.remove(&existing_row);
+    }
+
+    let row = adw::ActionRow::builder()
+        .title(&title)
+        .subtitle(&subtitle)
+        .build();
+
+    // Star toggle — prefix icon, pinning this
+    // server to the top of the discovered list and
+    // persisting the choice across app launches.
+    // Using the outlined / filled star icon pair
+    // so the toggle state reads clearly without
+    // extra CSS.
+    let star_btn = gtk4::ToggleButton::builder()
+        .icon_name(FAVORITE_ICON_OUTLINE)
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text("Pin as favorite")
+        .build();
+    // Use the stable hostname+port key, not
+    // `instance_name`. `instance_name` comes from
+    // the server's TXT nickname, which the operator
+    // can edit — keying favorites off it would
+    // silently drop the star on any rename.
+    let star_key = favorite_key(&server);
+    let starred_initially = favorites.borrow().contains_key(&star_key);
+    star_btn.set_active(starred_initially);
+    if starred_initially {
+        star_btn.set_icon_name(FAVORITE_ICON_FILLED);
+    }
+    // Initial accessible name — state-dependent so
+    // screen readers announce the action the click
+    // will take, not the icon's current appearance.
+    // Updated again inside the toggle closure when
+    // the user flips the state.
+    set_favorite_toggle_accessible_name(&star_btn, starred_initially);
+    // Register the star_btn against its
+    // favorite_key so the favorites-popover
+    // Unstar handler can find and flip this
+    // exact toggle when the user unstars from
+    // the popover. `insert` overwrites any
+    // prior (stale) weak ref under the same key
+    // — e.g. from a re-announce rebuild of the
+    // row, where the old button was dropped.
+    let star_key_for_map = favorite_key(&server);
+    discovered_star_buttons
+        .borrow_mut()
+        .insert(star_key_for_map, star_btn.downgrade());
+    // Capture the display metadata into move-able
+    // values so the toggle closure can build a
+    // `FavoriteEntry` without holding onto
+    // `server` (which is consumed by the HashMap
+    // insert further down).
+    let star_nickname = if server.txt.nickname.is_empty() {
+        server.instance_name.clone()
+    } else {
+        server.txt.nickname.clone()
+    };
+    let star_tuner_name = Some(server.txt.tuner.clone());
+    let star_gain_count = Some(server.txt.gains);
+    // Capture the announce-derived auth flag so
+    // a fresh star persists it alongside the
+    // rest of the metadata. Pre-`CodeRabbit`
+    // round 6 on PR #408 this was hard-set to
+    // `None` at star time, which meant a newly-
+    // starred auth-required server looked
+    // "unknown" until the next mDNS refresh —
+    // `apply_rtl_tcp_connect` + the startup
+    // restore wouldn't reveal the key row
+    // ahead of the first `AuthRequired` bounce.
+    // The discovery-refresh path below already
+    // writes `server.txt.auth_required` on re-
+    // announce; this keeps the two entry points
+    // consistent so freshly-starred favorites
+    // carry the same hint as refreshed ones.
+    let star_auth_required = server.txt.auth_required;
+    let star_favorites = Rc::clone(&favorites);
+    let star_config = std::sync::Arc::clone(&config_for_discovery);
+    let star_expander_weak = expander_weak.clone();
+    // Closure captures `star_row_ctx` only — reaches
+    // `displayed_rows` via its `Weak` field inside.
+    // A separate `Rc::clone(&displayed_rows)` capture
+    // here would reintroduce the retain cycle the
+    // `FavoriteRowContext.displayed_rows` docstring
+    // describes (map → row → signal → ctx → map).
+    let star_row_ctx = Rc::clone(&favorite_row_ctx);
+    star_btn.connect_toggled(move |btn| {
+        let active = btn.is_active();
+        btn.set_icon_name(if active {
+            FAVORITE_ICON_FILLED
+        } else {
+            FAVORITE_ICON_OUTLINE
+        });
+        // Keep the accessible name in sync with
+        // the new state so AT announces the next
+        // action ("Unpin from favorites" after the
+        // user just pinned it, and vice versa).
+        set_favorite_toggle_accessible_name(btn, active);
+        {
+            let mut favs = star_favorites.borrow_mut();
+            if active {
+                // Build a fresh entry with the
+                // current metadata. Replaces any
+                // older entry with the same key
+                // (= metadata refresh on re-star).
+                favs.insert(
+                    star_key.clone(),
+                    sidebar::source_panel::FavoriteEntry {
+                        key: star_key.clone(),
+                        nickname: star_nickname.clone(),
+                        tuner_name: star_tuner_name.clone(),
+                        gain_count: star_gain_count,
+                        last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
+                        // Fresh star — no role preference
+                        // yet; `auth_required` is captured
+                        // from the current mDNS announce's
+                        // TXT record above so
+                        // `apply_rtl_tcp_connect` + the
+                        // startup restore can pre-reveal
+                        // the key row immediately, without
+                        // waiting on a mDNS re-announce.
+                        // Per `CodeRabbit` round 6 on
+                        // PR #408 and issue #396.
+                        requested_role: None,
+                        auth_required: star_auth_required,
+                    },
+                );
+            } else {
+                favs.remove(&star_key);
+            }
+            // Persist immediately. Order within
+            // the persisted list is unspecified —
+            // the slide-out sorts on read.
+            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                favs.values().cloned().collect();
+            crate::sidebar::source_panel::save_favorites(&star_config, &snapshot);
+        }
+        // Rebuild the expander so the row moves
+        // to/from the top per the new favorite
+        // state. Reuses the `displayed_rows` map
+        // (strong refs on the AdwActionRow
+        // widgets) — ordering is the only thing
+        // that changes. The map is held Weak via
+        // `FavoriteRowContext`; upgrade fails
+        // silently if the discovery timer has
+        // already torn down, which means there's
+        // nothing to reorder anyway.
+        if let (Some(expander), Some(rows)) = (
+            star_expander_weak.upgrade(),
+            star_row_ctx.displayed_rows.upgrade(),
+        ) {
+            reorder_discovered_rows(&expander, &rows.borrow(), &star_favorites.borrow());
+        }
+        // Refresh the header-bar favorites popover
+        // so the star-toggle reflects there too.
+        // Upgrade-and-drop inside the rebuild keeps
+        // the closure leak-free per the #329
+        // weak-ref pattern.
+        rebuild_favorites_popover(&star_row_ctx, &star_favorites.borrow());
+    });
+    row.add_prefix(&star_btn);
+
+    let connect_btn = gtk4::Button::with_label("Connect");
+    connect_btn.add_css_class("suggested-action");
+    connect_btn.set_valign(gtk4::Align::Center);
+
+    let click_host = host.clone();
+    let click_port = server.port;
+    let hr = hostname_row.clone();
+    let pr = port_row.clone();
+    let protor = protocol_row.clone();
+    let dr = device_row.clone();
+    let rr = role_row.clone();
+    let akr = auth_key_row.clone();
+    let st = Rc::clone(&state);
+    let cfg = std::sync::Arc::clone(&config_for_discovery);
+    // Friendly nickname for the persisted snapshot.
+    // Prefer the TXT nickname if the responder set
+    // one, fall back to the DNS-SD instance name.
+    let click_nickname = if server.txt.nickname.is_empty() {
+        server.instance_name.clone()
+    } else {
+        server.txt.nickname.clone()
+    };
+    connect_btn.connect_clicked(move |_| {
+        // Shared ordering-sensitive flow lives in
+        // `apply_rtl_tcp_connect` — see its doc for
+        // why `protocol_row` gets set to TCP before
+        // the host/port writes and why
+        // `SetSourceType` only fires conditionally.
+        apply_rtl_tcp_connect(
+            &click_host,
+            click_port,
+            &click_nickname,
+            &hr,
+            &pr,
+            &protor,
+            &dr,
+            &rr,
+            &akr,
+            &st,
+            &cfg,
+        );
+    });
+    row.add_suffix(&connect_btn);
+    expander.add_row(&row);
+    // If this server is already favorited, refresh
+    // the persisted metadata (tuner name, gain
+    // count, nickname, last-seen) off the fresh
+    // announce. Keeps the favorites slide-out's
+    // display honest when the user revisits it
+    // after the server has been renamed /
+    // re-announced with updated TXT records.
+    let fav_key = favorite_key(&server);
+    {
+        let mut favs = favorites.borrow_mut();
+        if favs.contains_key(&fav_key) {
+            let refreshed_nickname = if server.txt.nickname.is_empty() {
+                server.instance_name.clone()
+            } else {
+                server.txt.nickname.clone()
+            };
+            // Preserve any saved `requested_role`
+            // from the previous favorites entry (the
+            // user's last pick sticks across
+            // re-announces); refresh the
+            // `auth_required` hint from the incoming
+            // TXT so the UI reveals the key field
+            // BEFORE the user clicks Connect. Per #396.
+            let preserved_role = favs.get(&fav_key).and_then(|f| f.requested_role);
+            favs.insert(
+                fav_key.clone(),
+                sidebar::source_panel::FavoriteEntry {
+                    key: fav_key.clone(),
+                    nickname: refreshed_nickname,
+                    tuner_name: Some(server.txt.tuner.clone()),
+                    gain_count: Some(server.txt.gains),
+                    last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
+                    requested_role: preserved_role,
+                    auth_required: server.txt.auth_required,
+                },
+            );
+            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                favs.values().cloned().collect();
+            crate::sidebar::source_panel::save_favorites(&config_for_discovery, &snapshot);
+            // Refresh the header-bar popover's
+            // rendering of this entry (age + tuner
+            // metadata). Cheap — it rebuilds the
+            // whole list but at favorites scale
+            // that's trivial.
+            rebuild_favorites_popover(&favorite_row_ctx, &favs);
+        }
+    }
+    rows.insert(server.instance_name.clone(), (row, server));
+    // Reorder after insert so favorites float to
+    // the top of the new view.
+    reorder_discovered_rows(&expander, &rows, &favorites.borrow());
+
+    expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+}
+
+/// Per-tick stale-row prune + "seen N ago" subtitle refresh for the
+/// discovery expander (3-minute grace; healthy responders re-announce
+/// well within it). Split out per the 50-NLOC gate (#817).
+fn prune_stale_discovery_rows(
+    displayed_rows: &Rc<
+        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
+    >,
+    expander: &adw::ExpanderRow,
+) {
+    use std::time::Instant;
+
+    let mut rows = displayed_rows.borrow_mut();
+    let now = Instant::now();
+    let stale_names: Vec<String> = rows
+        .iter()
+        .filter(|(_, (_, server))| {
+            now.saturating_duration_since(server.last_seen) > STALE_ROW_GRACE
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in stale_names {
+        if let Some((row, _)) = rows.remove(&name) {
+            tracing::debug!(instance = %name, "pruning stale rtl_tcp discovery row");
+            expander.remove(&row);
+        }
+    }
+    // Refresh each surviving row's subtitle with a fresh
+    // "seen N ago" stamp. Without this per-tick refresh the
+    // age text would freeze at whatever it said when the row
+    // was built (or last re-announced) and silently mislead
+    // the user about how recent a server is. GTK short-
+    // circuits the set_subtitle call when the string is
+    // unchanged, so this is nearly free on quiescent rows.
+    for (row, server) in rows.values() {
+        let elapsed = now.saturating_duration_since(server.last_seen);
+        row.set_subtitle(&format_discovery_subtitle(server, elapsed));
+    }
+    if rows.is_empty() {
+        expander.set_subtitle("No servers discovered on the local network yet.");
+    } else {
+        expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+    }
 }
 
 /// Icon name for the un-filled ("not pinned") star on discovery
