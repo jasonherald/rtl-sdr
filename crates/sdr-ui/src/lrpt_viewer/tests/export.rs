@@ -114,7 +114,6 @@ fn export_png_uses_composite_cache_when_active() {
     // export the composite surface — not the active per-APID
     // surface. Without this, exporting while a composite was
     // on screen wrote out the last greyscale APID instead.
-    use std::io::Read;
     let mut r = LrptImageRenderer::new();
     let image = LrptImage::new();
     let recipe = COMPOSITE_CATALOG[0];
@@ -143,7 +142,6 @@ fn write_greyscale_png_round_trips_to_a_real_file() {
     // Pin the new free-function path used by the LOS
     // `SaveLrptPass` handler in `window.rs`. Per
     // `CodeRabbit` round 7 on PR #543.
-    use std::io::Read;
     const W: usize = 32;
     const H: usize = 8;
     let pixels: Vec<u8> = (0..W * H)
@@ -190,7 +188,6 @@ fn write_greyscale_png_zero_dim_with_pixels_reports_zero_sized() {
 fn write_rgb_png_round_trips_to_a_real_file() {
     // Pin the new RGB writer used by the LRPT composite
     // LOS-save path. Per #547.
-    use std::io::Read;
     const W: usize = 32;
     const H: usize = 8;
     let pixels: Vec<u8> = (0..W * H * 3)
