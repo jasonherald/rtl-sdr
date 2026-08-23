@@ -155,6 +155,27 @@ pub(super) fn rebuild_rtl_tcp_source(
     // was in `AuthRequired`). Both calls also update the
     // sticky cache on the new source, which is fine — any
     // subsequent reconnect replays the fresher value.
+    reapply_rtl_tcp_rate_and_tune(state, source.as_mut(), request_takeover);
+    if let Err(e) = source.start() {
+        tracing::warn!(
+            error = %e,
+            request_takeover,
+            "rtl_tcp rebuild start failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!("{error_prefix}: {e}")));
+        return;
+    }
+    state.source = Some(source);
+}
+
+/// Warn-and-continue reapplication of the `DspState`-derived sample
+/// rate and center frequency on a freshly rebuilt `rtl_tcp` source.
+/// Split out of [`rebuild_rtl_tcp_source`] per CR on PR #841.
+fn reapply_rtl_tcp_rate_and_tune(
+    state: &DspState,
+    source: &mut dyn Source,
+    request_takeover: bool,
+) {
     if let Err(e) = source.set_sample_rate(state.configured_sample_rate) {
         tracing::warn!(
             error = %e,
@@ -169,16 +190,6 @@ pub(super) fn rebuild_rtl_tcp_source(
             "rtl_tcp rebuild tune failed"
         );
     }
-    if let Err(e) = source.start() {
-        tracing::warn!(
-            error = %e,
-            request_takeover,
-            "rtl_tcp rebuild start failed"
-        );
-        let _ = dsp_tx.send(DspToUi::Error(format!("{error_prefix}: {e}")));
-        return;
-    }
-    state.source = Some(source);
 }
 
 /// Dispatch the persisted RTL-SDR settings that the driver programs
@@ -311,6 +322,34 @@ pub(super) fn rtl_sdr_replay_persisted_settings(
     // `SourceType::RtlSdr` upstream, where the local USB driver
     // does fill the table at open time. Per CR round 1 on
     // PR #553.
+    replay_tuner_gain_index(state, source, dsp_tx);
+
+    if let Err(e) = source.set_bias_tee(state.bias_tee_enabled) {
+        tracing::warn!(
+            error = %e,
+            enabled = state.bias_tee_enabled,
+            "re-applying persisted bias-T on source open failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!(
+            "Bias tee {} failed: {e}",
+            if state.bias_tee_enabled { "on" } else { "off" }
+        )));
+    }
+}
+
+/// Replay a persisted discrete tuner-gain index, bounds-checked
+/// against the freshly-opened source's gain table — the index can be
+/// stale (persisted from a prior session against a different dongle),
+/// and replaying it unchecked produces a recurring startup toast on
+/// every open. Mirrors the live `UiToDsp::SetGainByIndex` handler's
+/// pre-check; skips when the table is empty (`rtl_tcp` can't populate
+/// it synchronously). Per CR round 1 on PR #553; split out of
+/// [`rtl_sdr_replay_persisted_settings`] per CR on PR #841.
+fn replay_tuner_gain_index(
+    state: &DspState,
+    source: &mut dyn Source,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+) {
     if let Some(index) = state.tuner_gain_index {
         let gains_len = source.gains().len();
         if gains_len > 0 && (index as usize) >= gains_len {
@@ -331,26 +370,15 @@ pub(super) fn rtl_sdr_replay_persisted_settings(
             let _ = dsp_tx.send(DspToUi::Error(format!("Set gain failed: {e}")));
         }
     }
-
-    if let Err(e) = source.set_bias_tee(state.bias_tee_enabled) {
-        tracing::warn!(
-            error = %e,
-            enabled = state.bias_tee_enabled,
-            "re-applying persisted bias-T on source open failed"
-        );
-        let _ = dsp_tx.send(DspToUi::Error(format!(
-            "Bias tee {} failed: {e}",
-            if state.bias_tee_enabled { "on" } else { "off" }
-        )));
-    }
 }
 
-/// Open the active IQ source and configure it for streaming.
-pub(super) fn open_source(
-    state: &mut DspState,
-    dsp_tx: &mpsc::Sender<DspToUi>,
-) -> Result<(), String> {
-    let mut source: Box<dyn Source> = match state.source_type {
+/// Construct the right [`Source`] implementation for the current
+/// `state.source_type`, applying construction-time config (file
+/// looping, `rtl_tcp` role/auth). Pure factory — rate/tune/start and
+/// the persisted-settings replay stay in [`open_source`]. Split out
+/// per CR on PR #841.
+fn create_source_instance(state: &DspState) -> Box<dyn Source> {
+    match state.source_type {
         SourceType::RtlSdr => Box::new(RtlSdrSource::new(DEVICE_INDEX)),
         SourceType::Network => Box::new(sdr_source_network::NetworkSource::new(
             &state.network_host,
@@ -412,7 +440,15 @@ pub(super) fn open_source(
                 rtl_tcp_config,
             ))
         }
-    };
+    }
+}
+
+/// Open the active IQ source and configure it for streaming.
+pub(super) fn open_source(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+) -> Result<(), String> {
+    let mut source: Box<dyn Source> = create_source_instance(state);
 
     if let Err(e) = source.set_sample_rate(state.configured_sample_rate) {
         if state.source_type == SourceType::File {
@@ -603,7 +639,7 @@ pub(super) fn auto_decimation_ratio(sample_rate: f64, if_rate: f64) -> u32 {
     }
     // Round down to nearest power of 2
     let pow2 = 1_u32 << ratio.ilog2();
-    pow2.clamp(1, 8192) // MAX_POWER_DECIM_RATIO
+    pow2.clamp(1, sdr_dsp::decim_taps::MAX_RATIO)
 }
 
 /// Largest VFO offset the post-decimation chain can reach without

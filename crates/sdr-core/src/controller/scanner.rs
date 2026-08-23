@@ -18,129 +18,15 @@ pub(super) fn apply_scanner_commands(
                 ctcss,
                 voice_squelch,
             } => {
-                // Mirror the manual `Tune` / `SetDemodMode` /
-                // `SetBandwidth` handlers so scanner hops end up
-                // with the same persisted state + VFO rebuild
-                // behavior. Omissions would leave `state.center_freq`
-                // / `state.bandwidth` / the RxVfo config stale —
-                // a subsequent `open_source()` restart would tune
-                // back to whatever the user manually picked before
-                // scanner started, and the IF filter width could
-                // stay locked to the previous channel's mode.
-                //
-                // Deliberately NOT emitting the corresponding
-                // `DspToUi::SampleRateChanged` / `DisplayBandwidth`
-                // / `DemodModeChanged` / `BandwidthChanged` events
-                // the manual handlers send — those are UI-sync
-                // signals for user-initiated changes. Scanner
-                // retunes carry their own `ScannerActiveChannelChanged`
-                // payload with freq/mode/bandwidth/name that the
-                // UI handler fans out to the same widgets; emitting
-                // both paths would double-drive the sync.
-
-                // Reset the squelch edge tracker AND re-arm the
-                // auto-squelch noise-floor estimate for the new
-                // channel. See `on_tune_change` for the full
-                // rationale — both are critical: without the
-                // edge reset a fresh `SquelchEdge::Open` would
-                // be suppressed by a trailing-open state from
-                // the previous channel (scanner invariant
-                // `persistent_open_during_settle_goes_directly_to_listening`
-                // relies on this); without the auto-squelch
-                // re-arm the scanner inherits the previous
-                // band's noise floor, which is the same bug
-                // issue #374 describes for manual tunes.
-                on_tune_change(state);
-
-                // 1. Center frequency (mirrors `UiToDsp::Tune`).
-                #[allow(clippy::cast_precision_loss)]
-                let freq_f64 = freq_hz as f64;
-                state.center_freq = freq_f64;
-                if let Some(source) = state.source.as_mut()
-                    && let Err(e) = source.tune(freq_f64)
-                {
-                    tracing::warn!(?e, "scanner retune: source.tune failed");
-                }
-
-                // 2. Demod mode + VFO rebuild on change (mirrors
-                // `UiToDsp::SetDemodMode`). The scanner doesn't
-                // emit retune commands redundantly — each Retune
-                // marks a new channel — but the target mode may
-                // equal the current mode (rotation pass on same-
-                // mode channels), so guard to avoid gratuitous
-                // rebuilds.
-                let old_mode = state.radio.current_mode();
-                if old_mode != demod_mode {
-                    if let Err(e) = state.radio.set_mode(demod_mode) {
-                        tracing::warn!(?e, "scanner retune: set_mode failed");
-                    } else {
-                        // Generic audio tap: same hard-boundary
-                        // treatment the `UiToDsp::SetDemodMode` path
-                        // applies. Scanner retunes deliberately
-                        // suppress `DemodModeChanged` to the UI
-                        // (per-hop chatter would be noise), which
-                        // means FFI tap consumers never see the
-                        // normal restart signal — so without this
-                        // reset, one audio stream would span mixed
-                        // demod outputs with stale 3:1 decimation
-                        // phase state. Mirrors the treatment at
-                        // L652-657 for the user-driven mode switch.
-                        state.audio_tap_tx = None;
-                        state.audio_tap_phase = 0;
-
-                        // Auto-adjust decimation for the new
-                        // demod's IF rate.
-                        let if_rate = state.radio.demod_config().if_sample_rate;
-                        let auto_decim = auto_decimation_ratio(state.sample_rate, if_rate);
-                        if auto_decim != state.frontend.decim_ratio()
-                            && let Err(e) = state.frontend.set_decimation(auto_decim)
-                        {
-                            tracing::warn!(?e, "scanner retune: auto-decimation failed");
-                        }
-                        // Rebuild the VFO for the new demod's IF
-                        // rate + bandwidth. Bandwidth is set
-                        // below; rebuild picks it up via
-                        // `state.bandwidth`.
-                        state.bandwidth = bandwidth;
-                        if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
-                            tracing::warn!(?e, "scanner retune: VFO rebuild failed");
-                        }
-                    }
-                }
-
-                // 3. Bandwidth (mirrors `UiToDsp::SetBandwidth`).
-                // Applied to the VFO channel filter first; only
-                // persist on success. For same-mode retunes the
-                // VFO already exists; for mode-change retunes the
-                // rebuild above already used `state.bandwidth`
-                // so the two paths converge.
-                if let Some(vfo) = &mut state.vfo {
-                    match vfo.set_bandwidth(bandwidth) {
-                        Ok(()) => state.bandwidth = bandwidth,
-                        Err(e) => {
-                            tracing::warn!(?e, "scanner retune: VFO bandwidth update failed");
-                        }
-                    }
-                } else {
-                    state.bandwidth = bandwidth;
-                }
-                state.radio.set_bandwidth(bandwidth);
-
-                // 4. CTCSS is per-channel: force-Off when the new
-                // channel doesn't carry a tone, otherwise a stale
-                // tone gate would silence the new channel.
-                let ctcss_mode = ctcss.unwrap_or(sdr_radio::af_chain::CtcssMode::Off);
-                if let Err(e) = state.radio.set_ctcss_mode(ctcss_mode) {
-                    tracing::warn!(?e, "scanner retune: set_ctcss_mode failed");
-                }
-                // 5. Voice squelch is device-level — preserve
-                // current setting when the channel doesn't
-                // override it.
-                if let Some(m) = voice_squelch
-                    && let Err(e) = state.radio.set_voice_squelch_mode(m)
-                {
-                    tracing::warn!(?e, "scanner retune: set_voice_squelch_mode failed");
-                }
+                handle_scanner_retune(
+                    state,
+                    dsp_tx,
+                    freq_hz,
+                    demod_mode,
+                    bandwidth,
+                    ctcss,
+                    voice_squelch,
+                );
             }
             sdr_scanner::ScannerCommand::MuteAudio(muted) => {
                 state.scanner_muted = muted;
@@ -153,6 +39,157 @@ pub(super) fn apply_scanner_commands(
             }
             sdr_scanner::ScannerCommand::EmptyRotation => {
                 let _ = dsp_tx.send(DspToUi::ScannerEmptyRotation);
+            }
+        }
+    }
+}
+
+/// Apply one scanner `Retune` hop: center frequency, demod mode +
+/// VFO rebuild, bandwidth, CTCSS, and voice squelch — mirroring the
+/// manual `Tune` / `SetDemodMode` / `SetBandwidth` handlers so hops
+/// leave the same persisted state behind. Split out of
+/// [`apply_scanner_commands`] per CR on PR #841.
+fn handle_scanner_retune(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    freq_hz: u64,
+    demod_mode: sdr_types::DemodMode,
+    bandwidth: f64,
+    ctcss: Option<sdr_radio::af_chain::CtcssMode>,
+    voice_squelch: Option<sdr_dsp::voice_squelch::VoiceSquelchMode>,
+) {
+    // Mirror the manual `Tune` / `SetDemodMode` /
+    // `SetBandwidth` handlers so scanner hops end up
+    // with the same persisted state + VFO rebuild
+    // behavior. Omissions would leave `state.center_freq`
+    // / `state.bandwidth` / the RxVfo config stale —
+    // a subsequent `open_source()` restart would tune
+    // back to whatever the user manually picked before
+    // scanner started, and the IF filter width could
+    // stay locked to the previous channel's mode.
+    //
+    // Deliberately NOT emitting the corresponding
+    // `DspToUi::SampleRateChanged` / `DisplayBandwidth`
+    // / `DemodModeChanged` / `BandwidthChanged` events
+    // the manual handlers send — those are UI-sync
+    // signals for user-initiated changes. Scanner
+    // retunes carry their own `ScannerActiveChannelChanged`
+    // payload with freq/mode/bandwidth/name that the
+    // UI handler fans out to the same widgets; emitting
+    // both paths would double-drive the sync.
+
+    // Reset the squelch edge tracker AND re-arm the
+    // auto-squelch noise-floor estimate for the new
+    // channel. See `on_tune_change` for the full
+    // rationale — both are critical: without the
+    // edge reset a fresh `SquelchEdge::Open` would
+    // be suppressed by a trailing-open state from
+    // the previous channel (scanner invariant
+    // `persistent_open_during_settle_goes_directly_to_listening`
+    // relies on this); without the auto-squelch
+    // re-arm the scanner inherits the previous
+    // band's noise floor, which is the same bug
+    // issue #374 describes for manual tunes.
+    on_tune_change(state);
+
+    // 1. Center frequency (mirrors `UiToDsp::Tune`).
+    #[allow(clippy::cast_precision_loss)]
+    let freq_f64 = freq_hz as f64;
+    state.center_freq = freq_f64;
+    if let Some(source) = state.source.as_mut()
+        && let Err(e) = source.tune(freq_f64)
+    {
+        tracing::warn!(?e, "scanner retune: source.tune failed");
+    }
+
+    retune_demod_mode(state, dsp_tx, demod_mode, bandwidth);
+
+    // 3. Bandwidth (mirrors `UiToDsp::SetBandwidth`).
+    // Applied to the VFO channel filter first; only
+    // persist on success. For same-mode retunes the
+    // VFO already exists; for mode-change retunes the
+    // rebuild above already used `state.bandwidth`
+    // so the two paths converge.
+    if let Some(vfo) = &mut state.vfo {
+        match vfo.set_bandwidth(bandwidth) {
+            Ok(()) => state.bandwidth = bandwidth,
+            Err(e) => {
+                tracing::warn!(?e, "scanner retune: VFO bandwidth update failed");
+            }
+        }
+    } else {
+        state.bandwidth = bandwidth;
+    }
+    state.radio.set_bandwidth(bandwidth);
+
+    // 4. CTCSS is per-channel: force-Off when the new
+    // channel doesn't carry a tone, otherwise a stale
+    // tone gate would silence the new channel.
+    let ctcss_mode = ctcss.unwrap_or(sdr_radio::af_chain::CtcssMode::Off);
+    if let Err(e) = state.radio.set_ctcss_mode(ctcss_mode) {
+        tracing::warn!(?e, "scanner retune: set_ctcss_mode failed");
+    }
+    // 5. Voice squelch is device-level — preserve
+    // current setting when the channel doesn't
+    // override it.
+    if let Some(m) = voice_squelch
+        && let Err(e) = state.radio.set_voice_squelch_mode(m)
+    {
+        tracing::warn!(?e, "scanner retune: set_voice_squelch_mode failed");
+    }
+}
+/// Demod-mode half of [`handle_scanner_retune`]: on a mode change,
+/// swap the demodulator, reset the generic audio tap, re-derive
+/// decimation for the new IF rate, and rebuild the VFO. No-op for
+/// same-mode hops. Split out per CR on PR #841.
+fn retune_demod_mode(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    demod_mode: sdr_types::DemodMode,
+    bandwidth: f64,
+) {
+    // 2. Demod mode + VFO rebuild on change (mirrors
+    // `UiToDsp::SetDemodMode`). The scanner doesn't
+    // emit retune commands redundantly — each Retune
+    // marks a new channel — but the target mode may
+    // equal the current mode (rotation pass on same-
+    // mode channels), so guard to avoid gratuitous
+    // rebuilds.
+    let old_mode = state.radio.current_mode();
+    if old_mode != demod_mode {
+        if let Err(e) = state.radio.set_mode(demod_mode) {
+            tracing::warn!(?e, "scanner retune: set_mode failed");
+        } else {
+            // Generic audio tap: same hard-boundary
+            // treatment the `UiToDsp::SetDemodMode` path
+            // applies. Scanner retunes deliberately
+            // suppress `DemodModeChanged` to the UI
+            // (per-hop chatter would be noise), which
+            // means FFI tap consumers never see the
+            // normal restart signal — so without this
+            // reset, one audio stream would span mixed
+            // demod outputs with stale 3:1 decimation
+            // phase state. Mirrors the treatment at
+            // L652-657 for the user-driven mode switch.
+            state.audio_tap_tx = None;
+            state.audio_tap_phase = 0;
+
+            // Auto-adjust decimation for the new
+            // demod's IF rate.
+            let if_rate = state.radio.demod_config().if_sample_rate;
+            let auto_decim = auto_decimation_ratio(state.sample_rate, if_rate);
+            if auto_decim != state.frontend.decim_ratio()
+                && let Err(e) = state.frontend.set_decimation(auto_decim)
+            {
+                tracing::warn!(?e, "scanner retune: auto-decimation failed");
+            }
+            // Rebuild the VFO for the new demod's IF
+            // rate + bandwidth. Bandwidth is set
+            // below; rebuild picks it up via
+            // `state.bandwidth`.
+            state.bandwidth = bandwidth;
+            if let Err(e) = rebuild_vfo_echoing(state, dsp_tx) {
+                tracing::warn!(?e, "scanner retune: VFO rebuild failed");
             }
         }
     }

@@ -3,9 +3,6 @@
 
 use super::{DspState, DspToUi, SstvDecoder, mpsc};
 
-/// Mutable state owned by the DSP thread.
-///
-/// This is a god-struct that holds every piece of DSP-thread state by
 /// Per-SSTV-pass diagnostic counters. Reset between passes by
 /// [`reset_imaging_decoders`] (which logs a summary first). Lets
 /// a post-pass log analysis answer:
@@ -127,12 +124,7 @@ pub(super) fn sstv_decode_tap(
     // Mono downmix. SSTV is mono — averaging L+R is equivalent to
     // either channel for FM-demodulated audio. Mirrors `apt_mono_buf`.
     // Pre-gate audio for the same reason as the APT tap (#734).
-    state.sstv_mono_buf.clear();
-    state.sstv_mono_buf.extend(
-        state.radio.pre_gate_audio()[..audio_count]
-            .iter()
-            .map(|s| f32::midpoint(s.l, s.r)),
-    );
+    super::audio::downmix_pre_gate_mono(&state.radio, audio_count, &mut state.sstv_mono_buf);
 
     // `SstvDecoder::process` returns a `Vec<SstvEvent>` — iterate and
     // dispatch. `SstvEvent` is `#[non_exhaustive]`, so a wildcard arm
@@ -205,28 +197,7 @@ pub(super) fn handle_sstv_event(
                 let _ = dsp_tx.send(DspToUi::SstvLineDecoded(line_index));
             }
             slowrx::SstvEvent::ImageComplete { image, .. } => {
-                // `take_completed` atomically swaps out the in-flight
-                // pixel buffer and resets for the next VIS detection.
-                // Move the completed image (via the shared handle's
-                // take path) into the DspToUi message for the wiring
-                // layer to save at LOS. If no handle is wired, fall
-                // back to the slowrx-owned `image` directly.
-                let completed = state
-                    .sstv_image
-                    .as_ref()
-                    .and_then(sdr_radio::sstv_image::SstvImageHandle::take_completed);
-                let width = image.width;
-                let height = image.height;
-                // `map_or` consumes `image.pixels` directly in the
-                // `None` arm, avoiding the `.clone()` the
-                // `map_or_else` call had. The `Some` arm returns
-                // the handle's buffer — both arms are owned moves.
-                let pixels = completed.map_or(image.pixels, |c| c.pixels);
-                let _ = dsp_tx.send(DspToUi::SstvImageComplete {
-                    width,
-                    height,
-                    pixels,
-                });
+                handle_sstv_image_complete(state, dsp_tx, image);
             }
             _ => {
                 // `SstvEvent` is `#[non_exhaustive]` — silently
@@ -235,6 +206,39 @@ pub(super) fn handle_sstv_event(
             }
         }
     }
+}
+
+/// Finish one decoded SSTV frame: drain the completed image out of
+/// the shared handle (or fall back to the slowrx-owned buffer when no
+/// handle is wired) and hand it to the UI for the LOS save. Split out
+/// of [`handle_sstv_event`] per CR on PR #841.
+fn handle_sstv_image_complete(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    image: slowrx::SstvImage,
+) {
+    // `take_completed` atomically swaps out the in-flight
+    // pixel buffer and resets for the next VIS detection.
+    // Move the completed image (via the shared handle's
+    // take path) into the DspToUi message for the wiring
+    // layer to save at LOS. If no handle is wired, fall
+    // back to the slowrx-owned `image` directly.
+    let completed = state
+        .sstv_image
+        .as_ref()
+        .and_then(sdr_radio::sstv_image::SstvImageHandle::take_completed);
+    let width = image.width;
+    let height = image.height;
+    // `map_or` consumes `image.pixels` directly in the
+    // `None` arm, avoiding the `.clone()` the
+    // `map_or_else` call had. The `Some` arm returns
+    // the handle's buffer — both arms are owned moves.
+    let pixels = completed.map_or(image.pixels, |c| c.pixels);
+    let _ = dsp_tx.send(DspToUi::SstvImageComplete {
+        width,
+        height,
+        pixels,
+    });
 }
 
 /// Map a [`slowrx::SstvMode`] to a `&'static str` mode name for

@@ -231,6 +231,9 @@ use source::{rebuild_vfo, rtl_sdr_pre_start_settings};
 #[cfg(test)]
 use sstv::handle_sstv_event;
 
+/// Mutable state owned by the DSP thread.
+///
+/// This is a god-struct that holds every piece of DSP-thread state by
 /// design — the DSP thread owns everything exclusively. The
 /// `struct_excessive_bools` lint triggers at 4 bools (`running`,
 /// `dc_blocking`, `invert_iq`, `squelch_was_open`); splitting them

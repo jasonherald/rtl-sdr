@@ -28,18 +28,6 @@ pub(super) fn stop_any_recording(state: &mut DspState, dsp_tx: &mpsc::Sender<Dsp
     stopped
 }
 
-/// Headless airband-lock enforcement. The spec ("VFO fully
-/// disabled while ACARS is on") greys these controls UI-side,
-/// but the DSP side must also reject geometry-changing
-/// `UiToDsp` commands while engaged — otherwise a stale
-/// command, an FFI consumer that doesn't know the convention,
-/// or a future scanner re-tune could mutate the live graph
-/// behind ACARS's back, leaving `acars_bank` decoding stale
-/// geometry while ACARS reads as logically engaged. Caller
-/// invokes this at the top of each geometry-mutating arm
-/// (`Tune` / `SetDemodMode` / `SetSampleRate` / `SetDecimation` /
-/// `SetVfoOffset`) and
-/// `return`s on `true`. CR round 14 on PR #584.
 /// User-facing message for a failed recording write. The WAV size cap
 /// (#694) is an expected end-of-file condition, not a fault, so it gets
 /// its own wording.
@@ -74,4 +62,27 @@ pub(super) fn iq_recording_rejects_rate_change(
         return true;
     }
     false
+}
+
+/// Mono-downmix the radio's pre-gate audio into `buf` by averaging
+/// L+R — equivalent to taking either channel for FM-demodulated
+/// audio once any stereo pilot is filtered out. Pre-gate audio
+/// because the speaker path zeroes on a closed power / CTCSS /
+/// voice squelch, and the imaging subcarriers have no speech
+/// cadence, so the gated buffer would feed the decoders black
+/// lines on every fade (#734). Shared by the APT and SSTV taps
+/// per CR on PR #841.
+pub(super) fn downmix_pre_gate_mono(
+    radio: &sdr_radio::RadioModule,
+    audio_count: usize,
+    buf: &mut Vec<f32>,
+) {
+    // `extend` over a `map` iterator is exact-size, so `Vec`'s
+    // internal reserve is precise — no manual `reserve` needed.
+    buf.clear();
+    buf.extend(
+        radio.pre_gate_audio()[..audio_count]
+            .iter()
+            .map(|s| f32::midpoint(s.l, s.r)),
+    );
 }

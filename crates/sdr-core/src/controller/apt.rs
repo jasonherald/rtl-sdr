@@ -61,12 +61,7 @@ pub(super) fn apt_decode_tap(
     // CTCSS / voice squelch, and the APT 2400 Hz subcarrier has no
     // speech cadence, so the gated buffer would feed the decoder
     // black lines on every fade (#734).
-    state.apt_mono_buf.clear();
-    state.apt_mono_buf.extend(
-        state.radio.pre_gate_audio()[..audio_count]
-            .iter()
-            .map(|s| f32::midpoint(s.l, s.r)),
-    );
+    super::audio::downmix_pre_gate_mono(&state.radio, audio_count, &mut state.apt_mono_buf);
 
     match decoder.process(&state.apt_mono_buf, &mut state.apt_lines_buf) {
         Ok(produced) => {
