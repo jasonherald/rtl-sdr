@@ -2424,13 +2424,14 @@ fn broadcaster_worker(
             UsbReadOutcome::Idle => {
                 // No data — loop and re-check shutdown.
             }
-            UsbReadOutcome::Retry => {
+            UsbReadOutcome::Retry(e) => {
                 tracing::warn!(
+                    %e,
                     consecutive = usb_errors,
                     "rtl_tcp bulk read error — retrying"
                 );
             }
-            UsbReadOutcome::Stop => {
+            UsbReadOutcome::Stop(e) => {
                 // Dongle unplug (or a sustained run of failed
                 // transfers) is unrecoverable at the server
                 // level. Escalate to a global shutdown so the
@@ -2439,6 +2440,7 @@ fn broadcaster_worker(
                 // clients' command / writer loops observe the
                 // flag and tear down.
                 tracing::error!(
+                    %e,
                     consecutive = usb_errors,
                     "rtl_tcp: USB read failure is terminal, stopping server"
                 );
@@ -2497,10 +2499,10 @@ enum UsbReadOutcome {
     /// Nothing to do: zero-length read or timeout.
     Idle,
     /// Transient failure: counted, read again.
-    Retry,
+    Retry(rusb::Error),
     /// Device gone, or [`MAX_CONSECUTIVE_USB_ERRORS`] failures in a
-    /// row: stop the server.
-    Stop,
+    /// row (this error being the last of them): stop the server.
+    Stop(rusb::Error),
 }
 
 /// librtlsdr's `xfer_errors` rule (#711 / #808): any successful read
@@ -2521,13 +2523,13 @@ fn classify_usb_read(
             }
         }
         Err(rusb::Error::Timeout) => UsbReadOutcome::Idle,
-        Err(rusb::Error::NoDevice) => UsbReadOutcome::Stop,
-        Err(_) => {
+        Err(e @ rusb::Error::NoDevice) => UsbReadOutcome::Stop(e),
+        Err(e) => {
             *consecutive_errors = consecutive_errors.saturating_add(1);
             if *consecutive_errors >= MAX_CONSECUTIVE_USB_ERRORS {
-                UsbReadOutcome::Stop
+                UsbReadOutcome::Stop(e)
             } else {
-                UsbReadOutcome::Retry
+                UsbReadOutcome::Retry(e)
             }
         }
     }
@@ -3633,7 +3635,7 @@ mod tests {
         for _ in 1..MAX_CONSECUTIVE_USB_ERRORS {
             assert_eq!(
                 classify_usb_read(Err(rusb::Error::Io), &mut errors),
-                UsbReadOutcome::Retry
+                UsbReadOutcome::Retry(rusb::Error::Io)
             );
         }
         assert_eq!(
@@ -3645,7 +3647,7 @@ mod tests {
         assert_eq!(errors, 0, "Ok(0) is a successful read");
         assert_eq!(
             classify_usb_read(Err(rusb::Error::Io), &mut errors),
-            UsbReadOutcome::Retry
+            UsbReadOutcome::Retry(rusb::Error::Io)
         );
         assert_eq!(
             classify_usb_read(Ok(7), &mut errors),
@@ -3662,17 +3664,17 @@ mod tests {
         for _ in 1..MAX_CONSECUTIVE_USB_ERRORS {
             assert_eq!(
                 classify_usb_read(Err(rusb::Error::Overflow), &mut errors),
-                UsbReadOutcome::Retry
+                UsbReadOutcome::Retry(rusb::Error::Overflow)
             );
         }
         assert_eq!(
             classify_usb_read(Err(rusb::Error::Pipe), &mut errors),
-            UsbReadOutcome::Stop
+            UsbReadOutcome::Stop(rusb::Error::Pipe)
         );
         let mut fresh = 0_u32;
         assert_eq!(
             classify_usb_read(Err(rusb::Error::NoDevice), &mut fresh),
-            UsbReadOutcome::Stop
+            UsbReadOutcome::Stop(rusb::Error::NoDevice)
         );
     }
 }
