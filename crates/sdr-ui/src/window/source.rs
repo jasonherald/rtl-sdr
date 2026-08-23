@@ -417,8 +417,6 @@ pub(super) fn connect_rtl_tcp_discovery(
         RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
     >,
 ) {
-    use std::collections::HashMap;
-
     wire_manage_favorites_button(panels, favorites_header);
 
     let (browser, disc_rx) = start_discovery_browser(panels);
