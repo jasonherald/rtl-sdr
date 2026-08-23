@@ -2650,6 +2650,22 @@ pub fn lrpt_downlink_for(norad_id: u32) -> sdr_radio::lrpt_decoder::LrptDownlink
     sdr_radio::lrpt_decoder::LrptDownlink::new(mode, differential)
 }
 
+/// The DSP commands an LRPT pass start sends, in the order they must
+/// be queued: the downlink profile first (a changed profile flushes
+/// the old decoder's held-back row group into `image`), then the
+/// canvas wipe. Clearing from the UI thread instead raced that flush
+/// (CR on PR #806).
+#[must_use]
+pub fn lrpt_pass_start_commands(
+    norad_id: u32,
+    image: &sdr_radio::lrpt_image::LrptImage,
+) -> [sdr_core::messages::UiToDsp; 2] {
+    [
+        sdr_core::messages::UiToDsp::SetLrptDownlink(lrpt_downlink_for(norad_id)),
+        sdr_core::messages::UiToDsp::ClearLrptImageContents(image.clone()),
+    ]
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -3421,5 +3437,21 @@ mod tests {
             lrpt_downlink_for(UNCATALOGUED_NORAD_ID),
             LrptDownlink::new(LrptMode::Qpsk, false)
         );
+    }
+
+    /// AOS queues the profile before the canvas wipe, so the DSP
+    /// thread flushes the previous decoder's tail before clearing.
+    #[test]
+    fn lrpt_pass_start_sends_profile_then_clear() {
+        use sdr_core::messages::UiToDsp;
+        use sdr_dsp::lrpt::LrptMode;
+        use sdr_radio::lrpt_decoder::LrptDownlink;
+        let image = sdr_radio::lrpt_image::LrptImage::new();
+        let [first, second] = lrpt_pass_start_commands(sdr_sat::METEOR_M2_4_NORAD_ID, &image);
+        assert!(matches!(
+            first,
+            UiToDsp::SetLrptDownlink(profile) if profile == LrptDownlink::new(LrptMode::Oqpsk, false)
+        ));
+        assert!(matches!(second, UiToDsp::ClearLrptImageContents(_)));
     }
 }

@@ -11578,17 +11578,15 @@ fn connect_satellites_panel(
                         // is more likely to be standard-spec
                         // than Meteor-style OQPSK. Per CR
                         // round 1 on PR #663.
-                        state_a.send_dsp(sdr_core::messages::UiToDsp::SetLrptDownlink(
-                            crate::lrpt_viewer::lrpt_downlink_for(norad_id),
-                        ));
-                        // Wipe the shared canvas on the DSP thread,
-                        // queued AFTER the profile change so a
-                        // changed profile's flush of held-back rows
-                        // lands before the clear rather than after
-                        // it (CR on PR #806).
-                        state_a.send_dsp(sdr_core::messages::UiToDsp::ClearLrptImageContents(
-                            state_a.lrpt_image.clone(),
-                        ));
+                        // Profile first, then the canvas wipe on the
+                        // DSP thread — the order matters (see
+                        // `lrpt_pass_start_commands`).
+                        for command in crate::lrpt_viewer::lrpt_pass_start_commands(
+                            norad_id,
+                            &state_a.lrpt_image,
+                        ) {
+                            state_a.send_dsp(command);
+                        }
 
                         crate::lrpt_viewer::open_lrpt_viewer_if_needed(
                             &parent_provider_a,

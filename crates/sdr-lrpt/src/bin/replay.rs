@@ -98,10 +98,11 @@ fn main() -> ExitCode {
         eprintln!("             soft-diff  — soft input + differential decode (legacy M2)");
         return ExitCode::from(USAGE_EXIT_CODE);
     }
-    let Some((mode, soft, differential)) = parse_mode(args.get(3).map(String::as_str)) else {
+    let mode_arg = args.get(3).map(String::as_str);
+    let Some((mode, soft, differential)) = parse_mode(mode_arg) else {
         eprintln!(
             "error: unknown mode '{}' (expected qpsk, qpsk-diff, oqpsk, oqpsk-diff, soft, or soft-diff)",
-            args[3]
+            mode_arg.unwrap_or_default()
         );
         return ExitCode::from(USAGE_EXIT_CODE);
     };
