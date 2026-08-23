@@ -1,31 +1,42 @@
 use super::*;
 
-/// A squelch threshold no real signal reaches (dB), a near-silent
-/// input well below it, and the residual the muted output may carry.
+/// A squelch threshold no real signal reaches (dB), a weak but
+/// genuinely FM-modulated input below it, and the residual the muted
+/// output may carry.
 const SQUELCH_VERY_HIGH_DB: f32 = 10.0;
-const SQUELCH_QUIET_INPUT_AMPLITUDE: f32 = 0.001;
-const SQUELCH_TEST_INPUT_SAMPLES: usize = 500;
-const SQUELCH_TEST_OUTPUT_CAPACITY: usize = 1000;
+const SQUELCH_WEAK_INPUT_AMPLITUDE: f32 = 0.05;
+const SQUELCH_TEST_INPUT_SAMPLES: usize = 4_000;
+const SQUELCH_TEST_OUTPUT_CAPACITY: usize = 8_000;
 const SQUELCH_MUTED_PEAK_LIMIT: f32 = 0.01;
 
-#[test]
-fn test_radio_module_squelch() {
+/// Demodulate the weak FM fixture with the squelch configured by `arm`.
+fn squelch_peak(arm: impl FnOnce(&mut RadioModule)) -> f32 {
     let mut radio = RadioModule::with_default_rate().unwrap();
-    radio.set_squelch_enabled(true);
-    radio.set_squelch(SQUELCH_VERY_HIGH_DB);
-
-    let input = vec![Complex::new(SQUELCH_QUIET_INPUT_AMPLITUDE, 0.0); SQUELCH_TEST_INPUT_SAMPLES];
+    radio.set_mode(DemodMode::Nfm).unwrap();
+    arm(&mut radio);
+    let input = fm_tone_iq(SQUELCH_TEST_INPUT_SAMPLES, SQUELCH_WEAK_INPUT_AMPLITUDE);
     let mut output = vec![Stereo::default(); SQUELCH_TEST_OUTPUT_CAPACITY];
     let count = radio.process(&input, &mut output).unwrap();
     assert!(count > 0);
-    // All output should be near zero (squelch closed)
-    let peak = output[..count]
-        .iter()
-        .map(|s| s.l.abs().max(s.r.abs()))
-        .fold(0.0_f32, f32::max);
+    peak(&output[..count])
+}
+
+#[test]
+fn test_radio_module_squelch() {
+    // The fixture is audible with the squelch off — otherwise a muted
+    // result would prove nothing.
+    let open_peak = squelch_peak(|r| r.set_squelch_enabled(false));
     assert!(
-        peak < SQUELCH_MUTED_PEAK_LIMIT,
-        "squelch should mute output, peak = {peak}"
+        open_peak >= SQUELCH_MUTED_PEAK_LIMIT,
+        "test premise: FM tone is audible with squelch off, peak = {open_peak}"
+    );
+    let muted_peak = squelch_peak(|r| {
+        r.set_squelch_enabled(true);
+        r.set_squelch(SQUELCH_VERY_HIGH_DB);
+    });
+    assert!(
+        muted_peak < SQUELCH_MUTED_PEAK_LIMIT,
+        "squelch should mute output, peak = {muted_peak}"
     );
 }
 

@@ -286,7 +286,10 @@ fn decode_mcu_dc_predictor_carries_across_calls() {
     // from-zero baseline, stay identical on the next call (carry),
     // and return to the baseline after `reset_dc`.
     const SEEDED_DC: f32 = 42.0;
-    let bytes = [0x28_u8]; // minimal zero-delta stream
+    /// Minimal encoded MCU: DC category 0 (delta 0) followed by the
+    /// AC end-of-block code, so every coefficient is the predictor.
+    const ZERO_DELTA_MCU: [u8; 1] = [0x28];
+    let bytes = ZERO_DELTA_MCU;
     let mut decoder = JpegDecoder::new();
     let mut bit_offset = 0_usize;
     let dqt = fill_dqt(QUALITY_LOWER_BRANCH);
