@@ -46,6 +46,12 @@ pub const VCDU_TOTAL_LEN: usize = VCDU_HEADER_LEN + MPDU_HEADER_LEN + MPDU_DATA_
 /// `cNoHeaderMark`.
 pub const FHP_NO_HEADER: u16 = 0x7FF;
 
+/// First-header-pointer value marking an idle / fill `M_PDU`: the
+/// data field carries no packet bytes at all (CCSDS 732.0-B, §4.1.4.2).
+/// Distinct from [`FHP_NO_HEADER`], which means "packet data continues,
+/// no header starts in this frame" (#729).
+pub const FHP_IDLE_FILL: u16 = 0x7FE;
+
 /// Virtual-channel ID for the AVHRR imaging stream. `MeteorDemod`'s
 /// `cVCIDAVHRR`.
 pub const VCID_AVHRR: u8 = 5;

@@ -57,6 +57,49 @@ const SEQUENCE_COUNT_MODULUS: i32 = 1 << 14;
 /// shifting later MCU placements hundreds of rows.
 const WRAP_MIN_BACKWARD_DELTA: i32 = SEQUENCE_COUNT_MODULUS / 2;
 
+/// Meteor AVHRR image APIDs (channels 1–6 map to 64–69). Anything else
+/// on the imaging VC is telemetry or a miscorrection and must not get a
+/// channel decoder (two 64 K-entry JPEG LUTs) or a viewer entry (#728).
+const IMAGE_APIDS: std::ops::RangeInclusive<u16> = 64..=69;
+
+/// Upper bound on MCU rows per pass (~20 min at one row group per
+/// second). Corrupt sequence counts cannot grow a channel buffer past
+/// `MAX_MCU_ROWS_PER_PASS · 8 · 1568` bytes (~15 MB) (#728).
+const MAX_MCU_ROWS_PER_PASS: usize = 1_200;
+
+/// A forward jump in a channel's sequence count larger than this is
+/// treated like a wrap: provisional until the next packet lands within
+/// [`CORROBORATION_WINDOW_PACKETS`] of it. Real fades lose packets, but
+/// a lone miscorrected count (`last + 9000`) must not allocate 1600
+/// blank rows and then make the next good packet look like a wrap.
+const MAX_FORWARD_GAP_PACKETS: i32 = 8 * PACKETS_PER_ROW_GROUP;
+
+/// How close the packet after a provisional discontinuity must be for
+/// the discontinuity to be believed (two row groups).
+const CORROBORATION_WINDOW_PACKETS: i32 = 2 * PACKETS_PER_ROW_GROUP;
+
+/// Wrap count saturates here: `8 · 16384 / 43` ≈ 3048 rows, already
+/// past [`MAX_MCU_ROWS_PER_PASS`], so every further packet is rejected
+/// by the row bound regardless, and `wraps · SEQUENCE_COUNT_MODULUS`
+/// can never overflow `i32` (CR on PR #803).
+const MAX_WRAPS_PER_PASS: i32 = 8;
+
+/// Does `pkt` corroborate `pending` — land within the window after it?
+fn corroborates(pending: PendingJump, pkt: i32) -> bool {
+    pkt >= pending.pkt && pkt - pending.pkt <= CORROBORATION_WINDOW_PACKETS
+}
+
+/// Row-group index for a non-negative anchor-relative packet position,
+/// or `None` beyond [`MAX_MCU_ROWS_PER_PASS`].
+fn bounded_mcu_row(apid: u16, row_pkt: i32) -> Option<usize> {
+    let mcu_row = usize::try_from(row_pkt / PACKETS_PER_ROW_GROUP).ok()?;
+    if mcu_row >= MAX_MCU_ROWS_PER_PASS {
+        tracing::trace!("dropping packet beyond the row bound on APID {apid}: row {mcu_row}");
+        return None;
+    }
+    Some(mcu_row)
+}
+
 /// Position of a channel's 14-packet segment within the 43-packet
 /// row group, in packets (per medet `progress_image`): APID 64 leads,
 /// 65 follows one segment later, 66 / 68 two segments later.
@@ -93,6 +136,8 @@ const IMAGE_PACKET_HEADER_LEN: usize = 6;
 
 /// APID of the on-board-time / housekeeping packet. Carries no
 /// MCU stream; dropped on entry to `consume_packet`.
+/// Test-only: it is outside [`IMAGE_APIDS`], which is the production gate.
+#[cfg(test)]
 const APID_ONBOARD_TIME: u16 = 70;
 
 /// Per-channel JPEG-decode + image-assembly state. The DC
@@ -108,6 +153,59 @@ struct ChannelDecoder {
     /// is what the row index is computed from, against the
     /// pipeline-wide anchor (#726).
     wraps: i32,
+    /// A sequence-count discontinuity (wrap or large forward jump)
+    /// seen on the previous packet, awaiting corroboration (#728).
+    pending: Option<PendingJump>,
+}
+
+impl ChannelDecoder {
+    /// Sequence-count discontinuity handling against the channel's
+    /// last placed packet. Returns `false` when `pkt` must be dropped:
+    /// a wrap or a large forward jump is provisional (`pending`) until
+    /// the next packet corroborates it. A small reversal is a
+    /// corrupted count byte (post-RS miscorrection or demux desync)
+    /// and is placed without touching the wrap count.
+    fn accept_sequence(&mut self, apid: u16, pkt: i32) -> bool {
+        let Some(last) = self.last_pkt else {
+            return true;
+        };
+        // 14-bit sequence count wraps at SEQUENCE_COUNT_MODULUS; only a
+        // backward step of at least half the modulus can be a wrap.
+        let candidate_wrap = pkt < last && last - pkt >= WRAP_MIN_BACKWARD_DELTA;
+        let forward_jump = pkt > last && pkt - last > MAX_FORWARD_GAP_PACKETS;
+        match self.pending.take() {
+            Some(pending) if corroborates(pending, pkt) => {
+                if pending.wrap {
+                    self.wraps = (self.wraps + 1).min(MAX_WRAPS_PER_PASS);
+                }
+            }
+            _ if candidate_wrap || forward_jump => {
+                self.pending = Some(PendingJump {
+                    pkt,
+                    wrap: candidate_wrap,
+                });
+                tracing::trace!(
+                    "provisional sequence-count discontinuity on APID {apid}: last={last} pkt={pkt}"
+                );
+                return false;
+            }
+            _ if pkt < last => {
+                tracing::trace!(
+                    "non-wrap sequence-count reversal on APID {apid}: last={last} pkt={pkt}"
+                );
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
+/// A discontinuity that is not believed until the next packet on the
+/// channel lands within [`CORROBORATION_WINDOW_PACKETS`] of it.
+#[derive(Clone, Copy)]
+struct PendingJump {
+    pkt: i32,
+    wrap: bool,
 }
 
 impl ChannelDecoder {
@@ -116,6 +214,7 @@ impl ChannelDecoder {
             jpeg: JpegDecoder::new(),
             last_pkt: None,
             wraps: 0,
+            pending: None,
         }
     }
 }
@@ -206,34 +305,13 @@ impl LrptPipeline {
     fn mcu_row_for(&mut self, packet: &ImagePacket, mcu_id: u16) -> Option<usize> {
         // The caller allocated this channel's decoder just before.
         let decoder = self.decoders.get_mut(&packet.apid)?;
-        // Different APIDs start their packet counter at different
-        // offsets within a row group; subtracting the channel's
-        // offset aligns every channel to the shared row-0 anchor.
         let offset = channel_group_offset(packet.apid);
         let pkt = i32::from(packet.sequence_count);
 
-        // 14-bit sequence count wraps at SEQUENCE_COUNT_MODULUS.
-        // Only treat large backward steps (≥ half the modulus)
-        // as a wrap — a small reversal is more likely a corrupted
-        // sequence-count byte (post-RS miscorrection or demux
-        // desync); the prior unconditional wrap fix shifted every
-        // later MCU placement by hundreds of rows in that case.
-        // Per CR round 7. Smaller reversals are trace-logged for
-        // visibility but do not count as a wrap.
-        if let Some(last) = decoder.last_pkt
-            && pkt < last
-        {
-            if last - pkt >= WRAP_MIN_BACKWARD_DELTA {
-                decoder.wraps += 1;
-            } else {
-                tracing::trace!(
-                    "non-wrap sequence-count reversal on APID {apid}: last={last} pkt={pkt}",
-                    apid = packet.apid,
-                );
-            }
+        if !decoder.accept_sequence(packet.apid, pkt) {
+            return None;
         }
         let first_on_channel = decoder.last_pkt.is_none();
-        decoder.last_pkt = Some(pkt);
         let unwrapped = pkt + decoder.wraps * SEQUENCE_COUNT_MODULUS;
 
         // Anchor only on a segment-start packet (`mcu_id == 0`), as
@@ -257,20 +335,13 @@ impl LrptPipeline {
         // the anchor) has no wrap of its own to count yet: resolve it
         // onto the anchor's cycle. Only a wrap-sized deficit counts —
         // a packet from just before the anchor (previous row group)
-        // is simply pre-anchor and is dropped below; treating it as
-        // post-wrap shifted that channel by a whole modulus for the
-        // rest of the pass (CR on PR #802).
+        // is simply pre-anchor and is dropped below (CR on PR #802).
         if first_on_channel && row_pkt <= -WRAP_MIN_BACKWARD_DELTA {
-            decoder.wraps += 1;
+            decoder.wraps = (decoder.wraps + 1).min(MAX_WRAPS_PER_PASS);
             row_pkt += SEQUENCE_COUNT_MODULUS;
         }
-        // Per CR round 8: drop pre-anchor packets entirely
-        // instead of clamping them to row 0. The previous
-        // `.max(0)` would silently snap a corrupted-but-not-
-        // wrap reversal (caught by WRAP_MIN_BACKWARD_DELTA
-        // above) onto the first image row, overwriting real
-        // data. Trace-log the drop so the corruption stays
-        // visible during debug runs.
+        // Pre-anchor packets are dropped, not clamped onto row 0, and
+        // do not move the channel's position (#728).
         if row_pkt < 0 {
             tracing::trace!(
                 "dropping pre-anchor packet on APID {apid}: anchor={anchor} pkt={pkt}",
@@ -278,11 +349,12 @@ impl LrptPipeline {
             );
             return None;
         }
-        #[allow(
-            clippy::cast_sign_loss,
-            reason = "row_pkt is non-negative after the row_pkt < 0 early return above"
-        )]
-        Some((row_pkt / PACKETS_PER_ROW_GROUP) as usize)
+        // `accept_sequence` has committed this packet's wrap / jump
+        // state, so the position must follow even when the row bound
+        // rejects it — a frozen `last_pkt` would turn every later
+        // packet into a phantom wrap (CR on PR #803).
+        decoder.last_pkt = Some(pkt);
+        bounded_mcu_row(packet.apid, row_pkt)
     }
 
     /// Decode one image packet: parse the per-MCU header bytes,
@@ -295,14 +367,26 @@ impl LrptPipeline {
     /// AVHRR MCU-segment header ([`IMAGE_PACKET_HEADER_LEN`]: MCU id,
     /// scan headers, quality byte), then the JPEG-coded MCU stream.
     fn consume_packet(&mut self, packet: &ImagePacket) {
-        if packet.apid == APID_ONBOARD_TIME {
+        // [`APID_ONBOARD_TIME`] (70) is outside the image range.
+        if !IMAGE_APIDS.contains(&packet.apid) {
             return;
         }
-        // Skip the 8-byte on-board timestamp secondary header to
-        // reach the AVHRR MCU segment. Without this, `payload[0]`
-        // is the timestamp's (near-constant) day byte, pinning
-        // every MCU to one column and shifting the JPEG stream 8
-        // bytes early into garbage.
+        // Meteor image packets always carry the 8-byte on-board
+        // timestamp secondary header, so the header flag is a validity
+        // gate: a clear flag is a miscorrected header bit, and reading
+        // the AVHRR header from offset 0 would place 14 garbage MCUs
+        // at the timestamp's day byte (#729, CR on PR #803).
+        if !packet.has_secondary_header {
+            tracing::trace!(
+                "dropping image packet without a secondary header on APID {apid}",
+                apid = packet.apid,
+            );
+            return;
+        }
+        // Skip the timestamp to reach the AVHRR MCU segment. Without
+        // this, `payload[0]` is the timestamp's (near-constant) day
+        // byte, pinning every MCU to one column and shifting the JPEG
+        // stream 8 bytes early into garbage.
         if packet.payload.len() < MPDU_TIME_HEADER_LEN + IMAGE_PACKET_HEADER_LEN {
             return;
         }
@@ -511,6 +595,7 @@ mod tests {
             vcid: TEST_VCID,
             apid,
             sequence_count,
+            has_secondary_header: true,
             payload,
         }
     }
@@ -539,6 +624,7 @@ mod tests {
             vcid: TEST_VCID,
             apid: 64,
             sequence_count: 100,
+            has_secondary_header: true,
             payload: vec![0_u8; HEADER_LEN - 1],
         };
         p.consume_packet(&pkt);
@@ -609,13 +695,15 @@ mod tests {
         let near_wrap = synthetic_image_packet(64, near);
         p.consume_packet(&near_wrap);
         let anchor_before = p.anchor.expect("anchor set on initial packet");
-        // Push a second packet whose sequence_count has wrapped.
+        // Push a second packet whose sequence_count has wrapped — it is
+        // provisional until the third corroborates it (#728).
         let after_wrap = synthetic_image_packet(64, 2);
         p.consume_packet(&after_wrap);
+        p.consume_packet(&synthetic_image_packet(64, 3));
         let dec = p.decoders.get(&64).expect("apid 64 still present");
         assert_eq!(dec.wraps, 1, "one wrap counted on the channel");
         assert_eq!(p.anchor, Some(anchor_before), "the anchor never moves");
-        assert_eq!(dec.last_pkt, Some(2));
+        assert_eq!(dec.last_pkt, Some(3));
     }
 
     #[test]
@@ -656,6 +744,7 @@ mod tests {
             vcid: TEST_VCID,
             apid: 64,
             sequence_count: 100,
+            has_secondary_header: true,
             payload: {
                 // Timestamp + AVHRR header, but no JPEG bytes after
                 // it — first decode_mcu hits EndOfStream.
@@ -713,7 +802,9 @@ mod tests {
         let dec = p.decoders.get(&64).expect("apid 64 still present");
         assert_eq!(dec.wraps, 0, "1-step reversal must NOT count as a wrap");
         assert_eq!(p.anchor, Some(anchor_before));
-        assert_eq!(dec.last_pkt, Some(99));
+        // 99 lands one packet before the anchor and is dropped; a
+        // dropped packet does not move the channel's position (#728).
+        assert_eq!(dec.last_pkt, Some(100));
     }
 
     #[test]
@@ -877,5 +968,127 @@ mod tests {
         // Its next packet, in the anchor's row group, lands on row 0.
         p.consume_packet(&packet_with_mcu_id(64, 1_000, 0));
         assert_eq!(p.assembler.channel(64).expect("placed").lines, MCU_SIDE);
+    }
+
+    // --- #728 (Aug 2026 deep review) ---
+
+    /// Only the AVHRR image APIDs (64–69) get a channel decoder; any
+    /// other APID is a miscorrection (or telemetry) and must not
+    /// allocate two 64 K-entry JPEG LUTs or a viewer channel.
+    #[test]
+    fn image_packet_without_secondary_header_is_rejected() {
+        let mut p = LrptPipeline::new();
+        let mut pkt = synthetic_image_packet(64, 10);
+        pkt.has_secondary_header = false;
+        p.consume_packet(&pkt);
+        assert!(p.decoders.is_empty(), "unflagged packet is not decoded");
+        assert!(p.anchor.is_none());
+    }
+
+    #[test]
+    fn unknown_apids_are_ignored() {
+        let mut p = LrptPipeline::new();
+        p.consume_packet(&synthetic_image_packet(100, 10));
+        p.consume_packet(&synthetic_image_packet(1_000, 10));
+        assert!(p.decoders.is_empty(), "no decoder for a non-image APID");
+        assert!(p.assembler.channels().next().is_none());
+    }
+
+    /// A forward miscorrection (`pkt = last + 9000`) used to allocate
+    /// ~1600 blank lines and make the next good packet look like a
+    /// 14-bit wrap. A discontinuity is now provisional: the jumped
+    /// packet is dropped and `last_pkt` is left alone until the next
+    /// packet corroborates the new position.
+    #[test]
+    fn forward_miscorrection_is_dropped_and_does_not_poison_the_wrap_state() {
+        let mut p = LrptPipeline::new();
+        p.consume_packet(&packet_with_mcu_id(64, 100, 0));
+        let lines_before = p.assembler.channel(64).map_or(0, |c| c.lines);
+        p.consume_packet(&packet_with_mcu_id(64, 9_100, 0));
+        assert_eq!(
+            p.assembler.channel(64).map_or(0, |c| c.lines),
+            lines_before,
+            "no blank rows allocated for a lone jump"
+        );
+        // The next good packet (row group 1) is not a wrap.
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let next = (100 + PACKETS_PER_ROW_GROUP) as u16;
+        p.consume_packet(&packet_with_mcu_id(64, next, 0));
+        assert_eq!(p.decoders[&64].wraps, 0, "no phantom wrap");
+        assert_eq!(p.assembler.channel(64).expect("placed").lines, 2 * MCU_SIDE);
+    }
+
+    /// A genuine wrap is corroborated by the following packet and
+    /// then counted once; a lone backward miscorrection is not.
+    #[test]
+    fn sequence_wrap_is_counted_only_when_corroborated() {
+        let mut p = LrptPipeline::new();
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let near = (SEQUENCE_COUNT_MODULUS - PACKETS_PER_ROW_GROUP) as u16;
+        p.consume_packet(&packet_with_mcu_id(64, near, 0));
+        // Lone backward "wrap" followed by the real continuation: not a wrap.
+        p.consume_packet(&packet_with_mcu_id(64, 7, 0));
+        assert_eq!(p.decoders[&64].wraps, 0, "uncorroborated");
+        p.consume_packet(&packet_with_mcu_id(64, near, 14));
+        assert_eq!(p.decoders[&64].wraps, 0);
+        // Real wrap: two consecutive post-wrap packets.
+        p.consume_packet(&packet_with_mcu_id(64, 0, 0)); // provisional
+        p.consume_packet(&packet_with_mcu_id(64, 1, 14)); // corroborates
+        assert_eq!(p.decoders[&64].wraps, 1);
+        assert_eq!(p.assembler.channel(64).expect("placed").lines, 2 * MCU_SIDE);
+    }
+
+    /// Rows are bounded per pass so corrupt input cannot drive a
+    /// multi-GB channel allocation. The 14-bit count spans 381 rows per
+    /// cycle, so the bound is only reachable through corroborated wraps
+    /// — which is how the test drives it. Row-bound rejections still
+    /// commit the channel's position (`wraps`, `last_pkt`) so the
+    /// detector is not poisoned for the rest of the pass.
+    #[test]
+    fn mcu_rows_are_bounded_per_pass() {
+        /// A count late in the 14-bit cycle, past the forward-gap limit.
+        const LATE_IN_CYCLE: u16 = 16_000;
+        let mut p = LrptPipeline::new();
+        p.consume_packet(&packet_with_mcu_id(64, 0, 0));
+        // Each cycle: a corroborated forward jump late into the cycle,
+        // then a corroborated wrap. Four wraps put the channel at
+        // ~1500 rows, past MAX_MCU_ROWS_PER_PASS.
+        for _ in 0..4 {
+            p.consume_packet(&packet_with_mcu_id(64, LATE_IN_CYCLE, 0));
+            p.consume_packet(&packet_with_mcu_id(64, LATE_IN_CYCLE + 1, 14));
+            p.consume_packet(&packet_with_mcu_id(64, 10, 0));
+            p.consume_packet(&packet_with_mcu_id(64, 11, 14));
+        }
+        let dec = &p.decoders[&64];
+        assert_eq!(dec.wraps, 4, "wraps are committed even past the bound");
+        assert_eq!(
+            dec.last_pkt,
+            Some(11),
+            "position follows the rejected packet"
+        );
+        let lines = p.assembler.channel(64).expect("exists").lines;
+        assert!(lines < MAX_MCU_ROWS_PER_PASS * MCU_SIDE, "bounded: {lines}");
+        // The last placed row is the third cycle's post-wrap packet 11:
+        // (11 + 3·16384) / 43 = row 1143.
+        assert_eq!(lines, 1144 * MCU_SIDE);
+    }
+
+    /// Past the row bound the wrap count saturates, so an endless
+    /// corrupt wrap cycle can never overflow the unwrapped position
+    /// and fold back onto row 0.
+    #[test]
+    fn wrap_count_saturates_past_the_row_bound() {
+        const LATE_IN_CYCLE: u16 = 16_000;
+        let mut p = LrptPipeline::new();
+        p.consume_packet(&packet_with_mcu_id(64, 0, 0));
+        for _ in 0..(MAX_WRAPS_PER_PASS + 4) {
+            p.consume_packet(&packet_with_mcu_id(64, LATE_IN_CYCLE, 0));
+            p.consume_packet(&packet_with_mcu_id(64, LATE_IN_CYCLE + 1, 14));
+            p.consume_packet(&packet_with_mcu_id(64, 10, 0));
+            p.consume_packet(&packet_with_mcu_id(64, 11, 14));
+        }
+        assert_eq!(p.decoders[&64].wraps, MAX_WRAPS_PER_PASS);
+        let lines = p.assembler.channel(64).expect("exists").lines;
+        assert!(lines < MAX_MCU_ROWS_PER_PASS * MCU_SIDE, "bounded: {lines}");
     }
 }

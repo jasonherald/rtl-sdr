@@ -14,7 +14,7 @@
 //! Reference (read-only):
 //! `original/MeteorDemod/decoder/protocol/lrpt/decoder.cpp`.
 
-use super::{FHP_NO_HEADER, MPDU_DATA_LEN, MPDU_HEADER_LEN};
+use super::{FHP_IDLE_FILL, FHP_NO_HEADER, MPDU_DATA_LEN, MPDU_HEADER_LEN};
 
 /// CCSDS packet primary header length.
 pub const PKT_HEADER_LEN: usize = 6;
@@ -90,20 +90,13 @@ impl MpduReassembler {
         // FHP: low 11 bits of first 2 bytes (top 5 bits reserved).
         let fhp_word = u16::from_be_bytes([region[0], region[1]]);
         let fhp = fhp_word & FHP_MASK;
+        // Idle / fill frame: no packet bytes, and sync is untouched.
+        if fhp == FHP_IDLE_FILL {
+            return Ok(Vec::new());
+        }
         let payload = &region[MPDU_HEADER_LEN..];
-        if self.in_sync {
-            self.buffer.extend_from_slice(payload);
-        } else {
-            // Drop the buffer + restart at FHP, unless FHP signals
-            // "no header" (entire payload is an unsynced
-            // continuation — discard) or FHP exceeds the data
-            // field (malformed CADU got past RS — skip silently).
-            if fhp == FHP_NO_HEADER || (fhp as usize) >= payload.len() {
-                return Ok(Vec::new());
-            }
-            self.buffer.clear();
-            self.buffer.extend_from_slice(&payload[fhp as usize..]);
-            self.in_sync = true;
+        if !self.align(fhp, payload) {
+            return Ok(Vec::new());
         }
         // Try to emit packets from the buffer. Walk a `consumed`
         // cursor instead of draining per packet — `Vec::drain`
@@ -153,12 +146,81 @@ impl MpduReassembler {
         Ok(packets)
     }
 
+    /// Append the frame's payload to the buffer, (re)aligning on its
+    /// first-header pointer as needed. Returns `false` when the frame
+    /// carries nothing usable (unsynced continuation or malformed FHP).
+    fn align(&mut self, fhp: u16, payload: &[u8]) -> bool {
+        let fhp_us = usize::from(fhp);
+        if self.in_sync {
+            // Re-align on every frame that carries a header pointer
+            // (MeteorDemod does the same): the bytes still owed to the
+            // packet in progress must end exactly where the frame says
+            // its first header starts. A corrupt length byte that
+            // slipped past the integrity gate otherwise mis-frames every
+            // following packet until the gate trips (#729).
+            // A pointer past the data field proves the M_PDU header
+            // is corrupt: do not splice the data field into the packet
+            // in progress (CR on PR #803).
+            if fhp != FHP_NO_HEADER && fhp_us >= payload.len() {
+                tracing::warn!(
+                    "M_PDU first-header pointer {fhp} exceeds the data field; losing sync"
+                );
+                self.lose_sync();
+                return false;
+            }
+            if fhp != FHP_NO_HEADER && !self.fhp_consistent(fhp_us, payload) {
+                tracing::warn!(
+                    "M_PDU first-header pointer {fhp} disagrees with the {} bytes buffered; realigning",
+                    self.buffer.len(),
+                );
+                self.buffer.clear();
+                self.buffer.extend_from_slice(&payload[fhp_us..]);
+            } else {
+                self.buffer.extend_from_slice(payload);
+            }
+            return true;
+        }
+        // Drop the buffer + restart at FHP, unless FHP signals
+        // "no header" (entire payload is an unsynced
+        // continuation — discard) or FHP exceeds the data
+        // field (malformed CADU got past RS — skip silently).
+        if fhp == FHP_NO_HEADER || fhp_us >= payload.len() {
+            return false;
+        }
+        self.buffer.clear();
+        self.buffer.extend_from_slice(&payload[fhp_us..]);
+        self.in_sync = true;
+        true
+    }
+
     /// Mark the reassembler as having lost sync (call when a VCDU
     /// is dropped or arrives out of order). Buffer is cleared at
     /// the next push that has a valid FHP.
     pub fn lose_sync(&mut self) {
         self.in_sync = false;
         self.buffer.clear();
+    }
+
+    /// Does the frame's first-header pointer agree with the packet in
+    /// progress? The bytes still owed to it must end exactly at
+    /// `fhp_us`. When fewer than a header's worth of bytes are
+    /// buffered, the length field is completed from the start of the
+    /// new payload before checking.
+    fn fhp_consistent(&self, fhp_us: usize, payload: &[u8]) -> bool {
+        if self.buffer.is_empty() {
+            return fhp_us == 0;
+        }
+        let header_byte = |i: usize| {
+            self.buffer
+                .get(i)
+                .or_else(|| payload.get(i - self.buffer.len()))
+                .copied()
+        };
+        let (Some(hi), Some(lo)) = (header_byte(4), header_byte(5)) else {
+            return false;
+        };
+        let total_len = PKT_HEADER_LEN + usize::from(u16::from_be_bytes([hi, lo])) + 1;
+        total_len == self.buffer.len() + fhp_us
     }
 
     /// Whether the reassembler currently has a packet header
@@ -356,5 +418,95 @@ mod tests {
         let out = r.push(&region).expect("push");
         assert!(out.is_empty());
         assert!(!r.is_in_sync());
+    }
+
+    // --- #729 (Aug 2026 deep review) ---
+
+    /// Each frame's FHP says where the first packet header sits; a
+    /// reassembler that is in sync but whose pending byte count
+    /// disagrees with it has been mis-framed by a corrupt length byte
+    /// and must resync at the FHP rather than mis-frame every packet
+    /// until the integrity gate trips (`MeteorDemod` re-aligns per frame).
+    #[test]
+    fn fhp_realigns_a_misframed_stream() {
+        let mut r = MpduReassembler::new();
+        // Frame 1 ends with a partial packet whose (corrupt) header
+        // claims 1000 more bytes than it really has.
+        let mut bogus = make_packet(0x100, &[0xAB; 40]);
+        bogus[4] = 0x03;
+        bogus[5] = 0xFF; // length field → 1030 bytes
+        let head = make_packet(0x101, b"good-one");
+        // `build_region` clips `bogus` to the data field: only its
+        // head is present, as the tail of frame 1.
+        let region1 = build_region(0, &[head.clone(), bogus]);
+        let out1 = r.push(&region1).expect("push 1");
+        assert_eq!(out1, vec![head]);
+        assert!(r.is_in_sync());
+        // Frame 2 says its first header is at byte 0: the pending
+        // bogus packet cannot be completed — realign.
+        let next = make_packet(0x102, b"after-realign");
+        let region2 = build_region(0, std::slice::from_ref(&next));
+        let out2 = r.push(&region2).expect("push 2");
+        // Zero padding after `next` parses as 7-byte all-zero packets.
+        assert_eq!(out2.first(), Some(&next), "resynced at the frame's FHP");
+        assert!(r.is_in_sync());
+    }
+
+    /// An in-sync reassembler that sees a header pointer past the data
+    /// field (but not `0x7FF` / `0x7FE`) has a corrupt `M_PDU` header:
+    /// the data field is not spliced into the packet in progress and
+    /// sync is lost, as the unsynced branch already does.
+    #[test]
+    fn in_sync_pointer_past_the_data_field_loses_sync() {
+        let mut r = MpduReassembler::new();
+        let pkt = make_packet(0x100, b"payload");
+        r.push(&build_region(0, std::slice::from_ref(&pkt)))
+            .expect("push");
+        assert!(r.is_in_sync());
+        let bad = build_region(FHP_IDLE_FILL - 1, &[]);
+        assert!(r.push(&bad).expect("push bad").is_empty());
+        assert!(!r.is_in_sync());
+    }
+
+    /// `fhp_consistent` edge cases: nothing buffered means the header
+    /// must start at byte 0; a sub-header remnant has its length field
+    /// completed from the new payload before the check.
+    #[test]
+    fn fhp_consistency_with_empty_and_partial_buffers() {
+        let mut r = MpduReassembler::new();
+        let filler = vec![0_u8; MPDU_DATA_LEN];
+        assert!(r.fhp_consistent(0, &filler));
+        assert!(!r.fhp_consistent(3, &filler));
+        // Two header bytes buffered; the packet claims 1 + 6 = 7 bytes
+        // total when the length field (bytes 4-5) reads 0, so the next
+        // header must start at payload byte 5.
+        r.buffer.extend_from_slice(&[0x01, 0x00]);
+        assert!(r.fhp_consistent(5, &filler));
+        assert!(!r.fhp_consistent(4, &filler));
+        // Fewer than 6 bytes available in total: the length is unknown
+        // and the pointer cannot be trusted.
+        assert!(!r.fhp_consistent(2, &filler[..2]));
+    }
+
+    /// `0x7FE` is the CCSDS idle/fill `M_PDU` marker: no packet data at
+    /// all. It must not be appended to the stream (and must not be
+    /// treated as "header at offset 2046").
+    #[test]
+    fn idle_fill_mpdu_is_skipped() {
+        let pkt = make_packet(0x100, b"payload");
+        let region = build_region(0, std::slice::from_ref(&pkt));
+        let mut r = MpduReassembler::new();
+        r.push(&region).expect("push");
+        let mut idle = vec![0_u8; MPDU_HEADER_LEN + MPDU_DATA_LEN];
+        idle[0..2].copy_from_slice(&FHP_IDLE_FILL.to_be_bytes());
+        idle[MPDU_HEADER_LEN..].fill(0x55);
+        let out = r.push(&idle).expect("push idle");
+        assert!(out.is_empty());
+        assert!(r.is_in_sync(), "idle frames do not disturb sync");
+        let next = make_packet(0x101, b"next");
+        let out = r
+            .push(&build_region(0, std::slice::from_ref(&next)))
+            .expect("push");
+        assert_eq!(out.first(), Some(&next));
     }
 }
