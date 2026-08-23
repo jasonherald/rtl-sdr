@@ -318,7 +318,7 @@ fn record_command_covers_all_14_wire_ops() {
     let all_bits = all_ops.iter().fold(0u32, |acc, op| acc | replay_bit(*op));
     // `SetTunerGain` is overridden by the later `SetGainByIndex`.
     let expected = all_bits & !replay_bit(CommandOp::SetTunerGain);
-    assert_eq!(mask & all_bits, expected, "mask={mask:#x}");
+    assert_eq!(mask, expected, "mask={mask:#x}");
 }
 
 /// #745 — `SetTunerGain` and `SetGainByIndex` both drive the same
