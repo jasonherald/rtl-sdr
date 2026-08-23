@@ -190,6 +190,20 @@ pub(super) fn connect_radio_panel(
     state: &Rc<AppState>,
     scanner_force_disable: &Rc<ScannerForceDisable>,
 ) {
+    wire_bandwidth_rows(panels, state, scanner_force_disable);
+
+    wire_squelch_rows(panels, state);
+
+    wire_af_rows(panels, state);
+}
+
+/// Bandwidth spin row + reset button (echo-suppressed).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_bandwidth_rows(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    scanner_force_disable: &Rc<ScannerForceDisable>,
+) {
     // Bandwidth. The DSP can originate a change too (VFO drag on
     // the spectrum dispatches `UiToDsp::SetBandwidth` directly,
     // and the controller echoes `DspToUi::BandwidthChanged` so the
@@ -241,7 +255,11 @@ pub(super) fn connect_radio_panel(
                 }
             }
         });
+}
 
+/// Squelch enable/level/auto rows.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_squelch_rows(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Squelch enable
     let state_squelch_en = Rc::clone(state);
     panels
@@ -269,7 +287,11 @@ pub(super) fn connect_radio_panel(
         .connect_active_notify(move |row| {
             state_auto_sq.send_dsp(UiToDsp::SetAutoSquelch(row.is_active()));
         });
+}
 
+/// Deemphasis / noise blanker / FM IF NR / WFM stereo rows.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_af_rows(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Deemphasis
     let state_de = Rc::clone(state);
     panels
@@ -312,6 +334,14 @@ pub(super) fn connect_radio_panel(
         state_stereo.send_dsp(UiToDsp::SetWfmStereo(row.is_active()));
     });
 
+    wire_notch_rows(panels, state);
+
+    wire_gate_rows(panels, state);
+}
+
+/// Notch filter enable/frequency rows.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_notch_rows(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Notch filter enable
     let state_notch_en = Rc::clone(state);
     panels
@@ -330,7 +360,11 @@ pub(super) fn connect_radio_panel(
             #[allow(clippy::cast_possible_truncation)]
             state_notch_freq.send_dsp(UiToDsp::SetNotchFrequency(row.value() as f32));
         });
+}
 
+/// CTCSS tone/threshold + voice-squelch mode/threshold rows.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_gate_rows(panels: &SidebarPanels, state: &Rc<AppState>) {
     // CTCSS tone selector
     let state_ctcss = Rc::clone(state);
     let radio_for_ctcss = panels.radio.clone();

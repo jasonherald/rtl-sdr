@@ -35,6 +35,16 @@ pub(super) fn connect_display_panel(
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
+    wire_fft_controls(panels, state);
+
+    wire_spectrum_colors(panels, state, spectrum_handle, config);
+
+    wire_averaging(panels, spectrum_handle);
+}
+
+/// FFT size / window-function / frame-rate rows of the Display panel.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_fft_controls(panels: &SidebarPanels, state: &Rc<AppState>) {
     // FFT size
     let state_fft = Rc::clone(state);
     panels
@@ -69,7 +79,16 @@ pub(super) fn connect_display_panel(
         .connect_value_notify(move |row| {
             state_fps.send_dsp(UiToDsp::SetFftRate(row.value()));
         });
+}
 
+/// Colormap and dB-range rows of the Display panel.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_spectrum_colors(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // Colormap
     let spectrum_for_cmap = Rc::clone(spectrum_handle);
     panels
@@ -84,6 +103,49 @@ pub(super) fn connect_display_panel(
             spectrum_for_cmap.set_colormap(style);
         });
 
+    wire_db_range(panels, state, spectrum_handle, config);
+}
+
+/// Averaging mode/factor rows of the Display panel.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_averaging(panels: &SidebarPanels, spectrum_handle: &Rc<spectrum::SpectrumHandle>) {
+    // Averaging mode selector.
+    let spectrum_avg = Rc::clone(spectrum_handle);
+    panels
+        .display
+        .averaging_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected() as usize;
+            let mode = AVERAGING_MODES
+                .get(idx)
+                .copied()
+                .unwrap_or(spectrum::AveragingMode::None);
+            spectrum_avg.set_averaging_mode(mode);
+        });
+
+    // Theme selector (System / Dark / Light).
+    panels
+        .display
+        .theme_row
+        .connect_selected_notify(move |row| {
+            let style_manager = adw::StyleManager::default();
+            let scheme = match row.selected() {
+                sidebar::display_panel::THEME_DARK => adw::ColorScheme::ForceDark,
+                sidebar::display_panel::THEME_LIGHT => adw::ColorScheme::ForceLight,
+                _ => adw::ColorScheme::Default,
+            };
+            style_manager.set_color_scheme(scheme);
+        });
+}
+
+/// Min/max dB rows — spectrum dB range with cross-row validation.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_db_range(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // Min dB level — update the spectrum dB range (skip if min >= max).
     let spectrum_min = Rc::clone(spectrum_handle);
     let max_row_for_min = panels.display.max_db_row.clone();
@@ -99,6 +161,17 @@ pub(super) fn connect_display_panel(
         tracing::debug!(min_db, max_db, "dB range changed");
     });
 
+    wire_max_db_row(panels, state, spectrum_handle, config);
+}
+
+/// Max-dB row of the spectrum dB range (skip if max <= min).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_max_db_row(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // Max dB level — update the spectrum dB range (skip if max <= min).
     let spectrum_max = Rc::clone(spectrum_handle);
     let min_row_for_max = panels.display.min_db_row.clone();
@@ -124,6 +197,17 @@ pub(super) fn connect_display_panel(
             tracing::debug!(fill = row.is_active(), "fill mode changed");
         });
 
+    wire_waterfall_toggle(panels, state, spectrum_handle, config);
+}
+
+/// Waterfall master toggle (#646) — seed-then-wire the persisted gate.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_waterfall_toggle(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // Waterfall master toggle (#646). Two inputs combine into the
     // DSP gate: this user-facing toggle and the auto-pause-on-
     // minimize handler in `wire_window_minimize_pause`. Both feed
@@ -170,33 +254,5 @@ pub(super) fn connect_display_panel(
                 spectrum_wf.clear_displays();
             }
             tracing::info!(active, "waterfall master toggle changed (#646)");
-        });
-
-    // Averaging mode selector.
-    let spectrum_avg = Rc::clone(spectrum_handle);
-    panels
-        .display
-        .averaging_row
-        .connect_selected_notify(move |row| {
-            let idx = row.selected() as usize;
-            let mode = AVERAGING_MODES
-                .get(idx)
-                .copied()
-                .unwrap_or(spectrum::AveragingMode::None);
-            spectrum_avg.set_averaging_mode(mode);
-        });
-
-    // Theme selector (System / Dark / Light).
-    panels
-        .display
-        .theme_row
-        .connect_selected_notify(move |row| {
-            let style_manager = adw::StyleManager::default();
-            let scheme = match row.selected() {
-                sidebar::display_panel::THEME_DARK => adw::ColorScheme::ForceDark,
-                sidebar::display_panel::THEME_LIGHT => adw::ColorScheme::ForceLight,
-                _ => adw::ColorScheme::Default,
-            };
-            style_manager.set_color_scheme(scheme);
         });
 }

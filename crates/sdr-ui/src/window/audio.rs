@@ -128,6 +128,14 @@ pub(super) fn connect_volume_persistence(
 
 /// Connect audio panel controls to DSP commands.
 pub(super) fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
+    wire_sink_selector(panels, state);
+
+    wire_network_sink_config(panels, state);
+}
+
+/// Audio device + sink-type selectors (issue #247).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_sink_selector(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Audio device selector — routes PipeWire output to the selected sink
     let state_dev = Rc::clone(state);
     let node_names = panels.audio.device_node_names.clone();
@@ -172,7 +180,11 @@ pub(super) fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) 
             network_group.set_visible(network_visible);
             state_sink_type.send_dsp(UiToDsp::SetAudioSinkType(new_type));
         });
+}
 
+/// Network host/port/protocol triple -> SetNetworkSinkConfig.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_network_sink_config(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Helper closure-builder: any change to the network host /
     // port / protocol triple re-sends the full SetNetworkSinkConfig
     // so the controller can rebuild the sink atomically. The
@@ -233,6 +245,12 @@ pub(super) fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) 
             .connect_selected_notify(move |_| push());
     }
 
+    wire_recording_toggles(panels, state);
+}
+
+/// Audio / IQ recording switch rows.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_recording_toggles(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Audio recording toggle
     let state_rec = Rc::clone(state);
     panels

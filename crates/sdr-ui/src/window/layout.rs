@@ -122,46 +122,8 @@ pub(super) fn build_layout(
     // chrome as every other activity panel.
     let transcript_panel = sidebar::transcript_panel::build_transcript_panel(config);
 
-    // Left panel stack — one real panel widget per activity. General
-    // hosts the composed `GeneralPanel` (band presets + bookmarks +
-    // source + rtl_tcp share as expander rows); Radio / Audio /
-    // Display / Scanner host their existing panel widget wrapped in
-    // a scroll so long pages can scroll internally without resizing
-    // the panel's width (design doc §2.4). Sub-tickets #423-#426
-    // later refactor each of those widgets into the expander-row
-    // layout the General panel demonstrates; the `name` strings MUST
-    // remain stable because they're the config-persistence keys
-    // (§5 of the design doc).
-    let left_stack = gtk4::Stack::builder()
-        .transition_type(gtk4::StackTransitionType::None)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    left_stack.add_named(&general_panel.widget, Some("general"));
-    left_stack.add_named(&panels.radio.widget, Some("radio"));
-    left_stack.add_named(&panels.audio.widget, Some("audio"));
-    left_stack.add_named(&panels.display.widget, Some("display"));
-    left_stack.add_named(&panels.scanner.widget, Some("scanner"));
-    left_stack.add_named(&page_from_group(&panels.server.widget), Some("share"));
-    left_stack.add_named(&panels.satellites.widget, Some("satellites"));
-    left_stack.add_named(&panels.aviation.widget, Some("aviation"));
+    let (left_stack, right_stack) = build_panel_stacks(&panels, &general_panel, &transcript_panel);
 
-    // Right panel stack — single child today, hosts the real
-    // transcript widget (not a placeholder) so transcription keeps
-    // working during the migration window.
-    let right_stack = gtk4::Stack::builder()
-        .transition_type(gtk4::StackTransitionType::None)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    right_stack.add_named(
-        &page_from_group(&transcript_panel.widget),
-        Some("transcript"),
-    );
-    right_stack.add_named(
-        &page_from_group(&panels.bookmarks.widget),
-        Some("bookmarks"),
-    );
     // Explicitly pin the initial visible child so a future
     // additional right-activity inserted before transcript doesn't
     // silently shift what the first `Ctrl+Shift+1` press (or the
@@ -169,22 +131,140 @@ pub(super) fn build_layout(
     // `wire_activity_bar_clicks(..., "transcript")` relies on below.
     right_stack.set_visible_child_name("transcript");
 
-    // Inner (right) split view — sidebar sits on the trailing edge
-    // so the right activity bar is the rightmost element on-screen.
-    //
-    // `sidebar_width_fraction` is `[0, 1]` regardless of the
-    // `sidebar-width-unit` we set; the unit only changes how
-    // `min`/`max-sidebar-width` are interpreted. Passing a pixel
-    // value as the fraction panics at property-set even with
-    // `unit = Px` (verified on libadwaita 1.9). So the default
-    // here is a fraction; under nested splits its pixel result
-    // is approximate, and `min-sidebar-width` clamps the transcript
-    // panel up to its 360 px floor when the math would otherwise
-    // leave it narrower. User-driven resize + persistence come from
-    // the drag handle wired below (#429).
+    build_split_views(
+        config,
+        panels,
+        general_panel,
+        transcript_panel,
+        left_stack,
+        right_stack,
+        content_box,
+        spectrum_handle,
+        status_bar,
+    )
+}
+
+/// Drag gesture of [`build_resize_handle`]: width follows the pointer
+/// from the drag-begin fraction, clamped to `[min_px, max_px]`, and
+/// the final width persists at drag-end. Split out per the 50-NLOC
+/// gate (#817).
+#[allow(clippy::too_many_arguments)]
+fn wire_resize_drag_gesture(
+    handle: &gtk4::Box,
+    split_view: &adw::OverlaySplitView,
+    direction: ResizeDirection,
+    min_px: f64,
+    max_px: f64,
+    start_fraction: &std::rc::Rc<std::cell::Cell<f64>>,
+    save_width_px: &std::rc::Rc<dyn Fn(u32)>,
+) {
+    let drag_gesture = gtk4::GestureDrag::new();
+
+    let split_view_weak = split_view.downgrade();
+    let start_fraction_begin = std::rc::Rc::clone(&start_fraction);
+    drag_gesture.connect_drag_begin(move |_, _, _| {
+        if let Some(sv) = split_view_weak.upgrade() {
+            start_fraction_begin.set(sv.sidebar_width_fraction());
+        }
+    });
+
+    let split_view_weak = split_view.downgrade();
+    let start_fraction_update = std::rc::Rc::clone(&start_fraction);
+    drag_gesture.connect_drag_update(move |_, offset_x, _| {
+        let Some(sv) = split_view_weak.upgrade() else {
+            return;
+        };
+        let sv_w = f64::from(sv.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let start_px = start_fraction_update.get() * sv_w;
+        let signed_offset = match direction {
+            ResizeDirection::RightGrowsSidebar => offset_x,
+            ResizeDirection::LeftGrowsSidebar => -offset_x,
+        };
+        let new_px = (start_px + signed_offset).clamp(min_px, max_px);
+        // Fraction pspec is `[0, 1]`; guard against 0 which the
+        // widget treats as "collapsed" at the animator level.
+        let new_fraction = (new_px / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
+        sv.set_sidebar_width_fraction(new_fraction);
+    });
+
+    wire_resize_drag_end(&drag_gesture, split_view, save_width_px);
+    handle.add_controller(drag_gesture);
+}
+
+/// Drag-end persistence of the resize gesture. Split out per the
+/// 50-NLOC gate (#817).
+fn wire_resize_drag_end(
+    drag_gesture: &gtk4::GestureDrag,
+    split_view: &adw::OverlaySplitView,
+    save_width_px: &std::rc::Rc<dyn Fn(u32)>,
+) {
+    let split_view_weak = split_view.downgrade();
+    let save_end = std::rc::Rc::clone(save_width_px);
+    drag_gesture.connect_drag_end(move |_, _, _| {
+        let Some(sv) = split_view_weak.upgrade() else {
+            return;
+        };
+        let sv_w = f64::from(sv.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let final_px = sv.sidebar_width_fraction() * sv_w;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let px = final_px.round().max(0.0) as u32;
+        save_end(px);
+    });
+}
+
+/// Double-click-to-reset gesture of [`build_resize_handle`] — the GTK
+/// paned-divider convention. Split out per the 50-NLOC gate (#817).
+fn wire_resize_double_click(
+    handle: &gtk4::Box,
+    split_view: &adw::OverlaySplitView,
+    default_px: f64,
+    save_width_px: &std::rc::Rc<dyn Fn(u32)>,
+) {
+    // Double-click = reset to default width. Matches the GTK paned-
+    // divider convention users expect ("I messed up my drag, take
+    // me back"). A single click does nothing — the drag gesture
+    // already handles press/release.
+    let click_gesture = gtk4::GestureClick::new();
+    click_gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    let split_view_weak = split_view.downgrade();
+    let save_click = std::rc::Rc::clone(save_width_px);
+    click_gesture.connect_released(move |_, n_press, _, _| {
+        if n_press != 2 {
+            return;
+        }
+        let Some(sv) = split_view_weak.upgrade() else {
+            return;
+        };
+        let sv_w = f64::from(sv.width());
+        if sv_w <= 0.0 {
+            return;
+        }
+        let fraction = (default_px / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
+        sv.set_sidebar_width_fraction(fraction);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let px = default_px.round().max(0.0) as u32;
+        save_click(px);
+    });
+    handle.add_controller(click_gesture);
+}
+
+/// Right (inner) split view + its resize handle and sidebar wrap.
+/// Split out of [`build_split_views`] per the 50-NLOC gate (#817).
+fn build_right_split(
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    transcript_panel: &sidebar::transcript_panel::TranscriptPanel,
+    right_stack: &gtk4::Stack,
+    content_box: &gtk4::Box,
+) -> (adw::OverlaySplitView, gtk4::Box) {
     let right_split_view = adw::OverlaySplitView::builder()
         .sidebar_position(gtk4::PackType::End)
-        .content(&content_box)
+        .content(content_box)
         .show_sidebar(false)
         .min_sidebar_width(RIGHT_SIDEBAR_MIN_WIDTH)
         .max_sidebar_width(RIGHT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER)
@@ -213,72 +293,10 @@ pub(super) fn build_layout(
         .vexpand(true)
         .build();
     right_sidebar_wrap.append(&right_handle);
-    right_sidebar_wrap.append(&right_stack);
+    right_sidebar_wrap.append(right_stack);
     right_split_view.set_sidebar(Some(&right_sidebar_wrap));
 
-    // Outer (left) split view — sidebar hosts the left activity
-    // stack. Starts open with "general" visible so a fresh launch
-    // lands on the General panel instead of an empty frame.
-    let left_split_view = adw::OverlaySplitView::builder()
-        .content(&right_split_view)
-        .show_sidebar(true)
-        .min_sidebar_width(LEFT_SIDEBAR_MIN_WIDTH)
-        .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER)
-        .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
-        .build();
-
-    // Compose the left sidebar with its resize handle on the
-    // trailing edge. Dragging the handle RIGHT widens the sidebar.
-    let config_left_resize = std::sync::Arc::clone(config);
-    let save_left_width: std::rc::Rc<dyn Fn(u32)> = std::rc::Rc::new(move |px| {
-        sidebar::activity_bar::save_left_width_px(&config_left_resize, px);
-    });
-    let left_handle = build_resize_handle(
-        &left_split_view,
-        ResizeDirection::RightGrowsSidebar,
-        LEFT_SIDEBAR_MIN_WIDTH,
-        LEFT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER,
-        LEFT_SIDEBAR_DEFAULT_WIDTH,
-        &save_left_width,
-    );
-    let left_sidebar_wrap = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    left_sidebar_wrap.append(&left_stack);
-    left_sidebar_wrap.append(&left_handle);
-    left_split_view.set_sidebar(Some(&left_sidebar_wrap));
-    left_stack.set_visible_child_name("general");
-
-    let left_activity_bar =
-        sidebar::build_activity_bar(sidebar::LEFT_ACTIVITIES, sidebar::ActivityBarSide::Left);
-    let right_activity_bar =
-        sidebar::build_activity_bar(sidebar::RIGHT_ACTIVITIES, sidebar::ActivityBarSide::Right);
-
-    let root = gtk4::Box::builder()
-        .orientation(gtk4::Orientation::Horizontal)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    root.append(&left_activity_bar.widget);
-    root.append(&left_split_view);
-    root.append(&right_activity_bar.widget);
-
-    LayoutHandles {
-        root,
-        left_split_view,
-        right_split_view,
-        left_activity_bar,
-        right_activity_bar,
-        left_stack,
-        right_stack,
-        panels,
-        spectrum_handle,
-        status_bar,
-        transcript_panel,
-        general_panel,
-    }
+    (right_split_view, right_sidebar_wrap)
 }
 
 /// Wrap an `AdwPreferencesGroup` in its own `AdwPreferencesPage`
@@ -393,81 +411,16 @@ pub(super) fn build_resize_handle(
     // close the loop and leak the whole sidebar subtree on window
     // teardown. Matches the `glib::WeakRef` idiom used elsewhere
     // in this file (scanner force-disable, RTL-TCP handlers).
-    let drag_gesture = gtk4::GestureDrag::new();
-
-    let split_view_weak = split_view.downgrade();
-    let start_fraction_begin = std::rc::Rc::clone(&start_fraction);
-    drag_gesture.connect_drag_begin(move |_, _, _| {
-        if let Some(sv) = split_view_weak.upgrade() {
-            start_fraction_begin.set(sv.sidebar_width_fraction());
-        }
-    });
-
-    let split_view_weak = split_view.downgrade();
-    let start_fraction_update = std::rc::Rc::clone(&start_fraction);
-    drag_gesture.connect_drag_update(move |_, offset_x, _| {
-        let Some(sv) = split_view_weak.upgrade() else {
-            return;
-        };
-        let sv_w = f64::from(sv.width());
-        if sv_w <= 0.0 {
-            return;
-        }
-        let start_px = start_fraction_update.get() * sv_w;
-        let signed_offset = match direction {
-            ResizeDirection::RightGrowsSidebar => offset_x,
-            ResizeDirection::LeftGrowsSidebar => -offset_x,
-        };
-        let new_px = (start_px + signed_offset).clamp(min_px, max_px);
-        // Fraction pspec is `[0, 1]`; guard against 0 which the
-        // widget treats as "collapsed" at the animator level.
-        let new_fraction = (new_px / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
-        sv.set_sidebar_width_fraction(new_fraction);
-    });
-
-    let split_view_weak = split_view.downgrade();
-    let save_end = std::rc::Rc::clone(save_width_px);
-    drag_gesture.connect_drag_end(move |_, _, _| {
-        let Some(sv) = split_view_weak.upgrade() else {
-            return;
-        };
-        let sv_w = f64::from(sv.width());
-        if sv_w <= 0.0 {
-            return;
-        }
-        let final_px = sv.sidebar_width_fraction() * sv_w;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let px = final_px.round().max(0.0) as u32;
-        save_end(px);
-    });
-    handle.add_controller(drag_gesture);
-
-    // Double-click = reset to default width. Matches the GTK paned-
-    // divider convention users expect ("I messed up my drag, take
-    // me back"). A single click does nothing — the drag gesture
-    // already handles press/release.
-    let click_gesture = gtk4::GestureClick::new();
-    click_gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
-    let split_view_weak = split_view.downgrade();
-    let save_click = std::rc::Rc::clone(save_width_px);
-    click_gesture.connect_released(move |_, n_press, _, _| {
-        if n_press != 2 {
-            return;
-        }
-        let Some(sv) = split_view_weak.upgrade() else {
-            return;
-        };
-        let sv_w = f64::from(sv.width());
-        if sv_w <= 0.0 {
-            return;
-        }
-        let fraction = (default_px / sv_w).clamp(SIDEBAR_FRACTION_MIN, SIDEBAR_FRACTION_MAX);
-        sv.set_sidebar_width_fraction(fraction);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let px = default_px.round().max(0.0) as u32;
-        save_click(px);
-    });
-    handle.add_controller(click_gesture);
+    wire_resize_drag_gesture(
+        &handle,
+        split_view,
+        direction,
+        min_px,
+        max_px,
+        &start_fraction,
+        save_width_px,
+    );
+    wire_resize_double_click(&handle, split_view, default_px, save_width_px);
 
     handle
 }
@@ -527,26 +480,7 @@ pub(super) fn build_header_bar(
     gtk4::ScaleButton,
     FavoritesHeaderHandle,
 ) {
-    // Play/stop button
-    let play_button = gtk4::ToggleButton::builder()
-        .icon_name("media-playback-start-symbolic")
-        .tooltip_text("Start / Stop")
-        .css_classes(["play-button"])
-        .build();
-
-    // Connect play/stop button to DSP
-    let state_play = Rc::clone(state);
-    play_button.connect_toggled(move |btn| {
-        if btn.is_active() {
-            btn.set_icon_name("media-playback-stop-symbolic");
-            state_play.is_running.set(true);
-            state_play.send_dsp(UiToDsp::Start);
-        } else {
-            btn.set_icon_name("media-playback-start-symbolic");
-            state_play.is_running.set(false);
-            state_play.send_dsp(UiToDsp::Stop);
-        }
-    });
+    let play_button = build_play_button(state);
 
     // Frequency selector as the title widget.
     // NOTE: The frequency-changed callback is connected later in `build_window`
@@ -561,29 +495,8 @@ pub(super) fn build_header_bar(
     // in a single handler in the right order.
     let (demod_dropdown, _demod_mode_cell) = header::build_demod_selector();
 
-    // Volume button (ScaleButton with audio icons)
-    let volume_button = gtk4::ScaleButton::new(
-        0.0,
-        1.0,
-        0.05,
-        &[
-            "audio-volume-muted-symbolic",
-            "audio-volume-low-symbolic",
-            "audio-volume-medium-symbolic",
-            "audio-volume-high-symbolic",
-        ],
-    );
-    // Initial value + `connect_value_changed` handler are wired in
-    // `build_window` after `connect_audio_panel` runs, so the
-    // persistence + audio-panel mirror rely on the full handle set.
-    volume_button.set_tooltip_text(Some("Volume"));
-    // Explicit accessibility label — tooltip text alone isn't
-    // announced reliably by screen readers for icon-only header
-    // controls (same idiom as the bookmarks / transcript / pinned-
-    // servers buttons).
-    volume_button.update_property(&[gtk4::accessible::Property::Label("Volume")]);
+    let volume_button = build_volume_button();
 
-    // App menu
     let menu_button = build_menu_button();
 
     let header = adw::HeaderBar::builder()
@@ -640,29 +553,9 @@ pub(super) const FAVORITES_POPOVER_WIDTH_PX: i32 = 420;
 /// of the window; the internal `ScrolledWindow` handles overflow.
 pub(super) const FAVORITES_POPOVER_HEIGHT_PX: i32 = 360;
 
-/// Build the header-bar favorites button + its popover contents.
-/// The popover hosts a `ListBox` (populated by
-/// `connect_rtl_tcp_discovery` whenever the favorites map mutates)
-/// wrapped in a capped `ScrolledWindow`. The empty-state label is
-/// shown when the list is empty and hidden when it's populated —
-/// callers are responsible for that toggle alongside row rebuilds.
-pub(super) fn build_favorites_header() -> FavoritesHeaderHandle {
-    let popover = gtk4::Popover::builder()
-        .autohide(true)
-        .has_arrow(true)
-        .width_request(FAVORITES_POPOVER_WIDTH_PX)
-        .build();
-    popover.add_css_class("menu");
-
-    let title = gtk4::Label::builder()
-        .label("Pinned servers")
-        .halign(gtk4::Align::Start)
-        .margin_start(12)
-        .margin_top(12)
-        .margin_bottom(6)
-        .css_classes(["heading"])
-        .build();
-
+/// Favorites list + scroll + empty-state label of
+/// [`build_favorites_header`]. Split out per the 50-NLOC gate (#817).
+fn build_favorites_list() -> (gtk4::ListBox, gtk4::ScrolledWindow, gtk4::Label) {
     let list = gtk4::ListBox::builder()
         .selection_mode(gtk4::SelectionMode::None)
         .css_classes(["boxed-list"])
@@ -688,6 +581,34 @@ pub(super) fn build_favorites_header() -> FavoritesHeaderHandle {
         .margin_end(24)
         .css_classes(["dim-label"])
         .build();
+
+    (list, scroll, empty_label)
+}
+
+/// Build the header-bar favorites button + its popover contents.
+/// The popover hosts a `ListBox` (populated by
+/// `connect_rtl_tcp_discovery` whenever the favorites map mutates)
+/// wrapped in a capped `ScrolledWindow`. The empty-state label is
+/// shown when the list is empty and hidden when it's populated —
+/// callers are responsible for that toggle alongside row rebuilds.
+pub(super) fn build_favorites_header() -> FavoritesHeaderHandle {
+    let popover = gtk4::Popover::builder()
+        .autohide(true)
+        .has_arrow(true)
+        .width_request(FAVORITES_POPOVER_WIDTH_PX)
+        .build();
+    popover.add_css_class("menu");
+
+    let title = gtk4::Label::builder()
+        .label("Pinned servers")
+        .halign(gtk4::Align::Start)
+        .margin_start(12)
+        .margin_top(12)
+        .margin_bottom(6)
+        .css_classes(["heading"])
+        .build();
+
+    let (list, scroll, empty_label) = build_favorites_list();
 
     let content = gtk4::Box::builder()
         .orientation(gtk4::Orientation::Vertical)
@@ -887,4 +808,220 @@ pub(super) fn build_breakpoint(
     breakpoint.add_setter(right_split_view, "collapsed", Some(&true.into()));
 
     breakpoint
+}
+
+/// Left/right activity panel stacks (names are config keys; design doc §5).
+/// Split out per the 50-NLOC gate (#817).
+fn build_panel_stacks(
+    panels: &SidebarPanels,
+    general_panel: &sidebar::GeneralPanel,
+    transcript_panel: &sidebar::transcript_panel::TranscriptPanel,
+) -> (gtk4::Stack, gtk4::Stack) {
+    // Left panel stack — one real panel widget per activity. General
+    // hosts the composed `GeneralPanel` (band presets + bookmarks +
+    // source + rtl_tcp share as expander rows); Radio / Audio /
+    // Display / Scanner host their existing panel widget wrapped in
+    // a scroll so long pages can scroll internally without resizing
+    // the panel's width (design doc §2.4). Sub-tickets #423-#426
+    // later refactor each of those widgets into the expander-row
+    // layout the General panel demonstrates; the `name` strings MUST
+    // remain stable because they're the config-persistence keys
+    // (§5 of the design doc).
+    let left_stack = gtk4::Stack::builder()
+        .transition_type(gtk4::StackTransitionType::None)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    left_stack.add_named(&general_panel.widget, Some("general"));
+    left_stack.add_named(&panels.radio.widget, Some("radio"));
+    left_stack.add_named(&panels.audio.widget, Some("audio"));
+    left_stack.add_named(&panels.display.widget, Some("display"));
+    left_stack.add_named(&panels.scanner.widget, Some("scanner"));
+    left_stack.add_named(&page_from_group(&panels.server.widget), Some("share"));
+    left_stack.add_named(&panels.satellites.widget, Some("satellites"));
+    left_stack.add_named(&panels.aviation.widget, Some("aviation"));
+
+    // Right panel stack — single child today, hosts the real
+    // transcript widget (not a placeholder) so transcription keeps
+    // working during the migration window.
+    let right_stack = gtk4::Stack::builder()
+        .transition_type(gtk4::StackTransitionType::None)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    right_stack.add_named(
+        &page_from_group(&transcript_panel.widget),
+        Some("transcript"),
+    );
+    right_stack.add_named(
+        &page_from_group(&panels.bookmarks.widget),
+        Some("bookmarks"),
+    );
+
+    (left_stack, right_stack)
+}
+
+/// Nested AdwOverlaySplitViews + resize handles + activity bars around the content box.
+/// Split out per the 50-NLOC gate (#817).
+#[allow(clippy::too_many_arguments)]
+fn build_split_views(
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    panels: SidebarPanels,
+    general_panel: sidebar::GeneralPanel,
+    transcript_panel: sidebar::transcript_panel::TranscriptPanel,
+    left_stack: gtk4::Stack,
+    right_stack: gtk4::Stack,
+    content_box: gtk4::Box,
+    spectrum_handle: spectrum::SpectrumHandle,
+    status_bar: StatusBar,
+) -> LayoutHandles {
+    // Inner (right) split view — sidebar sits on the trailing edge
+    // so the right activity bar is the rightmost element on-screen.
+    //
+    // `sidebar_width_fraction` is `[0, 1]` regardless of the
+    // `sidebar-width-unit` we set; the unit only changes how
+    // `min`/`max-sidebar-width` are interpreted. Passing a pixel
+    // value as the fraction panics at property-set even with
+    // `unit = Px` (verified on libadwaita 1.9). So the default
+    // here is a fraction; under nested splits its pixel result
+    // is approximate, and `min-sidebar-width` clamps the transcript
+    // panel up to its 360 px floor when the math would otherwise
+    // leave it narrower. User-driven resize + persistence come from
+    // the drag handle wired below (#429).
+    let (right_split_view, right_sidebar_wrap) =
+        build_right_split(config, &transcript_panel, &right_stack, &content_box);
+
+    let left_split_view = build_left_split(config, &left_stack, &right_split_view);
+
+    let left_activity_bar =
+        sidebar::build_activity_bar(sidebar::LEFT_ACTIVITIES, sidebar::ActivityBarSide::Left);
+    let right_activity_bar =
+        sidebar::build_activity_bar(sidebar::RIGHT_ACTIVITIES, sidebar::ActivityBarSide::Right);
+
+    let root = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    root.append(&left_activity_bar.widget);
+    root.append(&left_split_view);
+    root.append(&right_activity_bar.widget);
+
+    LayoutHandles {
+        root,
+        left_split_view,
+        right_split_view,
+        left_activity_bar,
+        right_activity_bar,
+        left_stack,
+        right_stack,
+        panels,
+        spectrum_handle,
+        status_bar,
+        transcript_panel,
+        general_panel,
+    }
+}
+
+/// Volume ScaleButton with a11y label (value wiring lives in build_window).
+/// Split out per the 50-NLOC gate (#817).
+/// Volume ScaleButton with a11y label (value wiring lives in
+/// build_window). Split out per the 50-NLOC gate (#817).
+fn build_volume_button() -> gtk4::ScaleButton {
+    // Volume button (ScaleButton with audio icons)
+    let volume_button = gtk4::ScaleButton::new(
+        0.0,
+        1.0,
+        0.05,
+        &[
+            "audio-volume-muted-symbolic",
+            "audio-volume-low-symbolic",
+            "audio-volume-medium-symbolic",
+            "audio-volume-high-symbolic",
+        ],
+    );
+    // Initial value + `connect_value_changed` handler are wired in
+    // `build_window` after `connect_audio_panel` runs, so the
+    // persistence + audio-panel mirror rely on the full handle set.
+    volume_button.set_tooltip_text(Some("Volume"));
+    // Explicit accessibility label — tooltip text alone isn't
+    // announced reliably by screen readers for icon-only header
+    // controls (same idiom as the bookmarks / transcript / pinned-
+    // servers buttons).
+    volume_button.update_property(&[gtk4::accessible::Property::Label("Volume")]);
+
+    // App menu
+    volume_button
+}
+
+/// Play/stop toggle + its DSP dispatch. Split out per the 50-NLOC gate (#817).
+/// Split out per the 50-NLOC gate (#817).
+fn build_play_button(state: &Rc<AppState>) -> gtk4::ToggleButton {
+    // Play/stop button
+    let play_button = gtk4::ToggleButton::builder()
+        .icon_name("media-playback-start-symbolic")
+        .tooltip_text("Start / Stop")
+        .css_classes(["play-button"])
+        .build();
+
+    // Connect play/stop button to DSP
+    let state_play = Rc::clone(state);
+    play_button.connect_toggled(move |btn| {
+        if btn.is_active() {
+            btn.set_icon_name("media-playback-stop-symbolic");
+            state_play.is_running.set(true);
+            state_play.send_dsp(UiToDsp::Start);
+        } else {
+            btn.set_icon_name("media-playback-start-symbolic");
+            state_play.is_running.set(false);
+            state_play.send_dsp(UiToDsp::Stop);
+        }
+    });
+
+    play_button
+}
+
+/// Left (outer) split view + its resize handle and sidebar wrap.
+/// Split out per the 50-NLOC gate (#817).
+fn build_left_split(
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    left_stack: &gtk4::Stack,
+    right_split_view: &adw::OverlaySplitView,
+) -> adw::OverlaySplitView {
+    // Outer (left) split view — sidebar hosts the left activity
+    // stack. Starts open with "general" visible so a fresh launch
+    // lands on the General panel instead of an empty frame.
+    let left_split_view = adw::OverlaySplitView::builder()
+        .content(right_split_view)
+        .show_sidebar(true)
+        .min_sidebar_width(LEFT_SIDEBAR_MIN_WIDTH)
+        .max_sidebar_width(LEFT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER)
+        .sidebar_width_fraction(LEFT_SIDEBAR_DEFAULT_WIDTH / f64::from(DEFAULT_WIDTH))
+        .build();
+
+    // Compose the left sidebar with its resize handle on the
+    // trailing edge. Dragging the handle RIGHT widens the sidebar.
+    let config_left_resize = std::sync::Arc::clone(config);
+    let save_left_width: std::rc::Rc<dyn Fn(u32)> = std::rc::Rc::new(move |px| {
+        sidebar::activity_bar::save_left_width_px(&config_left_resize, px);
+    });
+    let left_handle = build_resize_handle(
+        &left_split_view,
+        ResizeDirection::RightGrowsSidebar,
+        LEFT_SIDEBAR_MIN_WIDTH,
+        LEFT_SIDEBAR_DEFAULT_WIDTH * SIDEBAR_MAX_WIDTH_MULTIPLIER,
+        LEFT_SIDEBAR_DEFAULT_WIDTH,
+        &save_left_width,
+    );
+    let left_sidebar_wrap = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    left_sidebar_wrap.append(left_stack);
+    left_sidebar_wrap.append(&left_handle);
+    left_split_view.set_sidebar(Some(&left_sidebar_wrap));
+    left_stack.set_visible_child_name("general");
+
+    left_split_view
 }

@@ -243,6 +243,20 @@ pub(super) fn connect_scanner_panel(
 ) {
     let scanner = &panels.scanner;
 
+    wire_scanner_master_switch(panels, state, config, spectrum_handle, scanner);
+
+    wire_scanner_lockout_button(state, scanner);
+}
+
+/// Master switch -> SetScannerEnabled (notify-driven so F8 / force-disable / DSP syncs all fire it).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_scanner_master_switch(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    scanner: &sidebar::scanner_panel::ScannerPanel,
+) {
     // Master switch → SetScannerEnabled. Using `connect_active_notify`
     // (not `connect_state_set`) so programmatic toggles fire too:
     //   - F8 shortcut calls `set_active` which changes the active
@@ -310,6 +324,40 @@ pub(super) fn connect_scanner_panel(
     // construction — plus `build_window` re-seeds the scanner
     // right after `connect_sidebar_panels` returns, which would
     // pile on a second redundant dispatch per slider.
+    wire_scanner_timing_rows(panels, state, config, scanner);
+}
+
+/// Lockout button -> LockoutScannerChannel(active key).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_scanner_lockout_button(
+    state: &Rc<AppState>,
+    scanner: &sidebar::scanner_panel::ScannerPanel,
+) {
+    // Lockout button → `LockoutScannerChannel(key)`. The active
+    // channel key is updated on every `ScannerActiveChannelChanged`
+    // in `handle_dsp_message` and stashed on `state.scanner_active_key`.
+    // The button is hidden whenever that key is `None` (same
+    // handler), so a click here is guaranteed to have a key —
+    // but we check and early-return defensively in case a click
+    // races a state change.
+    let state_lockout = Rc::clone(state);
+    scanner.lockout_button.connect_clicked(move |_| {
+        let Some(key) = state_lockout.scanner_active_key.borrow().clone() else {
+            tracing::debug!("lockout clicked with no active key — no-op");
+            return;
+        };
+        state_lockout.send_dsp(UiToDsp::LockoutScannerChannel(key));
+    });
+}
+
+/// Dwell / hang rows with persisted seeds.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_scanner_timing_rows(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    scanner: &sidebar::scanner_panel::ScannerPanel,
+) {
     let dwell_ms = sidebar::scanner_panel::load_default_dwell_ms(config);
     scanner.default_dwell_row.set_value(f64::from(dwell_ms));
     let hang_ms = sidebar::scanner_panel::load_default_hang_ms(config);
@@ -347,21 +395,5 @@ pub(super) fn connect_scanner_panel(
             &state_hang,
             &config_hang_project,
         );
-    });
-
-    // Lockout button → `LockoutScannerChannel(key)`. The active
-    // channel key is updated on every `ScannerActiveChannelChanged`
-    // in `handle_dsp_message` and stashed on `state.scanner_active_key`.
-    // The button is hidden whenever that key is `None` (same
-    // handler), so a click here is guaranteed to have a key —
-    // but we check and early-return defensively in case a click
-    // races a state change.
-    let state_lockout = Rc::clone(state);
-    scanner.lockout_button.connect_clicked(move |_| {
-        let Some(key) = state_lockout.scanner_active_key.borrow().clone() else {
-            tracing::debug!("lockout clicked with no active key — no-op");
-            return;
-        };
-        state_lockout.send_dsp(UiToDsp::LockoutScannerChannel(key));
     });
 }

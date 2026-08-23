@@ -68,7 +68,9 @@ mod transcript;
 use audio::{connect_audio_panel, connect_volume_persistence};
 use aviation::{connect_aviation_panel, try_collapse_into_existing};
 use display::connect_display_panel;
-use dsp_events::{TOAST_TIMEOUT_PERSISTENT, TOAST_TIMEOUT_SHORT_SECS, handle_dsp_message};
+use dsp_events::{
+    DspEventCtx, TOAST_TIMEOUT_PERSISTENT, TOAST_TIMEOUT_SHORT_SECS, handle_dsp_message,
+};
 use layout::{
     FavoritesHeaderHandle, LEFT_SIDEBAR_DEFAULT_WIDTH, LayoutHandles, RIGHT_SIDEBAR_DEFAULT_WIDTH,
     apply_sidebar_width, build_breakpoint, build_header_bar, build_layout, build_sidebar_toggle,
@@ -1288,6 +1290,44 @@ pub fn build_window(
     // `ControlFlow::Break` when the window is dropped, which is GLib's
     // idiomatic "remove this source" signal. There's no other code path
     // that needs to remove the source explicitly.
+    let dsp_event_ctx = DspEventCtx {
+        spectrum_handle: spectrum_handle.clone(),
+        play_button_weak: play_button_weak.clone(),
+        state: state_rx.clone(),
+        toast_overlay_weak: toast_overlay_weak.clone(),
+        status_bar: status_bar_demod.clone(),
+        gain_row: gain_row_for_dsp.clone(),
+        record_audio_row: record_audio_for_dsp.clone(),
+        record_iq_row: record_iq_for_dsp.clone(),
+        radio_panel: radio_panel_for_dsp.clone(),
+        scanner_panel: scanner_panel_for_dsp.clone(),
+        freq_selector: freq_selector_for_dsp.clone(),
+        demod_dropdown: demod_dropdown_for_dsp.clone(),
+        sample_rate_row: sample_rate_row_for_dsp.clone(),
+        decimation_row: decimation_row_for_dsp.clone(),
+        volume_button: volume_button_for_dsp.clone(),
+        rtl_tcp_status_row_weak: rtl_tcp_status_row_weak.clone(),
+        rtl_tcp_disconnect_button_weak: rtl_tcp_disconnect_button_weak.clone(),
+        rtl_tcp_retry_button_weak: rtl_tcp_retry_button_weak.clone(),
+        rtl_tcp_role_row_weak: rtl_tcp_role_row_weak.clone(),
+        rtl_tcp_auth_key_row_weak: rtl_tcp_auth_key_row_weak.clone(),
+        rtl_tcp_hostname_row_weak: rtl_tcp_hostname_row_weak.clone(),
+        rtl_tcp_port_row_weak: rtl_tcp_port_row_weak.clone(),
+        pending_controller_busy_toasts: pending_controller_busy_toasts.clone(),
+        network_sink_status_row_weak: network_sink_status_row_weak.clone(),
+        transcription_enable_row: transcription_enable_for_dsp.clone(),
+        #[cfg(feature = "sherpa")]
+        auto_break_row: auto_break_row_for_dsp.clone(),
+        #[cfg(feature = "sherpa")]
+        auto_break_min_open_row: auto_break_min_open_row_for_dsp.clone(),
+        #[cfg(feature = "sherpa")]
+        auto_break_tail_row: auto_break_tail_row_for_dsp.clone(),
+        #[cfg(feature = "sherpa")]
+        auto_break_min_segment_row: auto_break_min_segment_row_for_dsp.clone(),
+        #[cfg(feature = "sherpa")]
+        model_row: model_row_for_dsp.clone(),
+    };
+
     let _ = glib::timeout_add_local(Duration::from_millis(DSP_POLL_INTERVAL_MS), move || {
         // Window-lifecycle gate. If the window is gone, send the engine
         // an explicit Stop and ask GLib to drop this source. The
@@ -1313,44 +1353,7 @@ pub fn build_window(
         loop {
             match dsp_rx.try_recv() {
                 Ok(msg) => {
-                    handle_dsp_message(
-                        msg,
-                        &spectrum_handle,
-                        &play_button_weak,
-                        &state_rx,
-                        &toast_overlay_weak,
-                        &status_bar_demod,
-                        &gain_row_for_dsp,
-                        &record_audio_for_dsp,
-                        &record_iq_for_dsp,
-                        &radio_panel_for_dsp,
-                        &scanner_panel_for_dsp,
-                        &freq_selector_for_dsp,
-                        &demod_dropdown_for_dsp,
-                        &sample_rate_row_for_dsp,
-                        &decimation_row_for_dsp,
-                        &volume_button_for_dsp,
-                        &rtl_tcp_status_row_weak,
-                        &rtl_tcp_disconnect_button_weak,
-                        &rtl_tcp_retry_button_weak,
-                        &rtl_tcp_role_row_weak,
-                        &rtl_tcp_auth_key_row_weak,
-                        &rtl_tcp_hostname_row_weak,
-                        &rtl_tcp_port_row_weak,
-                        &pending_controller_busy_toasts,
-                        &network_sink_status_row_weak,
-                        &transcription_enable_for_dsp,
-                        #[cfg(feature = "sherpa")]
-                        &auto_break_row_for_dsp,
-                        #[cfg(feature = "sherpa")]
-                        &auto_break_min_open_row_for_dsp,
-                        #[cfg(feature = "sherpa")]
-                        &auto_break_tail_row_for_dsp,
-                        #[cfg(feature = "sherpa")]
-                        &auto_break_min_segment_row_for_dsp,
-                        #[cfg(feature = "sherpa")]
-                        &model_row_for_dsp,
-                    );
+                    handle_dsp_message(msg, &dsp_event_ctx);
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
