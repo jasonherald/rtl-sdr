@@ -895,11 +895,13 @@ fn drain_sherpa_reload_events(
             }
             Ok(sdr_transcription::InitEvent::Failed { message }) => {
                 tracing::warn!(%message, "sherpa host reload failed");
-                status.set_text(&format!("Reload failed: {message}"));
-                status.set_css_classes(&["error"]);
-                status.set_visible(true);
-                progress.set_visible(false);
-                reenable_reload_rows(&model_row_reload_weak, &enable_row_reload_weak);
+                show_reload_failure(
+                    status,
+                    progress,
+                    &format!("Reload failed: {message}"),
+                    &model_row_reload_weak,
+                    &enable_row_reload_weak,
+                );
                 return Some(glib::ControlFlow::Break);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -910,16 +912,36 @@ fn drain_sherpa_reload_events(
                 // as an error and re-enable the controls so the
                 // user can try a different model.
                 tracing::warn!("sherpa host reload event channel disconnected unexpectedly");
-                status.set_text("Reload failed: recognizer worker disconnected");
-                status.set_css_classes(&["error"]);
-                status.set_visible(true);
-                progress.set_visible(false);
-                reenable_reload_rows(&model_row_reload_weak, &enable_row_reload_weak);
+                show_reload_failure(
+                    status,
+                    progress,
+                    "Reload failed: recognizer worker disconnected",
+                    &model_row_reload_weak,
+                    &enable_row_reload_weak,
+                );
                 return Some(glib::ControlFlow::Break);
             }
         }
     }
     None
+}
+
+/// Terminal-failure UI for a model reload: error text on the status
+/// label, progress hidden, and the model/enable rows re-enabled so
+/// the user can try a different model.
+#[cfg(feature = "sherpa")]
+fn show_reload_failure(
+    status: &gtk4::Label,
+    progress: &gtk4::ProgressBar,
+    msg: &str,
+    model_row: &glib::WeakRef<adw::ComboRow>,
+    enable_row: &glib::WeakRef<adw::SwitchRow>,
+) {
+    status.set_text(msg);
+    status.set_css_classes(&["error"]);
+    status.set_visible(true);
+    progress.set_visible(false);
+    reenable_reload_rows(model_row, enable_row);
 }
 
 /// Re-enable the model + enable rows after a reload finishes (Ready,
