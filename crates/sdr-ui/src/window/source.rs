@@ -45,11 +45,6 @@ pub(super) fn handle_rtl_tcp_state_toast(
 ) {
     use sdr_types::RtlTcpConnectionState;
 
-    use crate::state::{
-        RTL_TCP_STATE_DISC_AUTH_FAILED, RTL_TCP_STATE_DISC_AUTH_REQUIRED,
-        RTL_TCP_STATE_DISC_CONNECTING, RTL_TCP_STATE_DISC_CONTROLLER_BUSY,
-    };
-
     // Sweep any still-live ControllerBusy toasts on any
     // transition that isn't re-entering ControllerBusy. Pre-
     // `CodeRabbit` round 11 on PR #408 each ControllerBusy
@@ -63,222 +58,40 @@ pub(super) fn handle_rtl_tcp_state_toast(
     // resolves itself — but "the state resolved itself" needs
     // its own cleanup pass.
     if !matches!(state_val, RtlTcpConnectionState::ControllerBusy) {
-        let mut pending = pending_controller_busy_toasts.borrow_mut();
-        for weak in pending.drain(..) {
-            if let Some(toast) = weak.upgrade() {
-                toast.dismiss();
-            }
-        }
+        dismiss_stale_controller_busy_toasts(pending_controller_busy_toasts);
     }
 
     match state_val {
-        RtlTcpConnectionState::ControllerBusy => {
-            // Toast with two action buttons: "Connect as
-            // Listener" flips the role combo (its change handler
-            // re-dispatches SetRtlTcpClientConfig) and fires a
-            // normal retry; "Take control" dispatches the one-shot
-            // `RetryRtlTcpWithTakeover` message which rebuilds
-            // the source with `request_takeover = true` on the
-            // hello.
-            let Some(overlay) = toast_overlay_weak.upgrade() else {
-                return;
-            };
-            // Before creating the new pair, sweep any still-
-            // live toasts from a prior `ControllerBusy` entry
-            // (e.g. the user hit `Retry` without clicking either
-            // action, and the server is still busy on the
-            // rebound). Otherwise the overlay would stack two
-            // pairs, and dismissing one pair via the cross-
-            // dismiss helpers below would leave the other pair
-            // orphaned. Per `CodeRabbit` round 11 on PR #408.
-            {
-                let mut pending = pending_controller_busy_toasts.borrow_mut();
-                for weak in pending.drain(..) {
-                    if let Some(toast) = weak.upgrade() {
-                        toast.dismiss();
-                    }
-                }
-            }
+        RtlTcpConnectionState::ControllerBusy => on_rtl_tcp_controller_busy(
+            app_state,
+            toast_overlay_weak,
+            role_row_weak,
+            pending_controller_busy_toasts,
+        ),
 
-            let toast = adw::Toast::builder()
-                .title("Controller slot is occupied on this server.")
-                .timeout(TOAST_TIMEOUT_PERSISTENT)
-                .build();
-            let listen_toast = adw::Toast::builder()
-                .title("Or connect as Listener (read-only).")
-                .timeout(TOAST_TIMEOUT_PERSISTENT)
-                .build();
-            // Cross-dismiss: clicking either action dismisses
-            // BOTH toasts, so a stale sibling action can't fire
-            // later against a session that's already resolved.
-            // `WeakRef` rather than strong clones — the toasts
-            // hand out their own strong refs to the overlay
-            // internally, and we only need to reach the sibling
-            // when it's still live.
-            let toast_weak = toast.downgrade();
-            let listen_toast_weak = listen_toast.downgrade();
+        RtlTcpConnectionState::AuthRequired => on_rtl_tcp_auth_required(
+            app_state,
+            toast_overlay_weak,
+            auth_key_row_weak,
+            hostname_row_weak,
+            port_row_weak,
+        ),
 
-            // Track the two action buttons as separate signals.
-            // AdwToast supports a single primary action via
-            // `set_button_label` + `connect_button_clicked`; the
-            // "Take control" action lands there, and the
-            // "Connect as Listener" option lives in the
-            // sibling toast below so users still see both
-            // choices.
-            toast.set_button_label(Some("Take control"));
-            let state_for_takeover = Rc::clone(app_state);
-            let listen_weak_for_takeover = listen_toast_weak.clone();
-            toast.connect_button_clicked(move |t| {
-                state_for_takeover.send_dsp(UiToDsp::RetryRtlTcpWithTakeover);
-                t.dismiss();
-                if let Some(sibling) = listen_weak_for_takeover.upgrade() {
-                    sibling.dismiss();
-                }
-            });
-            overlay.add_toast(toast);
+        RtlTcpConnectionState::AuthFailed => on_rtl_tcp_auth_failed(
+            app_state,
+            toast_overlay_weak,
+            auth_key_row_weak,
+            hostname_row_weak,
+            port_row_weak,
+        ),
 
-            // Second toast offering the Listen fallback. Two
-            // separate toasts beats a single one because AdwToast
-            // exposes only one action button — splitting the two
-            // paths keeps both discoverable.
-            listen_toast.set_button_label(Some("Connect as Listener"));
-            let state_for_listen = Rc::clone(app_state);
-            let role_row_for_listen = role_row_weak.clone();
-            let toast_weak_for_listen = toast_weak.clone();
-            listen_toast.connect_button_clicked(move |t| {
-                if let Some(role_row) = role_row_for_listen.upgrade() {
-                    // Flipping the combo to Listen fires its
-                    // `selected-notify` handler which dispatches
-                    // `SetRtlTcpClientConfig` with the new role.
-                    // Follow with RetryRtlTcpNow so the user
-                    // doesn't have to click Retry themselves.
-                    role_row.set_selected(crate::sidebar::source_panel::RTL_TCP_ROLE_LISTEN_IDX);
-                }
-                state_for_listen.send_dsp(UiToDsp::RetryRtlTcpNow);
-                t.dismiss();
-                if let Some(sibling) = toast_weak_for_listen.upgrade() {
-                    sibling.dismiss();
-                }
-            });
-            overlay.add_toast(listen_toast);
-
-            // Record the pair so the non-ControllerBusy state
-            // transition at the top of this function can sweep
-            // them if the server resolves itself without user
-            // interaction.
-            {
-                let mut pending = pending_controller_busy_toasts.borrow_mut();
-                pending.push(toast_weak);
-                pending.push(listen_toast_weak);
-            }
-        }
-
-        RtlTcpConnectionState::AuthRequired => {
-            // Remember the active server so a subsequent
-            // successful Connected can save the user-entered
-            // key to the right keyring entry.
-            record_active_rtl_tcp_server(app_state, hostname_row_weak, port_row_weak);
-            // Reveal + focus the Server key field so the user
-            // can enter the key.
-            if let Some(row) = auth_key_row_weak.upgrade() {
-                row.set_visible(true);
-                row.grab_focus();
-            }
-            if let Some(overlay) = toast_overlay_weak.upgrade() {
-                let toast = adw::Toast::builder()
-                    .title("Server requires an authentication key.")
-                    .timeout(TOAST_TIMEOUT_SHORT_SECS)
-                    .build();
-                overlay.add_toast(toast);
-            }
-        }
-
-        RtlTcpConnectionState::AuthFailed => {
-            record_active_rtl_tcp_server(app_state, hostname_row_weak, port_row_weak);
-            // Clear the saved per-server key from the keyring
-            // too — not just the widget. Pre-CodeRabbit round 2
-            // on PR #408 only `row.set_text("")` was called, so
-            // the keyring entry survived the rejection and the
-            // next discovery / favorites / Play-restart path
-            // would auto-load the same rejected bytes into the
-            // row via `apply_rtl_tcp_connect` / the startup
-            // restore, silently bouncing the user straight back
-            // into `AuthFailed`. Now we delete the saved key
-            // whenever the server explicitly rejects it; the
-            // user has to re-enter (or paste the new) key on
-            // the next attempt, which is the only recovery path
-            // from a rotated server key anyway. Per issue #396.
-            let active = app_state.rtl_tcp_active_server.borrow().clone();
-            if let Some((host, port_str)) = active.rsplit_once(':')
-                && let Ok(port) = port_str.parse::<u16>()
-                && let Err(e) = clear_client_auth_key_from_keyring(host, port)
-            {
-                tracing::warn!(
-                    server = %active,
-                    %e,
-                    "rtl_tcp: client auth key keyring clear on AuthFailed failed (non-fatal)"
-                );
-            }
-            if let Some(row) = auth_key_row_weak.upgrade() {
-                row.set_visible(true);
-                row.grab_focus();
-                // Clear the entered value so the user doesn't
-                // re-submit the same wrong key by reflex on the
-                // next Retry.
-                row.set_text("");
-            }
-            if let Some(overlay) = toast_overlay_weak.upgrade() {
-                let toast = adw::Toast::builder()
-                    .title("Key rejected. Check with the server owner.")
-                    .timeout(TOAST_TIMEOUT_SHORT_SECS)
-                    .build();
-                overlay.add_toast(toast);
-            }
-        }
-
-        RtlTcpConnectionState::Connected { .. } => {
-            // Save the user-entered key to the per-server
-            // keyring so subsequent reconnects auto-use it.
-            // Fires on the edge from any of:
-            //
-            // - `AuthRequired` / `AuthFailed` — user typed a
-            //   key in response to a denial toast;
-            // - `Connecting` — user had auth configured up
-            //   front (server advertised `auth_required` via
-            //   mDNS, key was entered before the first
-            //   connect, and the handshake succeeded in a
-            //   single `Connecting → Connected` hop);
-            // - `ControllerBusy` — user entered a key before
-            //   the first connect, server denied with
-            //   `ControllerBusy`, and the user's subsequent
-            //   Take-control / Listener retry (via
-            //   `RetryRtlTcpWithTakeover` or `RetryRtlTcpNow`)
-            //   succeeded. Added per `CodeRabbit` round 12 on
-            //   PR #408 — without this branch an auth-required
-            //   server that's also busy on the first attempt
-            //   would accept the key on the takeover reconnect
-            //   but never persist it to the keyring.
-            //
-            // Pre-round-1 on PR #408 only the auth-denial arms
-            // triggered the save, so up-front keys never hit the
-            // keyring and the user had to re-type them on every
-            // reconnect. `save_current_auth_key_for_active_
-            // server` is a no-op when the key row is empty, so
-            // this is safe to trigger on every qualifying edge
-            // even if the server doesn't require auth. Call
-            // `record_active_rtl_tcp_server` first so the save-
-            // path sees the right `host:port` even when the
-            // user never hit an auth-denial arm (which is what
-            // previously set the cache).
-            if prev_disc == RTL_TCP_STATE_DISC_CONNECTING
-                || prev_disc == RTL_TCP_STATE_DISC_CONTROLLER_BUSY
-                || prev_disc == RTL_TCP_STATE_DISC_AUTH_REQUIRED
-                || prev_disc == RTL_TCP_STATE_DISC_AUTH_FAILED
-            {
-                record_active_rtl_tcp_server(app_state, hostname_row_weak, port_row_weak);
-                save_current_auth_key_for_active_server(app_state, auth_key_row_weak);
-            }
-        }
+        RtlTcpConnectionState::Connected { .. } => on_rtl_tcp_connected(
+            prev_disc,
+            app_state,
+            auth_key_row_weak,
+            hostname_row_weak,
+            port_row_weak,
+        ),
 
         // Non-toast states (Disconnected / Connecting / Retrying
         // / Failed) just update the status row subtitle via the
@@ -288,6 +101,20 @@ pub(super) fn handle_rtl_tcp_state_toast(
         | RtlTcpConnectionState::Connecting
         | RtlTcpConnectionState::Retrying { .. }
         | RtlTcpConnectionState::Failed { .. } => {}
+    }
+}
+
+/// Sweep still-live ControllerBusy toasts on any transition that
+/// isn't re-entering ControllerBusy (CR round 11 on PR #408). Split
+/// out per the 50-NLOC gate (#817).
+fn dismiss_stale_controller_busy_toasts(
+    pending_controller_busy_toasts: &Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
+) {
+    let mut pending = pending_controller_busy_toasts.borrow_mut();
+    for weak in pending.drain(..) {
+        if let Some(toast) = weak.upgrade() {
+            toast.dismiss();
+        }
     }
 }
 
@@ -1322,133 +1149,8 @@ pub(super) fn apply_rtl_tcp_connect(
     hostname_row.set_text(host);
     port_row.set_value(f64::from(port));
     state.rtl_tcp_hydration_in_progress.set(false);
-    // Restore saved per-server state (#396) BEFORE the
-    // `SetNetworkConfig` / `SetSourceType` dispatch so the DSP
-    // thread's first use of the new endpoint already carries the
-    // right `requested_role` + `auth_key`. Pre-CodeRabbit round 1
-    // on PR #408 this helper only pushed host / port / source,
-    // which meant the new favorite metadata (`requested_role`,
-    // `auth_required`) and per-server client-key keyring helpers
-    // were inert from the discovery + favorites entry points —
-    // role always reverted to the global default and keys never
-    // auto-filled.
-    //
-    // Resolution order for role:
-    // - If the server is a favorite and that favorite carries a
-    //   `requested_role`, use it.
-    // - Otherwise fall back to the global
-    //   `KEY_RTL_TCP_CLIENT_LAST_ROLE` default (if any).
-    // - Otherwise leave the picker alone (Control is the
-    //   picker's built-in default for fresh servers).
-    //
-    // For the auth-key row:
-    // - Reveal the row if the favorite's `auth_required` is
-    //   `Some(true)` — user doesn't have to hit an
-    //   `AuthRequired` denial before seeing the field.
-    // - Load any saved keyring hex for this `host:port` and
-    //   pre-fill the row so the subsequent connect succeeds in
-    //   a single `Connecting → Connected` hop.
-    //
-    // Both operations are no-ops for servers we've never
-    // favorited AND never connected to; the picker stays on
-    // Control and the row stays hidden, matching pre-#408
-    // behavior.
-    // Stable-id rule (per CodeRabbit round 2 on PR #408): all
-    // per-server state — keyring entries, favorite matches,
-    // `app_state.rtl_tcp_active_server` — keys off the
-    // *advertised* `hostname:port`, the same form
-    // `favorite_key(server)` produces on mDNS announce. The
-    // `host` param threaded into this helper already is that
-    // stable value (discovery + favorites both pass the
-    // advertised hostname, not a resolved IP), so we build the
-    // key from it directly rather than reading it back from
-    // `hostname_row.text()` — the row carries the dial target
-    // the DSP actually connects to, which could be a resolved
-    // IP or an IPv6 literal and would split identity between
-    // "favorite shack-pi.local.:1234" and "resolved
-    // 192.168.1.17:1234". Cache it on `AppState` so the
-    // subsequent auth-flow helpers (`save_current_auth_key_for_
-    // active_server`, the keyring-clear on `AuthFailed`, the
-    // role-picker's per-favorite update) use this same stable
-    // id without re-reading the widget.
-    let server_key = format!("{host}:{port}");
-    state
-        .rtl_tcp_active_server
-        .borrow_mut()
-        .clone_from(&server_key);
-    let favorite_entry = load_favorites(config)
-        .into_iter()
-        .find(|f| f.key == server_key);
-    let favorite_role = favorite_entry
-        .as_ref()
-        .and_then(|f| f.requested_role)
-        .or_else(|| {
-            config.read(|v| {
-                v.get(KEY_RTL_TCP_CLIENT_LAST_ROLE)
-                    .and_then(|rv| serde_json::from_value::<FavoriteRole>(rv.clone()).ok())
-            })
-        });
-    // Always set the role explicitly — never leave the combo
-    // showing whatever a prior favorite-restore put there. Pre-
-    // `CodeRabbit` round 9 on PR #408 this was `if let Some(
-    // fav_role) = favorite_role { ... }`, so a fresh server
-    // with no per-favorite role and no global
-    // `KEY_RTL_TCP_CLIENT_LAST_ROLE` would silently inherit
-    // whatever `Listen` a previous favorite had set — meaning
-    // the first connect against a never-seen server could
-    // accidentally request Listener instead of the legacy-safe
-    // Control default. `unwrap_or(Control)` forces the picker
-    // to the right default every time `apply_rtl_tcp_connect`
-    // runs.
-    let resolved_role = favorite_role.unwrap_or(FavoriteRole::Control);
-    let idx = match resolved_role {
-        FavoriteRole::Control => RTL_TCP_ROLE_CONTROL_IDX,
-        FavoriteRole::Listen => RTL_TCP_ROLE_LISTEN_IDX,
-    };
-    role_row.set_selected(idx);
-    // Auth-row state is driven by two inputs:
-    // - `auth_required = Some(true)` on the favorite → the
-    //   server advertises a required key, so reveal the row so
-    //   the user can enter one (or see a saved one below) BEFORE
-    //   the first connect lands — saves the
-    //   `AuthRequired` bounce.
-    // - A saved key in the per-server keyring → pre-fill the
-    //   hex representation so a pre-configured auth connect
-    //   succeeds in a single `Connecting → Connected` hop.
-    //
-    // Pre-CodeRabbit round 2 on PR #408 each of these was a
-    // positive-only mutation: on the "no auth / no saved key"
-    // path the row kept whatever visibility and text the
-    // previous server left behind, so switching from
-    // auth-required server A to no-auth server B would leak
-    // A's revealed row + pre-filled key bytes into B — the
-    // next connect would dispatch `SetRtlTcpClientConfig` with
-    // A's key bound to B's endpoint. Now we rewrite both fields
-    // deterministically: `set_visible(should_reveal)` and
-    // `set_text(saved_hex_or_empty)` fire on every call.
-    let has_auth_required = matches!(
-        favorite_entry.as_ref().and_then(|f| f.auth_required),
-        Some(true)
-    );
-    let saved_key_bytes = load_client_auth_key_from_keyring(host, port);
-    let should_reveal = has_auth_required || saved_key_bytes.is_some();
-    auth_key_row.set_visible(should_reveal);
-    if let Some(bytes) = saved_key_bytes {
-        auth_key_row.set_text(&crate::sidebar::server_panel::auth_key_to_hex(&bytes));
-    } else {
-        auth_key_row.set_text("");
-    }
-    // Dispatch a fresh `SetRtlTcpClientConfig` so the DSP
-    // thread has the restored role + key in place before the
-    // `SetNetworkConfig` + `SetSourceType` below trigger the
-    // actual handshake. Without this the DSP would use its
-    // last-known values (possibly stale from a prior server)
-    // and the first connect could land with the wrong role or
-    // a dead auth key from another session.
-    // Transient out-of-range ComboRow indices fall back to
-    // Control — the legacy-safe default. Collapsed with the
-    // explicit Control arm since both produce the same
-    // `FavoriteRole::Control`.
+    restore_saved_server_state(host, port, role_row, auth_key_row, state, config);
+
     let requested_role = match role_row.selected() {
         RTL_TCP_ROLE_LISTEN_IDX => FavoriteRole::Listen,
         _ => FavoriteRole::Control,
@@ -3747,4 +3449,409 @@ mod rtl_tcp_discovery_format_tests {
             "subtitle should read 'seen just now' for sub-5s age: {subtitle}"
         );
     }
+}
+
+/// `ControllerBusy` arm of [`handle_rtl_tcp_state_toast`]. Split out per the
+/// 50-NLOC gate (#817).
+fn on_rtl_tcp_controller_busy(
+    app_state: &Rc<AppState>,
+    toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
+    role_row_weak: &glib::WeakRef<adw::ComboRow>,
+    pending_controller_busy_toasts: &Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
+) {
+    // Toast with two action buttons: "Connect as
+    // Listener" flips the role combo (its change handler
+    // re-dispatches SetRtlTcpClientConfig) and fires a
+    // normal retry; "Take control" dispatches the one-shot
+    // `RetryRtlTcpWithTakeover` message which rebuilds
+    // the source with `request_takeover = true` on the
+    // hello.
+    let Some(overlay) = toast_overlay_weak.upgrade() else {
+        return;
+    };
+    // Before creating the new pair, sweep any still-
+    // live toasts from a prior `ControllerBusy` entry
+    // (e.g. the user hit `Retry` without clicking either
+    // action, and the server is still busy on the
+    // rebound). Otherwise the overlay would stack two
+    // pairs, and dismissing one pair via the cross-
+    // dismiss helpers below would leave the other pair
+    // orphaned. Per `CodeRabbit` round 11 on PR #408.
+    {
+        let mut pending = pending_controller_busy_toasts.borrow_mut();
+        for weak in pending.drain(..) {
+            if let Some(toast) = weak.upgrade() {
+                toast.dismiss();
+            }
+        }
+    }
+
+    let toast = adw::Toast::builder()
+        .title("Controller slot is occupied on this server.")
+        .timeout(TOAST_TIMEOUT_PERSISTENT)
+        .build();
+    let listen_toast = adw::Toast::builder()
+        .title("Or connect as Listener (read-only).")
+        .timeout(TOAST_TIMEOUT_PERSISTENT)
+        .build();
+    // Cross-dismiss: clicking either action dismisses
+    // BOTH toasts, so a stale sibling action can't fire
+    // later against a session that's already resolved.
+    // `WeakRef` rather than strong clones — the toasts
+    // hand out their own strong refs to the overlay
+    // internally, and we only need to reach the sibling
+    // when it's still live.
+    let toast_weak = toast.downgrade();
+    let listen_toast_weak = listen_toast.downgrade();
+
+    // Track the two action buttons as separate signals.
+    // AdwToast supports a single primary action via
+    // `set_button_label` + `connect_button_clicked`; the
+    // "Take control" action lands there, and the
+    // "Connect as Listener" option lives in the
+    // sibling toast below so users still see both
+    // choices.
+    toast.set_button_label(Some("Take control"));
+    let state_for_takeover = Rc::clone(app_state);
+    let listen_weak_for_takeover = listen_toast_weak.clone();
+    toast.connect_button_clicked(move |t| {
+        state_for_takeover.send_dsp(UiToDsp::RetryRtlTcpWithTakeover);
+        t.dismiss();
+        if let Some(sibling) = listen_weak_for_takeover.upgrade() {
+            sibling.dismiss();
+        }
+    });
+    overlay.add_toast(toast);
+
+    wire_listener_fallback_toast(
+        app_state,
+        role_row_weak,
+        &overlay,
+        &listen_toast,
+        &toast_weak,
+    );
+
+    // Record the pair so the non-ControllerBusy state
+    // transition at the top of this function can sweep
+    // them if the server resolves itself without user
+    // interaction.
+    {
+        let mut pending = pending_controller_busy_toasts.borrow_mut();
+        pending.push(toast_weak);
+        pending.push(listen_toast_weak);
+    }
+}
+
+/// `AuthRequired` arm of [`handle_rtl_tcp_state_toast`]. Split out per the
+/// 50-NLOC gate (#817).
+fn on_rtl_tcp_auth_required(
+    app_state: &Rc<AppState>,
+    toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
+    auth_key_row_weak: &glib::WeakRef<adw::PasswordEntryRow>,
+    hostname_row_weak: &glib::WeakRef<adw::EntryRow>,
+    port_row_weak: &glib::WeakRef<adw::SpinRow>,
+) {
+    // Remember the active server so a subsequent
+    // successful Connected can save the user-entered
+    // key to the right keyring entry.
+    record_active_rtl_tcp_server(app_state, hostname_row_weak, port_row_weak);
+    // Reveal + focus the Server key field so the user
+    // can enter the key.
+    if let Some(row) = auth_key_row_weak.upgrade() {
+        row.set_visible(true);
+        row.grab_focus();
+    }
+    if let Some(overlay) = toast_overlay_weak.upgrade() {
+        let toast = adw::Toast::builder()
+            .title("Server requires an authentication key.")
+            .timeout(TOAST_TIMEOUT_SHORT_SECS)
+            .build();
+        overlay.add_toast(toast);
+    }
+}
+
+/// `AuthFailed` arm of [`handle_rtl_tcp_state_toast`]. Split out per the
+/// 50-NLOC gate (#817).
+fn on_rtl_tcp_auth_failed(
+    app_state: &Rc<AppState>,
+    toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
+    auth_key_row_weak: &glib::WeakRef<adw::PasswordEntryRow>,
+    hostname_row_weak: &glib::WeakRef<adw::EntryRow>,
+    port_row_weak: &glib::WeakRef<adw::SpinRow>,
+) {
+    record_active_rtl_tcp_server(app_state, hostname_row_weak, port_row_weak);
+    // Clear the saved per-server key from the keyring
+    // too — not just the widget. Pre-CodeRabbit round 2
+    // on PR #408 only `row.set_text("")` was called, so
+    // the keyring entry survived the rejection and the
+    // next discovery / favorites / Play-restart path
+    // would auto-load the same rejected bytes into the
+    // row via `apply_rtl_tcp_connect` / the startup
+    // restore, silently bouncing the user straight back
+    // into `AuthFailed`. Now we delete the saved key
+    // whenever the server explicitly rejects it; the
+    // user has to re-enter (or paste the new) key on
+    // the next attempt, which is the only recovery path
+    // from a rotated server key anyway. Per issue #396.
+    let active = app_state.rtl_tcp_active_server.borrow().clone();
+    if let Some((host, port_str)) = active.rsplit_once(':')
+        && let Ok(port) = port_str.parse::<u16>()
+        && let Err(e) = clear_client_auth_key_from_keyring(host, port)
+    {
+        tracing::warn!(
+            server = %active,
+            %e,
+            "rtl_tcp: client auth key keyring clear on AuthFailed failed (non-fatal)"
+        );
+    }
+    if let Some(row) = auth_key_row_weak.upgrade() {
+        row.set_visible(true);
+        row.grab_focus();
+        // Clear the entered value so the user doesn't
+        // re-submit the same wrong key by reflex on the
+        // next Retry.
+        row.set_text("");
+    }
+    if let Some(overlay) = toast_overlay_weak.upgrade() {
+        let toast = adw::Toast::builder()
+            .title("Key rejected. Check with the server owner.")
+            .timeout(TOAST_TIMEOUT_SHORT_SECS)
+            .build();
+        overlay.add_toast(toast);
+    }
+}
+
+/// `Connected { .. }` arm of [`handle_rtl_tcp_state_toast`]. Split out per the
+/// 50-NLOC gate (#817).
+fn on_rtl_tcp_connected(
+    prev_disc: u8,
+    app_state: &Rc<AppState>,
+    auth_key_row_weak: &glib::WeakRef<adw::PasswordEntryRow>,
+    hostname_row_weak: &glib::WeakRef<adw::EntryRow>,
+    port_row_weak: &glib::WeakRef<adw::SpinRow>,
+) {
+    use crate::state::{
+        RTL_TCP_STATE_DISC_AUTH_FAILED, RTL_TCP_STATE_DISC_AUTH_REQUIRED,
+        RTL_TCP_STATE_DISC_CONNECTING, RTL_TCP_STATE_DISC_CONTROLLER_BUSY,
+    };
+
+    // Save the user-entered key to the per-server
+    // keyring so subsequent reconnects auto-use it.
+    // Fires on the edge from any of:
+    //
+    // - `AuthRequired` / `AuthFailed` — user typed a
+    //   key in response to a denial toast;
+    // - `Connecting` — user had auth configured up
+    //   front (server advertised `auth_required` via
+    //   mDNS, key was entered before the first
+    //   connect, and the handshake succeeded in a
+    //   single `Connecting → Connected` hop);
+    // - `ControllerBusy` — user entered a key before
+    //   the first connect, server denied with
+    //   `ControllerBusy`, and the user's subsequent
+    //   Take-control / Listener retry (via
+    //   `RetryRtlTcpWithTakeover` or `RetryRtlTcpNow`)
+    //   succeeded. Added per `CodeRabbit` round 12 on
+    //   PR #408 — without this branch an auth-required
+    //   server that's also busy on the first attempt
+    //   would accept the key on the takeover reconnect
+    //   but never persist it to the keyring.
+    //
+    // Pre-round-1 on PR #408 only the auth-denial arms
+    // triggered the save, so up-front keys never hit the
+    // keyring and the user had to re-type them on every
+    // reconnect. `save_current_auth_key_for_active_
+    // server` is a no-op when the key row is empty, so
+    // this is safe to trigger on every qualifying edge
+    // even if the server doesn't require auth. Call
+    // `record_active_rtl_tcp_server` first so the save-
+    // path sees the right `host:port` even when the
+    // user never hit an auth-denial arm (which is what
+    // previously set the cache).
+    if prev_disc == RTL_TCP_STATE_DISC_CONNECTING
+        || prev_disc == RTL_TCP_STATE_DISC_CONTROLLER_BUSY
+        || prev_disc == RTL_TCP_STATE_DISC_AUTH_REQUIRED
+        || prev_disc == RTL_TCP_STATE_DISC_AUTH_FAILED
+    {
+        record_active_rtl_tcp_server(app_state, hostname_row_weak, port_row_weak);
+        save_current_auth_key_for_active_server(app_state, auth_key_row_weak);
+    }
+}
+
+/// Second ControllerBusy toast offering the Listen fallback (AdwToast exposes only one action button).
+/// Split out per the 50-NLOC gate (#817).
+fn wire_listener_fallback_toast(
+    app_state: &Rc<AppState>,
+    role_row_weak: &glib::WeakRef<adw::ComboRow>,
+    overlay: &adw::ToastOverlay,
+    listen_toast: &adw::Toast,
+    toast_weak: &glib::WeakRef<adw::Toast>,
+) {
+    // Second toast offering the Listen fallback. Two
+    // separate toasts beats a single one because AdwToast
+    // exposes only one action button — splitting the two
+    // paths keeps both discoverable.
+    listen_toast.set_button_label(Some("Connect as Listener"));
+    let state_for_listen = Rc::clone(app_state);
+    let role_row_for_listen = role_row_weak.clone();
+    let toast_weak_for_listen = toast_weak.clone();
+    listen_toast.connect_button_clicked(move |t| {
+        if let Some(role_row) = role_row_for_listen.upgrade() {
+            // Flipping the combo to Listen fires its
+            // `selected-notify` handler which dispatches
+            // `SetRtlTcpClientConfig` with the new role.
+            // Follow with RetryRtlTcpNow so the user
+            // doesn't have to click Retry themselves.
+            role_row.set_selected(crate::sidebar::source_panel::RTL_TCP_ROLE_LISTEN_IDX);
+        }
+        state_for_listen.send_dsp(UiToDsp::RetryRtlTcpNow);
+        t.dismiss();
+        if let Some(sibling) = toast_weak_for_listen.upgrade() {
+            sibling.dismiss();
+        }
+    });
+    overlay.add_toast(listen_toast.clone());
+}
+
+/// Per-server role + auth-key restore (#396) before the dispatch.
+/// Split out per the 50-NLOC gate (#817).
+fn restore_saved_server_state(
+    host: &str,
+    port: u16,
+    role_row: &adw::ComboRow,
+    auth_key_row: &adw::PasswordEntryRow,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    use crate::sidebar::source_panel::{
+        FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
+        RTL_TCP_ROLE_LISTEN_IDX, load_favorites,
+    };
+    // Restore saved per-server state (#396) BEFORE the
+    // `SetNetworkConfig` / `SetSourceType` dispatch so the DSP
+    // thread's first use of the new endpoint already carries the
+    // right `requested_role` + `auth_key`. Pre-CodeRabbit round 1
+    // on PR #408 this helper only pushed host / port / source,
+    // which meant the new favorite metadata (`requested_role`,
+    // `auth_required`) and per-server client-key keyring helpers
+    // were inert from the discovery + favorites entry points —
+    // role always reverted to the global default and keys never
+    // auto-filled.
+    //
+    // Resolution order for role:
+    // - If the server is a favorite and that favorite carries a
+    //   `requested_role`, use it.
+    // - Otherwise fall back to the global
+    //   `KEY_RTL_TCP_CLIENT_LAST_ROLE` default (if any).
+    // - Otherwise leave the picker alone (Control is the
+    //   picker's built-in default for fresh servers).
+    //
+    // For the auth-key row:
+    // - Reveal the row if the favorite's `auth_required` is
+    //   `Some(true)` — user doesn't have to hit an
+    //   `AuthRequired` denial before seeing the field.
+    // - Load any saved keyring hex for this `host:port` and
+    //   pre-fill the row so the subsequent connect succeeds in
+    //   a single `Connecting → Connected` hop.
+    //
+    // Both operations are no-ops for servers we've never
+    // favorited AND never connected to; the picker stays on
+    // Control and the row stays hidden, matching pre-#408
+    // behavior.
+    // Stable-id rule (per CodeRabbit round 2 on PR #408): all
+    // per-server state — keyring entries, favorite matches,
+    // `app_state.rtl_tcp_active_server` — keys off the
+    // *advertised* `hostname:port`, the same form
+    // `favorite_key(server)` produces on mDNS announce. The
+    // `host` param threaded into this helper already is that
+    // stable value (discovery + favorites both pass the
+    // advertised hostname, not a resolved IP), so we build the
+    // key from it directly rather than reading it back from
+    // `hostname_row.text()` — the row carries the dial target
+    // the DSP actually connects to, which could be a resolved
+    // IP or an IPv6 literal and would split identity between
+    // "favorite shack-pi.local.:1234" and "resolved
+    // 192.168.1.17:1234". Cache it on `AppState` so the
+    // subsequent auth-flow helpers (`save_current_auth_key_for_
+    // active_server`, the keyring-clear on `AuthFailed`, the
+    // role-picker's per-favorite update) use this same stable
+    // id without re-reading the widget.
+    let server_key = format!("{host}:{port}");
+    state
+        .rtl_tcp_active_server
+        .borrow_mut()
+        .clone_from(&server_key);
+    let favorite_entry = load_favorites(config)
+        .into_iter()
+        .find(|f| f.key == server_key);
+    let favorite_role = favorite_entry
+        .as_ref()
+        .and_then(|f| f.requested_role)
+        .or_else(|| {
+            config.read(|v| {
+                v.get(KEY_RTL_TCP_CLIENT_LAST_ROLE)
+                    .and_then(|rv| serde_json::from_value::<FavoriteRole>(rv.clone()).ok())
+            })
+        });
+    // Always set the role explicitly — never leave the combo
+    // showing whatever a prior favorite-restore put there. Pre-
+    // `CodeRabbit` round 9 on PR #408 this was `if let Some(
+    // fav_role) = favorite_role { ... }`, so a fresh server
+    // with no per-favorite role and no global
+    // `KEY_RTL_TCP_CLIENT_LAST_ROLE` would silently inherit
+    // whatever `Listen` a previous favorite had set — meaning
+    // the first connect against a never-seen server could
+    // accidentally request Listener instead of the legacy-safe
+    // Control default. `unwrap_or(Control)` forces the picker
+    // to the right default every time `apply_rtl_tcp_connect`
+    // runs.
+    let resolved_role = favorite_role.unwrap_or(FavoriteRole::Control);
+    let idx = match resolved_role {
+        FavoriteRole::Control => RTL_TCP_ROLE_CONTROL_IDX,
+        FavoriteRole::Listen => RTL_TCP_ROLE_LISTEN_IDX,
+    };
+    role_row.set_selected(idx);
+    // Auth-row state is driven by two inputs:
+    // - `auth_required = Some(true)` on the favorite → the
+    //   server advertises a required key, so reveal the row so
+    //   the user can enter one (or see a saved one below) BEFORE
+    //   the first connect lands — saves the
+    //   `AuthRequired` bounce.
+    // - A saved key in the per-server keyring → pre-fill the
+    //   hex representation so a pre-configured auth connect
+    //   succeeds in a single `Connecting → Connected` hop.
+    //
+    // Pre-CodeRabbit round 2 on PR #408 each of these was a
+    // positive-only mutation: on the "no auth / no saved key"
+    // path the row kept whatever visibility and text the
+    // previous server left behind, so switching from
+    // auth-required server A to no-auth server B would leak
+    // A's revealed row + pre-filled key bytes into B — the
+    // next connect would dispatch `SetRtlTcpClientConfig` with
+    // A's key bound to B's endpoint. Now we rewrite both fields
+    // deterministically: `set_visible(should_reveal)` and
+    // `set_text(saved_hex_or_empty)` fire on every call.
+    let has_auth_required = matches!(
+        favorite_entry.as_ref().and_then(|f| f.auth_required),
+        Some(true)
+    );
+    let saved_key_bytes = load_client_auth_key_from_keyring(host, port);
+    let should_reveal = has_auth_required || saved_key_bytes.is_some();
+    auth_key_row.set_visible(should_reveal);
+    if let Some(bytes) = saved_key_bytes {
+        auth_key_row.set_text(&crate::sidebar::server_panel::auth_key_to_hex(&bytes));
+    } else {
+        auth_key_row.set_text("");
+    }
+    // Dispatch a fresh `SetRtlTcpClientConfig` so the DSP
+    // thread has the restored role + key in place before the
+    // `SetNetworkConfig` + `SetSourceType` below trigger the
+    // actual handshake. Without this the DSP would use its
+    // last-known values (possibly stale from a prior server)
+    // and the first connect could land with the wrong role or
+    // a dead auth key from another session.
+    // Transient out-of-range ComboRow indices fall back to
+    // Control — the legacy-safe default. Collapsed with the
+    // explicit Control arm since both produce the same
+    // `FavoriteRole::Control`.
 }
