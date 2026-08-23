@@ -15,8 +15,8 @@ fn test_ui_to_dsp_variants_1() {
     let mode = UiToDsp::SetDemodMode(DemodMode::Am);
     assert!(matches!(mode, UiToDsp::SetDemodMode(DemodMode::Am)));
 
-    let bw = UiToDsp::SetBandwidth(12_500.0);
-    assert!(matches!(bw, UiToDsp::SetBandwidth(b) if (b - 12_500.0).abs() < f64::EPSILON));
+    let bw = UiToDsp::SetBandwidth(TEST_BANDWIDTH_HZ);
+    assert!(matches!(bw, UiToDsp::SetBandwidth(b) if (b - TEST_BANDWIDTH_HZ).abs() < f64::EPSILON));
 
     let sq = UiToDsp::SetSquelch(-50.0);
     assert!(matches!(sq, UiToDsp::SetSquelch(s) if (s - (-50.0)).abs() < f32::EPSILON));
@@ -84,8 +84,10 @@ fn test_ui_to_dsp_variants_2() {
         UiToDsp::SetWindowFunction(sdr_pipeline::iq_frontend::FftWindow::Blackman)
     ));
 
-    let vfo = UiToDsp::SetVfoOffset(25_000.0);
-    assert!(matches!(vfo, UiToDsp::SetVfoOffset(o) if (o - 25_000.0).abs() < f64::EPSILON));
+    let vfo = UiToDsp::SetVfoOffset(TEST_VFO_OFFSET_HZ);
+    assert!(
+        matches!(vfo, UiToDsp::SetVfoOffset(o) if (o - TEST_VFO_OFFSET_HZ).abs() < f64::EPSILON)
+    );
 
     let nb = UiToDsp::SetNbLevel(5.0);
     assert!(matches!(nb, UiToDsp::SetNbLevel(l) if (l - 5.0).abs() < f32::EPSILON));

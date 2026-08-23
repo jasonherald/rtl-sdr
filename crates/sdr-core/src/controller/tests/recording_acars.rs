@@ -88,7 +88,18 @@ fn rtl_sdr_pre_start_settings_dispatch_gain_before_start() {
 }
 
 fn temp_wav(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("sdr-rs-ctl-test-{name}-{}.wav", std::process::id()))
+    // Randomized, 0700 per-process `tempfile` root; unique file names
+    // beneath it instead of fixed names in the system temp dir.
+    static TEST_TMP_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    TEST_TMP_ROOT
+        .get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("sdr-rs-ctl-tests-")
+                .tempdir()
+                .expect("test temp root")
+        })
+        .path()
+        .join(format!("{name}.wav"))
 }
 
 /// #695 — the IQ WAV header bakes in the sample rate at start, so a

@@ -2,10 +2,20 @@ use super::*;
 use serde_json::json;
 use std::fs;
 
+/// One randomized, 0700 `tempfile` root per test process — no fixed
+/// names in the shared system temp dir.
+fn test_tmp_root() -> &'static tempfile::TempDir {
+    static TEST_TMP_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    TEST_TMP_ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("sdr-config-tests-")
+            .tempdir()
+            .expect("test temp root")
+    })
+}
+
 fn temp_path(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("sdr-config-test");
-    fs::create_dir_all(&dir).unwrap();
-    dir.join(name)
+    test_tmp_root().path().join(name)
 }
 
 #[test]
@@ -103,12 +113,10 @@ fn test_auto_save() {
 
 /// Unique temp dir per test so parallel tests never share files.
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "sdr-config-test-{name}-{}-{}",
-        std::process::id(),
+    let dir = test_tmp_root().path().join(format!(
+        "{name}-{}",
         NEXT_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
 }

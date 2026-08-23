@@ -552,12 +552,18 @@ fn is_stale_returns_false_for_fresh_file() {
 static NEXT_TEST_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn unique_temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
+    // One randomized, 0700 `tempfile` root per test process; each
+    // call hands out a unique subdirectory path beneath it, so no
+    // fixed names ever land in the shared system temp dir.
+    static TEST_TMP_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let root = TEST_TMP_ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("sdr-sat-tests-")
+            .tempdir()
+            .expect("test temp root")
+    });
     let counter = NEXT_TEST_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("sdr-sat-test-{tag}-{pid}-{nanos}-{counter}"))
+    root.path().join(format!("{tag}-{counter}"))
 }
 
 // --- #720 (Aug 2026 deep review) ---

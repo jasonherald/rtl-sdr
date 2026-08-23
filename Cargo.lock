@@ -3184,6 +3184,7 @@ dependencies = [
  "sdr-types",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
 ]
@@ -3338,6 +3339,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sgp4",
+ "tempfile",
  "thiserror 2.0.20",
  "tracing",
 ]
