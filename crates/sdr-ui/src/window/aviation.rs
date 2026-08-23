@@ -172,69 +172,95 @@ fn wire_region_and_custom_rows(
         let channel_rows_cell = std::rc::Rc::clone(&panel.channel_rows);
         let custom_row_for_dispatch = panel.custom_channels_row.clone();
         panel.region_row.connect_selected_notify(move |row| {
-            // Guard against transient ComboRow indices. The model
-            // briefly emits selection notifications during
-            // teardown / repopulate that don't correspond to a
-            // real `REGION_OPTIONS` slot. If the round-trip
-            // through `region_from_combo_index` lands on a
-            // different index than the selector reported, the
-            // value is transient — skip persistence + dispatch
-            // so a UI quirk doesn't churn config or fire a
-            // needless DSP command. CR round 1 on PR #593.
-            let selected = row.selected();
-            let mut region = region_from_combo_index(selected);
-            if region_combo_index(&region) != selected {
-                tracing::debug!(
-                    selected,
-                    "acars region combo emitted transient index; ignoring"
-                );
-                return;
-            }
-            // Custom slot: hydrate from saved config (or the
-            // current EntryRow text if the user just typed
-            // something but hasn't pressed Enter yet). Empty
-            // list is fine — the variant is dispatched as
-            // `Custom([])` and the apply handler later
-            // replaces it with a real list.
-            if matches!(region, AcarsRegion::Custom(_)) {
-                let saved = crate::acars_config::read_acars_custom_channels(&config);
-                region = AcarsRegion::Custom(saved.into_boxed_slice());
-                // Make the EntryRow visible immediately on
-                // selection — the visibility-binding closure in
-                // the panel builder also fires on this same
-                // notify, but invoking the binding side-effect
-                // here would require ordering guarantees we
-                // don't have. Cheap idempotent set is fine.
-                custom_row_for_dispatch.set_visible(true);
-            }
-            crate::acars_config::save_acars_channel_set(&config, region.config_id());
-            // Rebuild channel rows to match the new region's
-            // channel count — borrow_mut + adw mutation must
-            // happen before send_dsp because the 4 Hz tick will
-            // start consulting the new row count almost
-            // immediately.
-            let new_count = region.channels().len();
-            // Inline the rebuild (the helper takes
-            // `&AviationPanel`, but we only have the
-            // individual fields here in the closure).
-            {
-                let mut rows = channel_rows_cell.borrow_mut();
-                for row in rows.iter() {
-                    channels_group.remove(row);
-                }
-                rows.clear();
-                for _ in 0..new_count {
-                    let row = adw::ActionRow::builder().title("—").subtitle("—").build();
-                    channels_group.add(&row);
-                    rows.push(row);
-                }
-            }
-            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
+            on_acars_region_selected(
+                row,
+                &state,
+                &config,
+                &channels_group,
+                &channel_rows_cell,
+                &custom_row_for_dispatch,
+            );
         });
     }
 
     // ─── Custom-channels apply handler (issue #592) ───
     wire_custom_channels_row(panel, state, config, toast_overlay);
+}
+
+/// Region-combo notify body: resolve the region (Custom pulls the
+/// saved channel list), persist + dispatch, and rebuild the channel
+/// rows. Split out per the 50-NLOC gate (#817).
+fn on_acars_region_selected(
+    row: &adw::ComboRow,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    channels_group: &adw::PreferencesGroup,
+    channel_rows_cell: &Rc<std::cell::RefCell<Vec<adw::ActionRow>>>,
+    custom_row_for_dispatch: &adw::EntryRow,
+) {
+    use crate::sidebar::aviation_panel::{
+        rebuild_channel_rows, region_combo_index, region_from_combo_index,
+    };
+    use sdr_core::acars_airband_lock::AcarsRegion;
+
+    // Guard against transient ComboRow indices. The model
+    // briefly emits selection notifications during
+    // teardown / repopulate that don't correspond to a
+    // real `REGION_OPTIONS` slot. If the round-trip
+    // through `region_from_combo_index` lands on a
+    // different index than the selector reported, the
+    // value is transient — skip persistence + dispatch
+    // so a UI quirk doesn't churn config or fire a
+    // needless DSP command. CR round 1 on PR #593.
+    let selected = row.selected();
+    let mut region = region_from_combo_index(selected);
+    if region_combo_index(&region) != selected {
+        tracing::debug!(
+            selected,
+            "acars region combo emitted transient index; ignoring"
+        );
+        return;
+    }
+    // Custom slot: hydrate from saved config (or the
+    // current EntryRow text if the user just typed
+    // something but hasn't pressed Enter yet). Empty
+    // list is fine — the variant is dispatched as
+    // `Custom([])` and the apply handler later
+    // replaces it with a real list.
+    if matches!(region, AcarsRegion::Custom(_)) {
+        let saved = crate::acars_config::read_acars_custom_channels(&config);
+        region = AcarsRegion::Custom(saved.into_boxed_slice());
+        // Make the EntryRow visible immediately on
+        // selection — the visibility-binding closure in
+        // the panel builder also fires on this same
+        // notify, but invoking the binding side-effect
+        // here would require ordering guarantees we
+        // don't have. Cheap idempotent set is fine.
+        custom_row_for_dispatch.set_visible(true);
+    }
+    crate::acars_config::save_acars_channel_set(&config, region.config_id());
+    // Rebuild channel rows to match the new region's
+    // channel count — borrow_mut + adw mutation must
+    // happen before send_dsp because the 4 Hz tick will
+    // start consulting the new row count almost
+    // immediately.
+    let new_count = region.channels().len();
+    // Inline the rebuild (the helper takes
+    // `&AviationPanel`, but we only have the
+    // individual fields here in the closure).
+    {
+        let mut rows = channel_rows_cell.borrow_mut();
+        for row in rows.iter() {
+            channels_group.remove(row);
+        }
+        rows.clear();
+        for _ in 0..new_count {
+            let row = adw::ActionRow::builder().title("—").subtitle("—").build();
+            channels_group.add(&row);
+            rows.push(row);
+        }
+    }
+    state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
 }
 
 /// ACARS enable switch + 4 Hz status/channel mirror tick.
