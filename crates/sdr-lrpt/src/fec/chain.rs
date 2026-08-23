@@ -534,17 +534,21 @@ mod tests {
         }
     }
 
-    /// Randomised CADU payload → ASM + payload bits + a 500-bit tail
-    /// (Viterbi's traceback is 224 symbols) → soft pairs.
+    /// Zero bits appended after a synthetic CADU so Viterbi's
+    /// 224-symbol traceback flushes the last payload bits out.
+    const VITERBI_FLUSH_BITS: usize = 500;
+
+    /// Randomised CADU payload → ASM + payload bits + a
+    /// `VITERBI_FLUSH_BITS` zero tail → soft pairs.
     fn encode_cadu_soft(randomised_payload: &[u8]) -> Vec<i8> {
         let mut bits = asm_to_bits();
-        bits.reserve(CADU_TOTAL_BITS + 500);
+        bits.reserve(CADU_TOTAL_BITS + VITERBI_FLUSH_BITS);
         for &byte in randomised_payload {
             for j in 0..8 {
                 bits.push((byte >> (7 - j)) & 1);
             }
         }
-        bits.extend(std::iter::repeat_n(0_u8, 500));
+        bits.extend(std::iter::repeat_n(0_u8, VITERBI_FLUSH_BITS));
         crate::fec::viterbi::ccsds_encode(&bits)
     }
 
