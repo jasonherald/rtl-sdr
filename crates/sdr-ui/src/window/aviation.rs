@@ -234,91 +234,12 @@ fn wire_region_and_custom_rows(
     }
 
     // ─── Custom-channels apply handler (issue #592) ───
-    // Fires on Enter or focus-out. Parses CSV → multiplies by
-    // 1e6 → validates via `validate_custom_channels`. On success
-    // persists + dispatches a `Custom` variant with real
-    // frequencies. On failure: toast naming the problem + add
-    // the `error` CSS class (cleared on success).
-    {
-        let state = Rc::clone(state);
-        let config = std::sync::Arc::clone(config);
-        let toast_overlay = toast_overlay.clone();
-        let channels_group = panel.channels_group.clone();
-        let channel_rows_cell = std::rc::Rc::clone(&panel.channel_rows);
-        panel.custom_channels_row.connect_apply(move |row| {
-            let text = row.text();
-            // Stage 1: parse CSV → Vec<f64> (Hz). Empty entries
-            // (e.g. trailing comma) are silently skipped; a
-            // truly empty list will be caught in stage 2 by
-            // `validate_custom_channels`.
-            let parsed: Result<Vec<f64>, String> = text
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    s.parse::<f64>()
-                        .map(|mhz| mhz * 1_000_000.0)
-                        .map_err(|e| format!("'{s}': {e}"))
-                })
-                .collect();
-            let chans = match parsed {
-                Ok(v) => v,
-                Err(e) => {
-                    row.add_css_class("error");
-                    let toast = adw::Toast::builder()
-                        .title(format!("Invalid custom channels: {e}"))
-                        .timeout(5)
-                        .build();
-                    toast_overlay.add_toast(toast);
-                    return;
-                }
-            };
-            // Stage 2: domain validation (size, finite, span).
-            if let Err(e) = validate_custom_channels(&chans) {
-                row.add_css_class("error");
-                let toast = adw::Toast::builder()
-                    .title(e.to_string())
-                    .timeout(5)
-                    .build();
-                toast_overlay.add_toast(toast);
-                return;
-            }
-            // Validated — clear any prior error styling and
-            // commit (persist + rebuild rows + dispatch).
-            row.remove_css_class("error");
-            crate::acars_config::save_acars_custom_channels(&config, &chans);
-            // Rebuild channel rows to match the new custom-
-            // channel count — same inline pattern as the
-            // region-change handler above.
-            let new_count = chans.len();
-            {
-                let mut rows = channel_rows_cell.borrow_mut();
-                for row in rows.iter() {
-                    channels_group.remove(row);
-                }
-                rows.clear();
-                for _ in 0..new_count {
-                    let r = adw::ActionRow::builder().title("—").subtitle("—").build();
-                    channels_group.add(&r);
-                    rows.push(r);
-                }
-            }
-            let region = AcarsRegion::Custom(chans.into_boxed_slice());
-            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
-        });
-    }
-
-    // ─── Toggle: switch-row → SetAcarsEnabled ───
+    wire_custom_channels_row(panel, state, config, toast_overlay);
 }
 
 /// ACARS enable switch + 4 Hz status/channel mirror tick.
 /// Split out per the 50-NLOC gate (#817).
 fn wire_acars_enable_switch(panel: &sidebar::aviation_panel::AviationPanel, state: &Rc<AppState>) {
-    use crate::sidebar::aviation_panel::{
-        GLYPH_IDLE, GLYPH_LOCKED, GLYPH_SIGNAL, SIDEBAR_STATUS_REFRESH_MS,
-    };
-    use sdr_acars::ChannelLockState;
-
     // Set `acars_pending` BEFORE dispatching so the 4 Hz mirror
     // tick (below) skips the switch-state mirror until the
     // AcarsEnabledChanged ack lands. Without this, the tick can
@@ -337,99 +258,7 @@ fn wire_acars_enable_switch(panel: &sidebar::aviation_panel::AviationPanel, stat
     }
 
     // ─── 4 Hz tick: AppState → switch row + status subtitle + per-channel rows ───
-    // Hold weak refs only so closing the window drops the panel
-    // widgets and the timer self-cancels via Break on the next
-    // fire. Strong refs would keep the panel + AppState alive
-    // for the rest of the process. The channel-rows view is an
-    // `Rc<RefCell<…>>` clone so the rebuild handler can swap the
-    // row list under us without the tick needing a re-snapshot.
-    // We hold a STRONG ref to the cell here — the cell itself
-    // is small (one `Vec<ActionRow>` plus a borrow flag) and
-    // the rows it owns are dropped in lock-step with the panel
-    // widgets when the window closes; the switch/status weak
-    // refs gate Break on the next fire either way.
-    let switch_weak = panel.enable_switch.downgrade();
-    let status_weak = panel.status_row.downgrade();
-    let channel_rows_for_tick = std::rc::Rc::clone(&panel.channel_rows);
-    let state_for_tick = Rc::clone(state);
-    glib::timeout_add_local(
-        std::time::Duration::from_millis(SIDEBAR_STATUS_REFRESH_MS),
-        move || {
-            let (Some(switch), Some(status)) = (switch_weak.upgrade(), status_weak.upgrade())
-            else {
-                return glib::ControlFlow::Break;
-            };
-
-            let enabled = state_for_tick.acars_enabled.get();
-
-            // Mirror Cell→switch one direction only — but only
-            // when no SetAcarsEnabled is in flight. While
-            // pending, the user's just-typed switch value is
-            // authoritative; mirroring back from the still-old
-            // `enabled` Cell would race the in-flight command.
-            // Cleared by every AcarsEnabledChanged arm.
-            if !state_for_tick.acars_pending.get() && switch.is_active() != enabled {
-                switch.set_active(enabled);
-            }
-
-            // Status subtitle.
-            let total = state_for_tick.acars_total_count.get();
-            let last_label = state_for_tick
-                .acars_recent
-                .borrow()
-                .back()
-                .map(|m| format!("Last: {}", format_relative_age(m.timestamp)));
-            let subtitle = if enabled {
-                match last_label {
-                    Some(s) => format!("Decoded {total} · {s}"),
-                    None => format!("Decoded {total} · Awaiting first message"),
-                }
-            } else {
-                "Disabled".to_string()
-            };
-            status.set_subtitle(&subtitle);
-
-            // Per-channel rows. Read the LIVE row list each tick
-            // so a region swap (which drops + recreates rows
-            // under `channel_rows_for_tick`) is reflected
-            // immediately — a snapshot taken at wire time would
-            // hold weak refs into the OLD generation of rows.
-            // `channel_stats` is a `Vec` sized from the active
-            // region (Task 9 migration); the two lengths can
-            // transiently differ around a region swap (panel
-            // rebuild lags the next DSP-side stats emission).
-            // Zip over the shorter of the two so neither side
-            // panics during the window. Issue #592.
-            let channel_stats = state_for_tick.acars_channel_stats.borrow();
-            let rows = channel_rows_for_tick.borrow();
-            for (row, ch) in rows.iter().zip(channel_stats.iter()) {
-                let glyph = match ch.lock_state {
-                    ChannelLockState::Locked => GLYPH_LOCKED,
-                    ChannelLockState::Idle => GLYPH_IDLE,
-                    ChannelLockState::Signal => GLYPH_SIGNAL,
-                };
-                row.set_title(&format!("{glyph}  {:.3} MHz", ch.freq_hz / 1_000_000.0));
-                row.set_subtitle(&format!(
-                    "{} msgs · {:.1} dB · {}",
-                    ch.msg_count,
-                    ch.level_db,
-                    ch.last_msg_at
-                        .map_or_else(|| "—".to_string(), format_relative_age)
-                ));
-            }
-            glib::ControlFlow::Continue
-        },
-    );
-
-    // ─── Open ACARS window button ───
-    {
-        let state = Rc::clone(state);
-        panel.open_viewer_button.connect_clicked(move |_| {
-            crate::acars_viewer::open_acars_viewer_if_needed(&state);
-        });
-    }
-
-    // ─── Output-formatter widget seed + wiring (issue #578) ───
+    wire_acars_status_tick(panel, state);
 }
 
 /// ACARS output-formatter rows (station ID, JSONL log, network feeder) — seed then wire then initial dispatch.
@@ -524,6 +353,106 @@ fn wire_acars_output_rows(
         });
     }
 
+    wire_jsonl_output_rows(panel, state, config);
+
+    wire_network_output_rows(panel, state, config);
+}
+
+/// Custom-channels CSV apply row (Enter / focus-out): parse, validate, persist + dispatch.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_custom_channels_row(
+    panel: &sidebar::aviation_panel::AviationPanel,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    toast_overlay: &adw::ToastOverlay,
+) {
+    use sdr_core::acars_airband_lock::AcarsRegion;
+    use sdr_core::acars_airband_lock::validate_custom_channels;
+
+    // Fires on Enter or focus-out. Parses CSV → multiplies by
+    // 1e6 → validates via `validate_custom_channels`. On success
+    // persists + dispatches a `Custom` variant with real
+    // frequencies. On failure: toast naming the problem + add
+    // the `error` CSS class (cleared on success).
+    {
+        let state = Rc::clone(state);
+        let config = std::sync::Arc::clone(config);
+        let toast_overlay = toast_overlay.clone();
+        let channels_group = panel.channels_group.clone();
+        let channel_rows_cell = std::rc::Rc::clone(&panel.channel_rows);
+        panel.custom_channels_row.connect_apply(move |row| {
+            let text = row.text();
+            // Stage 1: parse CSV → Vec<f64> (Hz). Empty entries
+            // (e.g. trailing comma) are silently skipped; a
+            // truly empty list will be caught in stage 2 by
+            // `validate_custom_channels`.
+            let parsed: Result<Vec<f64>, String> = text
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.parse::<f64>()
+                        .map(|mhz| mhz * 1_000_000.0)
+                        .map_err(|e| format!("'{s}': {e}"))
+                })
+                .collect();
+            let chans = match parsed {
+                Ok(v) => v,
+                Err(e) => {
+                    row.add_css_class("error");
+                    let toast = adw::Toast::builder()
+                        .title(format!("Invalid custom channels: {e}"))
+                        .timeout(5)
+                        .build();
+                    toast_overlay.add_toast(toast);
+                    return;
+                }
+            };
+            // Stage 2: domain validation (size, finite, span).
+            if let Err(e) = validate_custom_channels(&chans) {
+                row.add_css_class("error");
+                let toast = adw::Toast::builder()
+                    .title(e.to_string())
+                    .timeout(5)
+                    .build();
+                toast_overlay.add_toast(toast);
+                return;
+            }
+            // Validated — clear any prior error styling and
+            // commit (persist + rebuild rows + dispatch).
+            row.remove_css_class("error");
+            crate::acars_config::save_acars_custom_channels(&config, &chans);
+            // Rebuild channel rows to match the new custom-
+            // channel count — same inline pattern as the
+            // region-change handler above.
+            let new_count = chans.len();
+            {
+                let mut rows = channel_rows_cell.borrow_mut();
+                for row in rows.iter() {
+                    channels_group.remove(row);
+                }
+                rows.clear();
+                for _ in 0..new_count {
+                    let r = adw::ActionRow::builder().title("—").subtitle("—").build();
+                    channels_group.add(&r);
+                    rows.push(r);
+                }
+            }
+            let region = AcarsRegion::Custom(chans.into_boxed_slice());
+            state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
+        });
+    }
+
+    // ─── Toggle: switch-row → SetAcarsEnabled ───
+}
+
+/// JSONL log toggle + path row.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_jsonl_output_rows(
+    panel: &sidebar::aviation_panel::AviationPanel,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // Wire jsonl_enable_row toggle.
     {
         let state = Rc::clone(state);
@@ -589,7 +518,15 @@ fn wire_acars_output_rows(
             }
         });
     }
+}
 
+/// Network feeder toggle + address row + initial dispatch.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_network_output_rows(
+    panel: &sidebar::aviation_panel::AviationPanel,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // Wire network_enable_row toggle.
     {
         let state = Rc::clone(state);
@@ -674,4 +611,108 @@ fn wire_acars_output_rows(
     state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsNetworkEnabled(
         crate::acars_config::read_acars_network_enabled(config),
     ));
+}
+
+/// 4 Hz ACARS status/channel-row mirror tick + open-viewer button.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_acars_status_tick(panel: &sidebar::aviation_panel::AviationPanel, state: &Rc<AppState>) {
+    use crate::sidebar::aviation_panel::GLYPH_IDLE;
+    use crate::sidebar::aviation_panel::GLYPH_LOCKED;
+    use crate::sidebar::aviation_panel::GLYPH_SIGNAL;
+    use crate::sidebar::aviation_panel::SIDEBAR_STATUS_REFRESH_MS;
+    use sdr_acars::ChannelLockState;
+
+    // Hold weak refs only so closing the window drops the panel
+    // widgets and the timer self-cancels via Break on the next
+    // fire. Strong refs would keep the panel + AppState alive
+    // for the rest of the process. The channel-rows view is an
+    // `Rc<RefCell<…>>` clone so the rebuild handler can swap the
+    // row list under us without the tick needing a re-snapshot.
+    // We hold a STRONG ref to the cell here — the cell itself
+    // is small (one `Vec<ActionRow>` plus a borrow flag) and
+    // the rows it owns are dropped in lock-step with the panel
+    // widgets when the window closes; the switch/status weak
+    // refs gate Break on the next fire either way.
+    let switch_weak = panel.enable_switch.downgrade();
+    let status_weak = panel.status_row.downgrade();
+    let channel_rows_for_tick = std::rc::Rc::clone(&panel.channel_rows);
+    let state_for_tick = Rc::clone(state);
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(SIDEBAR_STATUS_REFRESH_MS),
+        move || {
+            let (Some(switch), Some(status)) = (switch_weak.upgrade(), status_weak.upgrade())
+            else {
+                return glib::ControlFlow::Break;
+            };
+
+            let enabled = state_for_tick.acars_enabled.get();
+
+            // Mirror Cell→switch one direction only — but only
+            // when no SetAcarsEnabled is in flight. While
+            // pending, the user's just-typed switch value is
+            // authoritative; mirroring back from the still-old
+            // `enabled` Cell would race the in-flight command.
+            // Cleared by every AcarsEnabledChanged arm.
+            if !state_for_tick.acars_pending.get() && switch.is_active() != enabled {
+                switch.set_active(enabled);
+            }
+
+            // Status subtitle.
+            let total = state_for_tick.acars_total_count.get();
+            let last_label = state_for_tick
+                .acars_recent
+                .borrow()
+                .back()
+                .map(|m| format!("Last: {}", format_relative_age(m.timestamp)));
+            let subtitle = if enabled {
+                match last_label {
+                    Some(s) => format!("Decoded {total} · {s}"),
+                    None => format!("Decoded {total} · Awaiting first message"),
+                }
+            } else {
+                "Disabled".to_string()
+            };
+            status.set_subtitle(&subtitle);
+
+            // Per-channel rows. Read the LIVE row list each tick
+            // so a region swap (which drops + recreates rows
+            // under `channel_rows_for_tick`) is reflected
+            // immediately — a snapshot taken at wire time would
+            // hold weak refs into the OLD generation of rows.
+            // `channel_stats` is a `Vec` sized from the active
+            // region (Task 9 migration); the two lengths can
+            // transiently differ around a region swap (panel
+            // rebuild lags the next DSP-side stats emission).
+            // Zip over the shorter of the two so neither side
+            // panics during the window. Issue #592.
+            let channel_stats = state_for_tick.acars_channel_stats.borrow();
+            let rows = channel_rows_for_tick.borrow();
+            for (row, ch) in rows.iter().zip(channel_stats.iter()) {
+                let glyph = match ch.lock_state {
+                    ChannelLockState::Locked => GLYPH_LOCKED,
+                    ChannelLockState::Idle => GLYPH_IDLE,
+                    ChannelLockState::Signal => GLYPH_SIGNAL,
+                };
+                row.set_title(&format!("{glyph}  {:.3} MHz", ch.freq_hz / 1_000_000.0));
+                row.set_subtitle(&format!(
+                    "{} msgs · {:.1} dB · {}",
+                    ch.msg_count,
+                    ch.level_db,
+                    ch.last_msg_at
+                        .map_or_else(|| "—".to_string(), format_relative_age)
+                ));
+            }
+            glib::ControlFlow::Continue
+        },
+    );
+
+    // ─── Open ACARS window button ───
+    {
+        let state = Rc::clone(state);
+        panel.open_viewer_button.connect_clicked(move |_| {
+            crate::acars_viewer::open_acars_viewer_if_needed(&state);
+        });
+    }
+
+    // ─── Output-formatter widget seed + wiring (issue #578) ───
 }
