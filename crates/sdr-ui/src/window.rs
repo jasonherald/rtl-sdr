@@ -11578,19 +11578,8 @@ fn connect_satellites_panel(
                         // is more likely to be standard-spec
                         // than Meteor-style OQPSK. Per CR
                         // round 1 on PR #663.
-                        let catalog = sdr_sat::KNOWN_SATELLITES
-                            .iter()
-                            .find(|s| s.norad_id == norad_id);
-                        let modulation = catalog
-                            .and_then(|s| s.lrpt_modulation)
-                            .unwrap_or(sdr_sat::LrptModulation::Qpsk);
-                        let dsp_mode = match modulation {
-                            sdr_sat::LrptModulation::Qpsk => sdr_dsp::lrpt::LrptMode::Qpsk,
-                            sdr_sat::LrptModulation::Oqpsk => sdr_dsp::lrpt::LrptMode::Oqpsk,
-                        };
-                        let differential = catalog.is_some_and(|s| s.lrpt_differential);
                         state_a.send_dsp(sdr_core::messages::UiToDsp::SetLrptDownlink(
-                            sdr_radio::lrpt_decoder::LrptDownlink::new(dsp_mode, differential),
+                            crate::lrpt_viewer::lrpt_downlink_for(norad_id),
                         ));
 
                         crate::lrpt_viewer::open_lrpt_viewer_if_needed(

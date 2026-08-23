@@ -2623,6 +2623,29 @@ pub fn open_lrpt_viewer_if_needed(
     });
 }
 
+/// Downlink profile the DSP thread should decode `norad_id` with,
+/// from the `KnownSatellite` catalog (`lrpt_modulation` +
+/// `lrpt_differential`). An uncatalogued satellite (or a catalog
+/// entry with no LRPT modulation) falls back to plain QPSK — the
+/// standards-default LRPT modulation, so an unknown bird is more
+/// likely standard-spec than Meteor-style OQPSK (CR round 1 on PR
+/// #663, #730).
+#[must_use]
+pub fn lrpt_downlink_for(norad_id: u32) -> sdr_radio::lrpt_decoder::LrptDownlink {
+    let catalog = sdr_sat::KNOWN_SATELLITES
+        .iter()
+        .find(|s| s.norad_id == norad_id);
+    let mode = match catalog
+        .and_then(|s| s.lrpt_modulation)
+        .unwrap_or(sdr_sat::LrptModulation::Qpsk)
+    {
+        sdr_sat::LrptModulation::Qpsk => sdr_dsp::lrpt::LrptMode::Qpsk,
+        sdr_sat::LrptModulation::Oqpsk => sdr_dsp::lrpt::LrptMode::Oqpsk,
+    };
+    let differential = catalog.is_some_and(|s| s.lrpt_differential);
+    sdr_radio::lrpt_decoder::LrptDownlink::new(mode, differential)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -3373,5 +3396,26 @@ mod tests {
         let result = write_rgb_png(&path, &[1_u8, 2, 3], 0, 1);
         assert!(matches!(result, Err(crate::viewer::ViewerError::ZeroSized)));
         assert!(!path.exists());
+    }
+
+    // --- #730 ---
+
+    /// The AOS wiring's catalog → profile mapping: current Meteors
+    /// are plain OQPSK; an uncatalogued id falls back to plain QPSK.
+    #[test]
+    fn lrpt_downlink_for_maps_the_catalog_profile() {
+        use sdr_dsp::lrpt::LrptMode;
+        use sdr_radio::lrpt_decoder::LrptDownlink;
+        const UNCATALOGUED_NORAD_ID: u32 = 1;
+        for norad_id in [sdr_sat::METEOR_M2_3_NORAD_ID, sdr_sat::METEOR_M2_4_NORAD_ID] {
+            assert_eq!(
+                lrpt_downlink_for(norad_id),
+                LrptDownlink::new(LrptMode::Oqpsk, false)
+            );
+        }
+        assert_eq!(
+            lrpt_downlink_for(UNCATALOGUED_NORAD_ID),
+            LrptDownlink::new(LrptMode::Qpsk, false)
+        );
     }
 }

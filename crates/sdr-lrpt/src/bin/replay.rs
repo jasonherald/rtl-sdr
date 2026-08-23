@@ -333,8 +333,20 @@ mod tests {
             Some((LrptMode::Oqpsk, false, false))
         );
         assert_eq!(
+            parse_mode(Some("oqpsk-diff")),
+            Some((LrptMode::Oqpsk, false, true))
+        );
+        assert_eq!(
+            parse_mode(Some("qpsk")),
+            Some((LrptMode::Qpsk, false, false))
+        );
+        assert_eq!(
             parse_mode(Some("qpsk-diff")),
             Some((LrptMode::Qpsk, false, true))
+        );
+        assert_eq!(
+            parse_mode(Some("soft")),
+            Some((LrptMode::Qpsk, true, false))
         );
         assert_eq!(
             parse_mode(Some("soft-diff")),

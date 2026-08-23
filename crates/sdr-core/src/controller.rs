@@ -6033,6 +6033,26 @@ mod tests {
         assert_eq!(snap.lines, MCU_SIDE);
     }
 
+    /// The lazy-init path builds the decoder with the profile the
+    /// controller was told about — modulation and precoding — and a
+    /// later chunk reuses that decoder (#730).
+    #[test]
+    fn lrpt_decode_tap_lazily_builds_the_decoder_with_the_profile() {
+        use sdr_dsp::lrpt::LrptMode;
+        let image = sdr_radio::lrpt_image::LrptImage::new();
+        let mut slot: Option<LrptDecoder> = None;
+        let mut init_failed = false;
+        let profile = LrptDownlink::new(LrptMode::Oqpsk, true);
+        let zeros = vec![Complex::default(); 256];
+        lrpt_decode_tap(&mut slot, Some(&image), &zeros, &mut init_failed, profile);
+        assert!(!init_failed);
+        assert_eq!(slot.as_ref().map(LrptDecoder::downlink), Some(profile));
+        // No image handle → no decoder is built.
+        let mut no_image: Option<LrptDecoder> = None;
+        lrpt_decode_tap(&mut no_image, None, &zeros, &mut init_failed, profile);
+        assert!(no_image.is_none());
+    }
+
     /// A precoding change alone (same modulation) also drops the
     /// decoder so the next init builds the right FEC chain (#730).
     #[test]

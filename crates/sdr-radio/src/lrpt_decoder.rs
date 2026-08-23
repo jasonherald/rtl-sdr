@@ -227,6 +227,12 @@ impl LrptDecoder {
         }
     }
 
+    /// Downlink profile this decoder was built for.
+    #[must_use]
+    pub fn downlink(&self) -> LrptDownlink {
+        self.downlink
+    }
+
     /// Flush all chain state. Called between passes so the
     /// next pass starts on a clean Viterbi traceback / sync
     /// window / RS path. The shared image is also cleared so
@@ -238,12 +244,6 @@ impl LrptDecoder {
     ///
     /// Returns `DspError` if the demod re-construction fails
     /// (see [`LrptDemod::new`]).
-    /// Downlink profile this decoder was built for.
-    #[must_use]
-    pub fn downlink(&self) -> LrptDownlink {
-        self.downlink
-    }
-
     pub fn reset(&mut self) -> Result<(), DspError> {
         self.demod = LrptDemod::new_with_mode(self.downlink.mode)?;
         self.pipeline.reset();
