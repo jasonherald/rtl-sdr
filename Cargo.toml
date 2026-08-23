@@ -114,7 +114,6 @@ members = [
     "crates/sdr-lrpt",
     "crates/sdr-transcription",
     "crates/sdr-core",
-    "crates/sdr-ffi",
     "crates/sdr-splash",
     "crates/sdr-splash-gtk",
     "crates/sdr-ui",
@@ -165,7 +164,6 @@ sdr-acars = { version = "0.1", default-features = false }
 sdr-lrpt = { path = "crates/sdr-lrpt" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }
-sdr-ffi = { path = "crates/sdr-ffi" }
 sdr-splash = { path = "crates/sdr-splash" }
 sdr-splash-gtk = { path = "crates/sdr-splash-gtk" }
 sdr-ui = { path = "crates/sdr-ui" }
@@ -270,10 +268,6 @@ rusb = "0.9"
 # Audio (PipeWire on Linux)
 pipewire = "0.10"
 
-# Audio (CoreAudio / AUHAL on macOS). Spec called for 0.12, but 0.14 is
-# the current maintained release; same surface, no breaking changes that
-# affect us.
-coreaudio-rs = "0.14"
 
 # WAV files
 hound = "3"
@@ -294,7 +288,7 @@ lz4_flex = { version = "0.14", default-features = false, features = ["std", "fra
 bytemuck = { version = "1", features = ["derive"] }
 
 # Stack-allocated bounded vectors. Used in the ACARS message path
-# (sdr-core / sdr-ffi / sdr-ui) for fixed-size fields — aircraft reg,
+# (sdr-core / sdr-ui) for fixed-size fields — aircraft reg,
 # flight id, message no — without per-message heap churn.
 arrayvec = "0.7"
 

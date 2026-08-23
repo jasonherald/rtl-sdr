@@ -3,8 +3,7 @@
 //! `sdr-core` owns the DSP controller thread, the source/sink instantiation
 //! logic, the message enums (`UiToDsp` / `DspToUi`), the shared FFT buffer
 //! primitive, and the WAV recording helpers. It exposes a single facade —
-//! [`Engine`] — that both the GTK4 frontend (`sdr-ui`) and the planned
-//! macOS `SwiftUI` frontend (via `sdr-ffi`, M2) consume.
+//! [`Engine`] — that the GTK4 frontend (`sdr-ui`) consumes.
 //!
 //! Crate layout:
 //!
@@ -21,13 +20,9 @@
 //!
 //! ## What this crate is **not**
 //!
-//! - It is not a UI library — there is no GTK, no `SwiftUI`, no rendering.
-//! - It is not an FFI surface — that lives in the future `sdr-ffi` crate
-//!   (M2). `sdr-core` is plain Rust; the FFI crate wraps it for C/Swift
-//!   consumers.
+//! - It is not a UI library — there is no GTK, no rendering.
 //! - It does not own a tokio runtime. The DSP thread is a raw OS thread;
-//!   commands cross via `mpsc::Sender<UiToDsp>`. Async consumers (the
-//!   eventual `SwiftUI` app) wrap their side; the engine stays sync.
+//!   commands cross via `mpsc::Sender<UiToDsp>`; the engine stays sync.
 
 // `controller` is **private** on purpose. The DSP thread spawn helper and
 // the channel surface live behind the `Engine` facade so consumers can't

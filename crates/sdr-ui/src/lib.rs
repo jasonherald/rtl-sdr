@@ -1,9 +1,7 @@
 //! GTK4 + libadwaita UI for sdr-rs.
 //!
 //! This crate is **Linux-only**. It depends on the GTK4 stack (`gtk4`,
-//! `libadwaita`, `cairo-rs`) which we don't ship on macOS or Windows. The
-//! macOS frontend lives in `apps/macos/` (`SwiftUI`) and consumes the engine
-//! through the planned `sdr-core` + `sdr-ffi` crates instead.
+//! `libadwaita`, `cairo-rs`), and drives the headless `sdr-core` engine.
 //!
 //! On non-Linux targets the crate compiles to an empty rlib so that
 //! `cargo build --workspace` works on every platform without surprising

@@ -4,7 +4,7 @@ Rust port of SDR++ — software-defined radio application with GTK4 UI.
 
 ## Architecture
 
-23-member workspace (root binary + 22 library crates) with clear dependency boundaries.
+22-member workspace (root binary + 21 library crates) with clear dependency boundaries.
 The driver layer (`sdr-rtlsdr`) was spun out as a standalone published crate
 [`librtlsdr-rs`](https://crates.io/crates/librtlsdr-rs) and is consumed from
 crates.io rather than as a path dependency.
@@ -20,7 +20,7 @@ sdr-server-rtltcp     → `rtl_tcp` server — share a local dongle over TCP
 sdr-source-rtlsdr     → RTL-SDR source module (depends on: types, pipeline, librtlsdr-rs, config)
 sdr-source-network    → TCP/UDP IQ source (depends on: types, pipeline, config)
 sdr-source-file       → WAV file playback source (depends on: types, pipeline, config)
-sdr-sink-audio        → PipeWire/CoreAudio output (depends on: types, pipeline, config)
+sdr-sink-audio        → PipeWire output (depends on: types, pipeline, config)
 sdr-sink-network      → TCP/UDP audio output (depends on: types, pipeline, config)
 sdr-radio             → Radio decoder, demod, IF/AF chains, APT image buffer (depends on: types, dsp, pipeline)
 sdr-lrpt              → Meteor-M LRPT decode pipeline (QPSK → Viterbi → RS → JPEG)
@@ -28,8 +28,7 @@ sdr-radioreference    → RadioReference.com SOAP client (depends on: types, con
 sdr-sat               → Satellite pass prediction (SGP4) + TLE cache + ground-station catalog
 sdr-scanner           → Multi-channel scanner engine — projection, dwell/hang, lockout
 sdr-transcription     → Whisper OR Sherpa-onnx backend, Silero VAD, spectral denoiser
-sdr-ffi               → C-ABI surface for the future macOS native-app bridge
-sdr-core              → Headless cross-platform engine facade (macOS port path)
+sdr-core              → Headless engine facade (controller thread, messages, FFT buffer)
 sdr-splash            → Cross-platform splash subprocess controller (stdin wire protocol)
 sdr-splash-gtk        → Linux GTK4 splash window implementation
 sdr-ui                → GTK4/libadwaita UI — Linux-only (depends on: all above)
@@ -133,7 +132,7 @@ Every activity panel is an `AdwPreferencesPage` of flat `AdwPreferencesGroup`s w
 
 Three config keys per side (six total) live in `activity_bar.rs`: `ui_sidebar_{left,right}_{selected,open,width_px}`. Load at launch via `load_session(config)`, apply before wiring handlers (seed-then-wire prevents the initial `set_active` / `set_show_sidebar` calls from writing back). On change, persist via `save_*` helpers. Pixel widths are converted to `AdwOverlaySplitView`'s `[0, 1]` fraction via `apply_sidebar_width`'s one-shot `notify::width` handler once the split view has its first real allocation.
 
-**macOS counterpart:** the same activity-bar pattern is implemented in SwiftUI on the Mac side, sharing the same six `ui_sidebar_*` config keys via the engine's config FFI (ABI 0.21+). Contributor docs for the SwiftUI version live in `apps/macos/README.md` → "Sidebar architecture (macOS)".
+(The former macOS SwiftUI counterpart was removed in #838; see the `mac-archive` branch.)
 
 ### Satellite reception
 

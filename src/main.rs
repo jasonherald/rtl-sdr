@@ -1,11 +1,9 @@
-// The `sdr` binary is the GTK4 + libadwaita frontend, which is currently
-// Linux-only and gated behind the `gtk-frontend` cargo feature. On
-// non-Linux platforms (macOS, Windows) — or on Linux without the
-// `gtk-frontend` feature — we provide a stub `main()` that prints a
-// message and exits non-zero so the workspace still builds end-to-end
-// on every platform without surprising linker failures. The macOS
-// native frontend lives in `apps/macos/` (SwiftUI) and runs against
-// the `sdr-core` engine via the `sdr-ffi` C ABI.
+// The `sdr` binary is the GTK4 + libadwaita frontend, which is
+// Linux-only and gated behind the `gtk-frontend` cargo feature. On any
+// other platform — or on Linux without the `gtk-frontend` feature — we
+// provide a stub `main()` that prints a message and exits non-zero so
+// the workspace still builds end-to-end without surprising linker
+// failures.
 
 #[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 use gtk4::glib;
