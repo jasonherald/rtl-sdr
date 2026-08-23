@@ -11552,9 +11552,11 @@ fn connect_satellites_panel(
                         // setpoint. Per epic #469 task 7.
 
                         // Tell the DSP thread which Meteor
-                        // modulation to use for this pass —
-                        // METEOR-M N2 was QPSK; the active
-                        // METEOR-M2 3 / M2-4 are OQPSK. Sent
+                        // downlink profile to use for this pass
+                        // — METEOR-M N2 was QPSK with
+                        // differential precoding; the active
+                        // METEOR-M2 3 / M2-4 are plain OQPSK
+                        // (#730). Sent
                         // BEFORE `open_lrpt_viewer_if_needed`
                         // (which triggers lazy decoder init)
                         // so the freshly-built decoder uses
@@ -11567,7 +11569,7 @@ fn connect_satellites_panel(
                         // into the next decoder init (the
                         // controller stash defaults to OQPSK at
                         // startup but mutates per
-                        // `SetLrptModulation`, so a Qpsk-then-
+                        // `SetLrptDownlink`, so a Qpsk-then-
                         // None sequence would silently keep the
                         // Qpsk chain). Fallback is `Qpsk`
                         // because that's the standards-default
@@ -11576,22 +11578,20 @@ fn connect_satellites_panel(
                         // is more likely to be standard-spec
                         // than Meteor-style OQPSK. Per CR
                         // round 1 on PR #663.
-                        let modulation = sdr_sat::KNOWN_SATELLITES
-                            .iter()
-                            .find(|s| s.norad_id == norad_id)
-                            .and_then(|s| s.lrpt_modulation)
-                            .unwrap_or(sdr_sat::LrptModulation::Qpsk);
-                        let dsp_mode = match modulation {
-                            sdr_sat::LrptModulation::Qpsk => sdr_dsp::lrpt::LrptMode::Qpsk,
-                            sdr_sat::LrptModulation::Oqpsk => sdr_dsp::lrpt::LrptMode::Oqpsk,
-                        };
-                        state_a.send_dsp(sdr_core::messages::UiToDsp::SetLrptModulation(dsp_mode));
+                        // Profile first, then the canvas wipe on the
+                        // DSP thread — the order matters (see
+                        // `lrpt_pass_start_commands`).
+                        for command in crate::lrpt_viewer::lrpt_pass_start_commands(
+                            norad_id,
+                            &state_a.lrpt_image,
+                        ) {
+                            state_a.send_dsp(command);
+                        }
 
                         crate::lrpt_viewer::open_lrpt_viewer_if_needed(
                             &parent_provider_a,
                             &state_a,
                         );
-                        state_a.lrpt_image.clear();
                         if let Some(view) = state_a.lrpt_viewer.borrow().as_ref() {
                             view.clear();
                         }

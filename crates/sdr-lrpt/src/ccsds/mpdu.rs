@@ -224,10 +224,10 @@ impl MpduReassembler {
     }
 
     /// Whether the reassembler currently has a packet header
-    /// alignment. Useful for callers that want to surface a
-    /// "currently locked" indicator.
-    #[must_use]
-    pub fn is_in_sync(&self) -> bool {
+    /// alignment. Test-only — no production caller surfaces it
+    /// (#733).
+    #[cfg(test)]
+    fn is_in_sync(&self) -> bool {
         self.in_sync
     }
 }
