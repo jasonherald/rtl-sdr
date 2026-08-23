@@ -764,14 +764,6 @@ fn on_server_announced(
 ) {
     use std::time::Instant;
 
-    let DiscoveredRowDeps {
-        config: config_for_discovery,
-        favorite_row_ctx,
-        discovered_star_buttons,
-        expander_weak,
-        ..
-    } = deps.as_ref();
-
     let mut rows = displayed_rows.borrow_mut();
     let title = if server.txt.nickname.is_empty() {
         server.instance_name.clone()
@@ -831,138 +823,13 @@ fn on_server_announced(
     // Using the outlined / filled star icon pair
     // so the toggle state reads clearly without
     // extra CSS.
-    let star_btn = gtk4::ToggleButton::builder()
-        .icon_name(FAVORITE_ICON_OUTLINE)
-        .valign(gtk4::Align::Center)
-        .css_classes(["flat"])
-        .tooltip_text("Pin as favorite")
-        .build();
-    // Use the stable hostname+port key, not
-    // `instance_name`. `instance_name` comes from
-    // the server's TXT nickname, which the operator
-    // can edit — keying favorites off it would
-    // silently drop the star on any rename.
-    let star_key = favorite_key(&server);
-    let starred_initially = favorites.borrow().contains_key(&star_key);
-    star_btn.set_active(starred_initially);
-    if starred_initially {
-        star_btn.set_icon_name(FAVORITE_ICON_FILLED);
-    }
-    // Initial accessible name — state-dependent so
-    // screen readers announce the action the click
-    // will take, not the icon's current appearance.
-    // Updated again inside the toggle closure when
-    // the user flips the state.
-    set_favorite_toggle_accessible_name(&star_btn, starred_initially);
-    // Register the star_btn against its
-    // favorite_key so the favorites-popover
-    // Unstar handler can find and flip this
-    // exact toggle when the user unstars from
-    // the popover. `insert` overwrites any
-    // prior (stale) weak ref under the same key
-    // — e.g. from a re-announce rebuild of the
-    // row, where the old button was dropped.
-    let star_key_for_map = favorite_key(&server);
-    discovered_star_buttons
-        .borrow_mut()
-        .insert(star_key_for_map, star_btn.downgrade());
-    // Capture the display metadata into move-able
-    // values so the toggle closure can build a
-    // `FavoriteEntry` without holding onto
-    // `server` (which is consumed by the HashMap
-    // insert further down).
-    let star_nickname = if server.txt.nickname.is_empty() {
-        server.instance_name.clone()
-    } else {
-        server.txt.nickname.clone()
-    };
-    let star_tuner_name = Some(server.txt.tuner.clone());
-    let star_gain_count = Some(server.txt.gains);
-    // Capture the announce-derived auth flag so
-    // a fresh star persists it alongside the
-    // rest of the metadata. Pre-`CodeRabbit`
-    // round 6 on PR #408 this was hard-set to
-    // `None` at star time, which meant a newly-
-    // starred auth-required server looked
-    // "unknown" until the next mDNS refresh —
-    // `apply_rtl_tcp_connect` + the startup
-    // restore wouldn't reveal the key row
-    // ahead of the first `AuthRequired` bounce.
-    // The discovery-refresh path below already
-    // writes `server.txt.auth_required` on re-
-    // announce; this keeps the two entry points
-    // consistent so freshly-starred favorites
-    // carry the same hint as refreshed ones.
-    let star_auth_required = server.txt.auth_required;
-    let star_favorites = Rc::clone(&favorites);
-    let star_config = std::sync::Arc::clone(&config_for_discovery);
-    let star_expander_weak = expander_weak.clone();
-    // Closure captures `star_row_ctx` only — reaches
-    // `displayed_rows` via its `Weak` field inside.
-    // A separate `Rc::clone(&displayed_rows)` capture
-    // here would reintroduce the retain cycle the
-    // `FavoriteRowContext.displayed_rows` docstring
-    // describes (map → row → signal → ctx → map).
-    let star_row_ctx = Rc::clone(&favorite_row_ctx);
-    star_btn.connect_toggled(move |btn| {
-        on_discovery_star_toggled(
-            btn,
-            &star_key,
-            &star_nickname,
-            &star_tuner_name,
-            star_gain_count,
-            star_auth_required,
-            &star_favorites,
-            &star_config,
-            &star_expander_weak,
-            &star_row_ctx,
-        );
-    });
-    row.add_prefix(&star_btn);
+    build_discovery_star_button(&row, &server, favorites, deps);
 
     wire_discovered_connect_button(&row, &server, &host, deps);
     expander.add_row(&row);
 
-    let fav_key = favorite_key(&server);
-    {
-        let mut favs = favorites.borrow_mut();
-        if favs.contains_key(&fav_key) {
-            let refreshed_nickname = if server.txt.nickname.is_empty() {
-                server.instance_name.clone()
-            } else {
-                server.txt.nickname.clone()
-            };
-            // Preserve any saved `requested_role`
-            // from the previous favorites entry (the
-            // user's last pick sticks across
-            // re-announces); refresh the
-            // `auth_required` hint from the incoming
-            // TXT so the UI reveals the key field
-            // BEFORE the user clicks Connect. Per #396.
-            let preserved_role = favs.get(&fav_key).and_then(|f| f.requested_role);
-            favs.insert(
-                fav_key.clone(),
-                sidebar::source_panel::FavoriteEntry {
-                    key: fav_key.clone(),
-                    nickname: refreshed_nickname,
-                    tuner_name: Some(server.txt.tuner.clone()),
-                    gain_count: Some(server.txt.gains),
-                    last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
-                    requested_role: preserved_role,
-                    auth_required: server.txt.auth_required,
-                },
-            );
-            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
-                favs.values().cloned().collect();
-            crate::sidebar::source_panel::save_favorites(&config_for_discovery, &snapshot);
-            // Refresh the header-bar popover's
-            // rendering of this entry (age + tuner
-            // metadata). Cheap — it rebuilds the
-            // whole list but at favorites scale
-            // that's trivial.
-            rebuild_favorites_popover(&favorite_row_ctx, &favs);
-        }
-    }
+    refresh_favorite_metadata(&server, favorites, deps);
+
     rows.insert(server.instance_name.clone(), (row, server));
     // Reorder after insert so favorites float to
     // the top of the new view.
@@ -4000,7 +3867,7 @@ fn wire_discovered_connect_button(
     connect_btn.add_css_class("suggested-action");
     connect_btn.set_valign(gtk4::Align::Center);
 
-    let click_host = host.clone();
+    let click_host = host.to_string();
     let click_port = server.port;
     let hr = hostname_row.clone();
     let pr = port_row.clone();
@@ -4046,4 +3913,189 @@ fn wire_discovered_connect_button(
     // display honest when the user revisits it
     // after the server has been renamed /
     // re-announced with updated TXT records.
+}
+
+/// Star toggle for a discovered row: initial pin state, weak-map registration, and the toggle wiring.
+/// Split out per the 50-NLOC gate (#817).
+fn build_discovery_star_button(
+    row: &adw::ActionRow,
+    server: &DiscoveredServer,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    deps: &Rc<DiscoveredRowDeps>,
+) {
+    let DiscoveredRowDeps {
+        config: config_for_discovery,
+        favorite_row_ctx,
+        discovered_star_buttons,
+        expander_weak,
+        ..
+    } = deps.as_ref();
+
+    let star_btn = gtk4::ToggleButton::builder()
+        .icon_name(FAVORITE_ICON_OUTLINE)
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .tooltip_text("Pin as favorite")
+        .build();
+    // Use the stable hostname+port key, not
+    // `instance_name`. `instance_name` comes from
+    // the server's TXT nickname, which the operator
+    // can edit — keying favorites off it would
+    // silently drop the star on any rename.
+    let star_key = favorite_key(&server);
+    let starred_initially = favorites.borrow().contains_key(&star_key);
+    star_btn.set_active(starred_initially);
+    if starred_initially {
+        star_btn.set_icon_name(FAVORITE_ICON_FILLED);
+    }
+    // Initial accessible name — state-dependent so
+    // screen readers announce the action the click
+    // will take, not the icon's current appearance.
+    // Updated again inside the toggle closure when
+    // the user flips the state.
+    set_favorite_toggle_accessible_name(&star_btn, starred_initially);
+    // Register the star_btn against its
+    // favorite_key so the favorites-popover
+    // Unstar handler can find and flip this
+    // exact toggle when the user unstars from
+    // the popover. `insert` overwrites any
+    // prior (stale) weak ref under the same key
+    // — e.g. from a re-announce rebuild of the
+    // row, where the old button was dropped.
+    let star_key_for_map = favorite_key(&server);
+    discovered_star_buttons
+        .borrow_mut()
+        .insert(star_key_for_map, star_btn.downgrade());
+    // Capture the display metadata into move-able
+    // values so the toggle closure can build a
+    // `FavoriteEntry` without holding onto
+    // `server` (which is consumed by the HashMap
+    // insert further down).
+    wire_discovery_star_toggle(&star_btn, server, favorites, deps);
+    row.add_prefix(&star_btn);
+}
+
+/// Capture set + toggle wiring for a discovered row's star button.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_discovery_star_toggle(
+    star_btn: &gtk4::ToggleButton,
+    server: &DiscoveredServer,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    deps: &Rc<DiscoveredRowDeps>,
+) {
+    let DiscoveredRowDeps {
+        config: config_for_discovery,
+        favorite_row_ctx,
+        expander_weak,
+        ..
+    } = deps.as_ref();
+    let star_key = favorite_key(server);
+    let star_nickname = if server.txt.nickname.is_empty() {
+        server.instance_name.clone()
+    } else {
+        server.txt.nickname.clone()
+    };
+    let star_tuner_name = Some(server.txt.tuner.clone());
+    let star_gain_count = Some(server.txt.gains);
+    // Capture the announce-derived auth flag so
+    // a fresh star persists it alongside the
+    // rest of the metadata. Pre-`CodeRabbit`
+    // round 6 on PR #408 this was hard-set to
+    // `None` at star time, which meant a newly-
+    // starred auth-required server looked
+    // "unknown" until the next mDNS refresh —
+    // `apply_rtl_tcp_connect` + the startup
+    // restore wouldn't reveal the key row
+    // ahead of the first `AuthRequired` bounce.
+    // The discovery-refresh path below already
+    // writes `server.txt.auth_required` on re-
+    // announce; this keeps the two entry points
+    // consistent so freshly-starred favorites
+    // carry the same hint as refreshed ones.
+    let star_auth_required = server.txt.auth_required;
+    let star_favorites = Rc::clone(&favorites);
+    let star_config = std::sync::Arc::clone(&config_for_discovery);
+    let star_expander_weak = expander_weak.clone();
+    // Closure captures `star_row_ctx` only — reaches
+    // `displayed_rows` via its `Weak` field inside.
+    // A separate `Rc::clone(&displayed_rows)` capture
+    // here would reintroduce the retain cycle the
+    // `FavoriteRowContext.displayed_rows` docstring
+    // describes (map → row → signal → ctx → map).
+    let star_row_ctx = Rc::clone(&favorite_row_ctx);
+    star_btn.connect_toggled(move |btn| {
+        on_discovery_star_toggled(
+            btn,
+            &star_key,
+            &star_nickname,
+            &star_tuner_name,
+            star_gain_count,
+            star_auth_required,
+            &star_favorites,
+            &star_config,
+            &star_expander_weak,
+            &star_row_ctx,
+        );
+    });
+}
+
+/// Metadata refresh for an already-favorited server off the fresh mDNS announce (#396).
+/// Split out per the 50-NLOC gate (#817).
+fn refresh_favorite_metadata(
+    server: &DiscoveredServer,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    deps: &Rc<DiscoveredRowDeps>,
+) {
+    let DiscoveredRowDeps {
+        config: config_for_discovery,
+        favorite_row_ctx,
+        ..
+    } = deps.as_ref();
+
+    let fav_key = favorite_key(&server);
+    {
+        let mut favs = favorites.borrow_mut();
+        if favs.contains_key(&fav_key) {
+            let refreshed_nickname = if server.txt.nickname.is_empty() {
+                server.instance_name.clone()
+            } else {
+                server.txt.nickname.clone()
+            };
+            // Preserve any saved `requested_role`
+            // from the previous favorites entry (the
+            // user's last pick sticks across
+            // re-announces); refresh the
+            // `auth_required` hint from the incoming
+            // TXT so the UI reveals the key field
+            // BEFORE the user clicks Connect. Per #396.
+            let preserved_role = favs.get(&fav_key).and_then(|f| f.requested_role);
+            favs.insert(
+                fav_key.clone(),
+                sidebar::source_panel::FavoriteEntry {
+                    key: fav_key.clone(),
+                    nickname: refreshed_nickname,
+                    tuner_name: Some(server.txt.tuner.clone()),
+                    gain_count: Some(server.txt.gains),
+                    last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
+                    requested_role: preserved_role,
+                    auth_required: server.txt.auth_required,
+                },
+            );
+            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                favs.values().cloned().collect();
+            crate::sidebar::source_panel::save_favorites(&config_for_discovery, &snapshot);
+            // Refresh the header-bar popover's
+            // rendering of this entry (age + tuner
+            // metadata). Cheap — it rebuilds the
+            // whole list but at favorites scale
+            // that's trivial.
+            rebuild_favorites_popover(&favorite_row_ctx, &favs);
+        }
+    }
 }
