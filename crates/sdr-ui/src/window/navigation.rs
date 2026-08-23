@@ -180,8 +180,6 @@ fn navigate_to_bookmark(
 /// Add Bookmark: capture the full tuning profile from current UI state.
 /// Split out per the 50-NLOC gate (#817).
 fn wire_add_bookmark_button(panels: &SidebarPanels, state: &Rc<AppState>) {
-    let nav = &panels.navigation;
-    let bm = &panels.bookmarks;
     // "Add Bookmark" button — capture full tuning profile from current UI state.
     let state_bm = Rc::clone(state);
     let radio_bm = panels.radio.clone();
@@ -363,7 +361,7 @@ fn capture_tuning_profile(
 /// Split out per the 50-NLOC gate (#817).
 fn restore_bookmark_gain_volume(
     bookmark: &sidebar::navigation_panel::Bookmark,
-    state: &AppState,
+    _state: &AppState,
     gain_row: &adw::SpinRow,
     agc_row: &adw::ComboRow,
     volume_button: &gtk4::ScaleButton,

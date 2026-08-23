@@ -258,10 +258,9 @@ fn wire_resize_double_click(
 /// Split out of [`build_split_views`] per the 50-NLOC gate (#817).
 fn build_right_split(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    transcript_panel: &sidebar::transcript_panel::TranscriptPanel,
     right_stack: &gtk4::Stack,
     content_box: &gtk4::Box,
-) -> (adw::OverlaySplitView, gtk4::Box) {
+) -> adw::OverlaySplitView {
     let right_split_view = adw::OverlaySplitView::builder()
         .sidebar_position(gtk4::PackType::End)
         .content(content_box)
@@ -296,7 +295,7 @@ fn build_right_split(
     right_sidebar_wrap.append(right_stack);
     right_split_view.set_sidebar(Some(&right_sidebar_wrap));
 
-    (right_split_view, right_sidebar_wrap)
+    right_split_view
 }
 
 /// Wrap an `AdwPreferencesGroup` in its own `AdwPreferencesPage`
@@ -888,8 +887,7 @@ fn build_split_views(
     // panel up to its 360 px floor when the math would otherwise
     // leave it narrower. User-driven resize + persistence come from
     // the drag handle wired below (#429).
-    let (right_split_view, right_sidebar_wrap) =
-        build_right_split(config, &transcript_panel, &right_stack, &content_box);
+    let right_split_view = build_right_split(config, &right_stack, &content_box);
 
     let left_split_view = build_left_split(config, &left_stack, &right_split_view);
 
