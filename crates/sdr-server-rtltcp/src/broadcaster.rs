@@ -1757,6 +1757,7 @@ mod tests {
     /// id or a newcomer that is not a live Control slot is a no-op.
     #[test]
     fn commit_takeover_rejects_a_stale_pair() {
+        const STALE_ID: ClientId = 9_999;
         let (reg, slot_a) = registry_with_controller(TAKEOVER_TEST_ORIG_CTRL_PORT);
         let a_id = slot_a.id;
         let slot_b = role_test_slot(&reg, TAKEOVER_TEST_NEW_CTRL_PORT, Role::Control);
@@ -1764,7 +1765,6 @@ mod tests {
             reg.register_with_role(slot_b.clone(), TEST_LISTENER_CAP, true),
             RoleDecision::GrantedViaTakeover { displaced_id: a_id }
         );
-        const STALE_ID: ClientId = 9_999;
         assert!(
             !reg.commit_takeover(slot_b.id, STALE_ID),
             "unknown incumbent"
