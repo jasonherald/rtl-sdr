@@ -109,33 +109,12 @@ fn wire_region_and_custom_rows(
     toast_overlay: &adw::ToastOverlay,
 ) {
     use crate::sidebar::aviation_panel::{rebuild_channel_rows, region_combo_index};
-    use sdr_core::acars_airband_lock::{AcarsRegion, validate_custom_channels};
 
     // Read the persisted region, dispatch it to DSP at startup,
     // and seed the combo index BEFORE wiring the change handler
     // — otherwise the seed itself would fire a redundant
     // dispatch + persist round-trip.
-    let saved_region_id = crate::acars_config::read_acars_channel_set(config);
-    let initial_region = if saved_region_id == "custom" {
-        // Two-key load: read channels, validate, then build
-        // Custom — or fall back to default on bad/stale config.
-        // `Custom([])` would reach the engage guard as invalid
-        // (validate_custom_channels rejects empty), so we must
-        // not dispatch it at startup.
-        let saved_chans = crate::acars_config::read_acars_custom_channels(config);
-        match validate_custom_channels(&saved_chans) {
-            Ok(()) => AcarsRegion::Custom(saved_chans.into_boxed_slice()),
-            Err(e) => {
-                tracing::warn!(
-                    "saved custom ACARS channels invalid ({e}); \
-                     falling back to default region"
-                );
-                AcarsRegion::default()
-            }
-        }
-    } else {
-        AcarsRegion::from_config_id(saved_region_id.as_str())
-    };
+    let initial_region = load_initial_region(config);
     panel
         .region_row
         .set_selected(region_combo_index(&initial_region));
@@ -183,6 +162,34 @@ fn wire_region_and_custom_rows(
 
     // ─── Custom-channels apply handler (issue #592) ───
     wire_custom_channels_row(panel, state, config, toast_overlay);
+}
+
+/// Resolve the persisted ACARS region from config. `"custom"` is a
+/// two-key load: read channels, validate, then build `Custom` — or
+/// fall back to the default region on bad/stale config. `Custom([])`
+/// would reach the engage guard as invalid (`validate_custom_channels`
+/// rejects empty), so it must never be dispatched at startup.
+fn load_initial_region(
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) -> sdr_core::acars_airband_lock::AcarsRegion {
+    use sdr_core::acars_airband_lock::{AcarsRegion, validate_custom_channels};
+
+    let saved_region_id = crate::acars_config::read_acars_channel_set(config);
+    if saved_region_id == "custom" {
+        let saved_chans = crate::acars_config::read_acars_custom_channels(config);
+        match validate_custom_channels(&saved_chans) {
+            Ok(()) => AcarsRegion::Custom(saved_chans.into_boxed_slice()),
+            Err(e) => {
+                tracing::warn!(
+                    "saved custom ACARS channels invalid ({e}); \
+                     falling back to default region"
+                );
+                AcarsRegion::default()
+            }
+        }
+    } else {
+        AcarsRegion::from_config_id(saved_region_id.as_str())
+    }
 }
 
 /// Region-combo notify body: resolve the region (Custom pulls the
