@@ -765,17 +765,11 @@ fn on_server_announced(
     use std::time::Instant;
 
     let DiscoveredRowDeps {
-        hostname_row,
-        port_row,
-        protocol_row,
-        device_row,
-        role_row,
-        auth_key_row,
-        state,
         config: config_for_discovery,
         favorite_row_ctx,
         discovered_star_buttons,
         expander_weak,
+        ..
     } = deps.as_ref();
 
     let mut rows = displayed_rows.borrow_mut();
@@ -926,57 +920,9 @@ fn on_server_announced(
     });
     row.add_prefix(&star_btn);
 
-    let connect_btn = gtk4::Button::with_label("Connect");
-    connect_btn.add_css_class("suggested-action");
-    connect_btn.set_valign(gtk4::Align::Center);
-
-    let click_host = host.clone();
-    let click_port = server.port;
-    let hr = hostname_row.clone();
-    let pr = port_row.clone();
-    let protor = protocol_row.clone();
-    let dr = device_row.clone();
-    let rr = role_row.clone();
-    let akr = auth_key_row.clone();
-    let st = Rc::clone(&state);
-    let cfg = std::sync::Arc::clone(&config_for_discovery);
-    // Friendly nickname for the persisted snapshot.
-    // Prefer the TXT nickname if the responder set
-    // one, fall back to the DNS-SD instance name.
-    let click_nickname = if server.txt.nickname.is_empty() {
-        server.instance_name.clone()
-    } else {
-        server.txt.nickname.clone()
-    };
-    connect_btn.connect_clicked(move |_| {
-        // Shared ordering-sensitive flow lives in
-        // `apply_rtl_tcp_connect` — see its doc for
-        // why `protocol_row` gets set to TCP before
-        // the host/port writes and why
-        // `SetSourceType` only fires conditionally.
-        apply_rtl_tcp_connect(
-            &click_host,
-            click_port,
-            &click_nickname,
-            &hr,
-            &pr,
-            &protor,
-            &dr,
-            &rr,
-            &akr,
-            &st,
-            &cfg,
-        );
-    });
-    row.add_suffix(&connect_btn);
+    wire_discovered_connect_button(&row, &server, &host, deps);
     expander.add_row(&row);
-    // If this server is already favorited, refresh
-    // the persisted metadata (tuner name, gain
-    // count, nickname, last-seen) off the fresh
-    // announce. Keeps the favorites slide-out's
-    // display honest when the user revisits it
-    // after the server has been renamed /
-    // re-announced with updated TXT records.
+
     let fav_key = favorite_key(&server);
     {
         let mut favs = favorites.borrow_mut();
@@ -4028,4 +3974,76 @@ fn attach_favorite_unstar_button(
         rebuild_favorites_popover(&unstar_ctx, &unstar_ctx.favorites.borrow());
     });
     row.add_suffix(&unstar_btn);
+}
+
+/// Connect button on a discovered row: hydrate the endpoint triple and run apply_rtl_tcp_connect.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_discovered_connect_button(
+    row: &adw::ActionRow,
+    server: &DiscoveredServer,
+    host: &str,
+    deps: &Rc<DiscoveredRowDeps>,
+) {
+    let DiscoveredRowDeps {
+        hostname_row,
+        port_row,
+        protocol_row,
+        device_row,
+        role_row,
+        auth_key_row,
+        state,
+        config: config_for_discovery,
+        ..
+    } = deps.as_ref();
+
+    let connect_btn = gtk4::Button::with_label("Connect");
+    connect_btn.add_css_class("suggested-action");
+    connect_btn.set_valign(gtk4::Align::Center);
+
+    let click_host = host.clone();
+    let click_port = server.port;
+    let hr = hostname_row.clone();
+    let pr = port_row.clone();
+    let protor = protocol_row.clone();
+    let dr = device_row.clone();
+    let rr = role_row.clone();
+    let akr = auth_key_row.clone();
+    let st = Rc::clone(&state);
+    let cfg = std::sync::Arc::clone(&config_for_discovery);
+    // Friendly nickname for the persisted snapshot.
+    // Prefer the TXT nickname if the responder set
+    // one, fall back to the DNS-SD instance name.
+    let click_nickname = if server.txt.nickname.is_empty() {
+        server.instance_name.clone()
+    } else {
+        server.txt.nickname.clone()
+    };
+    connect_btn.connect_clicked(move |_| {
+        // Shared ordering-sensitive flow lives in
+        // `apply_rtl_tcp_connect` — see its doc for
+        // why `protocol_row` gets set to TCP before
+        // the host/port writes and why
+        // `SetSourceType` only fires conditionally.
+        apply_rtl_tcp_connect(
+            &click_host,
+            click_port,
+            &click_nickname,
+            &hr,
+            &pr,
+            &protor,
+            &dr,
+            &rr,
+            &akr,
+            &st,
+            &cfg,
+        );
+    });
+    row.add_suffix(&connect_btn);
+    // If this server is already favorited, refresh
+    // the persisted metadata (tuner name, gain
+    // count, nickname, last-seen) off the fresh
+    // announce. Keeps the favorites slide-out's
+    // display honest when the user revisits it
+    // after the server has been renamed /
+    // re-announced with updated TXT records.
 }
