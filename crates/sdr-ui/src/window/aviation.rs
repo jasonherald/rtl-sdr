@@ -401,41 +401,21 @@ fn wire_custom_channels_row(
         let channels_group = panel.channels_group.clone();
         let channel_rows_cell = std::rc::Rc::clone(&panel.channel_rows);
         panel.custom_channels_row.connect_apply(move |row| {
-            let text = row.text();
-            // Stage 1: parse CSV → Vec<f64> (Hz). Empty entries
-            // (e.g. trailing comma) are silently skipped; a
-            // truly empty list will be caught in stage 2 by
-            // `validate_custom_channels`.
-            let parsed: Result<Vec<f64>, String> = text
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    s.parse::<f64>()
-                        .map(|mhz| mhz * 1_000_000.0)
-                        .map_err(|e| format!("'{s}': {e}"))
-                })
-                .collect();
-            let chans = match parsed {
+            // Stage 1: parse CSV → Vec<f64> (Hz). Stage 2:
+            // domain validation (size, finite, span).
+            let chans = match parse_custom_channels_csv(&row.text()) {
                 Ok(v) => v,
                 Err(e) => {
-                    row.add_css_class("error");
-                    let toast = adw::Toast::builder()
-                        .title(format!("Invalid custom channels: {e}"))
-                        .timeout(5)
-                        .build();
-                    toast_overlay.add_toast(toast);
+                    show_custom_channels_error(
+                        row,
+                        &toast_overlay,
+                        &format!("Invalid custom channels: {e}"),
+                    );
                     return;
                 }
             };
-            // Stage 2: domain validation (size, finite, span).
             if let Err(e) = validate_custom_channels(&chans) {
-                row.add_css_class("error");
-                let toast = adw::Toast::builder()
-                    .title(e.to_string())
-                    .timeout(5)
-                    .build();
-                toast_overlay.add_toast(toast);
+                show_custom_channels_error(row, &toast_overlay, &e.to_string());
                 return;
             }
             // Validated — clear any prior error styling and
@@ -457,6 +437,29 @@ fn wire_custom_channels_row(
     }
 
     // ─── Toggle: switch-row → SetAcarsEnabled ───
+}
+
+/// Parse the Custom-channels CSV into Hz values. Empty entries (e.g.
+/// a trailing comma) are silently skipped; a truly empty list is left
+/// for `validate_custom_channels` to reject.
+fn parse_custom_channels_csv(text: &str) -> Result<Vec<f64>, String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<f64>()
+                .map(|mhz| mhz * 1_000_000.0)
+                .map_err(|e| format!("'{s}': {e}"))
+        })
+        .collect()
+}
+
+/// Mark the Custom-channels row invalid and toast the reason. The
+/// `error` CSS class is cleared by the success path.
+fn show_custom_channels_error(row: &adw::EntryRow, toast_overlay: &adw::ToastOverlay, msg: &str) {
+    row.add_css_class("error");
+    let toast = adw::Toast::builder().title(msg).timeout(5).build();
+    toast_overlay.add_toast(toast);
 }
 
 /// JSONL log toggle + path row.
