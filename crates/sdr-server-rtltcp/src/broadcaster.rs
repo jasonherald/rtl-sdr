@@ -276,15 +276,19 @@ pub enum RoleDecision {
     /// Slot registered. Caller proceeds with the handshake response
     /// and spawns the per-client writer + command workers.
     Granted,
-    /// Slot registered AFTER displacing the prior Control client —
-    /// i.e., the takeover path (#393). The prior controller's
-    /// slot is marked disconnected by `register_with_role` under
-    /// the same lock, so its writer / command threads observe the
-    /// flag on their next tick and exit with a clean TCP FIN. The
-    /// caller treats this identically to [`Self::Granted`] on the
-    /// wire (both send `ServerExtension { status: Ok, granted_role:
-    /// Some(Control) }`) — the `displaced_id` is carried only for
-    /// server-side logging and UI activity-log correlation.
+    /// Slot registered alongside the prior Control client — the
+    /// takeover path (#393). Admission alone does **not** displace
+    /// the incumbent: the caller must finish the newcomer's setup
+    /// (header, timeout, worker threads) and then call
+    /// [`ClientRegistry::commit_takeover`] with `displaced_id`,
+    /// which marks the prior controller's slot disconnected so its
+    /// writer / command threads exit with a clean TCP FIN (#710).
+    /// An early return that skips the commit (after
+    /// `unwind_admission`) leaves the incumbent in control. On the
+    /// wire the caller treats this identically to [`Self::Granted`]
+    /// (both send `ServerExtension { status: Ok, granted_role:
+    /// Some(Control) }`); `displaced_id` also feeds server-side
+    /// logging and UI activity-log correlation.
     GrantedViaTakeover {
         /// `ClientId` of the Control slot that was displaced.
         /// Captured from the slot snapshot taken under the admission
@@ -454,12 +458,13 @@ impl ClientRegistry {
     /// - `Role::Control` — granted iff no other live slot currently
     ///   has role Control. When the slot IS taken:
     ///   - `request_takeover == false` → [`RoleDecision::ControllerBusy`].
-    ///   - `request_takeover == true` → the prior controller's slot
-    ///     is marked disconnected (its writer + command threads
-    ///     observe the flag on their next tick and exit with a
-    ///     clean TCP FIN) and the new slot is admitted; returns
-    ///     [`RoleDecision::GrantedViaTakeover`] carrying the
-    ///     displaced client's id for server-side logging. #393.
+    ///   - `request_takeover == true` → the new slot is admitted
+    ///     next to the incumbent and
+    ///     [`RoleDecision::GrantedViaTakeover`] carries the
+    ///     incumbent's id. The incumbent stays live (and keeps
+    ///     winning `ControllerBusy` decisions against plain Control
+    ///     requests) until the caller's [`Self::commit_takeover`]
+    ///     once the newcomer is fully viable. #393 / #710.
     /// - `Role::Listen` — granted iff the count of live `Listen`
     ///   slots is strictly less than `listener_cap`. Denying with
     ///   `ListenerCapReached`. `request_takeover` is ignored for
@@ -1505,6 +1510,18 @@ mod tests {
     const TAKEOVER_TEST_LISTENER_PORT: u16 = 20_130;
     const TAKEOVER_TEST_LISTENER_TAKEOVER_CTRL_PORT: u16 = 20_131;
 
+    /// Registry with one live Control client on `port` (the common
+    /// takeover-test setup). Returns the registry and the incumbent.
+    fn registry_with_controller(port: u16) -> (ClientRegistry, Arc<ClientSlot>) {
+        let reg = ClientRegistry::new();
+        let slot = role_test_slot(&reg, port, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot.clone(), TEST_LISTENER_CAP, false),
+            RoleDecision::Granted
+        );
+        (reg, slot)
+    }
+
     #[test]
     fn register_with_role_takeover_displaces_existing_controller() {
         // **Regression test for #393.** Core takeover contract:
@@ -1516,13 +1533,8 @@ mod tests {
         //     next tick with a clean TCP FIN)
         //   - `lifetime_accepted` reflects both admissions (A's
         //     kick doesn't decrement; it was a real session)
-        let reg = ClientRegistry::new();
-        let slot_a = role_test_slot(&reg, TAKEOVER_TEST_ORIG_CTRL_PORT, Role::Control);
+        let (reg, slot_a) = registry_with_controller(TAKEOVER_TEST_ORIG_CTRL_PORT);
         let a_id = slot_a.id;
-        assert_eq!(
-            reg.register_with_role(slot_a.clone(), TEST_LISTENER_CAP, false),
-            RoleDecision::Granted
-        );
 
         let slot_b = role_test_slot(&reg, TAKEOVER_TEST_NEW_CTRL_PORT, Role::Control);
         let b_id = slot_b.id;
@@ -1581,12 +1593,7 @@ mod tests {
         // Control client whose hello has the takeover flag
         // clear gets denied exactly as before — the #393 branch
         // only activates on an explicit `true` request.
-        let reg = ClientRegistry::new();
-        let slot_a = role_test_slot(&reg, TAKEOVER_TEST_DENIED_ORIG_PORT, Role::Control);
-        assert_eq!(
-            reg.register_with_role(slot_a.clone(), TEST_LISTENER_CAP, false),
-            RoleDecision::Granted
-        );
+        let (reg, slot_a) = registry_with_controller(TAKEOVER_TEST_DENIED_ORIG_PORT);
         let slot_b = role_test_slot(&reg, TAKEOVER_TEST_DENIED_NEW_PORT, Role::Control);
         assert_eq!(
             reg.register_with_role(slot_b, TEST_LISTENER_CAP, false),
@@ -1650,13 +1657,8 @@ mod tests {
     /// the dongle just by asking for takeover and hanging up.
     #[test]
     fn takeover_unwound_before_commit_keeps_the_incumbent() {
-        let reg = ClientRegistry::new();
-        let slot_a = role_test_slot(&reg, TAKEOVER_TEST_ORIG_CTRL_PORT, Role::Control);
+        let (reg, slot_a) = registry_with_controller(TAKEOVER_TEST_ORIG_CTRL_PORT);
         let a_id = slot_a.id;
-        assert_eq!(
-            reg.register_with_role(slot_a.clone(), TEST_LISTENER_CAP, false),
-            RoleDecision::Granted
-        );
         let slot_b = role_test_slot(&reg, TAKEOVER_TEST_NEW_CTRL_PORT, Role::Control);
         assert_eq!(
             reg.register_with_role(slot_b.clone(), TEST_LISTENER_CAP, true),

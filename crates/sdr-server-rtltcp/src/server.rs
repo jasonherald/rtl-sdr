@@ -1457,6 +1457,10 @@ fn spawn_client_workers(
     let writer_slot = slot.clone();
     let writer_registry = registry.clone();
     let writer_shutdown = shutdown.clone();
+    // Only a pass-through stream can resume a chunk mid-way after a
+    // send stall; a compressed stream's encoder state cannot be
+    // rewound (#709, CR on PR #807).
+    let retry_stalls = codec == Codec::None;
     let tracked_writer = StatsTrackingWrite {
         inner: writer,
         slot: slot.clone(),
@@ -1472,6 +1476,7 @@ fn spawn_client_workers(
                 writer_slot,
                 writer_registry,
                 writer_shutdown,
+                retry_stalls,
             );
         }) {
         Ok(h) => h,
@@ -2130,6 +2135,7 @@ fn tcp_writer<W: Write + Send>(
     slot: Arc<ClientSlot>,
     registry: Arc<ClientRegistry>,
     shutdown: Arc<AtomicBool>,
+    retry_stalls: bool,
 ) {
     // Write timeout (`DATA_WRITE_TIMEOUT`) installed by the caller on
     // the underlying `TcpStream` before wrapping in the codec — see
@@ -2143,9 +2149,15 @@ fn tcp_writer<W: Write + Send>(
         }
         match rx.recv_timeout(WRITER_RECV_TIMEOUT) {
             Ok(buf) => {
-                if write_chunk_shedding_backlog(&mut stream, &buf, &rx, &slot, &registry)
-                    == ChunkOutcome::Closed
-                {
+                let outcome = write_chunk_shedding_backlog(
+                    &mut stream,
+                    &buf,
+                    &rx,
+                    &slot,
+                    &registry,
+                    retry_stalls,
+                );
+                if outcome == ChunkOutcome::Closed {
                     slot.mark_disconnected();
                     return;
                 }
@@ -2186,9 +2198,14 @@ fn is_stall(e: &std::io::Error) -> bool {
 /// upstream rtl_tcp does (#709): a timed-out write sheds the chunks
 /// that queued up behind it (counted as drops), then resumes the
 /// *same* chunk at the byte where it stopped so the I/Q byte
-/// alignment on the wire survives. Only [`MAX_CONSECUTIVE_WRITE_STALLS`]
-/// stalls on one chunk, a zero-length write, or any other error
-/// close the client.
+/// alignment on the wire survives. [`MAX_CONSECUTIVE_WRITE_STALLS`]
+/// stalls in a row (the count resets on any progress), a zero-length
+/// write, or any other error close the client.
+///
+/// `retry_stalls` is `false` for compressed streams: the LZ4 frame
+/// encoder may have emitted part of a block before the inner socket
+/// timed out, and its state cannot be rewound, so a stall there is
+/// terminal rather than retried (CR on PR #807).
 ///
 /// Every chunk is flushed so the LZ4 frame encoder (when active)
 /// doesn't hold a partial block waiting for the next USB chunk to
@@ -2203,6 +2220,7 @@ fn write_chunk_shedding_backlog<W: Write>(
     rx: &Receiver<Vec<u8>>,
     slot: &ClientSlot,
     registry: &ClientRegistry,
+    retry_stalls: bool,
 ) -> ChunkOutcome {
     let mut offset = 0;
     let mut stalls: u32 = 0;
@@ -2221,9 +2239,9 @@ fn write_chunk_shedding_backlog<W: Write>(
                 tracing::debug!(client_id = slot.id, "rtl_tcp client socket closed by peer");
                 return ChunkOutcome::Closed;
             }
-            Ok(_) => {}
+            Ok(_) => stalls = 0,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) if is_stall(&e) => {
+            Err(e) if is_stall(&e) && retry_stalls => {
                 stalls += 1;
                 if stalls > MAX_CONSECUTIVE_WRITE_STALLS {
                     tracing::debug!(
@@ -3477,7 +3495,7 @@ mod tests {
                     stalls_remaining: 2,
                     written: Vec::new(),
                 };
-                tcp_writer(&mut w, rx, slot, registry, shutdown);
+                tcp_writer(&mut w, rx, slot, registry, shutdown, true);
                 *written.lock().expect("written") = w.written;
             })
         };
@@ -3519,9 +3537,78 @@ mod tests {
             stalls_remaining: MAX_CONSECUTIVE_WRITE_STALLS + 1,
             written: Vec::new(),
         };
-        tcp_writer(&mut w, rx, slot.clone(), registry, shutdown);
+        tcp_writer(&mut w, rx, slot.clone(), registry, shutdown, true);
         assert!(slot.is_disconnected());
         assert!(w.written.is_empty());
+    }
+
+    /// A compressed stream cannot resume mid-block: its first stall
+    /// closes the client instead of being retried.
+    #[test]
+    fn tcp_writer_closes_a_compressed_stream_on_its_first_stall() {
+        let registry = Arc::new(ClientRegistry::new());
+        let (slot, rx) = ClientSlot::new(
+            registry.allocate_id(),
+            test_peer(STALL_TEST_PORT),
+            Codec::None,
+            Role::Control,
+            TEST_CLIENT_CHANNEL_DEPTH,
+        );
+        slot.tx.send(STALL_TEST_CHUNK.to_vec()).expect("queue");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut w = StallingWriter {
+            stalls_remaining: 1,
+            written: Vec::new(),
+        };
+        tcp_writer(&mut w, rx, slot.clone(), registry, shutdown, false);
+        assert!(slot.is_disconnected());
+        assert!(w.written.is_empty());
+    }
+
+    /// Socket stand-in that alternates one byte of progress with a
+    /// stall: never two stalls in a row, so the consecutive budget
+    /// must never trip no matter how long the chunk is.
+    struct TricklingWriter {
+        stall_next: bool,
+        written: Vec<u8>,
+    }
+
+    impl Write for TricklingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.stall_next = !self.stall_next;
+            if !self.stall_next {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            self.written.push(buf[0]);
+            Ok(1)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The stall budget counts consecutive stalls: progress resets it.
+    #[test]
+    fn stall_budget_resets_on_progress() {
+        let registry = ClientRegistry::new();
+        let (slot, rx) = ClientSlot::new(
+            registry.allocate_id(),
+            test_peer(STALL_TEST_PORT),
+            Codec::None,
+            Role::Control,
+            TEST_CLIENT_CHANNEL_DEPTH,
+        );
+        // Longer than the budget, so an accumulating counter would
+        // close the client part-way through.
+        let chunk = vec![0xA5_u8; (MAX_CONSECUTIVE_WRITE_STALLS as usize) * 3];
+        let mut w = TricklingWriter {
+            stall_next: false,
+            written: Vec::new(),
+        };
+        let outcome = write_chunk_shedding_backlog(&mut w, &chunk, &rx, &slot, &registry, true);
+        assert_eq!(outcome, ChunkOutcome::Sent);
+        assert_eq!(w.written, chunk);
+        assert!(!slot.is_disconnected());
     }
 
     /// USB read failures are tolerated up to librtlsdr's consecutive
