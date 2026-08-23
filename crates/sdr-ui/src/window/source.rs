@@ -377,8 +377,11 @@ struct DiscoveredRowDeps {
     expander_weak: glib::WeakRef<adw::ExpanderRow>,
 }
 
-/// Long-term idle subtitle when mDNS startup failed or the browser
-/// thread exited.
+/// Subtitle shown on the discovered-servers expander when mDNS
+/// discovery is non-functional (either `Browser::start` failed or the
+/// browser thread exited at runtime). Distinguishes "nothing to see
+/// yet" from "we gave up listening" — without this the UI would lie by
+/// showing the idle "No servers discovered…" state.
 const DISCOVERY_UNAVAILABLE_SUBTITLE: &str = "Discovery unavailable on this system.";
 
 /// Grace period before a discovered-server row is pruned when the
@@ -428,11 +431,6 @@ pub(super) fn connect_rtl_tcp_discovery(
     /// not the selected source type.
     const DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-    /// Subtitle shown on the discovered-servers expander when mDNS
-    /// discovery is non-functional (either `Browser::start` failed or
-    /// the browser thread exited at runtime). Distinguishes "nothing
-    /// to see yet" from "we gave up listening" — without this the UI
-    /// would lie by showing the idle "No servers discovered…" state.
     // "Manage favorites…" button inside the discovered-servers
     // expander — a second entry point into the same popover as
     // the header-bar star button. Wired here because the
