@@ -278,34 +278,47 @@ fn decode_mcu_minimal_stream_produces_uniform_block() {
 
 #[test]
 fn decode_mcu_dc_predictor_carries_across_calls() {
-    // The DC predictor accumulates across consecutive MCUs
-    // in the same packet (decoder.last_dc), then `reset_dc`
-    // zeros it between packets. Verify that the second
-    // identical "delta=0" MCU stream produces the same
-    // pixels as the first — the predictor stays at 0 because
-    // both deltas are 0.
-    let bytes = [0x28_u8]; // same minimal stream
+    // The DC predictor (`decoder.last_dc`) carries across
+    // consecutive MCUs of one packet and `reset_dc` zeros it
+    // between packets. A zero-delta stream therefore reproduces
+    // whatever the predictor currently holds: seed it with a
+    // non-zero value and the decoded block must differ from the
+    // from-zero baseline, stay identical on the next call (carry),
+    // and return to the baseline after `reset_dc`.
+    const SEEDED_DC: f32 = 42.0;
+    let bytes = [0x28_u8]; // minimal zero-delta stream
     let mut decoder = JpegDecoder::new();
     let mut bit_offset = 0_usize;
     let dqt = fill_dqt(QUALITY_LOWER_BRANCH);
-    let block_a = decoder
+    let baseline = decoder
         .decode_mcu(&bytes, &mut bit_offset, &dqt)
-        .expect("first MCU");
+        .expect("baseline MCU");
+
+    decoder.last_dc = SEEDED_DC;
     bit_offset = 0;
-    let block_b = decoder
+    let seeded_a = decoder
         .decode_mcu(&bytes, &mut bit_offset, &dqt)
-        .expect("second MCU");
-    assert_eq!(block_a, block_b, "DC=0 streams must match exactly");
-    // Now write a non-zero DC and confirm reset clears the
-    // predictor for the third call.
-    decoder.last_dc = 42.0;
+        .expect("seeded MCU");
+    assert_ne!(
+        seeded_a, baseline,
+        "a non-zero predictor must shift the block"
+    );
+    bit_offset = 0;
+    let seeded_b = decoder
+        .decode_mcu(&bytes, &mut bit_offset, &dqt)
+        .expect("carried MCU");
+    assert_eq!(
+        seeded_a, seeded_b,
+        "the predictor carries across decode_mcu calls"
+    );
+
     decoder.reset_dc();
     bit_offset = 0;
-    let block_c = decoder
+    let after_reset = decoder
         .decode_mcu(&bytes, &mut bit_offset, &dqt)
         .expect("post-reset MCU");
     assert_eq!(
-        block_c, block_a,
+        after_reset, baseline,
         "post-reset MCU must match the from-zero baseline"
     );
 }

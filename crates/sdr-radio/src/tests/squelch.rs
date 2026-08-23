@@ -1,13 +1,21 @@
 use super::*;
 
+/// A squelch threshold no real signal reaches (dB), a near-silent
+/// input well below it, and the residual the muted output may carry.
+const SQUELCH_VERY_HIGH_DB: f32 = 10.0;
+const SQUELCH_QUIET_INPUT_AMPLITUDE: f32 = 0.001;
+const SQUELCH_TEST_INPUT_SAMPLES: usize = 500;
+const SQUELCH_TEST_OUTPUT_CAPACITY: usize = 1000;
+const SQUELCH_MUTED_PEAK_LIMIT: f32 = 0.01;
+
 #[test]
 fn test_radio_module_squelch() {
     let mut radio = RadioModule::with_default_rate().unwrap();
     radio.set_squelch_enabled(true);
-    radio.set_squelch(10.0); // very high threshold
+    radio.set_squelch(SQUELCH_VERY_HIGH_DB);
 
-    let input = vec![Complex::new(0.001, 0.0); 500];
-    let mut output = vec![Stereo::default(); 1000];
+    let input = vec![Complex::new(SQUELCH_QUIET_INPUT_AMPLITUDE, 0.0); SQUELCH_TEST_INPUT_SAMPLES];
+    let mut output = vec![Stereo::default(); SQUELCH_TEST_OUTPUT_CAPACITY];
     let count = radio.process(&input, &mut output).unwrap();
     assert!(count > 0);
     // All output should be near zero (squelch closed)
@@ -15,7 +23,10 @@ fn test_radio_module_squelch() {
         .iter()
         .map(|s| s.l.abs().max(s.r.abs()))
         .fold(0.0_f32, f32::max);
-    assert!(peak < 0.01, "squelch should mute output, peak = {peak}");
+    assert!(
+        peak < SQUELCH_MUTED_PEAK_LIMIT,
+        "squelch should mute output, peak = {peak}"
+    );
 }
 
 /// #734 — the speaker stays hard-muted while the power squelch is

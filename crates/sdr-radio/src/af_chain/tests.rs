@@ -12,30 +12,41 @@ fn test_af_chain_passthrough_same_rate() {
     assert_eq!(output[0].r, -0.5);
 }
 
+/// WFM AF rate in, audio rate out: 2500 samples → ~480 out
+/// (2500 · 48000 / 250000); the bounds allow filter warm-up and
+/// block-boundary slack.
+const WFM_AF_RATE_HZ: f64 = 250_000.0;
+const AUDIO_RATE_HZ: f64 = 48_000.0;
+const DOWNSAMPLE_INPUT_SAMPLES: usize = 2500;
+const DOWNSAMPLE_MIN_OUTPUT: usize = 350;
+const DOWNSAMPLE_MAX_OUTPUT: usize = 600;
+/// CW AF rate in: 300 samples → ~4800 out (300 · 48000 / 3000).
+const CW_AF_RATE_HZ: f64 = 3_000.0;
+const UPSAMPLE_INPUT_SAMPLES: usize = 300;
+const UPSAMPLE_OUTPUT_CAPACITY: usize = 6000;
+const UPSAMPLE_MIN_OUTPUT: usize = 4000;
+const UPSAMPLE_MAX_OUTPUT: usize = 5600;
+
 #[test]
 fn test_af_chain_resample_downsample() {
-    // 250kHz (WFM AF rate) -> 48kHz
-    let mut chain = AfChain::new(250_000.0, 48_000.0).unwrap();
-    let input = vec![Stereo::new(1.0, -1.0); 2500];
-    let mut output = vec![Stereo::default(); 2500];
+    let mut chain = AfChain::new(WFM_AF_RATE_HZ, AUDIO_RATE_HZ).unwrap();
+    let input = vec![Stereo::new(1.0, -1.0); DOWNSAMPLE_INPUT_SAMPLES];
+    let mut output = vec![Stereo::default(); DOWNSAMPLE_INPUT_SAMPLES];
     let count = chain.process(&input, &mut output).unwrap();
-    // Should produce roughly 2500 * 48000/250000 = 480 samples
     assert!(
-        count >= 350 && count <= 600,
+        (DOWNSAMPLE_MIN_OUTPUT..=DOWNSAMPLE_MAX_OUTPUT).contains(&count),
         "expected ~480 samples, got {count}"
     );
 }
 
 #[test]
 fn test_af_chain_resample_upsample() {
-    // 3kHz (CW AF rate) -> 48kHz
-    let mut chain = AfChain::new(3_000.0, 48_000.0).unwrap();
-    let input = vec![Stereo::new(0.5, 0.5); 300];
-    let mut output = vec![Stereo::default(); 6000];
+    let mut chain = AfChain::new(CW_AF_RATE_HZ, AUDIO_RATE_HZ).unwrap();
+    let input = vec![Stereo::new(0.5, 0.5); UPSAMPLE_INPUT_SAMPLES];
+    let mut output = vec![Stereo::default(); UPSAMPLE_OUTPUT_CAPACITY];
     let count = chain.process(&input, &mut output).unwrap();
-    // Should produce roughly 300 * 48000/3000 = 4800 samples
     assert!(
-        count >= 4000 && count <= 5600,
+        (UPSAMPLE_MIN_OUTPUT..=UPSAMPLE_MAX_OUTPUT).contains(&count),
         "expected ~4800 samples, got {count}"
     );
 }
@@ -572,6 +583,10 @@ fn test_voice_squelch_and_gates_with_ctcss() {
     let mut output = vec![Stereo::default(); VS_LONG_BLOCK_SAMPLES];
     chain.process(&input, &mut output).unwrap();
 
+    assert!(
+        chain.voice_squelch_open(),
+        "test premise: the strong in-band tone opens the voice gate"
+    );
     assert!(
         !chain.ctcss_sustained(),
         "CTCSS should stay closed without a 100 Hz sub-audible tone"

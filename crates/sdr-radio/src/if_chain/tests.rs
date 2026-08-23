@@ -20,8 +20,17 @@ const NR_SIGNAL_LEN: usize = 2 * NR_FFT_SIZE;
 const NR_TONE_BIN: f32 = 37.0;
 /// One block plus a partial remainder, so state is left buffered.
 const NR_PARTIAL_CHUNK: usize = NR_FFT_SIZE + 44;
-/// Sample-equality tolerance between two chains.
+/// Sample-equality tolerance between two chains that ran the same
+/// input. Both sides take the identical FFT / overlap-add path, so
+/// the only expected difference is f32 rounding in the 256-point
+/// transform and window arithmetic (~1e-6 relative on unit-scale
+/// samples); 1e-4 leaves two orders of headroom for that while a
+/// reset failure shows up as a wholesale block mismatch (≥ 1e-1).
 const NR_SAMPLE_TOL: f32 = 1e-4;
+
+/// Two NR FFT blocks' worth of samples — enough for the 256-point
+/// transform to run at least once with state left over.
+const NR_TWO_BLOCK_SAMPLES: usize = 512;
 
 fn nr_test_tone(len: usize) -> Vec<Complex> {
     (0..len)
@@ -164,11 +173,10 @@ fn test_if_chain_fm_if_nr_enabled() {
     chain.set_fm_if_nr_enabled(true);
     assert!(chain.fm_if_nr_enabled());
 
-    // Use a signal large enough for the FFT block size (256 default).
-    let input = vec![Complex::new(1.0, 0.0); 512];
-    let mut output = vec![Complex::default(); 512];
+    let input = vec![Complex::new(1.0, 0.0); NR_TWO_BLOCK_SAMPLES];
+    let mut output = vec![Complex::default(); NR_TWO_BLOCK_SAMPLES];
     let count = chain.process(&input, &mut output).unwrap();
-    assert_eq!(count, 512);
+    assert_eq!(count, NR_TWO_BLOCK_SAMPLES);
     // DC signal should mostly survive (peak bin = 0).
     let energy: f32 = output.iter().map(|s| s.re * s.re + s.im * s.im).sum();
     assert!(energy > 0.0, "FM IF NR should produce output");
@@ -182,10 +190,10 @@ fn test_if_chain_all_enabled() {
     chain.set_squelch_level(-50.0);
     chain.set_fm_if_nr_enabled(true);
 
-    let input = vec![Complex::new(1.0, 0.0); 512];
-    let mut output = vec![Complex::default(); 512];
+    let input = vec![Complex::new(1.0, 0.0); NR_TWO_BLOCK_SAMPLES];
+    let mut output = vec![Complex::default(); NR_TWO_BLOCK_SAMPLES];
     let count = chain.process(&input, &mut output).unwrap();
-    assert_eq!(count, 512);
+    assert_eq!(count, NR_TWO_BLOCK_SAMPLES);
 }
 
 #[test]

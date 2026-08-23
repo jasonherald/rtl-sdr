@@ -25,21 +25,28 @@ fn test_radio_module_mode_switching() {
     }
 }
 
+/// NFM fixture: a 1 kHz tone at the 50 kHz NFM IF rate, 1000 samples
+/// in, 2000 stereo samples of output capacity (≈ 960 expected after
+/// the 50 k → 48 k resample).
+const NFM_IF_RATE_HZ: f32 = 50_000.0;
+const NFM_TEST_TONE_HZ: f32 = 1000.0;
+const NFM_TEST_INPUT_SAMPLES: usize = 1000;
+const NFM_TEST_OUTPUT_CAPACITY: usize = 2000;
+
 #[test]
 fn test_radio_module_process_nfm() {
     let mut radio = RadioModule::with_default_rate().unwrap();
-    // Generate FM-modulated signal
-    let input: Vec<Complex> = (0..1000)
+    radio.set_mode(DemodMode::Nfm).unwrap();
+    let input: Vec<Complex> = (0..NFM_TEST_INPUT_SAMPLES)
         .map(|i| {
-            let phase = 2.0 * PI * 1000.0 * (i as f32) / 50_000.0;
+            let phase = 2.0 * PI * NFM_TEST_TONE_HZ * (i as f32) / NFM_IF_RATE_HZ;
             Complex::new(phase.cos(), phase.sin())
         })
         .collect();
-    let mut output = vec![Stereo::default(); 2000];
+    let mut output = vec![Stereo::default(); NFM_TEST_OUTPUT_CAPACITY];
     let count = radio.process(&input, &mut output).unwrap();
-    // NFM: 50kHz -> 48kHz, so output count should be ~960
     assert!(count > 0, "should produce output");
-    assert!(count <= 2000, "should not overflow");
+    assert!(count <= NFM_TEST_OUTPUT_CAPACITY, "should not overflow");
 }
 
 #[test]
