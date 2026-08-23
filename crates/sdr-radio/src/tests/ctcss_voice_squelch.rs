@@ -135,8 +135,6 @@ fn test_radio_module_voice_squelch_persists_across_set_mode() {
         syl,
         "cached setting must re-arm on NFM re-entry"
     );
-
-    // Flip to Snr and run a NFM → WFM → NFM gauntlet.
 }
 
 /// SNR mode follows the same cache / live split, and `Off` clears both.
