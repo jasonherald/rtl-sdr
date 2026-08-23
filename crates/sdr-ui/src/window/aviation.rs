@@ -547,11 +547,7 @@ fn wire_network_output_rows(
 /// 4 Hz ACARS status/channel-row mirror tick + open-viewer button.
 /// Split out per the 50-NLOC gate (#817).
 fn wire_acars_status_tick(panel: &sidebar::aviation_panel::AviationPanel, state: &Rc<AppState>) {
-    use crate::sidebar::aviation_panel::GLYPH_IDLE;
-    use crate::sidebar::aviation_panel::GLYPH_LOCKED;
-    use crate::sidebar::aviation_panel::GLYPH_SIGNAL;
     use crate::sidebar::aviation_panel::SIDEBAR_STATUS_REFRESH_MS;
-    use sdr_acars::ChannelLockState;
 
     // Hold weak refs only so closing the window drops the panel
     // widgets and the timer self-cancels via Break on the next
@@ -588,22 +584,7 @@ fn wire_acars_status_tick(panel: &sidebar::aviation_panel::AviationPanel, state:
                 switch.set_active(enabled);
             }
 
-            // Status subtitle.
-            let total = state_for_tick.acars_total_count.get();
-            let last_label = state_for_tick
-                .acars_recent
-                .borrow()
-                .back()
-                .map(|m| format!("Last: {}", format_relative_age(m.timestamp)));
-            let subtitle = if enabled {
-                match last_label {
-                    Some(s) => format!("Decoded {total} · {s}"),
-                    None => format!("Decoded {total} · Awaiting first message"),
-                }
-            } else {
-                "Disabled".to_string()
-            };
-            status.set_subtitle(&subtitle);
+            status.set_subtitle(&acars_status_subtitle(&state_for_tick, enabled));
 
             // Per-channel rows. Read the LIVE row list each tick
             // so a region swap (which drops + recreates rows
@@ -619,19 +600,7 @@ fn wire_acars_status_tick(panel: &sidebar::aviation_panel::AviationPanel, state:
             let channel_stats = state_for_tick.acars_channel_stats.borrow();
             let rows = channel_rows_for_tick.borrow();
             for (row, ch) in rows.iter().zip(channel_stats.iter()) {
-                let glyph = match ch.lock_state {
-                    ChannelLockState::Locked => GLYPH_LOCKED,
-                    ChannelLockState::Idle => GLYPH_IDLE,
-                    ChannelLockState::Signal => GLYPH_SIGNAL,
-                };
-                row.set_title(&format!("{glyph}  {:.3} MHz", ch.freq_hz / 1_000_000.0));
-                row.set_subtitle(&format!(
-                    "{} msgs · {:.1} dB · {}",
-                    ch.msg_count,
-                    ch.level_db,
-                    ch.last_msg_at
-                        .map_or_else(|| "—".to_string(), format_relative_age)
-                ));
+                render_acars_channel_row(row, ch);
             }
             glib::ControlFlow::Continue
         },
@@ -640,6 +609,46 @@ fn wire_acars_status_tick(panel: &sidebar::aviation_panel::AviationPanel, state:
     wire_open_viewer_button(panel, state);
 
     // ─── Output-formatter widget seed + wiring (issue #578) ───
+}
+
+/// Status-row subtitle for the 4 Hz mirror tick: decode count + age
+/// of the newest message while enabled, "Disabled" otherwise.
+fn acars_status_subtitle(state: &Rc<AppState>, enabled: bool) -> String {
+    let total = state.acars_total_count.get();
+    let last_label = state
+        .acars_recent
+        .borrow()
+        .back()
+        .map(|m| format!("Last: {}", format_relative_age(m.timestamp)));
+    if enabled {
+        match last_label {
+            Some(s) => format!("Decoded {total} · {s}"),
+            None => format!("Decoded {total} · Awaiting first message"),
+        }
+    } else {
+        "Disabled".to_string()
+    }
+}
+
+/// Paint one per-channel row: lock-state glyph + frequency title and
+/// the msgs / level / age subtitle.
+fn render_acars_channel_row(row: &adw::ActionRow, ch: &sdr_acars::ChannelStats) {
+    use crate::sidebar::aviation_panel::{GLYPH_IDLE, GLYPH_LOCKED, GLYPH_SIGNAL};
+    use sdr_acars::ChannelLockState;
+
+    let glyph = match ch.lock_state {
+        ChannelLockState::Locked => GLYPH_LOCKED,
+        ChannelLockState::Idle => GLYPH_IDLE,
+        ChannelLockState::Signal => GLYPH_SIGNAL,
+    };
+    row.set_title(&format!("{glyph}  {:.3} MHz", ch.freq_hz / 1_000_000.0));
+    row.set_subtitle(&format!(
+        "{} msgs · {:.1} dB · {}",
+        ch.msg_count,
+        ch.level_db,
+        ch.last_msg_at
+            .map_or_else(|| "—".to_string(), format_relative_age)
+    ));
 }
 
 /// Open-viewer button of the Aviation panel. Split out per the
