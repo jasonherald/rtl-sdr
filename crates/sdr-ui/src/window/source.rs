@@ -431,7 +431,7 @@ pub(super) fn connect_rtl_tcp_discovery(
     /// not the selected source type.
     const DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-    wire_manage_favorites_button(panels, favorites_header, favorites);
+    wire_manage_favorites_button(panels, favorites_header);
 
     let (browser, disc_rx) = start_discovery_browser(panels);
 
@@ -510,23 +510,16 @@ pub(super) fn connect_rtl_tcp_discovery(
     // hands a clone to each row's Connect / Copy / Unstar
     // closure, so each button ends up with a single `Rc` clone
     // instead of nine weak-ref captures.
-    let favorite_row_ctx: Rc<FavoriteRowContext> = Rc::new(FavoriteRowContext {
-        popover: favorites_popover_weak.clone(),
-        favorites: Rc::clone(&favorites),
-        config: std::sync::Arc::clone(&config_for_discovery),
-        state: Rc::clone(&state),
-        hostname_row: hostname_row.downgrade(),
-        port_row: port_row.downgrade(),
-        protocol_row: protocol_row.downgrade(),
-        device_row: device_row.downgrade(),
-        role_row: role_row.downgrade(),
-        auth_key_row: auth_key_row.downgrade(),
-        expander_weak: expander_weak.clone(),
-        // Weak refs — see `FavoriteRowContext.displayed_rows`
-        // docstring for the retain-cycle reasoning.
-        displayed_rows: Rc::downgrade(&displayed_rows),
-        discovered_star_buttons: Rc::downgrade(&discovered_star_buttons),
-    });
+    let favorite_row_ctx = build_favorite_row_ctx(
+        &favorites_popover_weak,
+        &favorites,
+        &config_for_discovery,
+        &state,
+        panels,
+        &expander_weak,
+        &displayed_rows,
+        &discovered_star_buttons,
+    );
     // Seed the popover's content from the restored favorites so
     // the list is ready when the user first clicks the header
     // star, without waiting for a mutation to trigger a rebuild.
@@ -597,6 +590,44 @@ pub(super) fn connect_rtl_tcp_discovery(
 
         drain_discovery_events(&disc_rx, &displayed_rows, &expander, &favorites, &row_deps)
     });
+}
+
+/// Build the per-row action context shared by the discovery rows and
+/// the favorites popover. Split out per the 50-NLOC gate (#817).
+#[allow(clippy::too_many_arguments)]
+fn build_favorite_row_ctx(
+    favorites_popover_weak: &FavoritesPopoverWeak,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    config_for_discovery: &std::sync::Arc<sdr_config::ConfigManager>,
+    state: &Rc<AppState>,
+    panels: &SidebarPanels,
+    expander_weak: &glib::WeakRef<adw::ExpanderRow>,
+    displayed_rows: &Rc<
+        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
+    >,
+    discovered_star_buttons: &Rc<
+        RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>,
+    >,
+) -> Rc<FavoriteRowContext> {
+    Rc::new(FavoriteRowContext {
+        popover: favorites_popover_weak.clone(),
+        favorites: Rc::clone(favorites),
+        config: std::sync::Arc::clone(config_for_discovery),
+        state: Rc::clone(state),
+        hostname_row: panels.source.hostname_row.downgrade(),
+        port_row: panels.source.port_row.downgrade(),
+        protocol_row: panels.source.protocol_row.downgrade(),
+        device_row: panels.source.device_row.downgrade(),
+        role_row: panels.source.rtl_tcp_role_row.downgrade(),
+        auth_key_row: panels.source.rtl_tcp_auth_key_row.downgrade(),
+        expander_weak: expander_weak.clone(),
+        // Weak refs — see `FavoriteRowContext.displayed_rows`
+        // docstring for the retain-cycle reasoning.
+        displayed_rows: Rc::downgrade(displayed_rows),
+        discovered_star_buttons: Rc::downgrade(discovered_star_buttons),
+    })
 }
 
 /// Start the mDNS browser + event channel. Returns `None` for the
@@ -4127,13 +4158,7 @@ fn restore_last_connected_endpoint(
 
 /// "Manage favorites…" button — second entry point into the header favorites popover.
 /// Split out per the 50-NLOC gate (#817).
-fn wire_manage_favorites_button(
-    panels: &SidebarPanels,
-    favorites_header: &FavoritesHeaderHandle,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
-) {
+fn wire_manage_favorites_button(panels: &SidebarPanels, favorites_header: &FavoritesHeaderHandle) {
     // "Manage favorites…" button inside the discovered-servers
     // expander — a second entry point into the same popover as
     // the header-bar star button. Wired here because the
