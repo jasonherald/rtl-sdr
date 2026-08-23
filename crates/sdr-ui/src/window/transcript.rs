@@ -876,21 +876,14 @@ fn drain_sherpa_reload_events(
                 progress.set_visible(false);
             }
             Ok(sdr_transcription::InitEvent::Ready) => {
-                tracing::info!("sherpa host reload complete");
-                status.set_text("");
-                status.set_visible(false);
-                progress.set_visible(false);
-                reenable_reload_rows(&model_row_reload_weak, &enable_row_reload_weak);
-                // Deferred persistence: the recognizer swap
-                // succeeded, so it's now safe to save the
-                // new selection to config. If this Ready
-                // arm never fires (reload failed), config
-                // keeps the previous model idx and next
-                // startup gets a known-working recognizer.
-                config_for_this_reload.write(|v| {
-                    v[crate::sidebar::transcript_panel::KEY_SHERPA_MODEL] =
-                        serde_json::json!(persist_idx);
-                });
+                finish_reload_success(
+                    status,
+                    progress,
+                    &model_row_reload_weak,
+                    &enable_row_reload_weak,
+                    config_for_this_reload,
+                    persist_idx,
+                );
                 return Some(glib::ControlFlow::Break);
             }
             Ok(sdr_transcription::InitEvent::Failed { message }) => {
@@ -924,6 +917,29 @@ fn drain_sherpa_reload_events(
         }
     }
     None
+}
+
+/// `Ready` arm of a model reload: clear the status area, re-enable
+/// the rows, and persist the new selection. Persistence is deferred
+/// to here so a failed swap can't leave a broken model idx in config
+/// that would wedge the next startup's `init_sherpa_host`.
+#[cfg(feature = "sherpa")]
+fn finish_reload_success(
+    status: &gtk4::Label,
+    progress: &gtk4::ProgressBar,
+    model_row: &glib::WeakRef<adw::ComboRow>,
+    enable_row: &glib::WeakRef<adw::SwitchRow>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    persist_idx: usize,
+) {
+    tracing::info!("sherpa host reload complete");
+    status.set_text("");
+    status.set_visible(false);
+    progress.set_visible(false);
+    reenable_reload_rows(model_row, enable_row);
+    config.write(|v| {
+        v[crate::sidebar::transcript_panel::KEY_SHERPA_MODEL] = serde_json::json!(persist_idx);
+    });
 }
 
 /// Terminal-failure UI for a model reload: error text on the status
