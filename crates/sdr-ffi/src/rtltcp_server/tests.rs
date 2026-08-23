@@ -431,8 +431,28 @@ fn stats_to_c_packs_aggregate_counters() {
     assert_eq!(c.gain_count, TEST_TUNER_GAIN_COUNT);
 }
 
+/// A `ClientInfo` with nothing recorded yet — the base every
+/// projection test overrides a few fields of.
+fn bare_client_info() -> ClientInfo {
+    ClientInfo {
+        id: TEST_CLIENT_ID,
+        peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
+        connected_since: std::time::Instant::now(),
+        codec: sdr_server_rtltcp::codec::Codec::None,
+        role: sdr_server_rtltcp::extension::Role::Control,
+        bytes_sent: 0,
+        buffers_dropped: 0,
+        last_command: None,
+        current_freq_hz: None,
+        current_sample_rate_hz: None,
+        current_gain_tenths_db: None,
+        current_gain_auto: None,
+        recent_commands: std::collections::VecDeque::new(),
+    }
+}
+
 #[test]
-fn client_info_to_c_preserves_independent_gain_validity() {
+fn client_info_to_c_with_nothing_recorded_reports_nothing() {
     // Four-state matrix for the two gain Options on
     // `ClientInfo`. Pins the "don't collapse into a single
     // `has_current_gain` bit" behavior that shipped on the
@@ -440,20 +460,15 @@ fn client_info_to_c_preserves_independent_gain_validity() {
     // now preserved per-client.
     use sdr_server_rtltcp::codec::Codec;
     let snapshot_at = std::time::Instant::now();
-    let mut info = ClientInfo {
+    let info = ClientInfo {
         id: TEST_CLIENT_ID,
         peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
-        connected_since: std::time::Instant::now(),
         codec: Codec::Lz4,
         role: sdr_server_rtltcp::extension::Role::Control,
         bytes_sent: TEST_CLIENT_BYTES_SENT,
         buffers_dropped: TEST_CLIENT_BUFFERS_DROPPED,
         last_command: None,
-        current_freq_hz: None,
-        current_sample_rate_hz: None,
-        current_gain_tenths_db: None,
-        current_gain_auto: None,
-        recent_commands: std::collections::VecDeque::new(),
+        ..bare_client_info()
     };
 
     // (None, None) → neither set
@@ -489,6 +504,14 @@ fn client_info_to_c_preserves_independent_gain_validity() {
     assert!(age_is_zero);
 
     // (Some(v), None) → value set, mode unknown
+}
+
+/// `has_current_gain_value` and `has_current_gain_mode` are projected
+/// independently from the two `Option`s.
+#[test]
+fn client_info_to_c_projects_gain_value_and_mode_independently() {
+    let snapshot_at = std::time::Instant::now();
+    let mut info = bare_client_info();
     info.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
     info.current_gain_auto = None;
     let c = client_info_to_c(&info, snapshot_at);
@@ -552,7 +575,6 @@ fn client_info_to_c_projects_last_command_fields() {
     let info = ClientInfo {
         id: TEST_CLIENT_ID,
         peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
-        connected_since: std::time::Instant::now(),
         codec: Codec::None,
         role: sdr_server_rtltcp::extension::Role::Control,
         bytes_sent: 0,
@@ -561,11 +583,7 @@ fn client_info_to_c_projects_last_command_fields() {
         // documented opcode — a projection bug that truncates
         // to a smaller `u8` range would still surface here.
         last_command: Some((CommandOp::SetBiasTee, dispatched_at)),
-        current_freq_hz: None,
-        current_sample_rate_hz: None,
-        current_gain_tenths_db: None,
-        current_gain_auto: None,
-        recent_commands: std::collections::VecDeque::new(),
+        ..bare_client_info()
     };
     let c = client_info_to_c(&info, snapshot_at);
     assert!(c.has_last_command);
@@ -606,17 +624,12 @@ fn client_info_to_c_peer_addr_is_nul_terminated() {
     let info = ClientInfo {
         id: 1,
         peer: SocketAddr::from((TEST_CLIENT_PEER_IP, TEST_CLIENT_PEER_PORT)),
-        connected_since: std::time::Instant::now(),
         codec: Codec::None,
         role: sdr_server_rtltcp::extension::Role::Control,
         bytes_sent: 0,
         buffers_dropped: 0,
         last_command: None,
-        current_freq_hz: None,
-        current_sample_rate_hz: None,
-        current_gain_tenths_db: None,
-        current_gain_auto: None,
-        recent_commands: std::collections::VecDeque::new(),
+        ..bare_client_info()
     };
     let c = client_info_to_c(&info, std::time::Instant::now());
     // Find the NUL byte and decode what's before. `c_char`
@@ -649,17 +662,12 @@ fn client_info_to_c_projects_listen_role() {
     let info = ClientInfo {
         id: TEST_CLIENT_ID,
         peer: SocketAddr::from(([127, 0, 0, 1], TEST_CLIENT_GAIN_PEER_PORT)),
-        connected_since: std::time::Instant::now(),
         codec: Codec::None,
         role: sdr_server_rtltcp::extension::Role::Listen,
         bytes_sent: 0,
         buffers_dropped: 0,
         last_command: None,
-        current_freq_hz: None,
-        current_sample_rate_hz: None,
-        current_gain_tenths_db: None,
-        current_gain_auto: None,
-        recent_commands: std::collections::VecDeque::new(),
+        ..bare_client_info()
     };
     let c = client_info_to_c(&info, std::time::Instant::now());
     assert_eq!(c.role, sdr_server_rtltcp::extension::Role::Listen.to_wire());
