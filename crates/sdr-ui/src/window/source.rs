@@ -427,7 +427,6 @@ pub(super) fn connect_rtl_tcp_discovery(
     // the window alive after close — upgrade() returns None on a
     // destroyed widget and the poller breaks out.
     let expander_weak = panels.source.rtl_tcp_discovered_row.downgrade();
-    let state = Rc::clone(state);
     // Shared config handle — the Connect button on each discovered
     // row clones it once more inside the closure so it can persist
     // a `LastConnectedServer` snapshot on click.
@@ -465,7 +464,7 @@ pub(super) fn connect_rtl_tcp_discovery(
         &FavoritesPopoverWeak::from_header(favorites_header),
         &favorites,
         &config_for_discovery,
-        &state,
+        state,
         panels,
         &expander_weak,
         &displayed_rows,
@@ -477,7 +476,7 @@ pub(super) fn connect_rtl_tcp_discovery(
     wire_favorites_popover_refresh(favorites_header, &favorite_row_ctx);
 
     restore_last_connected_endpoint(
-        &state,
+        state,
         &config_for_discovery,
         &panels.source.hostname_row,
         &panels.source.port_row,
@@ -486,7 +485,7 @@ pub(super) fn connect_rtl_tcp_discovery(
 
     let row_deps = build_row_deps(
         panels,
-        &state,
+        state,
         &config_for_discovery,
         &favorite_row_ctx,
         &discovered_star_buttons,
