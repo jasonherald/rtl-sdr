@@ -219,6 +219,8 @@ sherpa-onnx = { git = "https://github.com/jasonherald/sherpa-onnx.git", rev = "6
 # System directories / libc
 dirs-next = "2"
 libc = "0.2"
+# Safe socket-option access (keepalive tuning) — replaces raw `libc::setsockopt`.
+socket2 = { version = "0.6", features = ["all"] }
 
 # Satellite tracking (sdr-sat). The `sgp4` crate is the de-facto
 # pure-Rust port of Vallado's SGP4/SDP4 (matches the reference C++

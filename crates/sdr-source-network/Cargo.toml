@@ -19,7 +19,7 @@ thiserror.workspace = true
 tracing.workspace = true
 # SO_KEEPALIVE via setsockopt (see rtl_tcp.rs). Matches the pattern used
 # in sdr-server-rtltcp and sdr-transcription.
-libc.workspace = true
+socket2.workspace = true
 
 [lints]
 workspace = true
