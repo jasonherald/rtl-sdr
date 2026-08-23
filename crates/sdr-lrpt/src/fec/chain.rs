@@ -224,9 +224,11 @@ impl FecChain {
     /// Push one soft i8 symbol pair (one Viterbi-encoded bit's
     /// worth from the demod). Returns `Some(VCDU bytes)` on the
     /// call that completes a successful CADU decode; otherwise
-    /// `None`. Failed RS decodes are silently dropped — the
-    /// chain returns to hunting for the next ASM (without losing
-    /// rotation lock).
+    /// `None`. A failed RS decode is dropped and the chain hunts
+    /// for the next ASM with the rotation lock kept; after
+    /// [`REHUNT_AFTER_FAILED_CADUS`] consecutive failures (or
+    /// [`REHUNT_AFTER_SILENT_BITS`] bits without a frame-sync hit)
+    /// the lock is abandoned and the rotation is re-hunted (#727).
     pub fn push_symbol(&mut self, soft: [i8; 2]) -> Option<Vec<u8>> {
         // Differential pre-decode on the raw soft stream, before
         // sync correlation and Viterbi (dbdexter `decode.c`: the
