@@ -46,15 +46,34 @@ use crate::lrpt_image::LrptImage;
 /// LOS snapshot is taken before any reset (#725).
 const STALE_GROUP_FLUSH_SECONDS: u64 = 2;
 
+/// Per-satellite LRPT downlink profile: the modulation the demod
+/// runs and whether the FEC chain applies differential pre-decoding
+/// (#730). Built by the wiring layer from `KnownSatellite`'s
+/// `lrpt_modulation` / `lrpt_differential` catalog fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LrptDownlink {
+    /// QPSK (legacy METEOR-M N2) or OQPSK (METEOR-M2 3 / M2-4).
+    pub mode: LrptMode,
+    /// Differential precoding (legacy METEOR-M N2 only).
+    pub differential: bool,
+}
+
+impl LrptDownlink {
+    /// Profile from its two dimensions.
+    #[must_use]
+    pub const fn new(mode: LrptMode, differential: bool) -> Self {
+        Self { mode, differential }
+    }
+}
+
 pub struct LrptDecoder {
     demod: LrptDemod,
     pipeline: LrptPipeline,
     image: LrptImage,
-    /// Modulation the decoder was built for. Stored so
-    /// [`Self::reset`] can re-construct the inner demod chain in
-    /// the same mode without the caller having to plumb the
-    /// modulation through a second time.
-    mode: LrptMode,
+    /// Downlink profile the decoder was built for. Stored so
+    /// [`Self::reset`] can re-construct the inner chains the same
+    /// way without the caller having to plumb it through again.
+    downlink: LrptDownlink,
     /// Per-APID watermark — the last `channel.lines` count we
     /// pushed into the shared `LrptImage`. Indexed by APID
     /// (16-bit) since that's the identifier the demux stamps
@@ -70,21 +89,23 @@ pub struct LrptDecoder {
 
 impl LrptDecoder {
     /// Build a fresh decoder around the given shared image and
-    /// modulation. METEOR-M N2 is QPSK; METEOR-M2 3 / METEOR-M2 4
-    /// are OQPSK — the mode picks which inner demod chain runs
-    /// (per [`LrptDemod::new_with_mode`]).
+    /// downlink profile. METEOR-M N2 is QPSK with differential
+    /// precoding; METEOR-M2 3 / METEOR-M2 4 are OQPSK without — the
+    /// mode picks the inner demod chain (per
+    /// [`LrptDemod::new_with_mode`]) and the precoding flag picks
+    /// the FEC chain (per [`LrptPipeline::new_with_differential`]).
     ///
     /// # Errors
     ///
     /// Returns `DspError::InvalidParameter` if the underlying
     /// [`LrptDemod`] constructor rejects its parameters
     /// (practically unreachable — see that constructor's docs).
-    pub fn new(image: LrptImage, mode: LrptMode) -> Result<Self, DspError> {
+    pub fn new(image: LrptImage, downlink: LrptDownlink) -> Result<Self, DspError> {
         Ok(Self {
-            demod: LrptDemod::new_with_mode(mode)?,
-            pipeline: LrptPipeline::new(),
+            demod: LrptDemod::new_with_mode(downlink.mode)?,
+            pipeline: LrptPipeline::new_with_differential(downlink.differential),
             image,
-            mode,
+            downlink,
             last_pushed_lines: HashMap::new(),
             seen_lines: HashMap::new(),
             samples_since_growth: HashMap::new(),
@@ -217,8 +238,14 @@ impl LrptDecoder {
     ///
     /// Returns `DspError` if the demod re-construction fails
     /// (see [`LrptDemod::new`]).
+    /// Downlink profile this decoder was built for.
+    #[must_use]
+    pub fn downlink(&self) -> LrptDownlink {
+        self.downlink
+    }
+
     pub fn reset(&mut self) -> Result<(), DspError> {
-        self.demod = LrptDemod::new_with_mode(self.mode)?;
+        self.demod = LrptDemod::new_with_mode(self.downlink.mode)?;
         self.pipeline.reset();
         self.image.clear();
         self.last_pushed_lines.clear();
@@ -242,7 +269,21 @@ mod tests {
     #[test]
     fn lrpt_decoder_constructible() {
         let image = LrptImage::new();
-        let _decoder = LrptDecoder::new(image, LrptMode::Qpsk).expect("LrptDemod must construct");
+        let _decoder = LrptDecoder::new(image, LrptDownlink::new(LrptMode::Qpsk, false))
+            .expect("LrptDemod must construct");
+    }
+
+    /// The decoder builds its FEC chain from the downlink profile's
+    /// precoding flag, not a hard-coded `false` (#730).
+    #[test]
+    fn decoder_honours_the_profiles_differential_precoding() {
+        let plain = LrptDecoder::new(LrptImage::new(), LrptDownlink::new(LrptMode::Oqpsk, false))
+            .expect("construct");
+        assert!(!plain.pipeline.is_differential());
+        let diff = LrptDecoder::new(LrptImage::new(), LrptDownlink::new(LrptMode::Oqpsk, true))
+            .expect("construct");
+        assert!(diff.pipeline.is_differential());
+        assert_eq!(diff.downlink(), LrptDownlink::new(LrptMode::Oqpsk, true));
     }
 
     #[test]
@@ -251,7 +292,8 @@ mod tests {
         // image lines. The decoder should run cleanly and the
         // shared image should stay empty.
         let image = LrptImage::new();
-        let mut decoder = LrptDecoder::new(image.clone(), LrptMode::Qpsk).unwrap();
+        let mut decoder =
+            LrptDecoder::new(image.clone(), LrptDownlink::new(LrptMode::Qpsk, false)).unwrap();
         let zeros = vec![Complex::default(); 1_000];
         decoder.process(&zeros);
         assert!(image.snapshot_channel(APID_TEST).is_none());
@@ -275,7 +317,8 @@ mod tests {
         // an empty pipeline harvests nothing on the first
         // call.
         let image = LrptImage::new();
-        let mut decoder = LrptDecoder::new(image.clone(), LrptMode::Qpsk).unwrap();
+        let mut decoder =
+            LrptDecoder::new(image.clone(), LrptDownlink::new(LrptMode::Qpsk, false)).unwrap();
         // Empty pipeline → empty assembler → harvest is a no-op.
         decoder.harvest_new_lines();
         assert!(decoder.last_pushed_lines.is_empty());
@@ -289,7 +332,8 @@ mod tests {
         let image = LrptImage::new();
         image.push_line(APID_TEST, &vec![42_u8; IMAGE_WIDTH]);
         assert!(image.snapshot_channel(APID_TEST).is_some());
-        let mut decoder = LrptDecoder::new(image.clone(), LrptMode::Qpsk).unwrap();
+        let mut decoder =
+            LrptDecoder::new(image.clone(), LrptDownlink::new(LrptMode::Qpsk, false)).unwrap();
         decoder.last_pushed_lines.insert(APID_TEST, 7);
         decoder.reset().expect("reset must succeed");
         assert!(decoder.last_pushed_lines.is_empty());
@@ -310,7 +354,8 @@ mod tests {
     #[test]
     fn harvest_holds_back_the_in_progress_row_group() {
         let image = LrptImage::new();
-        let mut decoder = LrptDecoder::new(image.clone(), LrptMode::Qpsk).unwrap();
+        let mut decoder =
+            LrptDecoder::new(image.clone(), LrptDownlink::new(LrptMode::Qpsk, false)).unwrap();
         let block = [[200_u8; MCU_SIDE]; MCU_SIDE];
 
         // First MCU of row group 0: the group is in progress.
@@ -355,7 +400,8 @@ mod tests {
     #[test]
     fn stale_in_progress_group_is_released_after_the_flush_timeout() {
         let image = LrptImage::new();
-        let mut decoder = LrptDecoder::new(image.clone(), LrptMode::Qpsk).unwrap();
+        let mut decoder =
+            LrptDecoder::new(image.clone(), LrptDownlink::new(LrptMode::Qpsk, false)).unwrap();
         let block = [[200_u8; MCU_SIDE]; MCU_SIDE];
         decoder
             .pipeline

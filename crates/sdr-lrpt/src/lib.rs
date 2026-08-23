@@ -223,9 +223,11 @@ impl ChannelDecoder {
 /// 892-byte buffers from the FEC stage) and accumulates imagery
 /// into the per-channel image assembler.
 ///
-/// Caller pulls images out via [`Self::assembler`] (live snapshot)
-/// or saves PNGs at LOS via [`crate::image::save_channel`] /
-/// [`crate::image::save_composite`].
+/// Callers pull imagery out via [`Self::assembler`] (live snapshot):
+/// the app's `LrptDecoder` harvests scan lines into the shared
+/// viewer image and the UI writes its own PNGs at LOS, while the
+/// replay CLI saves per-channel / composite PNGs through
+/// [`crate::image::save_channel`] / [`crate::image::save_composite`].
 pub struct LrptPipeline {
     fec: FecChain,
     demux: Demux,
@@ -273,6 +275,13 @@ impl LrptPipeline {
     #[must_use]
     pub fn fec_stats(&self) -> crate::fec::FecStats {
         self.fec.stats()
+    }
+
+    /// Whether the FEC chain runs the differential pre-decoder
+    /// (see [`Self::new_with_differential`]).
+    #[must_use]
+    pub fn is_differential(&self) -> bool {
+        self.fec.is_differential()
     }
 
     /// Push one soft-symbol pair from the QPSK demod through the

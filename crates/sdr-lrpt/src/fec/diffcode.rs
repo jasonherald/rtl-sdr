@@ -26,6 +26,11 @@
 //! `meteor_decode/diffcode/diffcode.c` (`diff_decode`, `signsqrt`)
 //! and `meteor_decode/math/int.c` (`int_sqrt`).
 
+/// Soft-symbol saturation magnitude — the largest value the slicer
+/// produces (`i8::MAX`). `signsqrt` clamps to this so the single
+/// edge case `-128 × -128 → 128` fits `i8`.
+const SOFT_SAT: i32 = 127;
+
 /// Sign-preserving integer square root used to compand the product
 /// of two soft components back into the `i8` range.
 ///
@@ -36,11 +41,6 @@
 /// dbdexter casts straight to `int8_t` and lets 128 wrap to `-128`;
 /// clamping is both safer and a no-op for every real soft sample
 /// (the demod never emits `-128`).
-/// Soft-symbol saturation magnitude — the largest value the slicer
-/// produces (`i8::MAX`). `signsqrt` clamps to this so the single
-/// edge case `-128 × -128 → 128` fits `i8`.
-const SOFT_SAT: i32 = 127;
-
 #[must_use]
 fn signsqrt(x: i32) -> i8 {
     #[allow(

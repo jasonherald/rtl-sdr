@@ -66,7 +66,19 @@ fn main() -> ExitCode {
     // Initialise tracing so the chain's `tracing::trace!` /
     // `tracing::warn!` lines surface during a replay run when
     // RUST_LOG is set.
-    tracing_subscriber::fmt::try_init().ok();
+    // Status lines go through `tracing` at `info` (stderr, no
+    // timestamps); RUST_LOG still overrides the filter to surface the
+    // chain's `debug!` / `trace!` lines (#733).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .without_time()
+        .with_target(false)
+        .try_init()
+        .ok();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 || args.len() > 4 {
@@ -78,34 +90,43 @@ fn main() -> ExitCode {
         eprintln!("input.iq:    interleaved complex<f32> @ {SAMPLE_RATE_HZ} Hz");
         eprintln!("             (or interleaved i8 soft pairs for soft / soft-diff)");
         eprintln!("output_dir:  one ch<APID>.png written per detected channel");
-        eprintln!("mode:        qpsk (current M2-3/M2-4, default) | oqpsk  — demod IQ");
+        eprintln!(
+            "mode:        oqpsk (current M2-3/M2-4, default) | qpsk (legacy M N2)  — demod IQ"
+        );
         eprintln!("             qpsk-diff | oqpsk-diff  — demod IQ + differential decode");
         eprintln!("             soft  — feed a meteor_demod .s file straight to the FEC chain");
         eprintln!("             soft-diff  — soft input + differential decode (legacy M2)");
         return ExitCode::from(USAGE_EXIT_CODE);
     }
-    // (demod mode, bypass-demod soft input?, differential precoding?)
-    let (mode, soft, differential) = match args.get(3).map(String::as_str) {
-        None | Some("qpsk") => (LrptMode::Qpsk, false, false),
-        Some("qpsk-diff") => (LrptMode::Qpsk, false, true),
-        Some("oqpsk") => (LrptMode::Oqpsk, false, false),
-        Some("oqpsk-diff") => (LrptMode::Oqpsk, false, true),
-        Some("soft") => (LrptMode::Qpsk, true, false),
-        Some("soft-diff") => (LrptMode::Qpsk, true, true),
-        Some(other) => {
-            eprintln!(
-                "error: unknown mode '{other}' (expected qpsk, qpsk-diff, oqpsk, oqpsk-diff, soft, or soft-diff)"
-            );
-            return ExitCode::from(USAGE_EXIT_CODE);
-        }
+    let Some((mode, soft, differential)) = parse_mode(args.get(3).map(String::as_str)) else {
+        eprintln!(
+            "error: unknown mode '{}' (expected qpsk, qpsk-diff, oqpsk, oqpsk-diff, soft, or soft-diff)",
+            args[3]
+        );
+        return ExitCode::from(USAGE_EXIT_CODE);
     };
-    eprintln!("mode: {mode:?} soft_input={soft} differential={differential}");
+    tracing::info!("mode: {mode:?} soft_input={soft} differential={differential}");
     match run(&args[1], &PathBuf::from(&args[2]), mode, soft, differential) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Map the optional mode argument to (demod mode, bypass-demod soft
+/// input?, differential precoding?). A bare invocation replays the
+/// current METEOR-M2 3 / M2-4 downlink: OQPSK, no precoding (#730).
+fn parse_mode(arg: Option<&str>) -> Option<(LrptMode, bool, bool)> {
+    match arg {
+        None | Some("oqpsk") => Some((LrptMode::Oqpsk, false, false)),
+        Some("oqpsk-diff") => Some((LrptMode::Oqpsk, false, true)),
+        Some("qpsk") => Some((LrptMode::Qpsk, false, false)),
+        Some("qpsk-diff") => Some((LrptMode::Qpsk, false, true)),
+        Some("soft") => Some((LrptMode::Qpsk, true, false)),
+        Some("soft-diff") => Some((LrptMode::Qpsk, true, true)),
+        Some(_) => None,
     }
 }
 
@@ -222,18 +243,24 @@ fn run(
     )]
     if soft {
         let duration_s = symbol_count as f64 / f64::from(SYMBOL_RATE_HZ);
-        eprintln!(
+        tracing::info!(
             "input: {symbol_count} soft symbol pairs ({duration_s:.1} s @ {SYMBOL_RATE_HZ} sym/s)"
         );
     } else {
         let duration_s = total_samples as f64 / f64::from(SAMPLE_RATE_HZ);
-        eprintln!("input: {total_samples} IQ samples ({duration_s:.1} s @ {SAMPLE_RATE_HZ} Hz)");
-        eprintln!("processed: {symbol_count} symbol pairs from {total_samples} IQ samples");
+        tracing::info!(
+            "input: {total_samples} IQ samples ({duration_s:.1} s @ {SAMPLE_RATE_HZ} Hz)"
+        );
+        tracing::info!("processed: {symbol_count} symbol pairs from {total_samples} IQ samples");
     }
     let st = pipeline.fec_stats();
-    eprintln!(
+    tracing::info!(
         "fec: rotation_locks={} rotation_rehunts={} sync_timeouts={} cadus_decoded={} cadus_failed={}",
-        st.rotation_locks, st.rotation_rehunts, st.sync_timeouts, st.cadus_decoded, st.cadus_failed,
+        st.rotation_locks,
+        st.rotation_rehunts,
+        st.sync_timeouts,
+        st.cadus_decoded,
+        st.cadus_failed,
     );
 
     let assembler = pipeline.assembler();
@@ -255,10 +282,10 @@ fn run(
         let path = out_dir.join(format!("ch{apid}.png"));
         match save_channel(&path, channel) {
             Ok(()) => {
-                eprintln!("saved {} ({}× lines)", path.display(), channel.lines);
+                tracing::info!("saved {} ({}× lines)", path.display(), channel.lines);
                 saved += 1;
             }
-            Err(e) => eprintln!("note: ch{apid} not saved ({e})"),
+            Err(e) => tracing::warn!("ch{apid} not saved ({e})"),
         }
     }
     let composite_path = out_dir.join("composite-rgb.png");
@@ -270,14 +297,14 @@ fn run(
         COMPOSITE_B_APID,
     ) {
         Ok(()) => {
-            eprintln!("saved {}", composite_path.display());
+            tracing::info!("saved {}", composite_path.display());
             saved += 1;
         }
-        Err(e) => eprintln!(
-            "note: composite-rgb (APIDs {COMPOSITE_R_APID}/{COMPOSITE_G_APID}/{COMPOSITE_B_APID}) not saved ({e})"
+        Err(e) => tracing::warn!(
+            "composite-rgb (APIDs {COMPOSITE_R_APID}/{COMPOSITE_G_APID}/{COMPOSITE_B_APID}) not saved ({e})"
         ),
     }
-    eprintln!("total: {saved} PNGs in {}", out_dir.display());
+    tracing::info!("total: {saved} PNGs in {}", out_dir.display());
     if saved == 0 {
         let input_kind = if soft {
             "soft-symbol input"
@@ -289,4 +316,30 @@ fn run(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The current Meteor-M2 birds are OQPSK without differential
+    /// precoding, so that is what a bare invocation replays (#730);
+    /// the legacy soft-file path keeps its explicit `-diff` form.
+    #[test]
+    fn default_mode_is_oqpsk_without_precoding() {
+        assert_eq!(parse_mode(None), Some((LrptMode::Oqpsk, false, false)));
+        assert_eq!(
+            parse_mode(Some("oqpsk")),
+            Some((LrptMode::Oqpsk, false, false))
+        );
+        assert_eq!(
+            parse_mode(Some("qpsk-diff")),
+            Some((LrptMode::Qpsk, false, true))
+        );
+        assert_eq!(
+            parse_mode(Some("soft-diff")),
+            Some((LrptMode::Qpsk, true, true))
+        );
+        assert_eq!(parse_mode(Some("bogus")), None);
+    }
 }

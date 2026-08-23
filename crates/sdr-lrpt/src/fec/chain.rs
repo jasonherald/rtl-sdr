@@ -221,6 +221,12 @@ impl FecChain {
         self.stats
     }
 
+    /// Whether the chain runs the differential pre-decoder.
+    #[must_use]
+    pub fn is_differential(&self) -> bool {
+        self.diff.is_some()
+    }
+
     /// Push one soft i8 symbol pair (one Viterbi-encoded bit's
     /// worth from the demod). Returns `Some(VCDU bytes)` on the
     /// call that completes a successful CADU decode; otherwise
@@ -316,11 +322,10 @@ impl FecChain {
     }
 
     /// Currently-locked rotation, or `None` while the chain is
-    /// still hunting. Exposed for diagnostics / future status-bar
-    /// readouts; the FEC chain itself routes the rotation
-    /// internally.
-    #[must_use]
-    pub fn locked_rotation(&self) -> Option<Rotation> {
+    /// still hunting. Test-only: the chain routes the rotation
+    /// internally and nothing in production reads it (#733).
+    #[cfg(test)]
+    fn locked_rotation(&self) -> Option<Rotation> {
         match self.state {
             State::Locked { rotation, .. } => Some(rotation),
             State::HuntingRotation => None,

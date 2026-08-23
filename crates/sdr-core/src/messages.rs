@@ -448,14 +448,16 @@ pub enum UiToDsp {
     /// next source-stop, mirroring the APT decoder's
     /// "decoder kept across mode toggles" behavior.
     ClearLrptImage,
-    /// Tell the DSP thread which Meteor LRPT modulation to use
-    /// for the next decoder init. METEOR-M N2 is QPSK; the
-    /// active METEOR-M2 3 / METEOR-M2 4 satellites transmit
-    /// OQPSK. Sent by the wiring layer at AOS based on the
-    /// `KnownSatellite::lrpt_modulation` catalog field. Drops
-    /// any existing LRPT decoder so the next IQ chunk re-inits
-    /// at the new modulation; safe to send mid-pass. Per #662.
-    SetLrptModulation(sdr_dsp::lrpt::LrptMode),
+    /// Tell the DSP thread which Meteor LRPT downlink profile
+    /// (modulation + differential precoding) to use for the next
+    /// decoder init. METEOR-M N2 is QPSK with differential
+    /// precoding; the active METEOR-M2 3 / METEOR-M2 4 satellites
+    /// transmit plain OQPSK. Sent by the wiring layer at AOS from
+    /// the `KnownSatellite::lrpt_modulation` / `lrpt_differential`
+    /// catalog fields. Drops any existing LRPT decoder so the next
+    /// IQ chunk re-inits with the new profile; safe to send
+    /// mid-pass. Per #662 / #730.
+    SetLrptDownlink(sdr_radio::lrpt_decoder::LrptDownlink),
     /// Hand the DSP thread a clone of the shared
     /// `sdr_radio::sstv_image::SstvImageHandle` the live SSTV
     /// viewer reads from. Sent by the wiring layer at AOS for

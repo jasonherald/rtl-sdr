@@ -22,7 +22,7 @@ use sdr_dsp::apt::{AptDecoder, AptLine, READY_QUEUE_CAP};
 use sdr_dsp::channel::RxVfo;
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::source_manager::Source;
-use sdr_radio::lrpt_decoder::LrptDecoder;
+use sdr_radio::lrpt_decoder::{LrptDecoder, LrptDownlink};
 use slowrx::SstvDecoder;
 
 use crate::sink_slot::{
@@ -612,16 +612,16 @@ struct DspState {
     /// log at the IQ block rate (~100 Hz) until source-stop.
     /// Per `CodeRabbit` round 12 on PR #543.
     lrpt_init_failed: bool,
-    /// Modulation the LRPT decoder should be built with on the
-    /// next lazy-init. Set by `UiToDsp::SetLrptModulation` from
+    /// Downlink profile the LRPT decoder should be built with on
+    /// the next lazy-init. Set by `UiToDsp::SetLrptDownlink` from
     /// the wiring layer (which knows the current satellite from
-    /// the `KnownSatellite` catalog). Defaults to OQPSK because
-    /// every active Meteor satellite (M2-3, M2-4) transmits
-    /// OQPSK — manual LRPT-mode use without a satellite-aware
-    /// caller still works for current Meteors. A change here
-    /// drops the existing decoder so the next IQ chunk re-inits
-    /// at the new modulation. Per #662.
-    lrpt_modulation: sdr_dsp::lrpt::LrptMode,
+    /// the `KnownSatellite` catalog). Defaults to plain OQPSK
+    /// because every active Meteor satellite (M2-3, M2-4)
+    /// transmits that — manual LRPT-mode use without a
+    /// satellite-aware caller still works for current Meteors. A
+    /// change here drops the existing decoder so the next IQ chunk
+    /// re-inits with the new profile. Per #662 / #730.
+    lrpt_downlink: LrptDownlink,
     /// ISS SSTV decoder. Lazy-init on first `sstv_decode_tap` call
     /// at the `RadioModule`'s current audio sample rate (typically
     /// 48 kHz). The decoder internally resamples to `11_025` Hz, so
@@ -798,7 +798,7 @@ impl DspState {
             lrpt_decoder: None,
             lrpt_image: None,
             lrpt_init_failed: false,
-            lrpt_modulation: sdr_dsp::lrpt::LrptMode::Oqpsk,
+            lrpt_downlink: LrptDownlink::new(sdr_dsp::lrpt::LrptMode::Oqpsk, false),
             sstv_decoder: None,
             sstv_mono_buf: Vec::new(),
             sstv_init_failed_at_rate: None,
@@ -920,7 +920,7 @@ fn lrpt_decode_tap(
     image: Option<&sdr_radio::lrpt_image::LrptImage>,
     radio_input: &[Complex],
     init_failed: &mut bool,
-    modulation: sdr_dsp::lrpt::LrptMode,
+    downlink: LrptDownlink,
 ) {
     let Some(image) = image else {
         return;
@@ -934,10 +934,10 @@ fn lrpt_decode_tap(
         return;
     }
     if decoder_slot.is_none() {
-        match LrptDecoder::new(image.clone(), modulation) {
+        match LrptDecoder::new(image.clone(), downlink) {
             Ok(decoder) => {
                 tracing::info!(
-                    "LRPT decoder initialised at {} Hz IF rate, modulation = {modulation:?}",
+                    "LRPT decoder initialised at {} Hz IF rate, downlink = {downlink:?}",
                     sdr_dsp::lrpt::SAMPLE_RATE_HZ
                 );
                 *decoder_slot = Some(decoder);
@@ -2631,15 +2631,15 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // same contract `ClearLrptImage` codifies (round 1).
         }
 
-        UiToDsp::SetLrptModulation(mode) => {
-            tracing::info!("LRPT modulation set to {mode:?}");
-            // Drop the existing decoder iff the modulation
-            // actually changed — re-init lazily on the next IQ
-            // chunk against the new mode. A no-op repeat (auto-
-            // record re-sending the same modulation across
-            // overlapping passes) won't cost a Viterbi reset.
-            if state.lrpt_modulation != mode {
-                state.lrpt_modulation = mode;
+        UiToDsp::SetLrptDownlink(downlink) => {
+            tracing::info!("LRPT downlink profile set to {downlink:?}");
+            // Drop the existing decoder iff the profile actually
+            // changed — re-init lazily on the next IQ chunk with
+            // the new chains. A no-op repeat (auto-record
+            // re-sending the same profile across overlapping
+            // passes) won't cost a Viterbi reset.
+            if state.lrpt_downlink != downlink {
+                state.lrpt_downlink = downlink;
                 // The harvest holds back the in-progress row group
                 // (#725); hand it to the viewer before the decoder
                 // goes away.
@@ -3898,7 +3898,7 @@ fn reset_imaging_decoders(state: &mut DspState) {
         state.lrpt_decoder = None;
     }
     // Clear the shared LRPT canvas directly rather than relying on the
-    // decoder's reset to do it: `SetLrptModulation` and the reset-Err
+    // decoder's reset to do it: `SetLrptDownlink` and the reset-Err
     // branch above leave `lrpt_decoder = None`, and a between-pass
     // reset then left pass 1's pixels for pass 2 to composite over —
     // the LOS PNG held both passes (#700). The handle itself survives
@@ -4269,7 +4269,7 @@ fn process_iq_block(
                         state.lrpt_image.as_ref(),
                         radio_input,
                         &mut state.lrpt_init_failed,
-                        state.lrpt_modulation,
+                        state.lrpt_downlink,
                     );
                 }
 
@@ -6009,11 +6009,12 @@ mod tests {
         let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
         let mut state = DspState::new(dsp_tx.clone()).unwrap();
         let image = sdr_radio::lrpt_image::LrptImage::new();
-        let mut decoder = LrptDecoder::new(image.clone(), LrptMode::Oqpsk).unwrap();
+        let mut decoder =
+            LrptDecoder::new(image.clone(), LrptDownlink::new(LrptMode::Oqpsk, false)).unwrap();
         decoder
             .assembler_mut()
             .place_mcu(APID, 0, 0, &[[200_u8; MCU_SIDE]; MCU_SIDE]);
-        state.lrpt_modulation = LrptMode::Oqpsk;
+        state.lrpt_downlink = LrptDownlink::new(LrptMode::Oqpsk, false);
         state.lrpt_image = Some(image.clone());
         state.lrpt_decoder = Some(decoder);
         assert!(
@@ -6024,12 +6025,35 @@ mod tests {
         handle_command(
             &mut state,
             &dsp_tx,
-            UiToDsp::SetLrptModulation(LrptMode::Qpsk),
+            UiToDsp::SetLrptDownlink(LrptDownlink::new(LrptMode::Qpsk, false)),
         );
 
         assert!(state.lrpt_decoder.is_none(), "decoder dropped for re-init");
         let snap = image.snapshot_channel(APID).expect("pending group flushed");
         assert_eq!(snap.lines, MCU_SIDE);
+    }
+
+    /// A precoding change alone (same modulation) also drops the
+    /// decoder so the next init builds the right FEC chain (#730).
+    #[test]
+    fn lrpt_precoding_change_drops_the_decoder() {
+        use sdr_dsp::lrpt::LrptMode;
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let image = sdr_radio::lrpt_image::LrptImage::new();
+        state.lrpt_downlink = LrptDownlink::new(LrptMode::Oqpsk, false);
+        state.lrpt_decoder = Some(LrptDecoder::new(image.clone(), state.lrpt_downlink).unwrap());
+        state.lrpt_image = Some(image);
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetLrptDownlink(LrptDownlink::new(LrptMode::Oqpsk, true)),
+        );
+        assert!(state.lrpt_decoder.is_none(), "decoder dropped for re-init");
+        assert_eq!(
+            state.lrpt_downlink,
+            LrptDownlink::new(LrptMode::Oqpsk, true)
+        );
     }
 
     #[test]

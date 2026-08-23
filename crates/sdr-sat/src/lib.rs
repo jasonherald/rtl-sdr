@@ -370,6 +370,14 @@ pub struct KnownSatellite {
     /// #662 — investigation showed our hardcoded-QPSK pipeline
     /// can't cleanly demodulate OQPSK signals.
     pub lrpt_modulation: Option<LrptModulation>,
+    /// Whether this satellite's LRPT downlink is differentially
+    /// precoded (the FEC chain runs dbdexter's `diff_decode` on the
+    /// soft symbols before Viterbi). The legacy METEOR-M N2 used
+    /// differential precoding; the current METEOR-M2 3 / M2-4 use
+    /// plain concatenated coding. Part of the downlink profile so
+    /// the live decoder and the replay CLI build the same chain
+    /// (#730). Meaningless (`false`) for non-LRPT entries.
+    pub lrpt_differential: bool,
 }
 
 impl KnownSatellite {
@@ -470,6 +478,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // Current-generation METEOR-M2 satellites broadcast
         // Offset QPSK at 72 ksym/s. Per #662.
         lrpt_modulation: Some(LrptModulation::Oqpsk),
+        lrpt_differential: false,
     },
     KnownSatellite {
         // METEOR-M2 4 launched in 2024 and is actively transmitting
@@ -499,6 +508,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         expected_lrpt_apids: Some(METEOR_M2_4_EXPECTED_LRPT_APIDS),
         // Same OQPSK modulation as M2-3. Per #662.
         lrpt_modulation: Some(LrptModulation::Oqpsk),
+        lrpt_differential: false,
     },
     // ISS SSTV — epic #472. Currently 437.550 MHz UHF (ARISS Series
     // 31+, April 2026 onward, see #638); the catalog tracks the live
@@ -527,6 +537,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // apply.
         expected_lrpt_apids: None,
         lrpt_modulation: None,
+        lrpt_differential: false,
     },
     // Amateur-radio voice satellites — #649. Pure pass-prediction
     // entries: the user manually tunes / listens via the existing
@@ -566,6 +577,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         imaging_protocol: None,
         expected_lrpt_apids: None,
         lrpt_modulation: None,
+        lrpt_differential: false,
     },
     KnownSatellite {
         // SaudiSat-1C (SO-50). Single-channel FM voice repeater:
@@ -581,6 +593,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         imaging_protocol: None,
         expected_lrpt_apids: None,
         lrpt_modulation: None,
+        lrpt_differential: false,
     },
     KnownSatellite {
         // PO-101 (Diwata-2 / Philippines). FM voice repeater +
@@ -599,6 +612,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         imaging_protocol: None,
         expected_lrpt_apids: None,
         lrpt_modulation: None,
+        lrpt_differential: false,
     },
 ];
 
@@ -756,6 +770,24 @@ mod tests {
             Some(LrptModulation::Oqpsk),
             "METEOR-M2 4 transmits OQPSK; QPSK demod cannot decode it cleanly",
         );
+    }
+
+    /// Differential precoding is part of the downlink profile (#730):
+    /// the current Meteor-M2 birds use plain concatenated coding, so
+    /// the live decoder must not run the differential pre-decoder.
+    #[test]
+    fn meteor_downlinks_are_not_differentially_precoded() {
+        for norad_id in [METEOR_M2_3_NORAD_ID, METEOR_M2_4_NORAD_ID] {
+            let sat = KNOWN_SATELLITES
+                .iter()
+                .find(|s| s.norad_id == norad_id)
+                .expect("Meteor in KNOWN_SATELLITES");
+            assert!(
+                !sat.lrpt_differential,
+                "{}: no differential precoding",
+                sat.name
+            );
+        }
     }
 
     #[test]

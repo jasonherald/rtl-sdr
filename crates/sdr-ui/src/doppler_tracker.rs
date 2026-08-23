@@ -308,6 +308,7 @@ mod tests {
         // Doppler tracker tests don't read this field.
         expected_lrpt_apids: None,
         lrpt_modulation: None,
+        lrpt_differential: false,
     };
     static FIXTURE_B: KnownSatellite = KnownSatellite {
         name: "TEST_SAT_B",
@@ -318,6 +319,7 @@ mod tests {
         imaging_protocol: Some(sdr_sat::ImagingProtocol::Apt),
         expected_lrpt_apids: None,
         lrpt_modulation: None,
+        lrpt_differential: false,
     };
     static FIXTURE_C: KnownSatellite = KnownSatellite {
         name: "TEST_SAT_C",
@@ -328,6 +330,7 @@ mod tests {
         imaging_protocol: Some(sdr_sat::ImagingProtocol::Apt),
         expected_lrpt_apids: None,
         lrpt_modulation: None,
+        lrpt_differential: false,
     };
 
     fn noaa_15() -> &'static KnownSatellite {
