@@ -106,7 +106,7 @@ fn audio_recording_start_stop_round_trip() {
         metadata.len() >= WAV_HEADER_BYTES,
         "audio recording should finalize at least a WAV header"
     );
-    std::fs::remove_file(&tmp).unwrap();
+    // `_tmp_dir` removes the file with the directory when it drops.
     destroy(h);
 }
 

@@ -502,8 +502,6 @@ fn client_info_to_c_with_nothing_recorded_reports_nothing() {
     )]
     let age_is_zero = c.last_command_age_secs == 0.0;
     assert!(age_is_zero);
-
-    // (Some(v), None) → value set, mode unknown
 }
 
 /// `has_current_gain_value` and `has_current_gain_mode` are projected
@@ -511,6 +509,7 @@ fn client_info_to_c_with_nothing_recorded_reports_nothing() {
 #[test]
 fn client_info_to_c_projects_gain_value_and_mode_independently() {
     let snapshot_at = std::time::Instant::now();
+    // (Some(v), None) → value set, mode unknown
     let mut info = bare_client_info();
     info.current_gain_tenths_db = Some(TEST_NONZERO_GAIN_TENTHS);
     info.current_gain_auto = None;
