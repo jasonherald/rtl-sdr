@@ -74,8 +74,26 @@ pub const ASM_ENCODED_BITS: usize = 64;
 pub const SOFT_SYNC_AGREEMENT_NUM: i32 = 55;
 
 /// Denominator of the agreement fraction (window length in
-/// samples, as in medet's 64-bit correlator).
+/// samples, as in medet's 64-bit correlator). Pinned to
+/// [`ASM_ENCODED_BITS`] below.
 pub const SOFT_SYNC_AGREEMENT_DEN: i32 = 64;
+const _: () = assert!(
+    ASM_ENCODED_BITS == 64,
+    "agreement denominator is the window length"
+);
+
+/// Soft magnitude at or above which a window sample counts as
+/// evidence for the [`SOFT_SYNC_MIN_SIGNIFICANT_SAMPLES`] gate.
+pub const SOFT_SYNC_SIGNIFICANT_MAGNITUDE: i8 = 8;
+
+/// Minimum number of window samples at or above
+/// [`SOFT_SYNC_SIGNIFICANT_MAGNITUDE`] before a lock is declared
+/// (48 of 64). The energy-relative agreement is invariant to how
+/// the energy is distributed, so a handful of saturated spikes
+/// among near-zero samples — reachable at pass edges and after a
+/// dropout — would otherwise "agree" with some pattern by
+/// construction (CR on PR #804). Real demod output is dense.
+pub const SOFT_SYNC_MIN_SIGNIFICANT_SAMPLES: usize = 48;
 
 /// Energy floor below which no lock is declared: a mean soft
 /// magnitude under 8 (`8 · 64 = 512` total over the window) is
@@ -315,10 +333,8 @@ impl SoftSyncDetector {
     fn best_match(&self) -> Option<Rotation> {
         let mut best_idx: usize = 0;
         let mut best_score: i32 = i32::MIN;
-        let energy: i32 = (0..ASM_ENCODED_BITS)
-            .map(|j| i32::from(self.window[(self.head + j) % ASM_ENCODED_BITS]).abs())
-            .sum();
-        if energy < SOFT_SYNC_MIN_ENERGY {
+        let (energy, significant) = self.window_evidence();
+        if energy < SOFT_SYNC_MIN_ENERGY || significant < SOFT_SYNC_MIN_SIGNIFICANT_SAMPLES {
             return None;
         }
         for (idx, pattern) in self.patterns.iter().enumerate() {
@@ -341,6 +357,20 @@ impl SoftSyncDetector {
         } else {
             None
         }
+    }
+}
+
+impl SoftSyncDetector {
+    /// Total soft energy `Σ |sample|` of the window and the number
+    /// of samples at or above [`SOFT_SYNC_SIGNIFICANT_MAGNITUDE`].
+    fn window_evidence(&self) -> (i32, usize) {
+        self.window.iter().fold((0, 0), |(energy, count), &sample| {
+            let magnitude = i32::from(sample).abs();
+            (
+                energy + magnitude,
+                count + usize::from(magnitude >= i32::from(SOFT_SYNC_SIGNIFICANT_MAGNITUDE)),
+            )
+        })
     }
 }
 
@@ -567,6 +597,29 @@ mod tests {
                 pair[1].signum() * SILENT_MAGNITUDE,
             ];
             assert!(det.push_symbol(quiet).is_none());
+        }
+    }
+
+    /// Five saturated spikes among zeros pass the energy floor
+    /// (635 ≥ 512) and agree with some pattern by construction;
+    /// the significant-sample gate must reject them.
+    #[test]
+    fn rejects_sparse_window_of_isolated_spikes() {
+        const SPIKES: usize = 5;
+        let mut det = SoftSyncDetector::new();
+        let signs = bits_to_signs(ASM_ENCODED);
+        for _ in 0..(ASM_ENCODED_BITS / 2) {
+            let _ = det.push_symbol([0, 0]);
+        }
+        for (sym, pair) in signs_to_pairs(signs).iter().enumerate() {
+            let sparse = [
+                if sym * 2 < SPIKES { pair[0] } else { 0 },
+                if sym * 2 + 1 < SPIKES { pair[1] } else { 0 },
+            ];
+            assert!(
+                det.push_symbol(sparse).is_none(),
+                "sparse window must not lock"
+            );
         }
     }
 
