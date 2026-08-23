@@ -515,19 +515,14 @@ pub(super) fn connect_rtl_tcp_discovery(
         &panels.source.protocol_row,
     );
 
-    let row_deps = Rc::new(DiscoveredRowDeps {
-        hostname_row: panels.source.hostname_row.clone(),
-        port_row: panels.source.port_row.clone(),
-        protocol_row: panels.source.protocol_row.clone(),
-        device_row: panels.source.device_row.clone(),
-        role_row: panels.source.rtl_tcp_role_row.clone(),
-        auth_key_row: panels.source.rtl_tcp_auth_key_row.clone(),
-        state: Rc::clone(&state),
-        config: config_for_discovery.clone(),
-        favorite_row_ctx: Rc::clone(&favorite_row_ctx),
-        discovered_star_buttons: Rc::clone(&discovered_star_buttons),
-        expander_weak: expander_weak.clone(),
-    });
+    let row_deps = build_row_deps(
+        panels,
+        &state,
+        &config_for_discovery,
+        &favorite_row_ctx,
+        &discovered_star_buttons,
+        &expander_weak,
+    );
     arm_discovery_poller(
         browser,
         disc_rx,
@@ -536,6 +531,33 @@ pub(super) fn connect_rtl_tcp_discovery(
         &row_deps,
         &expander_weak,
     );
+}
+
+/// Assemble the discovery-row dependency bundle. Split out per the
+/// 50-NLOC gate (#817).
+fn build_row_deps(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config_for_discovery: &std::sync::Arc<sdr_config::ConfigManager>,
+    favorite_row_ctx: &Rc<FavoriteRowContext>,
+    discovered_star_buttons: &Rc<
+        RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>,
+    >,
+    expander_weak: &glib::WeakRef<adw::ExpanderRow>,
+) -> Rc<DiscoveredRowDeps> {
+    Rc::new(DiscoveredRowDeps {
+        hostname_row: panels.source.hostname_row.clone(),
+        port_row: panels.source.port_row.clone(),
+        protocol_row: panels.source.protocol_row.clone(),
+        device_row: panels.source.device_row.clone(),
+        role_row: panels.source.rtl_tcp_role_row.clone(),
+        auth_key_row: panels.source.rtl_tcp_auth_key_row.clone(),
+        state: Rc::clone(state),
+        config: std::sync::Arc::clone(config_for_discovery),
+        favorite_row_ctx: Rc::clone(favorite_row_ctx),
+        discovered_star_buttons: Rc::clone(discovered_star_buttons),
+        expander_weak: expander_weak.clone(),
+    })
 }
 
 /// Seed the favorites popover and rebuild it on every show so the
