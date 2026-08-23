@@ -507,7 +507,6 @@ fn wire_jsonl_output_rows(
     }
 
     wire_jsonl_path_row(panel, state, config);
-
 }
 
 /// Network feeder toggle + address row + initial dispatch.
@@ -549,7 +548,6 @@ fn wire_network_output_rows(
     }
 
     wire_network_addr_row(panel, state, config);
-
 }
 
 /// 4 Hz ACARS status/channel-row mirror tick + open-viewer button.
@@ -645,6 +643,14 @@ fn wire_acars_status_tick(panel: &sidebar::aviation_panel::AviationPanel, state:
         },
     );
 
+    wire_open_viewer_button(panel, state);
+
+    // ─── Output-formatter widget seed + wiring (issue #578) ───
+}
+
+/// Open-viewer button of the Aviation panel. Split out per the
+/// 50-NLOC gate (#817).
+fn wire_open_viewer_button(panel: &sidebar::aviation_panel::AviationPanel, state: &Rc<AppState>) {
     // ─── Open ACARS window button ───
     {
         let state = Rc::clone(state);
@@ -652,13 +658,15 @@ fn wire_acars_status_tick(panel: &sidebar::aviation_panel::AviationPanel, state:
             crate::acars_viewer::open_acars_viewer_if_needed(&state);
         });
     }
-
-    // ─── Output-formatter widget seed + wiring (issue #578) ───
 }
 
 /// JSONL path row: per-keystroke save + Enter/focus-out dispatch.
 /// Split out per the 50-NLOC gate (#817).
-fn wire_jsonl_path_row(panel: &sidebar::aviation_panel::AviationPanel, state: &Rc<AppState>, config: &std::sync::Arc<sdr_config::ConfigManager>) {
+fn wire_jsonl_path_row(
+    panel: &sidebar::aviation_panel::AviationPanel,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // Wire jsonl_path_row — per-keystroke save to config so
     // edits never get lost on focus-out / app close, plus
     // explicit-commit DSP dispatch on Enter (apply) so we
@@ -697,7 +705,11 @@ fn wire_jsonl_path_row(panel: &sidebar::aviation_panel::AviationPanel, state: &R
 
 /// Network address row + the initial persisted-value dispatch.
 /// Split out per the 50-NLOC gate (#817).
-fn wire_network_addr_row(panel: &sidebar::aviation_panel::AviationPanel, state: &Rc<AppState>, config: &std::sync::Arc<sdr_config::ConfigManager>) {
+fn wire_network_addr_row(
+    panel: &sidebar::aviation_panel::AviationPanel,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
     // Wire network_addr_row — same split as jsonl_path_row:
     // per-keystroke save to config (no DNS/dial spam), DSP
     // dispatch on apply. CR round 4 on PR #595.
