@@ -1,0 +1,365 @@
+use super::*;
+
+/// Records the order of `Source` setter calls.
+#[derive(Default)]
+struct RecordingSource {
+    calls: Vec<String>,
+}
+
+impl Source for RecordingSource {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+    fn start(&mut self) -> Result<(), sdr_types::SourceError> {
+        self.calls.push("start".into());
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn tune(&mut self, _frequency_hz: f64) -> Result<(), sdr_types::SourceError> {
+        self.calls.push("tune".into());
+        Ok(())
+    }
+    fn sample_rates(&self) -> &[f64] {
+        &[2_400_000.0]
+    }
+    fn sample_rate(&self) -> f64 {
+        2_400_000.0
+    }
+    fn set_sample_rate(&mut self, _rate: f64) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn read_samples(&mut self, _output: &mut [Complex]) -> Result<usize, sdr_types::SourceError> {
+        Ok(0)
+    }
+    fn set_direct_sampling(&mut self, mode: i32) -> Result<(), sdr_types::SourceError> {
+        self.calls.push(format!("set_direct_sampling({mode})"));
+        Ok(())
+    }
+    fn set_rtl_agc(&mut self, enabled: bool) -> Result<(), sdr_types::SourceError> {
+        self.calls.push(format!("set_rtl_agc({enabled})"));
+        Ok(())
+    }
+    fn set_gain_mode(&mut self, manual: bool) -> Result<(), sdr_types::SourceError> {
+        self.calls.push(format!("set_gain_mode({manual})"));
+        Ok(())
+    }
+    fn set_gain(&mut self, gain_tenths: i32) -> Result<(), sdr_types::SourceError> {
+        self.calls.push(format!("set_gain({gain_tenths})"));
+        Ok(())
+    }
+}
+
+/// #703 — gain mode, gain and RTL AGC must reach the source BEFORE
+/// `start()`, so the driver's open-time programming uses the user's
+/// persisted values instead of its first-time defaults (29.7 dB manual),
+/// which otherwise produces a saturated burst on every Play.
+#[test]
+fn rtl_sdr_pre_start_settings_dispatch_gain_before_start() {
+    const PERSISTED_GAIN_TENTHS_DB: i32 = 0;
+    const PERSISTED_DIRECT_SAMPLING: i32 = 2;
+    let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx).unwrap();
+    state.tuner_agc_auto = false;
+    state.tuner_gain_tenths_db = PERSISTED_GAIN_TENTHS_DB;
+    state.rtl_agc_enabled = true;
+    state.direct_sampling_mode = PERSISTED_DIRECT_SAMPLING;
+
+    let mut source = RecordingSource::default();
+    rtl_sdr_pre_start_settings(&state, &mut source);
+    source.start().unwrap();
+
+    let start_at = source.calls.iter().position(|c| c == "start").unwrap();
+    let before: Vec<&str> = source.calls[..start_at]
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        before,
+        [
+            "set_direct_sampling(2)",
+            "set_rtl_agc(true)",
+            "set_gain_mode(true)",
+            "set_gain(0)",
+        ],
+        "direct sampling, RTL AGC, gain mode and gain must precede start()"
+    );
+}
+
+fn temp_wav(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("sdr-rs-ctl-test-{name}-{}.wav", std::process::id()))
+}
+
+/// #695 — the IQ WAV header bakes in the sample rate at start, so a
+/// rate change mid-recording silently corrupts the file. Reject it.
+#[test]
+fn set_sample_rate_is_rejected_while_iq_recording() {
+    const NEW_RATE_HZ: f64 = 1_024_000.0;
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let path = temp_wav("rate-mutex");
+    state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+    let before = state.configured_sample_rate;
+    let _ = drain(&dsp_rx);
+
+    handle_command(&mut state, &dsp_tx, UiToDsp::SetSampleRate(NEW_RATE_HZ));
+
+    assert!((state.configured_sample_rate - before).abs() < f64::EPSILON);
+    let events = drain(&dsp_rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DspToUi::Error(m) if m.to_lowercase().contains("recording"))),
+        "expected a recording-mutex error, got {events:?}"
+    );
+    state.iq_writer = None;
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #695 — with no source there is no IQ flowing and `state.sample_rate`
+/// may be stale; a recording started now would get a wrong header.
+#[test]
+fn start_iq_recording_requires_a_running_source() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    assert!(state.source.is_none());
+    let path = temp_wav("needs-source");
+    let _ = drain(&dsp_rx);
+
+    handle_command(&mut state, &dsp_tx, UiToDsp::StartIqRecording(path.clone()));
+
+    assert!(state.iq_writer.is_none(), "no writer without a source");
+    let events = drain(&dsp_rx);
+    assert!(
+        events.iter().any(|e| matches!(e, DspToUi::Error(_))),
+        "expected an error, got {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, DspToUi::IqRecordingStarted(_))),
+        "must not report a started recording"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #695 — ACARS engage forces the airband rate; refuse while recording.
+#[test]
+fn acars_engage_is_rejected_while_iq_recording() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let path = temp_wav("acars-mutex");
+    state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+    let _ = drain(&dsp_rx);
+
+    let _ = handle_set_acars_enabled(&mut state, true, &dsp_tx);
+
+    assert!(state.acars_pre_lock.is_none(), "must not engage");
+    let events = drain(&dsp_rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DspToUi::AcarsEnabledChanged(Err(
+                crate::acars_airband_lock::AcarsEnableError::IqRecordingActive
+            ))
+        )),
+        "expected AcarsEnabledChanged(Err(IqRecordingActive)), got {events:?}"
+    );
+    state.iq_writer = None;
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #695 (CR round 3) — a user-initiated ACARS disengage restores the
+/// pre-lock source rate, which would desync an open IQ recording.
+#[test]
+fn acars_disengage_is_rejected_while_iq_recording() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let path = temp_wav("acars-disengage-mutex");
+    state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+    state.acars_pre_lock = Some(test_pre_lock_snapshot());
+    let _ = drain(&dsp_rx);
+
+    let _ = handle_set_acars_enabled(&mut state, false, &dsp_tx);
+
+    assert!(state.acars_pre_lock.is_some(), "must stay engaged");
+    let events = drain(&dsp_rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DspToUi::AcarsEnabledChanged(Err(
+                crate::acars_airband_lock::AcarsEnableError::IqRecordingActive
+            ))
+        )),
+        "expected AcarsEnabledChanged(Err(IqRecordingActive)), got {events:?}"
+    );
+    state.iq_writer = None;
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #695 (CR round 3) — `cleanup()` is the forced teardown path: it
+/// finalizes the recording first, so the ACARS disengage inside it
+/// must not be blocked by the recording mutex.
+#[test]
+fn cleanup_disengages_acars_even_while_iq_recording() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let path = temp_wav("acars-cleanup");
+    state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+    state.acars_pre_lock = Some(test_pre_lock_snapshot());
+    let _ = drain(&dsp_rx);
+
+    cleanup(&mut state, &dsp_tx);
+
+    assert!(state.iq_writer.is_none(), "cleanup finalizes the recording");
+    assert!(state.acars_pre_lock.is_none(), "cleanup disengages ACARS");
+    let events = drain(&dsp_rx);
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DspToUi::AcarsEnabledChanged(Err(
+                crate::acars_airband_lock::AcarsEnableError::IqRecordingActive
+            ))
+        )),
+        "cleanup must not trip the recording mutex, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DspToUi::AcarsEnabledChanged(Ok(false)))),
+        "cleanup must ack the disengage, got {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DspToUi::IqRecordingStopped)),
+        "cleanup must tell the UI the recording stopped, got {events:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #695 (CR round 5) — switching source type while IQ-recording with
+/// ACARS engaged must not trip the recording mutex: `cleanup()` stops
+/// the recording first and then performs the forced ACARS teardown.
+#[test]
+fn source_type_switch_while_iq_recording_defers_acars_teardown_to_cleanup() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let path = temp_wav("acars-source-switch");
+    state.iq_writer = Some(WavWriter::new(&path, 2_400_000, IQ_CHANNELS).unwrap());
+    state.acars_pre_lock = Some(test_pre_lock_snapshot());
+    state.running = true;
+    let _ = drain(&dsp_rx);
+
+    // File source with an empty path: the restart after cleanup fails
+    // fast and without hardware.
+    handle_command(
+        &mut state,
+        &dsp_tx,
+        UiToDsp::SetSourceType(SourceType::File),
+    );
+
+    let events = drain(&dsp_rx);
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            DspToUi::AcarsEnabledChanged(Err(
+                crate::acars_airband_lock::AcarsEnableError::IqRecordingActive
+            ))
+        )),
+        "source switch must not report a recording-mutex failure, got {events:?}"
+    );
+    assert!(state.acars_pre_lock.is_none(), "ACARS torn down by cleanup");
+    assert!(state.iq_writer.is_none(), "recording stopped by cleanup");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DspToUi::IqRecordingStopped)),
+        "expected IqRecordingStopped, got {events:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// #694 (CR round 5) — only the WAV structural limit gets the
+/// "4 GiB limit" wording; a full filesystem is a plain write failure.
+#[test]
+fn recording_write_error_message_distinguishes_wav_limit_from_disk_full() {
+    let wav_limit = crate::wav_writer::wav_limit_error();
+    assert!(recording_write_error_message("IQ", &wav_limit).contains("4 GiB"));
+    let disk_full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+    assert!(!recording_write_error_message("IQ", &disk_full).contains("4 GiB"));
+    assert!(recording_write_error_message("IQ", &disk_full).contains("write failed"));
+}
+
+#[test]
+fn acars_tap_lazy_inits_bank_on_first_call_and_stays_silent_for_zero_iq() {
+    let mut bank: Option<sdr_acars::ChannelBank> = None;
+    let mut init_failed = false;
+    let (tx, rx) = mpsc::channel::<DspToUi>();
+    let iq = vec![Complex::default(); 1024];
+    let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
+    let outputs = super::AcarsOutputs::new(acars_dsp_tx).unwrap();
+
+    super::acars_decode_tap(
+        &mut bank,
+        &mut init_failed,
+        ACARS_SOURCE_RATE_HZ,
+        ACARS_CENTER_HZ,
+        &US_SIX_CHANNELS_HZ,
+        &iq,
+        &tx,
+        &outputs,
+    );
+    assert!(bank.is_some(), "first call should initialize the bank");
+    assert!(!init_failed);
+    // Silent IQ produces no messages.
+    assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+}
+
+#[test]
+fn acars_tap_skips_processing_after_init_failure() {
+    let mut bank: Option<sdr_acars::ChannelBank> = None;
+    let mut init_failed = true; // Simulate prior failure.
+    let (tx, _rx) = mpsc::channel::<DspToUi>();
+    let iq = vec![Complex::default(); 1024];
+    let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
+    let outputs = super::AcarsOutputs::new(acars_dsp_tx).unwrap();
+
+    super::acars_decode_tap(
+        &mut bank,
+        &mut init_failed,
+        ACARS_SOURCE_RATE_HZ,
+        ACARS_CENTER_HZ,
+        &US_SIX_CHANNELS_HZ,
+        &iq,
+        &tx,
+        &outputs,
+    );
+    assert!(bank.is_none(), "init_failed=true must short-circuit");
+    assert!(init_failed);
+}
+
+#[test]
+fn acars_tap_records_init_failure_on_invalid_channel_list() {
+    let mut bank: Option<sdr_acars::ChannelBank> = None;
+    let mut init_failed = false;
+    let (tx, _rx) = mpsc::channel::<DspToUi>();
+    let iq = vec![Complex::default(); 1024];
+    let bad_channels: [f64; 6] = [0.0; 6]; // outside source bandwidth
+    let (acars_dsp_tx, _acars_dsp_rx) = mpsc::channel::<DspToUi>();
+    let outputs = super::AcarsOutputs::new(acars_dsp_tx).unwrap();
+
+    super::acars_decode_tap(
+        &mut bank,
+        &mut init_failed,
+        ACARS_SOURCE_RATE_HZ,
+        ACARS_CENTER_HZ,
+        &bad_channels,
+        &iq,
+        &tx,
+        &outputs,
+    );
+    assert!(bank.is_none());
+    assert!(init_failed, "bad channels should set init_failed");
+}

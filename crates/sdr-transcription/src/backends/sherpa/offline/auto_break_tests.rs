@@ -240,70 +240,60 @@ fn emit_stop_notification_empty_queue_still_emits_single_text() {
     }
 }
 
-#[test]
-fn session_io_loop_auto_break_forwards_back_to_back_segments() {
-    // Regression for #275: the I/O thread must keep draining audio
-    // and forwarding segments even when no one is consuming
-    // decode_rx yet. Simulates the user's "3 sec audio, stop, 2 sec
-    // audio, stop" scenario: two transmissions back-to-back, both
-    // long enough to pass the MIN_SEGMENT threshold, with the
-    // receiver deliberately not consuming decode_rx until both have
-    // fired. Both DecodeRequests must arrive in order with non-empty
-    // mono buffers.
+/// Spawn `session_io_loop_auto_break` with default thresholds on its
+/// own thread; returns the audio input, the decode-request output, the
+/// event receiver (keep it alive — the loop exits when it drops) and
+/// the join handle.
+fn spawn_auto_break_loop(
+    cancel: &Arc<AtomicBool>,
+) -> (
+    mpsc::Sender<TranscriptionInput>,
+    mpsc::Receiver<DecodeRequest>,
+    mpsc::Receiver<TranscriptionEvent>,
+    std::thread::JoinHandle<()>,
+) {
     let (audio_tx, audio_rx) = mpsc::channel::<TranscriptionInput>();
     let (decode_tx, decode_rx) = mpsc::channel::<DecodeRequest>();
-    let (event_tx, _event_rx) = mpsc::channel::<TranscriptionEvent>();
-    let cancel = Arc::new(AtomicBool::new(false));
-
-    let handle = std::thread::spawn({
-        let cancel = Arc::clone(&cancel);
-        move || {
-            session_io_loop_auto_break(SessionIoAutoBreakParams {
-                cancel,
-                audio_rx,
-                event_tx,
-                decode_tx,
-                noise_gate_ratio: 1.0,
-                auto_break_thresholds: super::super::host::AutoBreakThresholds::defaults(),
-                audio_enhancement: denoise::AudioEnhancement::default(),
-            });
-        }
+    let (event_tx, event_rx) = mpsc::channel::<TranscriptionEvent>();
+    let cancel = Arc::clone(cancel);
+    let handle = std::thread::spawn(move || {
+        session_io_loop_auto_break(SessionIoAutoBreakParams {
+            cancel,
+            audio_rx,
+            event_tx,
+            decode_tx,
+            noise_gate_ratio: 1.0,
+            auto_break_thresholds: super::super::host::AutoBreakThresholds::defaults(),
+            audio_enhancement: denoise::AudioEnhancement::default(),
+        });
     });
+    (audio_tx, decode_rx, event_rx, handle)
+}
 
-    // Transmission 1: 1 s of audio.
-    audio_tx
-        .send(TranscriptionInput::SquelchOpened)
-        .expect("I/O thread alive");
-    audio_tx
-        .send(TranscriptionInput::Samples(samples_for_ms(1_000)))
-        .expect("I/O thread alive");
-    audio_tx
-        .send(TranscriptionInput::SquelchClosed)
-        .expect("I/O thread alive");
+/// One squelch-open → `ms` of samples → squelch-close transmission.
+fn send_burst(audio_tx: &mpsc::Sender<TranscriptionInput>, ms: u32) {
+    for input in [
+        TranscriptionInput::SquelchOpened,
+        TranscriptionInput::Samples(samples_for_ms(ms)),
+        TranscriptionInput::SquelchClosed,
+    ] {
+        audio_tx.send(input).expect("I/O thread alive");
+    }
+}
 
-    // Wait for the tail timer to fire and transmission 1 to flush.
-    // `AUTO_BREAK_TAIL_MS_DEFAULT` is the longest we'd have to wait;
-    // double it and add a small margin to avoid flaky CI.
+#[test]
+fn session_io_loop_auto_break_forwards_back_to_back_segments() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (audio_tx, decode_rx, _event_rx, handle) = spawn_auto_break_loop(&cancel);
+
+    // First transmission, then wait past the tail deadline so the
+    // segment flushes before the second one starts.
+    send_burst(&audio_tx, 1_000);
     std::thread::sleep(std::time::Duration::from_millis(
         u64::from(crate::backend::AUTO_BREAK_TAIL_MS_DEFAULT) * 2 + 100,
     ));
+    send_burst(&audio_tx, 700);
 
-    // Transmission 2: 700 ms of audio. Send WITHOUT reading
-    // decode_rx — the first DecodeRequest is sitting in the queue
-    // unconsumed. This mimics a backed-up decoder: the I/O thread
-    // must keep forwarding segments regardless of whether anyone
-    // is consuming them yet.
-    audio_tx
-        .send(TranscriptionInput::SquelchOpened)
-        .expect("I/O thread alive");
-    audio_tx
-        .send(TranscriptionInput::Samples(samples_for_ms(700)))
-        .expect("I/O thread alive");
-    audio_tx
-        .send(TranscriptionInput::SquelchClosed)
-        .expect("I/O thread alive");
-
-    // Drop audio_tx so the I/O loop exits after its final tail timeout.
     drop(audio_tx);
 
     // Wait for the I/O thread to finish so both tail timeouts have
