@@ -566,6 +566,35 @@ pub(super) fn connect_rtl_tcp_discovery(
         discovered_star_buttons: Rc::clone(&discovered_star_buttons),
         expander_weak: expander_weak.clone(),
     });
+    arm_discovery_poller(
+        browser,
+        disc_rx,
+        &displayed_rows,
+        &favorites,
+        &row_deps,
+        &expander_weak,
+    );
+}
+
+/// Arm the 200 ms discovery poll timer (skipped when the mDNS browser
+/// failed to start). Split out per the 50-NLOC gate (#817).
+fn arm_discovery_poller(
+    browser: Option<Browser>,
+    disc_rx: mpsc::Receiver<DiscoveryEvent>,
+    displayed_rows: &Rc<
+        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
+    >,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    row_deps: &Rc<DiscoveredRowDeps>,
+    expander_weak: &glib::WeakRef<adw::ExpanderRow>,
+) {
+    const DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+    let displayed_rows = Rc::clone(displayed_rows);
+    let favorites = Rc::clone(favorites);
+    let row_deps = Rc::clone(row_deps);
+    let expander_weak = expander_weak.clone();
     let Some(browser) = browser else {
         return;
     };
