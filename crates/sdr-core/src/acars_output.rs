@@ -33,8 +33,15 @@ pub struct AcarsWriterConfig {
     /// network output is disabled.
     pub network_addr: Option<String>,
     /// Station ID injected into each emitted JSON record.
+    /// Bounded to [`STATION_ID_MAX_CHARS`] at the
+    /// `SetAcarsStationId` handler boundary.
     pub station_id: Option<String>,
 }
+
+/// Station-ID length cap, matching acarsdec's `idstation` field
+/// width so emitted JSON stays interchangeable with acarsdec
+/// consumers. Enforced by the `SetAcarsStationId` handler.
+pub(crate) const STATION_ID_MAX_CHARS: usize = 8;
 
 /// Messages handed from the DSP thread to the writer thread.
 /// Bounded `mpsc::sync_channel` decouples the DSP-thread
