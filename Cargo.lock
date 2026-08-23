@@ -3255,6 +3255,7 @@ dependencies = [
  "sdr-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

@@ -74,6 +74,7 @@ libc.workspace = true
 # C-ABI link surface free of crates the wire layer never references.
 sdr-acars.workspace = true
 arrayvec.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
