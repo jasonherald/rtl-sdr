@@ -1491,61 +1491,108 @@ fn wire_auth_require_toggle(
         .server
         .auth_require_row
         .connect_active_notify(move |row| {
-            if auth_toggle_guard_for_handler.get() {
-                // Re-entered from our own `set_active` revert
-                // path — let the signal settle without running
-                // the handler again.
-                return;
-            }
-            let Some(key_row) = key_row_for_toggle.upgrade() else {
-                return;
-            };
-            let widgets = widgets_weak_for_auth_toggle.upgrade();
-
-            if row.is_active() {
-                let ok = enable_auth_requirement(
-                    widgets.as_ref(),
-                    &running_for_auth_toggle,
-                    &toast_overlay_for_auth_toggle,
-                    &current_key_for_toggle,
-                    &revealed_for_toggle,
-                    &key_row,
-                    &reveal_button_for_toggle,
-                );
-                if !ok {
-                    // Revert the switch. UI stays on the pre-toggle
-                    // state; the user can click again after resolving
-                    // the server issue.
-                    auth_toggle_guard_for_handler.set(true);
-                    row.set_active(false);
-                    auth_toggle_guard_for_handler.set(false);
-                }
-            } else {
-                // Same structure for toggle-off. Server call
-                // first; on failure revert the switch so the UI
-                // stays honest about the running auth state.
-                let server_result = apply_live_auth_change(
-                    &running_for_auth_toggle,
-                    None,
-                    widgets.as_ref(),
-                    &toast_overlay_for_auth_toggle,
-                );
-
-                if !server_result {
-                    auth_toggle_guard_for_handler.set(true);
-                    row.set_active(true);
-                    auth_toggle_guard_for_handler.set(false);
-                    return;
-                }
-
-                *current_key_for_toggle.borrow_mut() = None;
-                key_row.set_visible(false);
-                // Zero the revealed flag too so a next toggle-on
-                // starts masked regardless of the prior reveal
-                // state.
-                revealed_for_toggle.set(false);
-            }
+            on_auth_require_toggled(
+                row,
+                &auth_toggle_guard_for_handler,
+                &key_row_for_toggle,
+                &widgets_weak_for_auth_toggle,
+                &running_for_auth_toggle,
+                &toast_overlay_for_auth_toggle,
+                &current_key_for_toggle,
+                &revealed_for_toggle,
+                &reveal_button_for_toggle,
+            );
         });
+}
+
+/// Body of the require-key toggle handler: reentry guard, widget
+/// upgrades, then the enable / disable halves with switch-revert on
+/// failure. Split out per the 50-NLOC gate (#817).
+#[allow(clippy::too_many_arguments)]
+fn on_auth_require_toggled(
+    row: &adw::SwitchRow,
+    auth_toggle_guard_for_handler: &Rc<std::cell::Cell<bool>>,
+    key_row_for_toggle: &glib::WeakRef<adw::ActionRow>,
+    widgets_weak_for_auth_toggle: &ServerSwitchWidgetsWeak,
+    running_for_auth_toggle: &Rc<RefCell<Option<RunningServer>>>,
+    toast_overlay_for_auth_toggle: &glib::WeakRef<adw::ToastOverlay>,
+    current_key_for_toggle: &Rc<RefCell<Option<Vec<u8>>>>,
+    revealed_for_toggle: &Rc<std::cell::Cell<bool>>,
+    reveal_button_for_toggle: &glib::WeakRef<gtk4::Button>,
+) {
+    if auth_toggle_guard_for_handler.get() {
+        // Re-entered from our own `set_active` revert
+        // path — let the signal settle without running
+        // the handler again.
+        return;
+    }
+    let Some(key_row) = key_row_for_toggle.upgrade() else {
+        return;
+    };
+    let widgets = widgets_weak_for_auth_toggle.upgrade();
+
+    if row.is_active() {
+        let ok = enable_auth_requirement(
+            widgets.as_ref(),
+            &running_for_auth_toggle,
+            &toast_overlay_for_auth_toggle,
+            &current_key_for_toggle,
+            &revealed_for_toggle,
+            &key_row,
+            &reveal_button_for_toggle,
+        );
+        if !ok {
+            // Revert the switch. UI stays on the pre-toggle
+            // state; the user can click again after resolving
+            // the server issue.
+            auth_toggle_guard_for_handler.set(true);
+            row.set_active(false);
+            auth_toggle_guard_for_handler.set(false);
+        }
+    } else {
+        let ok = disable_auth_requirement(
+            widgets.as_ref(),
+            &running_for_auth_toggle,
+            &toast_overlay_for_auth_toggle,
+            &current_key_for_toggle,
+            &revealed_for_toggle,
+            &key_row,
+        );
+        if !ok {
+            auth_toggle_guard_for_handler.set(true);
+            row.set_active(true);
+            auth_toggle_guard_for_handler.set(false);
+        }
+    }
+}
+
+/// Toggle-OFF half of the require-key handler — same order as the ON
+/// half: server call first, UI mutation only after success. Returns
+/// `false` when the caller must revert the switch. Split out per the
+/// 50-NLOC gate (#817).
+fn disable_auth_requirement(
+    widgets: Option<&ServerSwitchWidgets>,
+    running_for_auth_toggle: &Rc<RefCell<Option<RunningServer>>>,
+    toast_overlay_for_auth_toggle: &glib::WeakRef<adw::ToastOverlay>,
+    current_key_for_toggle: &Rc<RefCell<Option<Vec<u8>>>>,
+    revealed_for_toggle: &Rc<std::cell::Cell<bool>>,
+    key_row: &adw::ActionRow,
+) -> bool {
+    let server_result = apply_live_auth_change(
+        running_for_auth_toggle,
+        None,
+        widgets,
+        toast_overlay_for_auth_toggle,
+    );
+    if !server_result {
+        return false;
+    }
+    *current_key_for_toggle.borrow_mut() = None;
+    key_row.set_visible(false);
+    // Zero the revealed flag too so a next toggle-on starts masked
+    // regardless of the prior reveal state.
+    revealed_for_toggle.set(false);
+    true
 }
 
 /// Toggle-ON half of the require-key handler: generate/load the key,
