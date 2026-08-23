@@ -48,7 +48,7 @@ fn first_retry_uses_1s_backoff() {
 }
 
 #[test]
-fn second_client_is_rejected_not_queued() {
+fn atomic_busy_flag_swap_semantics() {
     // This test verifies the contract stated in the module docs:
     // "single client at a time; second connection rejected with
     // graceful close." Upstream rtl_tcp silently hangs second
@@ -313,8 +313,12 @@ fn record_command_covers_all_14_wire_ops() {
     // = opcode - 1) — except `SetTunerGain`, whose replay bit the
     // later `SetGainByIndex` clears (they drive the same server
     // gain; #745).
-    let tuner_gain_bit = 1u32 << ((CommandOp::SetTunerGain as u32) - 1);
-    assert_eq!(mask & 0x3fff, 0x3fff & !tuner_gain_bit, "mask={mask:#x}");
+    // Every op's replay bit, derived from the discriminants so a new
+    // opcode added to `all_ops` widens the expectation automatically.
+    let all_bits = all_ops.iter().fold(0u32, |acc, op| acc | replay_bit(*op));
+    // `SetTunerGain` is overridden by the later `SetGainByIndex`.
+    let expected = all_bits & !replay_bit(CommandOp::SetTunerGain);
+    assert_eq!(mask & all_bits, expected, "mask={mask:#x}");
 }
 
 /// #745 — `SetTunerGain` and `SetGainByIndex` both drive the same
@@ -496,8 +500,7 @@ fn replay_bits_set_independently_per_op() {
         param: 1,
     });
     let mask = src.shared.replay_mask.load(Ordering::Relaxed);
-    // BiasTee is op 0x0e, so bit index (0x0e - 1) = 13.
-    assert!(mask & (1 << 13) != 0);
+    assert!(mask & replay_bit(CommandOp::SetBiasTee) != 0);
     // No other bits should be set.
     assert_eq!(mask.count_ones(), 1);
 }

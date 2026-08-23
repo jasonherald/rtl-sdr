@@ -115,13 +115,8 @@ fn session_end_clears_rx_buf_and_rearms_overflow() {
     }
 
     // Simulate the disconnect cleanup body inline.
-    if let Ok(mut sink) = src.shared.command_sink.lock() {
-        *sink = None;
-    }
-    if let Ok(mut rx) = src.shared.rx_buf.lock() {
-        rx.clear();
-    }
-    src.shared.rx_in_overflow.store(false, Ordering::Relaxed);
+    // The production teardown the data pump runs on exit.
+    end_session(&src.shared);
 
     assert_eq!(src.shared.rx_buf.lock().unwrap().len(), 0);
     assert!(!src.shared.rx_in_overflow.load(Ordering::Relaxed));

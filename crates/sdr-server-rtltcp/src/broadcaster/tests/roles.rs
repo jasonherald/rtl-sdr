@@ -109,7 +109,10 @@ fn register_with_role_denies_listen_past_cap() {
     // Denial must not push into slots.
     assert_eq!(reg.len(), TEST_LISTENER_CAP);
     // Denials don't count toward lifetime_accepted.
-    assert_eq!(reg.lifetime_accepted() as usize, TEST_LISTENER_CAP);
+    assert_eq!(
+        reg.lifetime_accepted(),
+        u64::try_from(TEST_LISTENER_CAP).expect("listener cap fits u64")
+    );
 }
 
 #[test]

@@ -89,12 +89,7 @@ fn rtlx_test_serve_one(listener: &TcpListener, ext: ServerExtension) {
     let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
     sock.read_exact(&mut hello_buf).expect("read hello");
     assert_eq!(&hello_buf[..EXTENSION_MAGIC.len()], &EXTENSION_MAGIC);
-    let header = DongleInfo {
-        tuner: TunerTypeCode::R820t,
-        gain_count: RTLX_TEST_GAIN_COUNT,
-    }
-    .to_bytes();
-    sock.write_all(&header).unwrap();
+    sock.write_all(&rtlx_test_dongle_info()).unwrap();
     sock.write_all(&ext.to_bytes()).unwrap();
     thread::sleep(RTLX_TEST_SERVER_HOLD);
 }
@@ -105,6 +100,11 @@ const HELLO_CODEC_MASK_OFFSET: usize = 4;
 const HELLO_ROLE_OFFSET: usize = 5;
 const HELLO_FLAGS_OFFSET: usize = 6;
 const HELLO_VERSION_OFFSET: usize = 7;
+
+/// Replay-mask bit for `op`: wire ops are 1-based, bits 0-based.
+fn replay_bit(op: CommandOp) -> u32 {
+    1u32 << ((op as u32) - 1)
+}
 
 /// The `dongle_info_t` every loopback server in these tests sends.
 fn rtlx_test_dongle_info() -> [u8; DONGLE_INFO_LEN] {
@@ -168,8 +168,11 @@ where
         sock.read_exact(&mut hello).expect("read hello");
         let _ = hello_tx.send(hello);
         let ext = on_hello(&mut sock, &hello);
-        sock.write_all(&rtlx_test_dongle_info()).unwrap();
-        sock.write_all(&ext.to_bytes()).unwrap();
+        // Hello-only tests stop the client as soon as the hello is
+        // captured, so the reply may hit a closed socket; that is not
+        // a fixture failure (the assertions above are).
+        let _ = sock.write_all(&rtlx_test_dongle_info());
+        let _ = sock.write_all(&ext.to_bytes());
         thread::sleep(RTLX_TEST_SERVER_HOLD);
     });
     (handle, hello_rx)
@@ -195,6 +198,13 @@ fn rtlx_serve_silent_lz4_sessions(
         }
         thread::sleep(hold);
     })
+}
+
+/// Join a loopback-server fixture thread, failing the test if an
+/// assertion inside the fixture panicked (otherwise a server-side
+/// failure only shows up as an unrelated client timeout).
+fn join_server(handle: JoinHandle<()>) {
+    handle.join().expect("loopback server fixture panicked");
 }
 
 /// The hello the loopback server captured, or a panic past the deadline.

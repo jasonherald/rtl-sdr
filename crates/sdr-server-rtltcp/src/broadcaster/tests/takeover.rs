@@ -99,7 +99,7 @@ fn register_with_role_takeover_leaves_listeners_alone() {
         reg.register_with_role(listener.clone(), TEST_LISTENER_CAP, false),
         RoleDecision::Granted
     );
-    let ctrl_a = role_test_slot(&reg, TAKEOVER_TEST_ORIG_CTRL_PORT, Role::Control);
+    let ctrl_a = role_test_slot(&reg, TAKEOVER_TEST_LISTENER_ORIG_CTRL_PORT, Role::Control);
     let a_id = ctrl_a.id;
     assert_eq!(
         reg.register_with_role(ctrl_a.clone(), TEST_LISTENER_CAP, false),

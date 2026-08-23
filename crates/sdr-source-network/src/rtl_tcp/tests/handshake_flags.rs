@@ -26,7 +26,7 @@ fn rtlx_handshake_sends_takeover_flag_when_config_opts_in() {
     );
 
     src.stop_manager();
-    let _ = server_thread.join();
+    join_server(server_thread);
 }
 
 #[test]
@@ -49,7 +49,7 @@ fn rtlx_handshake_clears_takeover_flag_when_only_compression_opts_in() {
     );
 
     src.stop_manager();
-    let _ = server_thread.join();
+    join_server(server_thread);
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn rtlx_handshake_sends_auth_key_when_config_opts_in() {
     );
 
     src.stop_manager();
-    let _ = server_thread.join();
+    join_server(server_thread);
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn rtlx_handshake_omits_auth_flag_when_no_auth_key_configured() {
     );
 
     src.stop_manager();
-    let _ = server_thread.join();
+    join_server(server_thread);
 }
 
 #[test]
@@ -164,13 +164,7 @@ fn rtlx_handshake_sends_listen_role_when_config_opts_in() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (server_thread, hello_rx) = rtlx_serve_one_with(listener, |_, hello| {
-        let version = hello[HELLO_VERSION_OFFSET];
-        assert_eq!(
-            version,
-            sdr_server_rtltcp::extension::PROTOCOL_VERSION_V1,
-            "role-only hello must stay on v1 for backward compatibility (got 0x{version:02x})",
-        );
-        rtlx_ok_extension(Codec::None, Role::Listen, version)
+        rtlx_ok_extension(Codec::None, Role::Listen, hello[HELLO_VERSION_OFFSET])
     });
     let mut config = rtlx_test_config(CodecMask::NONE_ONLY);
     config.requested_role = Role::Listen;
@@ -178,6 +172,12 @@ fn rtlx_handshake_sends_listen_role_when_config_opts_in() {
 
     let hello = recv_hello(&hello_rx);
     assert_eq!(&hello[..EXTENSION_MAGIC.len()], &EXTENSION_MAGIC);
+    let version = hello[HELLO_VERSION_OFFSET];
+    assert_eq!(
+        version,
+        sdr_server_rtltcp::extension::PROTOCOL_VERSION_V1,
+        "role-only hello must stay on v1 for backward compatibility (got 0x{version:02x})",
+    );
     assert_eq!(
         hello[HELLO_ROLE_OFFSET],
         Role::Listen as u8,
@@ -202,7 +202,7 @@ fn rtlx_handshake_sends_listen_role_when_config_opts_in() {
     );
 
     src.stop_manager();
-    let _ = server_thread.join();
+    join_server(server_thread);
 }
 
 #[test]

@@ -1569,25 +1569,25 @@ fn run_data_pump(
         }
     }
 
-    // Drop the command sink so subsequent send_command calls stop
-    // writing into a dead stream, and the session cancel handle with it.
+    end_session(shared);
+    outcome
+}
+
+/// Tear down the per-session state when the data pump exits: drop the
+/// command sink so later `send_command` calls stop writing into a dead
+/// stream (and the session cancel handle with it), clear any buffered
+/// I/Q so the next session doesn't rewind the consumer with pre-drop
+/// samples, and rearm the edge-triggered overflow warning so a stall in
+/// the next session logs again.
+fn end_session(shared: &SharedState) {
     if let Ok(mut sink) = shared.command_sink.lock() {
         *sink = None;
     }
     clear_pending_stream(shared);
-    // Clear any buffered I/Q so the next successful session doesn't
-    // rewind the consumer with pre-drop samples from the previous
-    // server. Stale samples are useless for a live SDR; the user wants
-    // fresh data from the new handshake onward.
     if let Ok(mut rx) = shared.rx_buf.lock() {
         rx.clear();
     }
-    // Rearm the edge-triggered overflow warn so if the next session
-    // stalls, the warning logs again rather than being suppressed by a
-    // stale flag left over from the previous session.
     shared.rx_in_overflow.store(false, Ordering::Relaxed);
-
-    outcome
 }
 
 fn replay_sticky_commands(shared: &Arc<SharedState>) {

@@ -42,11 +42,6 @@ const TEST_CHANNEL_DEPTH_STANDARD: usize = 4;
 /// the full-channel drop-isolation test — must never fill.
 const TEST_CHANNEL_DEPTH_GENEROUS: usize = 16;
 
-/// Kept as an alias to `TEST_CHANNEL_DEPTH_SMALL` for the one
-/// call site (`broadcast_full_channel_counts_drop_for_that_client_only`)
-/// that reads better with the original name.
-const TEST_CHANNEL_DEPTH: usize = TEST_CHANNEL_DEPTH_SMALL;
-
 // ============================================================
 // register_with_role decision matrix (#392)
 //
@@ -140,6 +135,7 @@ const TAKEOVER_TEST_NO_CONFLICT_PORT: u16 = 20_110;
 const TAKEOVER_TEST_DENIED_ORIG_PORT: u16 = 20_120;
 const TAKEOVER_TEST_DENIED_NEW_PORT: u16 = 20_121;
 const TAKEOVER_TEST_LISTENER_PORT: u16 = 20_130;
+const TAKEOVER_TEST_LISTENER_ORIG_CTRL_PORT: u16 = 20_132;
 const TAKEOVER_TEST_LISTENER_TAKEOVER_CTRL_PORT: u16 = 20_131;
 
 /// Registry with one live Control client on `port` (the common

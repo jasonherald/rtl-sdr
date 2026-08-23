@@ -113,7 +113,7 @@ fn broadcast_full_channel_counts_drop_for_that_client_only() {
         test_peer(TEST_PORT_FIRST),
         Codec::None,
         Role::Control,
-        TEST_CHANNEL_DEPTH,
+        TEST_CHANNEL_DEPTH_SMALL,
     );
     // Fast client with generous room — shouldn't drop anything.
     let (fast, fast_rx) = ClientSlot::new(
@@ -165,7 +165,10 @@ fn broadcast_skips_disconnected_slot() {
 
     // Nothing should have been sent — `try_send` never called
     // against a disconnected slot. The Receiver sees Empty.
-    assert!(rx.try_recv().is_err());
+    assert!(
+        matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "broadcast must skip the slot, not close its channel"
+    );
 }
 
 #[test]
