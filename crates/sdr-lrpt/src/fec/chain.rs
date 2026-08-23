@@ -42,7 +42,7 @@
 //! itself stays unit-testable on synthetic byte streams.
 
 use crate::fec::{
-    Derandomizer, DiffDecoder, ReedSolomon, Rotation, SoftSyncDetector, SyncCorrelator,
+    ASM_BITS, Derandomizer, DiffDecoder, ReedSolomon, Rotation, SoftSyncDetector, SyncCorrelator,
     ViterbiDecoder,
 };
 
@@ -69,6 +69,23 @@ const RS_MESSAGE_LEN: usize = 223;
 /// [`super::super::ccsds::Demux`] expects per VCDU.
 const VCDU_LEN: usize = RS_INTERLEAVE * RS_MESSAGE_LEN; // 892
 
+/// Total bits in a CADU including the 32-bit ASM (8192).
+const CADU_TOTAL_BITS: usize = ASM_BITS + CADU_PAYLOAD_LEN * 8;
+
+/// Consecutive RS-failed CADUs after which the rotation lock is
+/// abandoned and the chain re-hunts (#727). A genuine fade fails a
+/// few CADUs and recovers; eight in a row (~1 s at 72 kbit/s) with
+/// frame sync still hitting means the orientation — not the SNR —
+/// is wrong, e.g. a 90° Costas slip whose ASM happens to correlate.
+const REHUNT_AFTER_FAILED_CADUS: u32 = 8;
+
+/// Post-Viterbi bits without a frame-sync hit after which the
+/// rotation lock is abandoned (#727): four CADU lengths (~0.45 s).
+/// After a ±90° slip Viterbi emits garbage and the per-CADU
+/// correlator never hits (only a 180° residual is recoverable via
+/// the inverted ASM), so silence is the only symptom.
+const REHUNT_AFTER_SILENT_BITS: usize = 4 * CADU_TOTAL_BITS;
+
 /// Per-symbol chain state. Two-phase lock:
 ///
 /// 1. [`State::HuntingRotation`]: feeding raw soft pairs to the
@@ -82,12 +99,12 @@ const VCDU_LEN: usize = RS_INTERLEAVE * RS_MESSAGE_LEN; // 892
 ///    chain, but now operating on a known-canonical bit stream
 ///    that actually produces matches.
 ///
-/// Once Locked, we stay Locked for the whole pass. Costas can
-/// drift through quarter-turns during a low-SNR pass, but
-/// re-detecting per-CADU would only re-lock at the same
-/// (correct) rotation in the steady state. If we ever observe
-/// pathological mid-pass rotation drift, a "if last K CADUs all
-/// failed RS, re-hunt rotation" fallback can be added later.
+/// Locked is held for as long as it keeps producing: Costas can
+/// slip a quarter-turn mid-pass, after which Viterbi emits garbage
+/// and nothing downstream recovers ±90°. The chain falls back to
+/// `HuntingRotation` when [`REHUNT_AFTER_FAILED_CADUS`] CADUs fail
+/// RS in a row or [`REHUNT_AFTER_SILENT_BITS`] bits pass without a
+/// frame-sync hit (#727).
 #[derive(Debug)]
 enum State {
     /// No rotation lock yet. Soft pairs feed
@@ -113,7 +130,21 @@ enum State {
         bytes: Vec<u8>,
         partial: u8,
         partial_count: u8,
+        /// RS-failed CADUs since the last successful decode.
+        failed_run: u32,
+        /// Post-Viterbi bits since the last frame-sync hit (or
+        /// since lock) while hunting for the next ASM.
+        silent_bits: usize,
     },
+}
+
+/// Why a rotation lock was abandoned (#727).
+#[derive(Debug, Clone, Copy)]
+enum RehuntCause {
+    /// No frame-sync hit within [`REHUNT_AFTER_SILENT_BITS`].
+    Silence,
+    /// [`REHUNT_AFTER_FAILED_CADUS`] consecutive RS failures.
+    FailedCadus,
 }
 
 /// Streaming FEC chain — push one soft i8 symbol pair per call,
@@ -145,6 +176,11 @@ pub struct FecStats {
     pub cadus_decoded: u64,
     /// CADUs whose RS decode failed (dropped).
     pub cadus_failed: u64,
+    /// Times the locked chain went [`REHUNT_AFTER_SILENT_BITS`]
+    /// bits without a frame-sync hit (#727).
+    pub sync_timeouts: u64,
+    /// Times a rotation lock was abandoned to re-hunt (#727).
+    pub rotation_rehunts: u64,
 }
 
 impl Default for FecChain {
@@ -188,9 +224,11 @@ impl FecChain {
     /// Push one soft i8 symbol pair (one Viterbi-encoded bit's
     /// worth from the demod). Returns `Some(VCDU bytes)` on the
     /// call that completes a successful CADU decode; otherwise
-    /// `None`. Failed RS decodes are silently dropped — the
-    /// chain returns to hunting for the next ASM (without losing
-    /// rotation lock).
+    /// `None`. A failed RS decode is dropped and the chain hunts
+    /// for the next ASM with the rotation lock kept; after
+    /// [`REHUNT_AFTER_FAILED_CADUS`] consecutive failures (or
+    /// [`REHUNT_AFTER_SILENT_BITS`] bits without a frame-sync hit)
+    /// the lock is abandoned and the rotation is re-hunted (#727).
     pub fn push_symbol(&mut self, soft: [i8; 2]) -> Option<Vec<u8>> {
         // Differential pre-decode on the raw soft stream, before
         // sync correlation and Viterbi (dbdexter `decode.c`: the
@@ -225,6 +263,8 @@ impl FecChain {
                         bytes: Vec::with_capacity(CADU_PAYLOAD_LEN),
                         partial: 0,
                         partial_count: 0,
+                        failed_run: 0,
+                        silent_bits: 0,
                     };
                     let mut emitted: Option<Vec<u8>> = None;
                     for pair_chunk in window.as_chunks::<2>().0 {
@@ -287,6 +327,36 @@ impl FecChain {
         }
     }
 
+    /// Abandon the rotation lock and return to hunting: the
+    /// detector, Viterbi and frame-sync state all restart so the
+    /// next ASM in the soft stream re-establishes the orientation
+    /// (#727). Decode statistics are kept.
+    fn rehunt(&mut self, cause: RehuntCause) {
+        tracing::debug!("LRPT FEC chain abandoning rotation lock ({cause:?}); re-hunting");
+        self.detector.reset();
+        self.viterbi = ViterbiDecoder::new();
+        self.sync = SyncCorrelator::new();
+        self.state = State::HuntingRotation;
+        self.stats.rotation_rehunts += 1;
+    }
+
+    /// Track the outcome of a captured CADU: a success clears the
+    /// failure run, a failure extends it and re-hunts once the run
+    /// reaches [`REHUNT_AFTER_FAILED_CADUS`].
+    fn note_cadu_outcome(&mut self, decoded: bool) {
+        let State::Locked { failed_run, .. } = &mut self.state else {
+            return;
+        };
+        if decoded {
+            *failed_run = 0;
+            return;
+        }
+        *failed_run += 1;
+        if *failed_run >= REHUNT_AFTER_FAILED_CADUS {
+            self.rehunt(RehuntCause::FailedCadus);
+        }
+    }
+
     fn process_bit(&mut self, bit: u8) -> Option<Vec<u8>> {
         let State::Locked {
             is_capturing,
@@ -294,6 +364,7 @@ impl FecChain {
             bytes,
             partial,
             partial_count,
+            silent_bits,
             ..
         } = &mut self.state
         else {
@@ -314,6 +385,13 @@ impl FecChain {
             if let Some(hit) = self.sync.push(bit) {
                 *is_capturing = true;
                 *inverted = hit.inverted;
+                *silent_bits = 0;
+            } else {
+                *silent_bits += 1;
+                if *silent_bits >= REHUNT_AFTER_SILENT_BITS {
+                    self.stats.sync_timeouts += 1;
+                    self.rehunt(RehuntCause::Silence);
+                }
             }
             return None;
         }
@@ -348,7 +426,9 @@ impl FecChain {
             *partial = 0;
             *partial_count = 0;
             self.sync = SyncCorrelator::new();
-            return self.decode_cadu(cadu);
+            let decoded = self.decode_cadu(cadu);
+            self.note_cadu_outcome(decoded.is_some());
+            return decoded;
         }
         None
     }
@@ -392,10 +472,6 @@ impl FecChain {
 mod tests {
     use super::*;
 
-    /// Total bits in a CADU including the 32-bit ASM. Used by
-    /// the tests below to size the synthetic bit streams.
-    const CADU_TOTAL_BITS: usize = 32 + CADU_PAYLOAD_LEN * 8;
-
     #[test]
     fn fec_chain_constructible_and_resets() {
         let mut c = FecChain::new();
@@ -417,29 +493,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn decode_cadu_returns_none_on_invalid_codeword() {
-        // Build a VALID RS-encoded, derandomised CADU (so the
-        // chain's derand recovers clean codewords), then corrupt
-        // one interleave column far beyond the RS correction
-        // capacity (t = 16). That column can't decode, so the
-        // all-or-nothing `decode_cadu` must return None.
-        //
-        // Note: we deliberately do NOT rely on "all-zeros → derand
-        // → PN is not a codeword" — that was an accident of an
-        // earlier corrupted PN table. This construction guarantees
-        // an uncorrectable column for any (correct) PN sequence.
+    /// The 32-bit ASM as MSB-first bits.
+    fn asm_to_bits() -> Vec<u8> {
+        (0..32)
+            .map(|i| u8::from((crate::fec::ASM >> (31 - i)) & 1 == 1))
+            .collect()
+    }
+
+    /// RS-encode a VCDU into the 4-way byte-interleaved 1020-byte
+    /// CADU payload (not yet randomised).
+    fn rs_encode_cadu(vcdu: &[u8]) -> Vec<u8> {
         let rs = ReedSolomon::new();
-        let mut vcdu = vec![0_u8; VCDU_LEN];
-        for (i, b) in vcdu.iter_mut().enumerate() {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "modulo 256 fits in u8 by definition"
-            )]
-            let byte = ((i * 7 + 11) % 256) as u8;
-            *b = byte;
-        }
-        let mut cadu = vec![0_u8; CADU_PAYLOAD_LEN];
+        let mut payload = vec![0_u8; CADU_PAYLOAD_LEN];
         for col in 0..RS_INTERLEAVE {
             let mut message = [0_u8; RS_MESSAGE_LEN];
             for i in 0..RS_MESSAGE_LEN {
@@ -447,87 +512,68 @@ mod tests {
             }
             let codeword = rs.encode(&message);
             for i in 0..RS_CODEWORD_LEN {
-                cadu[i * RS_INTERLEAVE + col] = codeword[i];
+                payload[i * RS_INTERLEAVE + col] = codeword[i];
             }
         }
-        // Corrupt column 0 with the specific T+1 = 17-error
-        // pattern that `reed_solomon::tests::rejects_this_t_plus_
-        // one_pattern` pins as detectably uncorrectable (positions
-        // 0, 11, 22, … XOR 0x3C). RS beyond-T detection is NOT
-        // guaranteed for arbitrary patterns — far-over-capacity
-        // inputs can miscorrect to a different valid codeword and
-        // return Ok — so we reuse the known-caught pattern here.
-        // XOR is linear and survives the chain's later derand, so
-        // post-derand column 0 carries exactly these 17 errors.
-        for k in 0..=16 {
-            cadu[(k * 11) * RS_INTERLEAVE] ^= 0x3C;
-        }
-        // Apply derand so the chain's derand recovers our (corrupted)
-        // codewords.
+        payload
+    }
+
+    /// Apply the CCSDS randomiser (its own inverse) to a payload.
+    fn randomise(payload: &mut [u8]) {
         let mut derand = Derandomizer::new();
         derand.reset();
-        for byte in &mut cadu {
+        for byte in payload {
             *byte = derand.process(*byte);
         }
+    }
+
+    /// 17 byte errors in interleave column 0 — beyond RS(255,223)'s
+    /// 16-symbol correction capacity, so the codeword is pinned
+    /// uncorrectable.
+    fn corrupt_column_zero(payload: &mut [u8]) {
+        for k in 0..=16 {
+            payload[(k * 11) * RS_INTERLEAVE] ^= 0x3C;
+        }
+    }
+
+    /// Zero bits appended after a synthetic CADU so Viterbi's
+    /// 224-symbol traceback flushes the last payload bits out.
+    const VITERBI_FLUSH_BITS: usize = 500;
+
+    /// Randomised CADU payload → ASM + payload bits + a
+    /// `VITERBI_FLUSH_BITS` zero tail → soft pairs.
+    fn encode_cadu_soft(randomised_payload: &[u8]) -> Vec<i8> {
+        let mut bits = asm_to_bits();
+        bits.reserve(CADU_TOTAL_BITS + VITERBI_FLUSH_BITS);
+        for &byte in randomised_payload {
+            for j in 0..8 {
+                bits.push((byte >> (7 - j)) & 1);
+            }
+        }
+        bits.extend(std::iter::repeat_n(0_u8, VITERBI_FLUSH_BITS));
+        crate::fec::viterbi::ccsds_encode(&bits)
+    }
+
+    #[test]
+    fn decode_cadu_returns_none_on_invalid_codeword() {
+        let mut cadu = rs_encode_cadu(&patterned_vcdu());
+        corrupt_column_zero(&mut cadu);
+        randomise(&mut cadu);
         let mut c = FecChain::new();
         assert!(
             c.decode_cadu(cadu).is_none(),
-            "a column with 255 byte-errors must exceed RS capacity and yield None",
+            "a column with 17 byte-errors must exceed RS capacity and yield None",
         );
     }
 
     #[test]
     fn decode_cadu_round_trips_clean_rs_encoded_data() {
-        // Build a synthetic CADU from scratch:
-        //   1. Pick 892 bytes of "VCDU" content
-        //   2. De-interleave (split into 4 × 223-byte messages)
-        //   3. RS-encode each message → 4 × 255-byte codewords
-        //   4. Interleave into a 1020-byte CADU payload
-        //   5. Apply derand (XOR with PN) so when the chain's
-        //      derand undoes it, we recover the encoded form
-        //
-        // Then push that synthetic CADU through `decode_cadu`
-        // and assert we recover the original 892-byte VCDU.
-        let rs = ReedSolomon::new();
-        // Distinct, non-uniform VCDU content so any byte-order
-        // bug surfaces visibly.
-        let mut original_vcdu = vec![0_u8; VCDU_LEN];
-        for (i, b) in original_vcdu.iter_mut().enumerate() {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "modulo 256 fits in u8 by definition"
-            )]
-            let byte = ((i * 7 + 11) % 256) as u8;
-            *b = byte;
-        }
-        // De-interleave VCDU into 4 message buffers.
-        let mut messages = [[0_u8; RS_MESSAGE_LEN]; RS_INTERLEAVE];
-        for col in 0..RS_INTERLEAVE {
-            for i in 0..RS_MESSAGE_LEN {
-                messages[col][i] = original_vcdu[i * RS_INTERLEAVE + col];
-            }
-        }
-        // RS-encode each message.
-        let codewords: Vec<[u8; RS_CODEWORD_LEN]> = messages.iter().map(|m| rs.encode(m)).collect();
-        // Interleave back into 1020-byte CADU payload.
-        let mut cadu_payload = vec![0_u8; CADU_PAYLOAD_LEN];
-        for col in 0..RS_INTERLEAVE {
-            for i in 0..RS_CODEWORD_LEN {
-                cadu_payload[i * RS_INTERLEAVE + col] = codewords[col][i];
-            }
-        }
-        // Apply derand (XOR with PN) so the chain's derand
-        // (which XORs again with PN) recovers `cadu_payload`.
-        let mut derand = Derandomizer::new();
-        derand.reset();
-        for byte in &mut cadu_payload {
-            *byte = derand.process(*byte);
-        }
-        // Now feed into the chain's decode path and confirm we
-        // get the original VCDU back.
+        let original_vcdu = patterned_vcdu();
+        let mut cadu = rs_encode_cadu(&original_vcdu);
+        randomise(&mut cadu);
         let mut c = FecChain::new();
         let recovered = c
-            .decode_cadu(cadu_payload)
+            .decode_cadu(cadu)
             .expect("clean RS-encoded CADU must decode");
         assert_eq!(recovered, original_vcdu);
     }
@@ -564,56 +610,132 @@ mod tests {
         }
     }
 
-    /// Build a clean encoded soft stream for one full CADU
-    /// (ASM + RS-encoded + derandomised payload that decodes
-    /// back to `original_vcdu`), padded with enough trailing
-    /// zero input bits to flush Viterbi's traceback so the
-    /// chain emits the VCDU before the soft buffer runs out.
+    /// Soft stream for one clean CADU carrying `original_vcdu`.
     fn synthesise_cadu_soft(original_vcdu: &[u8]) -> Vec<i8> {
-        // RS-encode: de-interleave VCDU → 4 messages, encode
-        // each, re-interleave into 1020-byte CADU payload.
-        let rs = ReedSolomon::new();
-        let mut messages = [[0_u8; RS_MESSAGE_LEN]; RS_INTERLEAVE];
-        for col in 0..RS_INTERLEAVE {
-            for i in 0..RS_MESSAGE_LEN {
-                messages[col][i] = original_vcdu[i * RS_INTERLEAVE + col];
-            }
-        }
-        let codewords: Vec<[u8; RS_CODEWORD_LEN]> = messages.iter().map(|m| rs.encode(m)).collect();
-        let mut cadu_payload = vec![0_u8; CADU_PAYLOAD_LEN];
-        for col in 0..RS_INTERLEAVE {
-            for i in 0..RS_CODEWORD_LEN {
-                cadu_payload[i * RS_INTERLEAVE + col] = codewords[col][i];
-            }
-        }
-        // Apply derand so the chain's derand re-XOR recovers the
-        // RS-encoded form.
-        let mut derand = Derandomizer::new();
-        derand.reset();
-        for byte in &mut cadu_payload {
-            *byte = derand.process(*byte);
-        }
-        // Build the ASM + payload bitstream (MSB first).
-        let mut bits: Vec<u8> = Vec::with_capacity(32 + CADU_PAYLOAD_LEN * 8);
-        for i in 0..32 {
+        let mut payload = rs_encode_cadu(original_vcdu);
+        randomise(&mut payload);
+        encode_cadu_soft(&payload)
+    }
+
+    /// Distinct, non-uniform VCDU content so any byte-order bug
+    /// surfaces visibly.
+    fn patterned_vcdu() -> Vec<u8> {
+        let mut vcdu = vec![0_u8; VCDU_LEN];
+        for (i, b) in vcdu.iter_mut().enumerate() {
             #[allow(
                 clippy::cast_possible_truncation,
-                reason = "ASM is u32, shift index 0..32 is safe"
+                reason = "modulo 256 fits in u8 by definition"
             )]
-            let bit = ((crate::fec::ASM >> (31 - i)) & 1) as u8;
-            bits.push(bit);
+            let byte = ((i * 7 + 11) % 256) as u8;
+            *b = byte;
         }
-        for &byte in &cadu_payload {
-            for j in 0..8 {
-                bits.push((byte >> (7 - j)) & 1);
+        vcdu
+    }
+
+    /// Push a soft stream through the chain at a forward rotation,
+    /// returning the VCDUs it emitted.
+    fn push_rotated(chain: &mut FecChain, soft: &[i8], rot_idx: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for pair_chunk in soft.as_chunks::<2>().0 {
+            let pair = forward_rotation(rot_idx, [pair_chunk[0], pair_chunk[1]]);
+            if let Some(vcdu) = chain.push_symbol(pair) {
+                out.push(vcdu);
             }
         }
-        // Trailing zero bits: enough to push every CADU bit out
-        // of Viterbi's TRACEBACK_DEPTH window. 32 ASM + 8160
-        // payload + slack = 8500 input bits for a comfortable
-        // margin (Viterbi's traceback is 224 symbols).
-        bits.extend(std::iter::repeat_n(0_u8, 500));
-        crate::fec::viterbi::ccsds_encode(&bits)
+        out
+    }
+
+    // --- #727 (Aug 2026 deep review) ---
+
+    /// After a Costas quarter-turn slip the locked rotation is wrong,
+    /// Viterbi emits garbage and the per-CADU correlator never hits
+    /// (only a 180° residual is recoverable via `ASM_INVERTED`). The
+    /// chain must notice the silence and re-hunt the rotation instead
+    /// of yielding nothing for the rest of the pass.
+    #[test]
+    fn rehunts_rotation_after_a_quarter_turn_slip() {
+        let vcdu = patterned_vcdu();
+        let soft = synthesise_cadu_soft(&vcdu);
+        let mut chain = FecChain::new();
+        assert_eq!(push_rotated(&mut chain, &soft, 0), vec![vcdu.clone()]);
+        assert_eq!(chain.locked_rotation(), Some(Rotation::Zero));
+        // The constellation slips by 90°: feed enough CADUs at the
+        // new orientation to exceed the silence limit.
+        // REHUNT_AFTER_FAILED_CADUS copies trigger the re-hunt; the
+        // remaining copies re-acquire and decode at the new rotation.
+        let mut decoded_after_slip = Vec::new();
+        for _ in 0..(REHUNT_AFTER_FAILED_CADUS + 4) {
+            decoded_after_slip.extend(push_rotated(&mut chain, &soft, 1));
+        }
+        // (A 90°-rotated ASM still frame-syncs within the bit-error
+        // limit, so this slip is caught by the failed-CADU run; the
+        // silence limit is exercised separately below.)
+        let st = chain.stats();
+        assert_eq!(st.rotation_rehunts, 1, "{st:?}");
+        assert_eq!(st.sync_timeouts, 0, "failed-CADU run, not silence: {st:?}");
+        assert_eq!(chain.locked_rotation(), Some(Rotation::Rot90));
+        assert!(
+            decoded_after_slip.contains(&vcdu),
+            "decoding resumed at the new rotation"
+        );
+    }
+
+    /// A lock that stops producing frame-sync hits altogether (the
+    /// orientation is wrong and nothing correlates) is abandoned
+    /// after `REHUNT_AFTER_SILENT_BITS` post-Viterbi bits.
+    #[test]
+    fn rehunts_rotation_after_frame_sync_silence() {
+        let vcdu = patterned_vcdu();
+        let clean = synthesise_cadu_soft(&vcdu);
+        let mut chain = FecChain::new();
+        assert_eq!(push_rotated(&mut chain, &clean, 0), vec![vcdu]);
+        // Constant soft pairs carry no ASM: Viterbi keeps emitting
+        // bits, the frame-sync correlator never hits.
+        let silent_pairs = REHUNT_AFTER_SILENT_BITS + 2 * CADU_TOTAL_BITS;
+        for _ in 0..silent_pairs {
+            assert!(chain.push_symbol([40, -40]).is_none());
+        }
+        let st = chain.stats();
+        assert_eq!(st.sync_timeouts, 1, "{st:?}");
+        assert_eq!(st.rotation_rehunts, 1, "{st:?}");
+        assert_eq!(st.cadus_failed, 0, "{st:?}");
+        assert_eq!(chain.locked_rotation(), None, "back to hunting");
+    }
+
+    /// CADUs that frame-sync but fail Reed-Solomon `REHUNT_AFTER_FAILED_CADUS`
+    /// times in a row also abandon the lock (the module doc's deferred
+    /// "last K CADUs all failed RS" fallback).
+    #[test]
+    fn rehunts_rotation_after_consecutive_rs_failures() {
+        let vcdu = patterned_vcdu();
+        let clean = synthesise_cadu_soft(&vcdu);
+        let mut chain = FecChain::new();
+        assert_eq!(push_rotated(&mut chain, &clean, 0), vec![vcdu.clone()]);
+        // ASM + uncorrectable payload: syncs, RS fails every time.
+        let garbage = synthesise_garbage_cadu_soft();
+        for _ in 0..REHUNT_AFTER_FAILED_CADUS {
+            assert!(push_rotated(&mut chain, &garbage, 0).is_empty());
+        }
+        let st = chain.stats();
+        assert_eq!(
+            st.cadus_failed,
+            u64::from(REHUNT_AFTER_FAILED_CADUS),
+            "{st:?}"
+        );
+        assert_eq!(st.rotation_rehunts, 1, "{st:?}");
+        // A clean CADU re-acquires the rotation and decodes again.
+        assert_eq!(push_rotated(&mut chain, &clean, 0), vec![vcdu]);
+        assert_eq!(chain.stats().rotation_locks, 2);
+    }
+
+    /// Soft stream for a CADU that frame-syncs but cannot be
+    /// corrected: a pinned 17-error column (CR on PR #804). The
+    /// payload contains no further sync hit within its 8160 bits.
+    fn synthesise_garbage_cadu_soft() -> Vec<i8> {
+        let mut payload = rs_encode_cadu(&patterned_vcdu());
+        corrupt_column_zero(&mut payload);
+        randomise(&mut payload);
+        encode_cadu_soft(&payload)
     }
 
     /// **Gold-standard test for issue #605.** Build a clean
@@ -626,17 +748,7 @@ mod tests {
     /// the chain only decoded at the upright phase.
     #[test]
     fn fec_chain_decodes_through_each_of_eight_rotations() {
-        // Distinct, non-uniform VCDU content so any byte-order
-        // bug surfaces visibly.
-        let mut original_vcdu = vec![0_u8; VCDU_LEN];
-        for (i, b) in original_vcdu.iter_mut().enumerate() {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "modulo 256 fits in u8 by definition"
-            )]
-            let byte = ((i * 7 + 11) % 256) as u8;
-            *b = byte;
-        }
+        let original_vcdu = patterned_vcdu();
         let soft = synthesise_cadu_soft(&original_vcdu);
         for (idx, rot) in Rotation::ALL.iter().enumerate() {
             let mut chain = FecChain::new();

@@ -232,8 +232,8 @@ fn run(
     }
     let st = pipeline.fec_stats();
     eprintln!(
-        "fec: rotation_locks={} cadus_decoded={} cadus_failed={}",
-        st.rotation_locks, st.cadus_decoded, st.cadus_failed,
+        "fec: rotation_locks={} rotation_rehunts={} sync_timeouts={} cadus_decoded={} cadus_failed={}",
+        st.rotation_locks, st.rotation_rehunts, st.sync_timeouts, st.cadus_decoded, st.cadus_failed,
     );
 
     let assembler = pipeline.assembler();
