@@ -279,15 +279,7 @@ pub(super) fn handle_start_audio_recording(
             // Recording committed — now apply the mutex.
             // Scanner, per-hit recording, and transcription
             // are mutually exclusive in Phase 1.
-            if state.scanner.is_enabled() {
-                let cmds = state
-                    .scanner
-                    .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
-                apply_scanner_commands(state, dsp_tx, cmds);
-                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                    ScannerMutexReason::ScannerStoppedForRecording,
-                ));
-            }
+            stop_scanner_for_recording(state, dsp_tx);
             // Recording ↔ transcription leg: stop any active
             // transcription tap so the two don't run concurrently.
             // `stop_transcription` is silent (no DspToUi event) —
@@ -332,15 +324,7 @@ pub(super) fn handle_start_iq_recording(
     // as `StartAudioRecording` above.
     match WavWriter::new(&path, iq_rate, IQ_CHANNELS) {
         Ok(writer) => {
-            if state.scanner.is_enabled() {
-                let cmds = state
-                    .scanner
-                    .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
-                apply_scanner_commands(state, dsp_tx, cmds);
-                let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
-                    ScannerMutexReason::ScannerStoppedForRecording,
-                ));
-            }
+            stop_scanner_for_recording(state, dsp_tx);
             // Recording ↔ transcription mutex — see
             // StartAudioRecording for rationale.
             stop_transcription(state);
@@ -373,4 +357,26 @@ pub(super) fn handle_enable_audio_tap(
     // wraps.
     state.audio_tap_phase = 0;
     tracing::info!("audio tap enabled");
+}
+
+/// Scanner ↔ recording mutex: stop a running scanner before a
+/// recording starts and tell the UI why. Shared by the audio and IQ
+/// recording paths (CR on PR #842).
+fn stop_scanner_for_recording(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
+    if state.scanner.is_enabled() {
+        let cmds = state
+            .scanner
+            .handle_event(sdr_scanner::ScannerEvent::SetEnabled(false));
+        apply_scanner_commands(state, dsp_tx, cmds);
+        let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
+            ScannerMutexReason::ScannerStoppedForRecording,
+        ));
+    }
+}
+
+/// Handler for `UiToDsp::DisableAudioTap`, delegated from
+/// `handle_command` (CR on PR #842).
+pub(super) fn handle_disable_audio_tap(state: &mut DspState) {
+    state.audio_tap_tx = None;
+    tracing::info!("audio tap disabled");
 }

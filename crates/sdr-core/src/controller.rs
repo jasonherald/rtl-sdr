@@ -1142,20 +1142,14 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             transcription::handle_enable_transcription(state, dsp_tx, tx);
         }
         UiToDsp::DisableTranscription => {
-            state.transcription_tx = None;
-            // Mirror the reset on disable so a subsequent
-            // EnableTranscription always starts from a known state.
-            // Scanner tracker is independent and stays intact.
-            state.transcription_squelch_was_open = false;
-            tracing::info!("transcription audio tap disabled");
+            transcription::handle_disable_transcription(state);
         }
 
         UiToDsp::EnableAudioTap(tx) => {
             audio::handle_enable_audio_tap(state, tx);
         }
         UiToDsp::DisableAudioTap => {
-            state.audio_tap_tx = None;
-            tracing::info!("audio tap disabled");
+            audio::handle_disable_audio_tap(state);
         }
         UiToDsp::DisconnectRtlTcp => {
             source::handle_disconnect_rtl_tcp(state, dsp_tx);

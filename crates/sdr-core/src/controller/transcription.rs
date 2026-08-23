@@ -53,3 +53,13 @@ pub(super) fn handle_enable_transcription(
     state.transcription_tx = Some(tx);
     tracing::info!("transcription audio tap enabled");
 }
+
+/// Handler for `UiToDsp::DisableTranscription`, delegated from
+/// `handle_command` (CR on PR #842). Unconditional tracker reset
+/// mirrors the pre-#816 arm: even a disable with no active tap
+/// leaves the edge tracker cleared.
+pub(super) fn handle_disable_transcription(state: &mut DspState) {
+    stop_transcription(state);
+    state.transcription_squelch_was_open = false;
+    tracing::info!("transcription audio tap disabled");
+}

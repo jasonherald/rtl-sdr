@@ -37,6 +37,7 @@ fn test_pre_lock_snapshot() -> crate::acars_airband_lock::PreLockSnapshot {
 
 use crate::acars_airband_lock::{ACARS_CENTER_HZ, ACARS_SOURCE_RATE_HZ, US_SIX_CHANNELS_HZ};
 
+mod command_handlers;
 mod frontend_vfo;
 mod lifecycle;
 mod lrpt;

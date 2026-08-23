@@ -915,14 +915,21 @@ fn send_start_epilogue(state: &DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // values to the UI.
     if let Some(source) = &state.source {
         let _ = dsp_tx.send(DspToUi::DeviceInfo(source.name().to_string()));
-        let gains: Vec<f64> = source
-            .gains()
-            .iter()
-            .map(|&g| f64::from(g) / 10.0) // tenths of dB → dB
-            .collect();
-        if !gains.is_empty() {
-            let _ = dsp_tx.send(DspToUi::GainList(gains));
-        }
+        send_gain_list(source.as_ref(), dsp_tx);
+    }
+}
+
+/// Map the source's gain table (tenths of dB) to dB and emit
+/// `GainList` when non-empty. Shared by the Start epilogue and the
+/// post-switch restart (CR on PR #842).
+fn send_gain_list(source: &dyn Source, dsp_tx: &mpsc::Sender<DspToUi>) {
+    let gains: Vec<f64> = source
+        .gains()
+        .iter()
+        .map(|&g| f64::from(g) / 10.0) // tenths of dB → dB
+        .collect();
+    if !gains.is_empty() {
+        let _ = dsp_tx.send(DspToUi::GainList(gains));
     }
 }
 
@@ -1347,14 +1354,7 @@ fn restart_after_source_switch(state: &mut DspState, dsp_tx: &mpsc::Sender<DspTo
             state.running = true;
             // Refresh UI with new source capabilities
             if let Some(source) = &state.source {
-                let gains: Vec<f64> = source
-                    .gains()
-                    .iter()
-                    .map(|&g| f64::from(g) / 10.0)
-                    .collect();
-                if !gains.is_empty() {
-                    let _ = dsp_tx.send(DspToUi::GainList(gains));
-                }
+                send_gain_list(source.as_ref(), dsp_tx);
             }
             let _ = dsp_tx.send(DspToUi::SampleRateChanged(
                 state.frontend.effective_sample_rate(),
