@@ -457,12 +457,6 @@ pub(super) fn connect_rtl_tcp_discovery(
     // the window alive after close — upgrade() returns None on a
     // destroyed widget and the poller breaks out.
     let expander_weak = panels.source.rtl_tcp_discovered_row.downgrade();
-    let hostname_row = panels.source.hostname_row.clone();
-    let port_row = panels.source.port_row.clone();
-    let protocol_row = panels.source.protocol_row.clone();
-    let device_row = panels.source.device_row.clone();
-    let role_row = panels.source.rtl_tcp_role_row.clone();
-    let auth_key_row = panels.source.rtl_tcp_auth_key_row.clone();
     let state = Rc::clone(state);
     // Shared config handle — the Connect button on each discovered
     // row clones it once more inside the closure so it can persist
@@ -511,7 +505,47 @@ pub(super) fn connect_rtl_tcp_discovery(
     // Seed the popover's content from the restored favorites so
     // the list is ready when the user first clicks the header
     // star, without waiting for a mutation to trigger a rebuild.
-    rebuild_favorites_popover(&favorite_row_ctx, &favorites.borrow());
+    wire_favorites_popover_refresh(favorites_header, &favorite_row_ctx);
+
+    restore_last_connected_endpoint(
+        &state,
+        &config_for_discovery,
+        &panels.source.hostname_row,
+        &panels.source.port_row,
+        &panels.source.protocol_row,
+    );
+
+    let row_deps = Rc::new(DiscoveredRowDeps {
+        hostname_row: panels.source.hostname_row.clone(),
+        port_row: panels.source.port_row.clone(),
+        protocol_row: panels.source.protocol_row.clone(),
+        device_row: panels.source.device_row.clone(),
+        role_row: panels.source.rtl_tcp_role_row.clone(),
+        auth_key_row: panels.source.rtl_tcp_auth_key_row.clone(),
+        state: Rc::clone(&state),
+        config: config_for_discovery.clone(),
+        favorite_row_ctx: Rc::clone(&favorite_row_ctx),
+        discovered_star_buttons: Rc::clone(&discovered_star_buttons),
+        expander_weak: expander_weak.clone(),
+    });
+    arm_discovery_poller(
+        browser,
+        disc_rx,
+        &displayed_rows,
+        &favorites,
+        &row_deps,
+        &expander_weak,
+    );
+}
+
+/// Seed the favorites popover and rebuild it on every show so the
+/// "seen Xm ago" subtitles track wall-clock time. Split out per the
+/// 50-NLOC gate (#817).
+fn wire_favorites_popover_refresh(
+    favorites_header: &FavoritesHeaderHandle,
+    favorite_row_ctx: &Rc<FavoriteRowContext>,
+) {
+    rebuild_favorites_popover(&favorite_row_ctx, &favorite_row_ctx.favorites.borrow());
 
     // Rebuild on every popover show so the "seen Xm ago" subtitles
     // reflect current wall-clock time. Without this, the ages
@@ -532,36 +566,6 @@ pub(super) fn connect_rtl_tcp_discovery(
             rebuild_favorites_popover(&ctx_for_show, &ctx_for_show.favorites.borrow());
         });
     }
-
-    restore_last_connected_endpoint(
-        &state,
-        &config_for_discovery,
-        &hostname_row,
-        &port_row,
-        &protocol_row,
-    );
-
-    let row_deps = Rc::new(DiscoveredRowDeps {
-        hostname_row: hostname_row.clone(),
-        port_row: port_row.clone(),
-        protocol_row: protocol_row.clone(),
-        device_row: device_row.clone(),
-        role_row: role_row.clone(),
-        auth_key_row: auth_key_row.clone(),
-        state: Rc::clone(&state),
-        config: config_for_discovery.clone(),
-        favorite_row_ctx: Rc::clone(&favorite_row_ctx),
-        discovered_star_buttons: Rc::clone(&discovered_star_buttons),
-        expander_weak: expander_weak.clone(),
-    });
-    arm_discovery_poller(
-        browser,
-        disc_rx,
-        &displayed_rows,
-        &favorites,
-        &row_deps,
-        &expander_weak,
-    );
 }
 
 /// Arm the 200 ms discovery poll timer (skipped when the mDNS browser
