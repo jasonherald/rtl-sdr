@@ -313,6 +313,52 @@ pub(super) fn apply_rtl_tcp_connection_state(
     retry_button.set_sensitive(can_retry_now);
 }
 
+/// Dispatch half of [`apply_rtl_tcp_connect`]: role + auth-key config,
+/// device selection, canonical `SetNetworkConfig`, and last-connected
+/// persistence. Split out per the 50-NLOC gate (#817).
+fn dispatch_rtl_tcp_connect(
+    host: &str,
+    port: u16,
+    nickname: &str,
+    role_row: &adw::ComboRow,
+    auth_key_row: &adw::PasswordEntryRow,
+    device_row: &adw::ComboRow,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    use crate::sidebar::source_panel::{FavoriteRole, RTL_TCP_ROLE_LISTEN_IDX};
+
+    let requested_role = match role_row.selected() {
+        RTL_TCP_ROLE_LISTEN_IDX => FavoriteRole::Listen,
+        _ => FavoriteRole::Control,
+    }
+    .as_wire_role();
+    let key_text = auth_key_row.text().to_string();
+    let auth_key: Option<Vec<u8>> = if key_text.is_empty() {
+        None
+    } else {
+        crate::sidebar::server_panel::auth_key_from_hex(&key_text)
+    };
+    state.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+        requested_role,
+        auth_key,
+    });
+    device_row.set_selected(DEVICE_RTLTCP);
+    state.send_dsp(UiToDsp::SetNetworkConfig {
+        hostname: host.to_string(),
+        port,
+        protocol: sdr_types::Protocol::TcpClient,
+    });
+    crate::sidebar::source_panel::save_last_connected(
+        config,
+        &crate::sidebar::source_panel::LastConnectedServer {
+            host: host.to_string(),
+            port,
+            nickname: nickname.to_string(),
+        },
+    );
+}
+
 /// Connect source panel controls to DSP commands.
 #[allow(clippy::too_many_lines)]
 /// Spawn an mDNS browser for `_rtl_tcp._tcp.local.` services and wire
@@ -1126,11 +1172,6 @@ pub(super) fn apply_rtl_tcp_connect(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
-    use crate::sidebar::source_panel::{
-        FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
-        RTL_TCP_ROLE_LISTEN_IDX, load_favorites,
-    };
-
     let already_rtl_tcp = device_row.selected() == DEVICE_RTLTCP;
     // Guard the programmatic row rewrites so the per-field
     // handlers don't clobber `KEY_SOURCE_NETWORK_*` (which belong
@@ -1151,34 +1192,15 @@ pub(super) fn apply_rtl_tcp_connect(
     state.rtl_tcp_hydration_in_progress.set(false);
     restore_saved_server_state(host, port, role_row, auth_key_row, state, config);
 
-    let requested_role = match role_row.selected() {
-        RTL_TCP_ROLE_LISTEN_IDX => FavoriteRole::Listen,
-        _ => FavoriteRole::Control,
-    }
-    .as_wire_role();
-    let key_text = auth_key_row.text().to_string();
-    let auth_key: Option<Vec<u8>> = if key_text.is_empty() {
-        None
-    } else {
-        crate::sidebar::server_panel::auth_key_from_hex(&key_text)
-    };
-    state.send_dsp(UiToDsp::SetRtlTcpClientConfig {
-        requested_role,
-        auth_key,
-    });
-    device_row.set_selected(DEVICE_RTLTCP);
-    state.send_dsp(UiToDsp::SetNetworkConfig {
-        hostname: host.to_string(),
+    dispatch_rtl_tcp_connect(
+        host,
         port,
-        protocol: sdr_types::Protocol::TcpClient,
-    });
-    crate::sidebar::source_panel::save_last_connected(
+        nickname,
+        role_row,
+        auth_key_row,
+        device_row,
+        state,
         config,
-        &crate::sidebar::source_panel::LastConnectedServer {
-            host: host.to_string(),
-            port,
-            nickname: nickname.to_string(),
-        },
     );
     if already_rtl_tcp {
         state.send_dsp(UiToDsp::SetSourceType(SourceType::RtlTcp));
@@ -1373,160 +1395,9 @@ pub(super) fn attach_favorite_row_actions(
     entry: &sidebar::source_panel::FavoriteEntry,
     ctx: &Rc<FavoriteRowContext>,
 ) {
-    // Connect button — pins TCP, loads host/port, switches to RTL-TCP.
-    let connect_btn = gtk4::Button::with_label("Connect");
-    connect_btn.add_css_class("suggested-action");
-    connect_btn.set_valign(gtk4::Align::Center);
-    let connect_ctx = Rc::clone(ctx);
-    let connect_key = entry.key.clone();
-    let connect_nickname = entry.nickname.clone();
-    connect_btn.connect_clicked(move |_| {
-        let Some((host, port)) = parse_host_port(&connect_key) else {
-            // Corrupt key shouldn't happen in practice —
-            // `favorite_key(server)` always produces
-            // `hostname:port`. Log rather than silently dropping
-            // the click, so a future schema drift is discoverable.
-            tracing::warn!(
-                key = %connect_key,
-                "favorites popover: Connect clicked on un-parseable key, ignoring",
-            );
-            return;
-        };
-        let (
-            Some(hostname_row),
-            Some(port_row),
-            Some(protocol_row),
-            Some(device_row),
-            Some(role_row),
-            Some(auth_key_row),
-        ) = (
-            connect_ctx.hostname_row.upgrade(),
-            connect_ctx.port_row.upgrade(),
-            connect_ctx.protocol_row.upgrade(),
-            connect_ctx.device_row.upgrade(),
-            connect_ctx.role_row.upgrade(),
-            connect_ctx.auth_key_row.upgrade(),
-        )
-        else {
-            return;
-        };
-        // Shared ordering-sensitive flow lives in
-        // `apply_rtl_tcp_connect`. The popover-specific follow-up
-        // (popdown) happens after this returns.
-        apply_rtl_tcp_connect(
-            &host,
-            port,
-            &connect_nickname,
-            &hostname_row,
-            &port_row,
-            &protocol_row,
-            &device_row,
-            &role_row,
-            &auth_key_row,
-            &connect_ctx.state,
-            &connect_ctx.config,
-        );
-        // Dismiss the popover once the connection is dispatched
-        // so the user sees the source row update underneath.
-        if let Some(popover) = connect_ctx.popover.popover.upgrade() {
-            popover.popdown();
-        }
-    });
-    row.add_suffix(&connect_btn);
+    attach_favorite_connect_button(row, entry, ctx);
 
-    // Copy button — writes `host:port` to the clipboard. Lets
-    // the user grab the endpoint for pasting into another tool
-    // without having to hand-transcribe the subtitle.
-    let copy_btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
-    copy_btn.set_tooltip_text(Some("Copy host:port"));
-    copy_btn.add_css_class("flat");
-    copy_btn.set_valign(gtk4::Align::Center);
-    // Icon-only button — give it an explicit accessible name so
-    // screen readers don't fall back to the icon filename.
-    copy_btn.update_property(&[gtk4::accessible::Property::Label("Copy server address")]);
-    let copy_key = entry.key.clone();
-    copy_btn.connect_clicked(move |btn| {
-        // `WidgetExt::clipboard` reaches the display clipboard
-        // via the button's realized display. If the popover has
-        // been torn down the button isn't reachable anyway, so
-        // we just use the button itself as the anchor widget.
-        btn.clipboard().set_text(&copy_key);
-    });
-    row.add_suffix(&copy_btn);
-
-    // Unstar button — removes from the favorites map, persists,
-    // and rebuilds both the discovery expander (so the row moves
-    // out of the pinned section) and the popover list (so the
-    // row disappears from here).
-    let unstar_btn = gtk4::Button::from_icon_name("starred-symbolic");
-    unstar_btn.set_tooltip_text(Some("Remove from favorites"));
-    unstar_btn.add_css_class("flat");
-    unstar_btn.set_valign(gtk4::Align::Center);
-    // Icon-only button — matches the tooltip here but stays as
-    // a distinct property so screen readers announce it even
-    // when tooltips are disabled / long-hover wouldn't fire.
-    unstar_btn.update_property(&[gtk4::accessible::Property::Label("Remove from favorites")]);
-    let unstar_key = entry.key.clone();
-    let unstar_ctx = Rc::clone(ctx);
-    unstar_btn.connect_clicked(move |_| {
-        {
-            let mut favs = unstar_ctx.favorites.borrow_mut();
-            if favs.remove(&unstar_key).is_none() {
-                // Already gone (e.g., double-click race). Nothing
-                // to persist and nothing to rebuild.
-                return;
-            }
-            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
-                favs.values().cloned().collect();
-            crate::sidebar::source_panel::save_favorites(&unstar_ctx.config, &snapshot);
-        }
-
-        // If the discovery row for this key is currently rendered,
-        // flip its star toggle to the unpinned state. The
-        // toggle's own `connect_toggled` handler then does the
-        // map cleanup (no-op — we already removed), the persist
-        // (redundant but idempotent), the discovery reorder, and
-        // the popover rebuild — so we early-return and skip OUR
-        // reorder / rebuild below.
-        //
-        // Without this, the filled star would keep rendering
-        // until the next mDNS beacon, which isn't just
-        // cosmetic: the first user click on the stale filled
-        // star fires `toggled` with `active=false` (the intent
-        // was "re-pin"), silently wasting a click.
-        if let Some(star_map) = unstar_ctx.discovered_star_buttons.upgrade() {
-            let maybe_btn = star_map
-                .borrow()
-                .get(&unstar_key)
-                .and_then(glib::WeakRef::upgrade);
-            if let Some(btn) = maybe_btn
-                && btn.is_active()
-            {
-                btn.set_active(false);
-                return;
-            }
-        }
-
-        // No discovery row visible for this key — do the reorder
-        // and popover rebuild ourselves.
-        //
-        // `displayed_rows` is Weak on the context — upgrade fails
-        // if the discovery timer has been torn down, which also
-        // means there's nothing left to reorder.
-        if let (Some(expander), Some(rows)) = (
-            unstar_ctx.expander_weak.upgrade(),
-            unstar_ctx.displayed_rows.upgrade(),
-        ) {
-            reorder_discovered_rows(&expander, &rows.borrow(), &unstar_ctx.favorites.borrow());
-        }
-        // Rebuild the popover so the unstarred row disappears.
-        // GTK signal-lifetime guarantees we can `ListBox::remove`
-        // our own row from inside this button-clicked handler:
-        // GTK retains the signal's source widget for the
-        // callback's duration, so the button won't drop under us.
-        rebuild_favorites_popover(&unstar_ctx, &unstar_ctx.favorites.borrow());
-    });
-    row.add_suffix(&unstar_btn);
+    attach_favorite_copy_unstar_buttons(row, entry, ctx);
 }
 
 /// Parse a `hostname:port` favorite key back into its two fields.
@@ -3469,22 +3340,7 @@ fn on_rtl_tcp_controller_busy(
     let Some(overlay) = toast_overlay_weak.upgrade() else {
         return;
     };
-    // Before creating the new pair, sweep any still-
-    // live toasts from a prior `ControllerBusy` entry
-    // (e.g. the user hit `Retry` without clicking either
-    // action, and the server is still busy on the
-    // rebound). Otherwise the overlay would stack two
-    // pairs, and dismissing one pair via the cross-
-    // dismiss helpers below would leave the other pair
-    // orphaned. Per `CodeRabbit` round 11 on PR #408.
-    {
-        let mut pending = pending_controller_busy_toasts.borrow_mut();
-        for weak in pending.drain(..) {
-            if let Some(toast) = weak.upgrade() {
-                toast.dismiss();
-            }
-        }
-    }
+    sweep_prior_controller_busy_toasts(pending_controller_busy_toasts);
 
     let toast = adw::Toast::builder()
         .title("Controller slot is occupied on this server.")
@@ -3854,4 +3710,220 @@ fn restore_saved_server_state(
     // Control — the legacy-safe default. Collapsed with the
     // explicit Control arm since both produce the same
     // `FavoriteRole::Control`.
+}
+
+/// Connect button — pins TCP, loads host/port, switches to RTL-TCP.
+/// Split out per the 50-NLOC gate (#817).
+fn attach_favorite_connect_button(
+    row: &adw::ActionRow,
+    entry: &sidebar::source_panel::FavoriteEntry,
+    ctx: &Rc<FavoriteRowContext>,
+) {
+    // Connect button — pins TCP, loads host/port, switches to RTL-TCP.
+    let connect_btn = gtk4::Button::with_label("Connect");
+    connect_btn.add_css_class("suggested-action");
+    connect_btn.set_valign(gtk4::Align::Center);
+    let connect_ctx = Rc::clone(ctx);
+    let connect_key = entry.key.clone();
+    let connect_nickname = entry.nickname.clone();
+    connect_btn.connect_clicked(move |_| {
+        on_favorite_connect_clicked(&connect_ctx, &connect_key, &connect_nickname);
+    });
+    row.add_suffix(&connect_btn);
+
+    // Copy button — writes `host:port` to the clipboard. Lets
+    // the user grab the endpoint for pasting into another tool
+    // without having to hand-transcribe the subtitle.
+}
+
+/// Click body of the favorite Connect button: parse the key, upgrade
+/// the row-context widgets, and run [`apply_rtl_tcp_connect`]. Split
+/// out per the 50-NLOC gate (#817).
+fn on_favorite_connect_clicked(
+    connect_ctx: &Rc<FavoriteRowContext>,
+    connect_key: &str,
+    connect_nickname: &str,
+) {
+    let Some((host, port)) = parse_host_port(&connect_key) else {
+        // Corrupt key shouldn't happen in practice —
+        // `favorite_key(server)` always produces
+        // `hostname:port`. Log rather than silently dropping
+        // the click, so a future schema drift is discoverable.
+        tracing::warn!(
+            key = %connect_key,
+            "favorites popover: Connect clicked on un-parseable key, ignoring",
+        );
+        return;
+    };
+    let (
+        Some(hostname_row),
+        Some(port_row),
+        Some(protocol_row),
+        Some(device_row),
+        Some(role_row),
+        Some(auth_key_row),
+    ) = (
+        connect_ctx.hostname_row.upgrade(),
+        connect_ctx.port_row.upgrade(),
+        connect_ctx.protocol_row.upgrade(),
+        connect_ctx.device_row.upgrade(),
+        connect_ctx.role_row.upgrade(),
+        connect_ctx.auth_key_row.upgrade(),
+    )
+    else {
+        return;
+    };
+    // Shared ordering-sensitive flow lives in
+    // `apply_rtl_tcp_connect`. The popover-specific follow-up
+    // (popdown) happens after this returns.
+    apply_rtl_tcp_connect(
+        &host,
+        port,
+        &connect_nickname,
+        &hostname_row,
+        &port_row,
+        &protocol_row,
+        &device_row,
+        &role_row,
+        &auth_key_row,
+        &connect_ctx.state,
+        &connect_ctx.config,
+    );
+    // Dismiss the popover once the connection is dispatched
+    // so the user sees the source row update underneath.
+    if let Some(popover) = connect_ctx.popover.popover.upgrade() {
+        popover.popdown();
+    }
+}
+
+/// Copy-address + unstar buttons for a favorite row.
+/// Split out per the 50-NLOC gate (#817).
+fn attach_favorite_copy_unstar_buttons(
+    row: &adw::ActionRow,
+    entry: &sidebar::source_panel::FavoriteEntry,
+    ctx: &Rc<FavoriteRowContext>,
+) {
+    let copy_btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
+    copy_btn.set_tooltip_text(Some("Copy host:port"));
+    copy_btn.add_css_class("flat");
+    copy_btn.set_valign(gtk4::Align::Center);
+    // Icon-only button — give it an explicit accessible name so
+    // screen readers don't fall back to the icon filename.
+    copy_btn.update_property(&[gtk4::accessible::Property::Label("Copy server address")]);
+    let copy_key = entry.key.clone();
+    copy_btn.connect_clicked(move |btn| {
+        // `WidgetExt::clipboard` reaches the display clipboard
+        // via the button's realized display. If the popover has
+        // been torn down the button isn't reachable anyway, so
+        // we just use the button itself as the anchor widget.
+        btn.clipboard().set_text(&copy_key);
+    });
+    row.add_suffix(&copy_btn);
+
+    // Unstar button — removes from the favorites map, persists,
+    // and rebuilds both the discovery expander (so the row moves
+    // out of the pinned section) and the popover list (so the
+    // row disappears from here).
+    attach_favorite_unstar_button(row, entry, ctx);
+}
+
+/// Sweep still-live toasts from a prior ControllerBusy entry so the overlay does not stack pairs.
+/// Split out per the 50-NLOC gate (#817).
+fn sweep_prior_controller_busy_toasts(
+    pending_controller_busy_toasts: &Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
+) {
+    // Before creating the new pair, sweep any still-
+    // live toasts from a prior `ControllerBusy` entry
+    // (e.g. the user hit `Retry` without clicking either
+    // action, and the server is still busy on the
+    // rebound). Otherwise the overlay would stack two
+    // pairs, and dismissing one pair via the cross-
+    // dismiss helpers below would leave the other pair
+    // orphaned. Per `CodeRabbit` round 11 on PR #408.
+    {
+        let mut pending = pending_controller_busy_toasts.borrow_mut();
+        for weak in pending.drain(..) {
+            if let Some(toast) = weak.upgrade() {
+                toast.dismiss();
+            }
+        }
+    }
+}
+
+/// Unstar button for a favorite row.
+/// Split out per the 50-NLOC gate (#817).
+fn attach_favorite_unstar_button(
+    row: &adw::ActionRow,
+    entry: &sidebar::source_panel::FavoriteEntry,
+    ctx: &Rc<FavoriteRowContext>,
+) {
+    let unstar_btn = gtk4::Button::from_icon_name("starred-symbolic");
+    unstar_btn.set_tooltip_text(Some("Remove from favorites"));
+    unstar_btn.add_css_class("flat");
+    unstar_btn.set_valign(gtk4::Align::Center);
+    // Icon-only button — matches the tooltip here but stays as
+    // a distinct property so screen readers announce it even
+    // when tooltips are disabled / long-hover wouldn't fire.
+    unstar_btn.update_property(&[gtk4::accessible::Property::Label("Remove from favorites")]);
+    let unstar_key = entry.key.clone();
+    let unstar_ctx = Rc::clone(ctx);
+    unstar_btn.connect_clicked(move |_| {
+        {
+            let mut favs = unstar_ctx.favorites.borrow_mut();
+            if favs.remove(&unstar_key).is_none() {
+                // Already gone (e.g., double-click race). Nothing
+                // to persist and nothing to rebuild.
+                return;
+            }
+            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+                favs.values().cloned().collect();
+            crate::sidebar::source_panel::save_favorites(&unstar_ctx.config, &snapshot);
+        }
+
+        // If the discovery row for this key is currently rendered,
+        // flip its star toggle to the unpinned state. The
+        // toggle's own `connect_toggled` handler then does the
+        // map cleanup (no-op — we already removed), the persist
+        // (redundant but idempotent), the discovery reorder, and
+        // the popover rebuild — so we early-return and skip OUR
+        // reorder / rebuild below.
+        //
+        // Without this, the filled star would keep rendering
+        // until the next mDNS beacon, which isn't just
+        // cosmetic: the first user click on the stale filled
+        // star fires `toggled` with `active=false` (the intent
+        // was "re-pin"), silently wasting a click.
+        if let Some(star_map) = unstar_ctx.discovered_star_buttons.upgrade() {
+            let maybe_btn = star_map
+                .borrow()
+                .get(&unstar_key)
+                .and_then(glib::WeakRef::upgrade);
+            if let Some(btn) = maybe_btn
+                && btn.is_active()
+            {
+                btn.set_active(false);
+                return;
+            }
+        }
+
+        // No discovery row visible for this key — do the reorder
+        // and popover rebuild ourselves.
+        //
+        // `displayed_rows` is Weak on the context — upgrade fails
+        // if the discovery timer has been torn down, which also
+        // means there's nothing left to reorder.
+        if let (Some(expander), Some(rows)) = (
+            unstar_ctx.expander_weak.upgrade(),
+            unstar_ctx.displayed_rows.upgrade(),
+        ) {
+            reorder_discovered_rows(&expander, &rows.borrow(), &unstar_ctx.favorites.borrow());
+        }
+        // Rebuild the popover so the unstarred row disappears.
+        // GTK signal-lifetime guarantees we can `ListBox::remove`
+        // our own row from inside this button-clicked handler:
+        // GTK retains the signal's source widget for the
+        // callback's duration, so the button won't drop under us.
+        rebuild_favorites_popover(&unstar_ctx, &unstar_ctx.favorites.borrow());
+    });
+    row.add_suffix(&unstar_btn);
 }
