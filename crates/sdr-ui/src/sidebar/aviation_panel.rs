@@ -315,14 +315,25 @@ pub fn build_aviation_panel(channel_count: usize) -> AviationPanel {
 /// is variable, including 0 when the user hasn't entered a CSV
 /// yet). Issue #592.
 pub fn rebuild_channel_rows(panel: &AviationPanel, channel_count: usize) {
-    let mut rows = panel.channel_rows.borrow_mut();
+    rebuild_channel_rows_parts(&panel.channels_group, &panel.channel_rows, channel_count);
+}
+
+/// Field-level form of [`rebuild_channel_rows`] for signal-handler
+/// closures that can't capture the whole (non-`Clone`) panel struct —
+/// they clone the group + rows cell instead.
+pub fn rebuild_channel_rows_parts(
+    channels_group: &adw::PreferencesGroup,
+    channel_rows: &std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>>,
+    channel_count: usize,
+) {
+    let mut rows = channel_rows.borrow_mut();
     for row in rows.iter() {
-        panel.channels_group.remove(row);
+        channels_group.remove(row);
     }
     rows.clear();
     for _ in 0..channel_count {
         let row = adw::ActionRow::builder().title("—").subtitle("—").build();
-        panel.channels_group.add(&row);
+        channels_group.add(&row);
         rows.push(row);
     }
 }

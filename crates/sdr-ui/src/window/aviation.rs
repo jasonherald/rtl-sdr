@@ -251,18 +251,11 @@ fn on_acars_region_selected(
     // Inline the rebuild (the helper takes
     // `&AviationPanel`, but we only have the
     // individual fields here in the closure).
-    {
-        let mut rows = channel_rows_cell.borrow_mut();
-        for row in rows.iter() {
-            channels_group.remove(row);
-        }
-        rows.clear();
-        for _ in 0..new_count {
-            let row = adw::ActionRow::builder().title("—").subtitle("—").build();
-            channels_group.add(&row);
-            rows.push(row);
-        }
-    }
+    crate::sidebar::aviation_panel::rebuild_channel_rows_parts(
+        channels_group,
+        channel_rows_cell,
+        new_count,
+    );
     state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
 }
 
@@ -453,18 +446,11 @@ fn wire_custom_channels_row(
             // channel count — same inline pattern as the
             // region-change handler above.
             let new_count = chans.len();
-            {
-                let mut rows = channel_rows_cell.borrow_mut();
-                for row in rows.iter() {
-                    channels_group.remove(row);
-                }
-                rows.clear();
-                for _ in 0..new_count {
-                    let r = adw::ActionRow::builder().title("—").subtitle("—").build();
-                    channels_group.add(&r);
-                    rows.push(r);
-                }
-            }
+            crate::sidebar::aviation_panel::rebuild_channel_rows_parts(
+                &channels_group,
+                &channel_rows_cell,
+                new_count,
+            );
             let region = AcarsRegion::Custom(chans.into_boxed_slice());
             state.send_dsp(sdr_core::messages::UiToDsp::SetAcarsRegion(region));
         });
