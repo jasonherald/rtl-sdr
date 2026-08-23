@@ -1720,134 +1720,20 @@ fn configure_client_socket(stream: &TcpStream) {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
+/// Enable `SO_KEEPALIVE` and tune the probe schedule through
+/// `socket2` — no raw `setsockopt` / `unsafe` (#715). Idle time is
+/// portable; the probe interval and retry count are applied where the
+/// platform exposes them (Linux), matching the previous per-OS paths.
 fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-
-    // Enable SO_KEEPALIVE first — the per-tunable options below
-    // are no-ops without it.
-    let on: libc::c_int = 1;
-    set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, on)?;
-
-    // Idle time before first probe (seconds).
-    set_sockopt_int(
-        fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_KEEPIDLE,
-        TCP_KEEPALIVE_IDLE_SECS as libc::c_int,
-    )?;
-    // Interval between subsequent probes.
-    set_sockopt_int(
-        fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_KEEPINTVL,
-        TCP_KEEPALIVE_INTERVAL_SECS as libc::c_int,
-    )?;
-    // Probe count before declaring the peer dead.
-    set_sockopt_int(
-        fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_KEEPCNT,
-        TCP_KEEPALIVE_RETRIES as libc::c_int,
-    )?;
-    Ok(())
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(u64::from(TCP_KEEPALIVE_IDLE_SECS)));
+    #[cfg(target_os = "linux")]
+    let keepalive = keepalive
+        .with_interval(Duration::from_secs(u64::from(TCP_KEEPALIVE_INTERVAL_SECS)))
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)
 }
 
-#[cfg(all(unix, target_os = "macos"))]
-#[allow(unsafe_code)]
-fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-
-    let on: libc::c_int = 1;
-    set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, on)?;
-
-    // macOS exposes only `TCP_KEEPALIVE` (seconds-until-first-probe,
-    // analogous to Linux's `TCP_KEEPIDLE`). The per-probe interval
-    // and count use system-level defaults (`sysctl
-    // net.inet.tcp.keepintvl` / `keepcnt`), typically 75 s × 8 =
-    // ~10 minute detection. Good enough for takeover — the zombie
-    // detection path is the fallback; the explicit takeover
-    // handshake is the normal case.
-    set_sockopt_int(
-        fd,
-        libc::IPPROTO_TCP,
-        libc::TCP_KEEPALIVE,
-        TCP_KEEPALIVE_IDLE_SECS as libc::c_int,
-    )?;
-    Ok(())
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-#[allow(unsafe_code)]
-fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    // Other unix targets (FreeBSD, etc.) — enable keepalive with
-    // system defaults. The per-target `TCP_KEEPIDLE` constant names
-    // vary; dedicated handling for those targets can be added here
-    // when we actually ship on them.
-    let on: libc::c_int = 1;
-    set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, on)
-}
-
-#[cfg(not(unix))]
-fn set_keepalive_tuned(stream: &TcpStream) -> std::io::Result<()> {
-    // Non-unix targets (Windows, WASI, etc.) enable keepalive with
-    // system defaults via socket2 — std::net::TcpStream exposes no
-    // keepalive setter, and our primary tunables
-    // (`TCP_KEEPIDLE` / `TCP_KEEPINTVL` / `TCP_KEEPCNT`) are
-    // Linux-specific. Using `SockRef::from(&stream)` lets us flip
-    // `SO_KEEPALIVE` without taking ownership of the TcpStream.
-    // The kernel's default probe timings apply (~2 h first probe
-    // on Windows), so the #393 zombie-detection fallback is slower
-    // than on Linux but still runs. Per `CodeRabbit` round 1 on
-    // PR #404. #393.
-    let sock = socket2::SockRef::from(stream);
-    sock.set_keepalive(true)
-}
-
-/// Tiny `setsockopt(fd, level, name, &value)` wrapper for integer
-/// options. Extracted so each keepalive tunable is a one-liner
-/// instead of five lines of repeated FFI boilerplate. Only used
-/// on unix targets.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn set_sockopt_int(
-    fd: libc::c_int,
-    level: libc::c_int,
-    name: libc::c_int,
-    value: libc::c_int,
-) -> std::io::Result<()> {
-    // SAFETY: `fd` is a valid open socket borrowed from the
-    // caller's `&TcpStream` for the duration of this call.
-    // `value` is a stack-local `c_int`; we pass its address plus
-    // the matching size, which is the documented calling
-    // convention for `setsockopt`'s integer options.
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            std::ptr::addr_of!(value).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-/// How long the server waits on a fresh TCP connection for a
-/// `ClientHello` before assuming the client is a legacy vanilla
-/// `rtl_tcp` peer and falling through to the unchanged legacy
-/// path. Short enough to be invisible to the user (RTL-SDR init
-/// takes full seconds anyway); long enough to cover LAN RTT
-/// jitter. Per #307.
 const HELLO_SNIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Try to read + parse an extended-protocol [`ClientHello`] from

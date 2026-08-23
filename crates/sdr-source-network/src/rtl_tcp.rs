@@ -1704,37 +1704,10 @@ fn read_exact_with_context(stream: &TcpStream, buf: &mut [u8]) -> Result<(), Sou
     Ok(())
 }
 
-#[cfg(unix)]
-#[allow(unsafe_code)]
+/// `SO_KEEPALIVE` through `socket2` — the same option the server
+/// tunes, without a raw `setsockopt` / `unsafe` block (#715).
 fn set_keepalive(stream: &TcpStream, on: bool) -> std::io::Result<()> {
-    // Same setsockopt dance as `sdr-server-rtltcp::server::set_keepalive`.
-    // Kept duplicated rather than extracted into a shared crate so both
-    // ends stay self-contained — this is one function.
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let value: libc::c_int = libc::c_int::from(on);
-    // SAFETY: `fd` is a valid open socket for the duration of this call
-    // (we borrow `stream` by reference); `value` is a stable stack local
-    // with the matching `c_int` type for `SO_KEEPALIVE`.
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_KEEPALIVE,
-            std::ptr::addr_of!(value).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if ret == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn set_keepalive(_stream: &TcpStream, _on: bool) -> std::io::Result<()> {
-    Ok(())
+    socket2::SockRef::from(stream).set_keepalive(on)
 }
 
 impl Source for RtlTcpSource {

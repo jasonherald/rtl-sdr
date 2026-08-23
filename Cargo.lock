@@ -3408,11 +3408,11 @@ dependencies = [
 name = "sdr-source-network"
 version = "0.1.0"
 dependencies = [
- "libc",
  "sdr-config",
  "sdr-pipeline",
  "sdr-server-rtltcp",
  "sdr-types",
+ "socket2",
  "thiserror 2.0.20",
  "tracing",
 ]
