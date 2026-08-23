@@ -3926,10 +3926,7 @@ fn build_discovery_star_button(
     deps: &Rc<DiscoveredRowDeps>,
 ) {
     let DiscoveredRowDeps {
-        config: config_for_discovery,
-        favorite_row_ctx,
         discovered_star_buttons,
-        expander_weak,
         ..
     } = deps.as_ref();
 
