@@ -13,71 +13,96 @@ fn test_default_state() {
     assert_eq!(state.demod_mode.get(), DemodMode::Wfm);
 }
 
+/// Part 1 of 2: the ACARS toggle, counters and snapshot defaults.
 #[test]
-fn acars_defaults_pin_initializer_contract() {
+fn acars_defaults_pin_initializer_contract_1() {
     // Pin the ACARS field defaults so a future regression
     // (e.g. changing the keep-count config helper, swapping
     // the ChannelStats default, or accidentally pre-loading
     // a snapshot) fails this test instead of silently
     // shipping a UI that mis-states ACARS state. Per
     // CodeRabbit round 3 on PR #584.
+
     let state = make_test_state();
+
     assert!(!state.acars_enabled.get(), "ACARS toggle defaults off");
+
     assert_eq!(state.acars_total_count.get(), 0, "no decoded messages yet");
+
     let recent = state.acars_recent.borrow();
+
     assert!(recent.is_empty(), "ring is empty on init");
     // `VecDeque::with_capacity(n)` guarantees AT LEAST n —
     // the allocator may round up. Pin the lower bound rather
     // than exact equality so allocator-growth differences
     // across toolchains don't false-fail this test. Per CR
     // round 4 on PR #584.
+
     assert!(
         recent.capacity() >= crate::acars_config::default_recent_keep() as usize,
         "ring capacity sourced from acars_config::default_recent_keep (>= {}, got {})",
         crate::acars_config::default_recent_keep(),
         recent.capacity(),
     );
+
     drop(recent);
+
     assert!(
         state.acars_channel_stats.borrow().is_empty(),
         "channel-stats Vec starts empty; populated by AcarsChannelStats arrivals"
     );
+
     assert!(
         state.acars_pre_lock_state.borrow().is_none(),
         "no snapshot until first engage"
     );
+
     assert!(
         state.acars_viewer_window.borrow().is_none(),
         "no viewer window until first open"
     );
+
     assert!(
         state.acars_saved_tune.get().is_none(),
         "no saved pre-engage tune (center, offset) until first engage"
     );
+}
+
+/// Part 2 of 2: the auto-record ACARS flags and the config defaults.
+#[test]
+fn acars_defaults_pin_initializer_contract_2() {
+    let state = make_test_state();
+
     assert!(
         !state.acars_was_engaged_pre_pass.get(),
         "auto-record pre-pass ACARS flag defaults false"
     );
+
     assert!(
         !state.acars_pending.get(),
         "no SetAcarsEnabled command in flight at construction"
     );
+
     assert!(
         state.acars_saved_volume.get().is_none(),
         "no saved pre-engage volume until first engage"
     );
+
     assert!(
         !state.suppress_volume_notify.get(),
         "volume notify suppression off at construction"
     );
+
     assert!(
         state.pending_aos_actions.borrow().is_none(),
         "no pending AOS action batch stashed at construction"
     );
+
     assert!(
         state.recorder_action_interpreter.borrow().is_none(),
         "no recorder action interpreter wired until satellites panel connects"
     );
+
     assert!(
         state.acars_viewer_handles.borrow().is_none(),
         "no viewer handles until first open"

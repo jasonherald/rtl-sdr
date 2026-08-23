@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 /// Fixed Unix timestamp used in the favorites round-trip test
 /// to pin the `last_seen_unix` field. Value is arbitrary (from
@@ -47,17 +48,18 @@ fn device_indices_are_distinct() {
     assert_ne!(DEVICE_FILE, DEVICE_RTLTCP);
 }
 
+/// Part 1 of 3 of the `format_rtl_tcp_state` sweep (`time` … `Connected`).
 #[test]
-fn format_rtl_tcp_state_covers_every_variant() {
-    use std::time::Duration;
-
+fn format_rtl_tcp_state_covers_every_variant_1() {
     // Disconnected → empty-looking but consistent with the const.
+
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::Disconnected),
         RTL_TCP_STATUS_DISCONNECTED_SUBTITLE
     );
     // Connecting → ellipsis marker (avoids the reader confusing
     // "Connecting" with "Connected" on a cursory glance).
+
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::Connecting),
         "Connecting…"
@@ -66,6 +68,7 @@ fn format_rtl_tcp_state_covers_every_variant() {
     // common path every legacy server hits, and the default for
     // our own client. Adding a "(None)" suffix here would noise
     // up every single connection in exchange for zero signal.
+
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::Connected {
             tuner_name: "R820T".into(),
@@ -79,6 +82,11 @@ fn format_rtl_tcp_state_covers_every_variant() {
     // the user can see which codec actually landed. Signals
     // that compression is active without forcing them to hunt
     // through logs.
+}
+
+/// Part 2 of 3 of the `format_rtl_tcp_state` sweep (`Connected` … `from_secs`).
+#[test]
+fn format_rtl_tcp_state_covers_every_variant_2() {
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::Connected {
             tuner_name: "R820T".into(),
@@ -91,6 +99,7 @@ fn format_rtl_tcp_state_covers_every_variant() {
     // Retrying ceils fractional seconds so the row never
     // understates the delay: 250 ms remaining → "1 s", not
     // "0 s" (which would read as "the retry just fired").
+
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
             attempt: 3,
@@ -101,6 +110,7 @@ fn format_rtl_tcp_state_covers_every_variant() {
     // Key regression guard for the ceil semantics — 1.9 s must
     // read as "2 s", never "1 s". Flooring on `as_secs` would
     // silently understate the countdown here.
+
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
             attempt: 4,
@@ -110,6 +120,7 @@ fn format_rtl_tcp_state_covers_every_variant() {
     );
     // Exact integer seconds must NOT get bumped by the ceil —
     // 12 s stays at "12 s", not "13 s".
+
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::Retrying {
             attempt: 5,
@@ -117,6 +128,11 @@ fn format_rtl_tcp_state_covers_every_variant() {
         }),
         "Retrying in 12 s (attempt 5)"
     );
+}
+
+/// Part 3 of 3 of the `format_rtl_tcp_state` sweep (`Failed` … `AuthFailed`).
+#[test]
+fn format_rtl_tcp_state_covers_every_variant_3() {
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::Failed {
             reason: "bad handshake".into(),
@@ -128,14 +144,17 @@ fn format_rtl_tcp_state_covers_every_variant() {
     // variant itself IS the reason. Lock in each copy
     // against accidental drift; a typo here would ship
     // to users without CI catching it otherwise.
+
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::ControllerBusy),
         "Controller slot is occupied",
     );
+
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::AuthRequired),
         "Server requires a key",
     );
+
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::AuthFailed),
         "Key rejected",
