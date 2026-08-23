@@ -12,6 +12,10 @@ const DEFAULT_MIN_ELEV_DEG: f64 = 25.0;
 /// from `now`, lasting `duration_secs`, with the given peak
 /// elevation. Mirrors the synthetic-pass fixture pattern used
 /// by the `satellites_panel` tests.
+/// Slug `pass_satellite_slug` derives from the fixture's
+/// "METEOR-M2 3" name — the prefix the path tests check against.
+const FIXTURE_SLUG: &str = "METEOR-M2-3";
+
 fn synthetic_meteor_m2_3(
     now: DateTime<Utc>,
     aos_offset_secs: i64,

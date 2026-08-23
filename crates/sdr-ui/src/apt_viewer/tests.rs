@@ -1,5 +1,4 @@
 use super::*;
-use std::io::Read;
 
 /// Number of lines pushed by the renderer tests. Keeps tests fast
 /// while still exercising more than one line of buffer growth.
@@ -116,28 +115,16 @@ fn export_png_round_trips_to_a_real_file() {
         #[allow(clippy::cast_possible_truncation)]
         r.push_line(&synth_line(i as u8));
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!("sdr-ui-apt-test-{nanos}.png"));
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-apt-test.png");
     r.export_png(&path).unwrap();
-    let metadata = std::fs::metadata(&path).unwrap();
-    assert!(metadata.len() > 0, "PNG file shouldn't be empty");
-    // PNG magic bytes — first 8 bytes of any valid PNG.
-    let mut header = [0_u8; 8];
-    let mut f = std::fs::File::open(&path).unwrap();
-    f.read_exact(&mut header).unwrap();
-    assert_eq!(
-        &header, b"\x89PNG\r\n\x1a\n",
-        "exported file isn't a valid PNG (header mismatch)",
-    );
-    let _ = std::fs::remove_file(&path);
+    crate::test_util::assert_png_file(&path);
 }
 
 #[test]
 fn export_png_refuses_when_buffer_is_empty() {
     let r = AptImageRenderer::try_new().unwrap();
-    let path = std::env::temp_dir().join("apt-test-empty-should-not-be-written.png");
+    let (_tmp_dir, path) =
+        crate::test_util::test_output_path("apt-test-empty-should-not-be-written.png");
     let result = r.export_png(&path);
     assert!(result.is_err());
     assert!(!path.exists(), "no file should be created on empty export");

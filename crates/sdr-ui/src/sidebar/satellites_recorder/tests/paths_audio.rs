@@ -7,7 +7,7 @@ fn png_path_includes_satellite_slug_and_timestamp() {
     let pass = synthetic_meteor_m2_3(now, 0, 720, 50.0);
     let path = png_path_for(&pass, now);
     let s = path.to_string_lossy().to_string();
-    assert!(s.contains("apt-NOAA-19-"));
+    assert!(s.contains(&format!("apt-{FIXTURE_SLUG}-")));
     assert!(
         std::path::Path::new(&s)
             .extension()
@@ -90,7 +90,7 @@ fn audio_and_png_paths_share_aos_timestamp_across_pass_duration() {
 
     // The defining assertion: the timestamp tail of the PNG
     // matches the timestamp tail of the WAV. Strip the
-    // "apt-NOAA-19-" / "audio-NOAA-19-" prefix and compare
+    // "apt-{slug}-" / "audio-{slug}-" prefix and compare
     // verbatim.
     let png_stem = png_path.file_stem().unwrap().to_string_lossy().to_string();
     let audio_stem = audio_path
@@ -98,8 +98,14 @@ fn audio_and_png_paths_share_aos_timestamp_across_pass_duration() {
         .unwrap()
         .to_string_lossy()
         .to_string();
-    let png_ts = png_stem.strip_prefix("apt-NOAA-19-").unwrap();
-    let audio_ts = audio_stem.strip_prefix("audio-NOAA-19-").unwrap();
+    let png_ts = png_stem
+        .strip_prefix(&format!("apt-{FIXTURE_SLUG}-"))
+        .map(str::to_owned)
+        .unwrap();
+    let audio_ts = audio_stem
+        .strip_prefix(&format!("audio-{FIXTURE_SLUG}-"))
+        .map(str::to_owned)
+        .unwrap();
     assert_eq!(
         png_ts, audio_ts,
         "PNG and WAV must share the AOS timestamp (regression: \
@@ -169,7 +175,7 @@ fn audio_toggle_on_emits_paired_start_and_stop() {
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with("audio-NOAA-19-")
+            .starts_with(&format!("audio-{FIXTURE_SLUG}-"))
     );
     // Settle then LOS — flipping the audio toggle off mid-
     // pass should NOT cancel the in-flight stop. The stop

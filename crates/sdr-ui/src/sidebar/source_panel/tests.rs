@@ -78,15 +78,15 @@ fn format_rtl_tcp_state_covers_every_variant_1() {
         }),
         "Connected — R820T (29 gains)"
     );
-    // Connected with a non-`None` codec gets an extra suffix so
-    // the user can see which codec actually landed. Signals
-    // that compression is active without forcing them to hunt
-    // through logs.
 }
 
 /// Part 2 of 3 of the `format_rtl_tcp_state` sweep (`Connected` … `from_secs`).
 #[test]
 fn format_rtl_tcp_state_covers_every_variant_2() {
+    // Connected with a non-`None` codec gets an extra suffix so
+    // the user can see which codec actually landed. Signals
+    // that compression is active without forcing them to hunt
+    // through logs.
     assert_eq!(
         format_rtl_tcp_state(&RtlTcpConnectionState::Connected {
             tuner_name: "R820T".into(),

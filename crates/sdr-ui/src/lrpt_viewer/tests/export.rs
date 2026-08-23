@@ -3,7 +3,8 @@ use super::*;
 #[test]
 fn export_png_refuses_when_no_active_channel() {
     let r = LrptImageRenderer::new();
-    let path = std::env::temp_dir().join("lrpt-test-no-active-should-not-be-written.png");
+    let (_tmp_dir, path) =
+        crate::test_util::test_output_path("lrpt-test-no-active-should-not-be-written.png");
     let result = r.export_png(&path);
     assert!(result.is_err());
     assert!(!path.exists(), "no file should be created on empty export");
@@ -28,7 +29,8 @@ fn export_png_refuses_when_active_channel_has_no_data() {
     let mut r = LrptImageRenderer::new();
     r.push_line(APID_TEST, &synth_line(TEST_PIXEL));
     r.channels.get_mut(&APID_TEST).unwrap().n_lines = 0;
-    let path = std::env::temp_dir().join("lrpt-test-empty-channel-should-not-be-written.png");
+    let (_tmp_dir, path) =
+        crate::test_util::test_output_path("lrpt-test-empty-channel-should-not-be-written.png");
     let result = r.export_png(&path);
     assert!(result.is_err());
     assert!(!path.exists());
@@ -36,26 +38,13 @@ fn export_png_refuses_when_active_channel_has_no_data() {
 
 #[test]
 fn export_png_round_trips_to_a_real_file() {
-    use std::io::Read;
     let mut r = LrptImageRenderer::new();
     for _ in 0..16 {
         r.push_line(APID_TEST, &synth_line(TEST_PIXEL));
     }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!("sdr-ui-lrpt-test-{nanos}.png"));
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-test.png");
     r.export_png(&path).expect("export per-APID PNG");
-    let metadata = std::fs::metadata(&path).expect("metadata");
-    assert!(metadata.len() > 0, "PNG file shouldn't be empty");
-    let mut header = [0_u8; 8];
-    let mut f = std::fs::File::open(&path).expect("open");
-    f.read_exact(&mut header).expect("read_exact");
-    assert_eq!(
-        &header, b"\x89PNG\r\n\x1a\n",
-        "exported file isn't a valid PNG (header mismatch)",
-    );
-    let _ = std::fs::remove_file(&path);
+    crate::test_util::assert_png_file(&path);
 }
 
 #[test]
@@ -78,7 +67,8 @@ fn export_png_refuses_when_composite_active_but_cache_empty() {
     // ISN'T part of the recipe — the bug we're guarding
     // against is "fall through and export this one".
     r.push_line(99, &synth_line(TEST_PIXEL));
-    let path = std::env::temp_dir().join("lrpt-test-empty-composite-should-not-be-written.png");
+    let (_tmp_dir, path) =
+        crate::test_util::test_output_path("lrpt-test-empty-composite-should-not-be-written.png");
     let result = r.export_png(&path);
     assert!(matches!(
         result,
@@ -143,18 +133,9 @@ fn export_png_uses_composite_cache_when_active() {
     // wrote (the byte-level guarantee is covered by
     // `build_argb32_from_rgb_writes_bgra_byte_order`).
     assert!(r.set_composite(recipe, &image));
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!("sdr-ui-lrpt-comp-{nanos}.png"));
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-comp.png");
     r.export_png(&path).expect("export composite PNG");
-    let metadata = std::fs::metadata(&path).expect("metadata");
-    assert!(metadata.len() > 0, "PNG file shouldn't be empty");
-    let mut header = [0_u8; 8];
-    let mut f = std::fs::File::open(&path).expect("open");
-    f.read_exact(&mut header).expect("read_exact");
-    assert_eq!(&header, b"\x89PNG\r\n\x1a\n", "not a PNG");
-    let _ = std::fs::remove_file(&path);
+    crate::test_util::assert_png_file(&path);
 }
 
 #[test]
@@ -168,23 +149,14 @@ fn write_greyscale_png_round_trips_to_a_real_file() {
     let pixels: Vec<u8> = (0..W * H)
         .map(|i| u8::try_from(i & 0xff).unwrap_or(0))
         .collect();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!("sdr-ui-lrpt-bare-{nanos}.png"));
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-bare.png");
     write_greyscale_png(&path, &pixels, W, H).unwrap();
-    let metadata = std::fs::metadata(&path).unwrap();
-    assert!(metadata.len() > 0);
-    let mut header = [0_u8; 8];
-    let mut f = std::fs::File::open(&path).unwrap();
-    f.read_exact(&mut header).unwrap();
-    assert_eq!(&header, b"\x89PNG\r\n\x1a\n");
-    let _ = std::fs::remove_file(&path);
+    crate::test_util::assert_png_file(&path);
 }
 
 #[test]
 fn write_greyscale_png_rejects_size_mismatch() {
-    let path = std::env::temp_dir().join("sdr-ui-lrpt-bare-mismatch.png");
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-bare-mismatch.png");
     let result = write_greyscale_png(&path, &[0_u8; 10], 4, 4);
     assert!(result.is_err());
     assert!(
@@ -195,7 +167,7 @@ fn write_greyscale_png_rejects_size_mismatch() {
 
 #[test]
 fn write_greyscale_png_rejects_zero_size() {
-    let path = std::env::temp_dir().join("sdr-ui-lrpt-bare-zero.png");
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-bare-zero.png");
     let result = write_greyscale_png(&path, &[], 0, 0);
     assert!(result.is_err());
     assert!(!path.exists());
@@ -207,7 +179,8 @@ fn write_greyscale_png_zero_dim_with_pixels_reports_zero_sized() {
     // non-empty pixel buffer must surface as `ZeroSized`, not
     // mask as the generic `InvalidBuffer` length-mismatch.
     // Per CR on PR #550.
-    let path = std::env::temp_dir().join("sdr-ui-lrpt-bare-zero-dim-pixels.png");
+    let (_tmp_dir, path) =
+        crate::test_util::test_output_path("sdr-ui-lrpt-bare-zero-dim-pixels.png");
     let result = write_greyscale_png(&path, &[1_u8], 0, 1);
     assert!(matches!(result, Err(crate::viewer::ViewerError::ZeroSized)));
     assert!(!path.exists());
@@ -223,23 +196,14 @@ fn write_rgb_png_round_trips_to_a_real_file() {
     let pixels: Vec<u8> = (0..W * H * 3)
         .map(|i| u8::try_from(i & 0xff).unwrap_or(0))
         .collect();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!("sdr-ui-lrpt-rgb-{nanos}.png"));
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-rgb.png");
     write_rgb_png(&path, &pixels, W, H).expect("write_rgb_png");
-    let metadata = std::fs::metadata(&path).expect("metadata");
-    assert!(metadata.len() > 0);
-    let mut header = [0_u8; 8];
-    let mut f = std::fs::File::open(&path).expect("open");
-    f.read_exact(&mut header).expect("read_exact");
-    assert_eq!(&header, b"\x89PNG\r\n\x1a\n");
-    let _ = std::fs::remove_file(&path);
+    crate::test_util::assert_png_file(&path);
 }
 
 #[test]
 fn write_rgb_png_rejects_size_mismatch() {
-    let path = std::env::temp_dir().join("sdr-ui-lrpt-rgb-mismatch.png");
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-rgb-mismatch.png");
     // 10 bytes can't equal 4*4*3 = 48 — should fail without
     // creating the file.
     let result = write_rgb_png(&path, &[0_u8; 10], 4, 4);
@@ -252,7 +216,7 @@ fn write_rgb_png_rejects_size_mismatch() {
 
 #[test]
 fn write_rgb_png_rejects_zero_size() {
-    let path = std::env::temp_dir().join("sdr-ui-lrpt-rgb-zero.png");
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-rgb-zero.png");
     let result = write_rgb_png(&path, &[], 0, 0);
     assert!(result.is_err());
     assert!(!path.exists());
@@ -264,7 +228,7 @@ fn write_rgb_png_zero_dim_with_pixels_reports_zero_sized() {
     // zero-dim call with a non-empty pixel buffer surfaces as
     // `ZeroSized`, not as the generic `InvalidBuffer`
     // length-mismatch.
-    let path = std::env::temp_dir().join("sdr-ui-lrpt-rgb-zero-dim.png");
+    let (_tmp_dir, path) = crate::test_util::test_output_path("sdr-ui-lrpt-rgb-zero-dim.png");
     let result = write_rgb_png(&path, &[1_u8, 2, 3], 0, 1);
     assert!(matches!(result, Err(crate::viewer::ViewerError::ZeroSized)));
     assert!(!path.exists());
