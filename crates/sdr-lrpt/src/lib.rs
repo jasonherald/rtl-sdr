@@ -83,19 +83,10 @@ fn corroborates(pending: PendingJump, pkt: i32) -> bool {
     pkt >= pending.pkt && pkt - pending.pkt <= CORROBORATION_WINDOW_PACKETS
 }
 
-/// Row-group index for an anchor-relative packet position, or `None`
-/// for a pre-anchor packet (dropped, not clamped onto row 0) or one
-/// beyond [`MAX_MCU_ROWS_PER_PASS`].
-fn bounded_mcu_row(apid: u16, anchor: i32, pkt: i32, row_pkt: i32) -> Option<usize> {
-    if row_pkt < 0 {
-        tracing::trace!("dropping pre-anchor packet on APID {apid}: anchor={anchor} pkt={pkt}");
-        return None;
-    }
-    #[allow(
-        clippy::cast_sign_loss,
-        reason = "row_pkt is non-negative after the row_pkt < 0 early return above"
-    )]
-    let mcu_row = (row_pkt / PACKETS_PER_ROW_GROUP) as usize;
+/// Row-group index for a non-negative anchor-relative packet position,
+/// or `None` beyond [`MAX_MCU_ROWS_PER_PASS`].
+fn bounded_mcu_row(apid: u16, row_pkt: i32) -> Option<usize> {
+    let mcu_row = usize::try_from(row_pkt / PACKETS_PER_ROW_GROUP).ok()?;
     if mcu_row >= MAX_MCU_ROWS_PER_PASS {
         tracing::trace!("dropping packet beyond the row bound on APID {apid}: row {mcu_row}");
         return None;
@@ -139,6 +130,8 @@ const IMAGE_PACKET_HEADER_LEN: usize = 6;
 
 /// APID of the on-board-time / housekeeping packet. Carries no
 /// MCU stream; dropped on entry to `consume_packet`.
+/// Test-only: it is outside [`IMAGE_APIDS`], which is the production gate.
+#[cfg(test)]
 const APID_ONBOARD_TIME: u16 = 70;
 
 /// Per-channel JPEG-decode + image-assembly state. The DC
@@ -341,11 +334,21 @@ impl LrptPipeline {
             decoder.wraps += 1;
             row_pkt += SEQUENCE_COUNT_MODULUS;
         }
-        let mcu_row = bounded_mcu_row(packet.apid, anchor, pkt, row_pkt)?;
-        // Only a placed packet advances the channel's position, so a
-        // dropped one cannot poison the wrap / jump detection (#728).
+        // Pre-anchor packets are dropped, not clamped onto row 0, and
+        // do not move the channel's position (#728).
+        if row_pkt < 0 {
+            tracing::trace!(
+                "dropping pre-anchor packet on APID {apid}: anchor={anchor} pkt={pkt}",
+                apid = packet.apid,
+            );
+            return None;
+        }
+        // `accept_sequence` has committed this packet's wrap / jump
+        // state, so the position must follow even when the row bound
+        // rejects it — a frozen `last_pkt` would turn every later
+        // packet into a phantom wrap (CR on PR #803).
         decoder.last_pkt = Some(pkt);
-        Some(mcu_row)
+        bounded_mcu_row(packet.apid, row_pkt)
     }
 
     /// Decode one image packet: parse the per-MCU header bytes,
@@ -358,25 +361,30 @@ impl LrptPipeline {
     /// AVHRR MCU-segment header ([`IMAGE_PACKET_HEADER_LEN`]: MCU id,
     /// scan headers, quality byte), then the JPEG-coded MCU stream.
     fn consume_packet(&mut self, packet: &ImagePacket) {
-        if packet.apid == APID_ONBOARD_TIME || !IMAGE_APIDS.contains(&packet.apid) {
+        // [`APID_ONBOARD_TIME`] (70) is outside the image range.
+        if !IMAGE_APIDS.contains(&packet.apid) {
             return;
         }
-        // Skip the 8-byte on-board timestamp secondary header to
-        // reach the AVHRR MCU segment. Without this, `payload[0]`
-        // is the timestamp's (near-constant) day byte, pinning
-        // every MCU to one column and shifting the JPEG stream 8
-        // bytes early into garbage.
-        // Only when the packet header says a secondary header is
-        // present (#729); Meteor image packets always set it.
-        let time_header_len = if packet.has_secondary_header {
-            MPDU_TIME_HEADER_LEN
-        } else {
-            0
-        };
-        if packet.payload.len() < time_header_len + IMAGE_PACKET_HEADER_LEN {
+        // Meteor image packets always carry the 8-byte on-board
+        // timestamp secondary header, so the header flag is a validity
+        // gate: a clear flag is a miscorrected header bit, and reading
+        // the AVHRR header from offset 0 would place 14 garbage MCUs
+        // at the timestamp's day byte (#729, CR on PR #803).
+        if !packet.has_secondary_header {
+            tracing::trace!(
+                "dropping image packet without a secondary header on APID {apid}",
+                apid = packet.apid,
+            );
             return;
         }
-        let avhrr = &packet.payload[time_header_len..];
+        // Skip the timestamp to reach the AVHRR MCU segment. Without
+        // this, `payload[0]` is the timestamp's (near-constant) day
+        // byte, pinning every MCU to one column and shifting the JPEG
+        // stream 8 bytes early into garbage.
+        if packet.payload.len() < MPDU_TIME_HEADER_LEN + IMAGE_PACKET_HEADER_LEN {
+            return;
+        }
+        let avhrr = &packet.payload[MPDU_TIME_HEADER_LEN..];
         let mcu_id = u16::from(avhrr[0]);
         // bytes 1-2 = scan_hdr, bytes 3-5 = segment_hdr (byte 5 of
         // the AVHRR header = segment_hdr[2] = the quality factor).
@@ -962,6 +970,16 @@ mod tests {
     /// other APID is a miscorrection (or telemetry) and must not
     /// allocate two 64 K-entry JPEG LUTs or a viewer channel.
     #[test]
+    fn image_packet_without_secondary_header_is_rejected() {
+        let mut p = LrptPipeline::new();
+        let mut pkt = synthetic_image_packet(64, 10);
+        pkt.has_secondary_header = false;
+        p.consume_packet(&pkt);
+        assert!(p.decoders.is_empty(), "unflagged packet is not decoded");
+        assert!(p.anchor.is_none());
+    }
+
+    #[test]
     fn unknown_apids_are_ignored() {
         let mut p = LrptPipeline::new();
         p.consume_packet(&synthetic_image_packet(100, 10));
@@ -1015,21 +1033,37 @@ mod tests {
     }
 
     /// Rows are bounded per pass so corrupt input cannot drive a
-    /// multi-GB channel allocation.
+    /// multi-GB channel allocation. The 14-bit count spans 381 rows per
+    /// cycle, so the bound is only reachable through corroborated wraps
+    /// — which is how the test drives it. Row-bound rejections still
+    /// commit the channel's position (`wraps`, `last_pkt`) so the
+    /// detector is not poisoned for the rest of the pass.
     #[test]
     fn mcu_rows_are_bounded_per_pass() {
+        /// A count late in the 14-bit cycle, past the forward-gap limit.
+        const LATE_IN_CYCLE: u16 = 16_000;
         let mut p = LrptPipeline::new();
-        p.consume_packet(&packet_with_mcu_id(64, 100, 0));
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let rows = i32::try_from(MAX_MCU_ROWS_PER_PASS).expect("row bound fits i32");
-        let far = u16::try_from(100 + PACKETS_PER_ROW_GROUP * (rows + 1)).expect("fits u16");
-        // Corroborate the jump so it is not dropped as a lone discontinuity.
-        p.consume_packet(&packet_with_mcu_id(64, far, 0));
-        p.consume_packet(&packet_with_mcu_id(64, far + 1, 14));
+        p.consume_packet(&packet_with_mcu_id(64, 0, 0));
+        // Each cycle: a corroborated forward jump late into the cycle,
+        // then a corroborated wrap. Four wraps put the channel at
+        // ~1500 rows, past MAX_MCU_ROWS_PER_PASS.
+        for _ in 0..4 {
+            p.consume_packet(&packet_with_mcu_id(64, LATE_IN_CYCLE, 0));
+            p.consume_packet(&packet_with_mcu_id(64, LATE_IN_CYCLE + 1, 14));
+            p.consume_packet(&packet_with_mcu_id(64, 10, 0));
+            p.consume_packet(&packet_with_mcu_id(64, 11, 14));
+        }
+        let dec = &p.decoders[&64];
+        assert_eq!(dec.wraps, 4, "wraps are committed even past the bound");
         assert_eq!(
-            p.assembler.channel(64).expect("exists").lines,
-            MCU_SIDE,
-            "beyond the bound: dropped"
+            dec.last_pkt,
+            Some(11),
+            "position follows the rejected packet"
         );
+        let lines = p.assembler.channel(64).expect("exists").lines;
+        assert!(lines < MAX_MCU_ROWS_PER_PASS * MCU_SIDE, "bounded: {lines}");
+        // The last placed row is the third cycle's post-wrap packet 11:
+        // (11 + 3·16384) / 43 = row 1143.
+        assert_eq!(lines, 1144 * MCU_SIDE);
     }
 }

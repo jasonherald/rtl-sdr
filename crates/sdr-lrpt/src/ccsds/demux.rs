@@ -66,11 +66,16 @@ pub struct ImagePacket {
 pub struct Demux {
     reassemblers: HashMap<u8, MpduReassembler>,
     last_counter: HashMap<u8, u32>,
-    /// Spacecraft id of the first accepted imaging VCDU. Admitting on
-    /// version + VCID alone let ~1/256 of RS over-T miscorrections
-    /// through to the reassembler, where they desynced the good
-    /// stream; a frame from "another spacecraft" is dropped (#729).
+    /// Spacecraft id the demux has locked onto. Admitting on version +
+    /// VCID alone let ~1/256 of RS over-T miscorrections through to
+    /// the reassembler, where they desynced the good stream; once
+    /// locked, a frame from "another spacecraft" is dropped (#729).
     locked_scid: Option<u16>,
+    /// Spacecraft id of the previous unlocked frame. The lock needs
+    /// two consecutive agreeing frames, so a miscorrected first frame
+    /// at AOS (lowest SNR) cannot lock the demux onto a wrong id and
+    /// drop the whole pass (CR on PR #803).
+    scid_candidate: Option<u16>,
 }
 
 impl Default for Demux {
@@ -86,6 +91,7 @@ impl Demux {
             reassemblers: HashMap::new(),
             last_counter: HashMap::new(),
             locked_scid: None,
+            scid_candidate: None,
         }
     }
 
@@ -109,16 +115,8 @@ impl Demux {
         if header.replay_flag {
             return Vec::new();
         }
-        match self.locked_scid {
-            None => self.locked_scid = Some(header.spacecraft_id),
-            Some(locked) if locked != header.spacecraft_id => {
-                tracing::trace!(
-                    "dropping VCDU with foreign spacecraft id {} (locked to {locked})",
-                    header.spacecraft_id,
-                );
-                return Vec::new();
-            }
-            Some(_) => {}
+        if !self.admit_spacecraft_id(header.spacecraft_id) {
+            return Vec::new();
         }
         // Counter-jump detection: a non-sequential counter means
         // we lost at least one VCDU on this VC; drop the partial
@@ -146,6 +144,29 @@ impl Demux {
             .into_iter()
             .filter_map(|raw| parse_packet(raw, header.virtual_channel_id))
             .collect()
+    }
+}
+
+impl Demux {
+    /// Spacecraft-id admission: unlocked frames pass, and the lock is
+    /// taken once two consecutive frames agree; a locked demux drops
+    /// frames carrying any other id.
+    fn admit_spacecraft_id(&mut self, scid: u16) -> bool {
+        if let Some(locked) = self.locked_scid {
+            if locked != scid {
+                tracing::trace!(
+                    "dropping VCDU with foreign spacecraft id {scid} (locked to {locked})"
+                );
+                return false;
+            }
+            return true;
+        }
+        if self.scid_candidate == Some(scid) {
+            self.locked_scid = Some(scid);
+        } else {
+            self.scid_candidate = Some(scid);
+        }
+        true
     }
 }
 
@@ -300,10 +321,10 @@ mod tests {
         buf
     }
 
-    /// The demux locks onto the first accepted spacecraft id; a frame
-    /// carrying another SCID (an RS over-T miscorrection that happened
-    /// to keep version + VCID) is dropped instead of desyncing the
-    /// reassembler.
+    /// The demux locks onto the spacecraft id once two consecutive
+    /// frames agree; a later frame carrying another SCID (an RS over-T
+    /// miscorrection that happened to keep version + VCID) is dropped
+    /// instead of desyncing the reassembler.
     #[test]
     fn scid_mismatch_is_dropped_after_lock() {
         let mut d = Demux::new();
@@ -313,12 +334,49 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 1, 0, &pkt))
+                .len(),
+            1
+        );
+        assert_eq!(d.locked_scid, Some(140));
         let other = make_packet(0x100, b"other-sat");
-        let out = d.push(&synthetic_vcdu_scid(141, VCID_AVHRR, 1, 0, &other));
+        let out = d.push(&synthetic_vcdu_scid(141, VCID_AVHRR, 2, 0, &other));
         assert!(out.is_empty(), "foreign SCID dropped");
         let good = make_packet(0x100, b"still-ours");
-        let out = d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 1, 0, &good));
+        let out = d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 2, 0, &good));
         assert_eq!(out.len(), 1, "the stream continues in sync");
+    }
+
+    /// A miscorrected first frame must not lock the demux onto a wrong
+    /// id for the rest of the pass: the lock needs two agreeing frames,
+    /// and a lone foreign id before the lock is only a candidate.
+    #[test]
+    fn scid_lock_needs_two_consecutive_agreeing_frames() {
+        let mut d = Demux::new();
+        let pkt = make_packet(0x100, b"frame");
+        assert_eq!(
+            d.push(&synthetic_vcdu_scid(141, VCID_AVHRR, 0, 0, &pkt))
+                .len(),
+            1
+        );
+        assert_eq!(d.locked_scid, None, "one frame is only a candidate");
+        assert_eq!(
+            d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 1, 0, &pkt))
+                .len(),
+            1
+        );
+        assert_eq!(d.locked_scid, None, "candidate replaced, still unlocked");
+        assert_eq!(
+            d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 2, 0, &pkt))
+                .len(),
+            1
+        );
+        assert_eq!(d.locked_scid, Some(140));
+        assert!(
+            d.push(&synthetic_vcdu_scid(141, VCID_AVHRR, 3, 0, &pkt))
+                .is_empty()
+        );
     }
 
     /// Replay-flagged VCDUs are not live data and are dropped.

@@ -158,10 +158,17 @@ impl MpduReassembler {
             // its first header starts. A corrupt length byte that
             // slipped past the integrity gate otherwise mis-frames every
             // following packet until the gate trips (#729).
-            if fhp != FHP_NO_HEADER
-                && fhp_us < payload.len()
-                && !self.fhp_consistent(fhp_us, payload)
-            {
+            // A pointer past the data field proves the M_PDU header
+            // is corrupt: do not splice the data field into the packet
+            // in progress (CR on PR #803).
+            if fhp != FHP_NO_HEADER && fhp_us >= payload.len() {
+                tracing::warn!(
+                    "M_PDU first-header pointer {fhp} exceeds the data field; losing sync"
+                );
+                self.lose_sync();
+                return false;
+            }
+            if fhp != FHP_NO_HEADER && !self.fhp_consistent(fhp_us, payload) {
                 tracing::warn!(
                     "M_PDU first-header pointer {fhp} disagrees with the {} bytes buffered; realigning",
                     self.buffer.len(),
@@ -429,10 +436,9 @@ mod tests {
         bogus[4] = 0x03;
         bogus[5] = 0xFF; // length field → 1030 bytes
         let head = make_packet(0x101, b"good-one");
-        let mut region1 = build_region(0, &[head.clone(), bogus.clone()]);
-        // Truncate: bogus only partially present — it's the tail.
-        let frame1_tail_len = MPDU_DATA_LEN - head.len();
-        assert!(frame1_tail_len < 1030);
+        // `build_region` clips `bogus` to the data field: only its
+        // head is present, as the tail of frame 1.
+        let region1 = build_region(0, &[head.clone(), bogus]);
         let out1 = r.push(&region1).expect("push 1");
         assert_eq!(out1, vec![head]);
         assert!(r.is_in_sync());
@@ -444,7 +450,42 @@ mod tests {
         // Zero padding after `next` parses as 7-byte all-zero packets.
         assert_eq!(out2.first(), Some(&next), "resynced at the frame's FHP");
         assert!(r.is_in_sync());
-        region1.clear();
+    }
+
+    /// An in-sync reassembler that sees a header pointer past the data
+    /// field (but not `0x7FF` / `0x7FE`) has a corrupt `M_PDU` header:
+    /// the data field is not spliced into the packet in progress and
+    /// sync is lost, as the unsynced branch already does.
+    #[test]
+    fn in_sync_pointer_past_the_data_field_loses_sync() {
+        let mut r = MpduReassembler::new();
+        let pkt = make_packet(0x100, b"payload");
+        r.push(&build_region(0, std::slice::from_ref(&pkt)))
+            .expect("push");
+        assert!(r.is_in_sync());
+        let bad = build_region(FHP_IDLE_FILL - 1, &[]);
+        assert!(r.push(&bad).expect("push bad").is_empty());
+        assert!(!r.is_in_sync());
+    }
+
+    /// `fhp_consistent` edge cases: nothing buffered means the header
+    /// must start at byte 0; a sub-header remnant has its length field
+    /// completed from the new payload before the check.
+    #[test]
+    fn fhp_consistency_with_empty_and_partial_buffers() {
+        let mut r = MpduReassembler::new();
+        let filler = vec![0_u8; MPDU_DATA_LEN];
+        assert!(r.fhp_consistent(0, &filler));
+        assert!(!r.fhp_consistent(3, &filler));
+        // Two header bytes buffered; the packet claims 1 + 6 = 7 bytes
+        // total when the length field (bytes 4-5) reads 0, so the next
+        // header must start at payload byte 5.
+        r.buffer.extend_from_slice(&[0x01, 0x00]);
+        assert!(r.fhp_consistent(5, &filler));
+        assert!(!r.fhp_consistent(4, &filler));
+        // Fewer than 6 bytes available in total: the length is unknown
+        // and the pointer cannot be trusted.
+        assert!(!r.fhp_consistent(2, &filler[..2]));
     }
 
     /// `0x7FE` is the CCSDS idle/fill `M_PDU` marker: no packet data at
