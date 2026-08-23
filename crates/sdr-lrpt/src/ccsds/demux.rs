@@ -43,6 +43,9 @@ const APID_IDLE: u16 = APID_MASK; // 0x07FF
 /// remainder). Real Meteor AVHRR packets all use non-zero APIDs.
 const APID_ZERO: u16 = 0;
 
+/// Packet-header word bit: a secondary header follows the primary one.
+const SECONDARY_HEADER_FLAG: u16 = 0x0800;
+
 /// Decoded CCSDS image packet (post-M_PDU-reassembly,
 /// pre-JPEG-decode). Field meanings depend on the imaging
 /// virtual channel; consumed by the image-assembly stage in
@@ -52,6 +55,10 @@ pub struct ImagePacket {
     pub vcid: u8,
     pub apid: u16,
     pub sequence_count: u16,
+    /// CCSDS packet-header bit `0x0800`: a secondary header (the
+    /// 8-byte MPDU timestamp on Meteor image packets) precedes the
+    /// user data (#729).
+    pub has_secondary_header: bool,
     pub payload: Vec<u8>,
 }
 
@@ -59,6 +66,11 @@ pub struct ImagePacket {
 pub struct Demux {
     reassemblers: HashMap<u8, MpduReassembler>,
     last_counter: HashMap<u8, u32>,
+    /// Spacecraft id of the first accepted imaging VCDU. Admitting on
+    /// version + VCID alone let ~1/256 of RS over-T miscorrections
+    /// through to the reassembler, where they desynced the good
+    /// stream; a frame from "another spacecraft" is dropped (#729).
+    locked_scid: Option<u16>,
 }
 
 impl Default for Demux {
@@ -73,6 +85,7 @@ impl Demux {
         Self {
             reassemblers: HashMap::new(),
             last_counter: HashMap::new(),
+            locked_scid: None,
         }
     }
 
@@ -91,6 +104,21 @@ impl Demux {
         }
         if !is_imaging_vcid(header.virtual_channel_id) {
             return Vec::new();
+        }
+        // Replayed frames are not live data.
+        if header.replay_flag {
+            return Vec::new();
+        }
+        match self.locked_scid {
+            None => self.locked_scid = Some(header.spacecraft_id),
+            Some(locked) if locked != header.spacecraft_id => {
+                tracing::trace!(
+                    "dropping VCDU with foreign spacecraft id {} (locked to {locked})",
+                    header.spacecraft_id,
+                );
+                return Vec::new();
+            }
+            Some(_) => {}
         }
         // Counter-jump detection: a non-sequential counter means
         // we lost at least one VCDU on this VC; drop the partial
@@ -139,6 +167,7 @@ fn parse_packet(mut raw: Vec<u8>, vcid: u8) -> Option<ImagePacket> {
     if apid == APID_IDLE || apid == APID_ZERO {
         return None;
     }
+    let has_secondary_header = header_word & SECONDARY_HEADER_FLAG != 0;
     let seq_word = u16::from_be_bytes([raw[2], raw[3]]);
     let sequence_count = seq_word & SEQUENCE_COUNT_MASK;
     // Reuse the raw packet buffer as the payload Vec — drain
@@ -150,6 +179,7 @@ fn parse_packet(mut raw: Vec<u8>, vcid: u8) -> Option<ImagePacket> {
         vcid,
         apid,
         sequence_count,
+        has_secondary_header,
         payload: raw,
     })
 }
@@ -259,5 +289,60 @@ mod tests {
         let mut d = Demux::new();
         let out = d.push(&vcdu);
         assert_eq!(out.len(), 1);
+    }
+
+    // --- #729 (Aug 2026 deep review) ---
+
+    fn synthetic_vcdu_scid(scid: u16, vcid: u8, counter: u32, fhp: u16, payload: &[u8]) -> Vec<u8> {
+        let mut buf = synthetic_vcdu(vcid, counter, fhp, payload);
+        buf[0] = (1 << 6) | ((scid >> 2) & 0b0011_1111) as u8;
+        buf[1] = (((scid & 0b11) as u8) << 6) | (vcid & 0x3F);
+        buf
+    }
+
+    /// The demux locks onto the first accepted spacecraft id; a frame
+    /// carrying another SCID (an RS over-T miscorrection that happened
+    /// to keep version + VCID) is dropped instead of desyncing the
+    /// reassembler.
+    #[test]
+    fn scid_mismatch_is_dropped_after_lock() {
+        let mut d = Demux::new();
+        let pkt = make_packet(0x100, b"first");
+        assert_eq!(
+            d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 0, 0, &pkt))
+                .len(),
+            1
+        );
+        let other = make_packet(0x100, b"other-sat");
+        let out = d.push(&synthetic_vcdu_scid(141, VCID_AVHRR, 1, 0, &other));
+        assert!(out.is_empty(), "foreign SCID dropped");
+        let good = make_packet(0x100, b"still-ours");
+        let out = d.push(&synthetic_vcdu_scid(140, VCID_AVHRR, 1, 0, &good));
+        assert_eq!(out.len(), 1, "the stream continues in sync");
+    }
+
+    /// Replay-flagged VCDUs are not live data and are dropped.
+    #[test]
+    fn replay_vcdu_is_dropped() {
+        let mut d = Demux::new();
+        let pkt = make_packet(0x100, b"replayed");
+        let mut vcdu = synthetic_vcdu(VCID_AVHRR, 0, 0, &pkt);
+        vcdu[5] |= 0x80;
+        assert!(d.push(&vcdu).is_empty());
+    }
+
+    /// The packet header's secondary-header flag (bit 0x0800) is
+    /// carried on `ImagePacket` so the consumer can skip the 8-byte
+    /// MPDU timestamp only when it is actually present.
+    #[test]
+    fn secondary_header_flag_is_carried() {
+        let mut d = Demux::new();
+        let mut with = make_packet(0x100, b"with-timestamp");
+        with[0] |= 0x08;
+        let out = d.push(&synthetic_vcdu(VCID_AVHRR, 0, 0, &with));
+        assert!(out[0].has_secondary_header);
+        let without = make_packet(0x100, b"bare");
+        let out = d.push(&synthetic_vcdu(VCID_AVHRR, 1, 0, &without));
+        assert!(!out[0].has_secondary_header);
     }
 }
