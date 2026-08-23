@@ -3470,110 +3470,81 @@ fn wire_role_and_server_key_rows(
         .source
         .rtl_tcp_role_row
         .connect_selected_notify(move |row| {
-            use crate::sidebar::source_panel::{
-                FavoriteRole, KEY_RTL_TCP_CLIENT_LAST_ROLE, RTL_TCP_ROLE_CONTROL_IDX,
-                RTL_TCP_ROLE_LISTEN_IDX, save_favorites,
-            };
-            let fav_role = match row.selected() {
-                RTL_TCP_ROLE_CONTROL_IDX => FavoriteRole::Control,
-                RTL_TCP_ROLE_LISTEN_IDX => FavoriteRole::Listen,
-                _ => return, // transient out-of-range indices
-            };
-            let requested_role = fav_role.as_wire_role();
-            // Resolve the auth_key for this dispatch:
-            // - Empty text → `None` (intentional clear).
-            // - Valid hex → `Some(bytes)`.
-            // - Malformed non-empty text → the cached last-good
-            //   bytes (which the auth handler maintains). This
-            //   means a role flip with bad hex in the auth field
-            //   still pushes the new role to DSP — pre-
-            //   `CodeRabbit` round 9 on PR #408 we'd skip the
-            //   dispatch entirely, so a user could switch to
-            //   Listener, hit Retry / ControllerBusy-toast-
-            //   Takeover, and still end up as Controller because
-            //   DSP never saw the new role. The auth_key-row
-            //   handler still drives the `error` CSS class on
-            //   the row so the user sees the malformed input.
-            let key_text = auth_key_for_role.text().to_string();
-            let auth_key: Option<Vec<u8>> = if key_text.is_empty() {
-                None
-            } else if let Some(bytes) = crate::sidebar::server_panel::auth_key_from_hex(&key_text) {
-                Some(bytes)
-            } else {
-                last_good_for_role.borrow().clone()
-            };
-            state_role.send_dsp(UiToDsp::SetRtlTcpClientConfig {
-                requested_role,
-                auth_key,
-            });
-            // Tier 1: global default — always written so a fresh
-            // server ("never favorited, never configured") picks
-            // this up as the picker seed.
-            config_for_role.write(|v| {
-                v[KEY_RTL_TCP_CLIENT_LAST_ROLE] =
-                    serde_json::to_value(fav_role).unwrap_or(serde_json::Value::Null);
-            });
-            // Tier 2: per-favorite override. Resolve the
-            // server key from the cached stable identity first
-            // (`state.rtl_tcp_active_server`, written by
-            // `apply_rtl_tcp_connect` / the startup restore at
-            // connect-setup time) and only fall back to reading
-            // the `hostname_row` / `port_row` widgets when the
-            // cache is empty (manually-typed Play path, no
-            // apply_rtl_tcp_connect). Pre-`CodeRabbit` round 10
-            // on PR #408 this handler always rebuilt the key
-            // from the widgets, so a discovery connect that
-            // persisted `shack-pi.local.:1234` as the favorite
-            // identity could silently diverge from whatever
-            // resolved-IP value the dial path had pushed into
-            // `hostname_row` — the lookup below would miss the
-            // favorite, and `requested_role` wouldn't round-
-            // trip between discovery, favorites, and reconnects.
-            //
-            // Then update the matching entry's `requested_role`
-            // in the SHARED in-memory map
-            // (`connect_rtl_tcp_discovery`'s re-announce path
-            // also reads + mutates this map), and persist the
-            // full snapshot. Pre-round-8 this handler called
-            // `load_favorites` on every fire and saved a fresh
-            // `Vec`, diverging from the discovery path's in-
-            // memory map — a subsequent `ServerAnnounced` would
-            // preserve the stale in-memory role and clobber the
-            // just-saved selection. Mutating the shared map
-            // keeps both paths honest.
-            let server_key = {
-                let cached = state_role.rtl_tcp_active_server.borrow().clone();
-                if cached.is_empty() {
-                    let host = hostname_for_role.text().to_string();
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let port = port_for_role.value() as u16;
-                    if host.is_empty() || port == 0 {
-                        return;
-                    }
-                    format!("{host}:{port}")
-                } else {
-                    cached
-                }
-            };
-            let dirty = {
-                let mut favorites = favorites_for_role.borrow_mut();
-                if let Some(fav) = favorites.get_mut(&server_key)
-                    && fav.requested_role != Some(fav_role)
-                {
-                    fav.requested_role = Some(fav_role);
-                    true
-                } else {
-                    false
-                }
-            };
-            if dirty {
-                let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
-                    favorites_for_role.borrow().values().cloned().collect();
-                save_favorites(&config_for_role, &snapshot);
-            }
+            on_rtl_tcp_role_selected(
+                row,
+                &state_role,
+                &auth_key_for_role,
+                &config_for_role,
+                &hostname_for_role,
+                &port_for_role,
+                &favorites_for_role,
+                &last_good_for_role,
+            );
         });
 
     wire_server_key_entry(panels, state, config, last_good_auth_key);
+}
+
+/// Role-picker dispatch (#396): resolve the auth key (empty → None,
+/// valid hex → bytes, malformed → last-good cache), push the new role
+/// to DSP, then persist the two-tier role preference (global default
+/// + per-favorite override). Split out per the 50-NLOC gate (#817).
+#[allow(clippy::too_many_arguments)]
+fn on_rtl_tcp_role_selected(
+    row: &adw::ComboRow,
+    state_role: &Rc<AppState>,
+    auth_key_for_role: &adw::PasswordEntryRow,
+    config_for_role: &std::sync::Arc<sdr_config::ConfigManager>,
+    hostname_for_role: &adw::EntryRow,
+    port_for_role: &adw::SpinRow,
+    favorites_for_role: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    last_good_for_role: &Rc<RefCell<Option<Vec<u8>>>>,
+) {
+    use crate::sidebar::source_panel::{
+        FavoriteRole, RTL_TCP_ROLE_CONTROL_IDX, RTL_TCP_ROLE_LISTEN_IDX,
+    };
+    let fav_role = match row.selected() {
+        RTL_TCP_ROLE_CONTROL_IDX => FavoriteRole::Control,
+        RTL_TCP_ROLE_LISTEN_IDX => FavoriteRole::Listen,
+        _ => return, // transient out-of-range indices
+    };
+    let requested_role = fav_role.as_wire_role();
+    // Resolve the auth_key for this dispatch:
+    // - Empty text → `None` (intentional clear).
+    // - Valid hex → `Some(bytes)`.
+    // - Malformed non-empty text → the cached last-good
+    //   bytes (which the auth handler maintains). This
+    //   means a role flip with bad hex in the auth field
+    //   still pushes the new role to DSP — pre-
+    //   `CodeRabbit` round 9 on PR #408 we'd skip the
+    //   dispatch entirely, so a user could switch to
+    //   Listener, hit Retry / ControllerBusy-toast-
+    //   Takeover, and still end up as Controller because
+    //   DSP never saw the new role. The auth_key-row
+    //   handler still drives the `error` CSS class on
+    //   the row so the user sees the malformed input.
+    let key_text = auth_key_for_role.text().to_string();
+    let auth_key: Option<Vec<u8>> = if key_text.is_empty() {
+        None
+    } else if let Some(bytes) = crate::sidebar::server_panel::auth_key_from_hex(&key_text) {
+        Some(bytes)
+    } else {
+        last_good_for_role.borrow().clone()
+    };
+    state_role.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+        requested_role,
+        auth_key,
+    });
+    persist_role_preference(
+        state_role,
+        config_for_role,
+        hostname_for_role,
+        port_for_role,
+        favorites_for_role,
+        fav_role,
+    );
 }
 
 /// Direct-sampling combo + offset-tuning toggle (#538/#539).
@@ -4366,6 +4337,26 @@ fn restore_rtl_tcp_client_state(
             FavoriteRole::Listen => RTL_TCP_ROLE_LISTEN_IDX,
         };
         panels.source.rtl_tcp_role_row.set_selected(idx);
+        restore_saved_auth_key(
+            panels,
+            state,
+            last_good_auth_key,
+            &last_connected,
+            &favorite_entry,
+            persisted_role,
+        );
+    }
+
+    /// Auth-key half of the rtl_tcp client restore: keyring load, last-good seed, and key-row reveal.
+    /// Split out per the 50-NLOC gate (#817).
+    fn restore_saved_auth_key(
+        panels: &SidebarPanels,
+        state: &Rc<AppState>,
+        last_good_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
+        last_connected: &Option<crate::sidebar::source_panel::LastConnectedServer>,
+        favorite_entry: &Option<sidebar::source_panel::FavoriteEntry>,
+        persisted_role: crate::sidebar::source_panel::FavoriteRole,
+    ) {
         // Load the saved per-server auth key for the last-
         // connected endpoint, if any. Also cache that server's
         // stable id on `AppState` so the first post-Play
@@ -4422,5 +4413,86 @@ fn restore_rtl_tcp_client_state(
             requested_role: persisted_role.as_wire_role(),
             auth_key,
         });
+    }
+}
+
+/// Two-tier role persistence: global default + per-favorite override.
+/// Split out per the 50-NLOC gate (#817).
+fn persist_role_preference(
+    state_role: &Rc<AppState>,
+    config_for_role: &std::sync::Arc<sdr_config::ConfigManager>,
+    hostname_for_role: &adw::EntryRow,
+    port_for_role: &adw::SpinRow,
+    favorites_for_role: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    fav_role: crate::sidebar::source_panel::FavoriteRole,
+) {
+    use crate::sidebar::source_panel::{KEY_RTL_TCP_CLIENT_LAST_ROLE, save_favorites};
+
+    // Tier 1: global default — always written so a fresh
+    // server ("never favorited, never configured") picks
+    // this up as the picker seed.
+    config_for_role.write(|v| {
+        v[KEY_RTL_TCP_CLIENT_LAST_ROLE] =
+            serde_json::to_value(fav_role).unwrap_or(serde_json::Value::Null);
+    });
+    // Tier 2: per-favorite override. Resolve the
+    // server key from the cached stable identity first
+    // (`state.rtl_tcp_active_server`, written by
+    // `apply_rtl_tcp_connect` / the startup restore at
+    // connect-setup time) and only fall back to reading
+    // the `hostname_row` / `port_row` widgets when the
+    // cache is empty (manually-typed Play path, no
+    // apply_rtl_tcp_connect). Pre-`CodeRabbit` round 10
+    // on PR #408 this handler always rebuilt the key
+    // from the widgets, so a discovery connect that
+    // persisted `shack-pi.local.:1234` as the favorite
+    // identity could silently diverge from whatever
+    // resolved-IP value the dial path had pushed into
+    // `hostname_row` — the lookup below would miss the
+    // favorite, and `requested_role` wouldn't round-
+    // trip between discovery, favorites, and reconnects.
+    //
+    // Then update the matching entry's `requested_role`
+    // in the SHARED in-memory map
+    // (`connect_rtl_tcp_discovery`'s re-announce path
+    // also reads + mutates this map), and persist the
+    // full snapshot. Pre-round-8 this handler called
+    // `load_favorites` on every fire and saved a fresh
+    // `Vec`, diverging from the discovery path's in-
+    // memory map — a subsequent `ServerAnnounced` would
+    // preserve the stale in-memory role and clobber the
+    // just-saved selection. Mutating the shared map
+    // keeps both paths honest.
+    let server_key = {
+        let cached = state_role.rtl_tcp_active_server.borrow().clone();
+        if cached.is_empty() {
+            let host = hostname_for_role.text().to_string();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let port = port_for_role.value() as u16;
+            if host.is_empty() || port == 0 {
+                return;
+            }
+            format!("{host}:{port}")
+        } else {
+            cached
+        }
+    };
+    let dirty = {
+        let mut favorites = favorites_for_role.borrow_mut();
+        if let Some(fav) = favorites.get_mut(&server_key)
+            && fav.requested_role != Some(fav_role)
+        {
+            fav.requested_role = Some(fav_role);
+            true
+        } else {
+            false
+        }
+    };
+    if dirty {
+        let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
+            favorites_for_role.borrow().values().cloned().collect();
+        save_favorites(&config_for_role, &snapshot);
     }
 }
