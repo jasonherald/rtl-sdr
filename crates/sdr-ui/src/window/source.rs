@@ -431,50 +431,9 @@ pub(super) fn connect_rtl_tcp_discovery(
     /// not the selected source type.
     const DISCOVERY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
-    // "Manage favorites…" button inside the discovered-servers
-    // expander — a second entry point into the same popover as
-    // the header-bar star button. Wired here because the
-    // `MenuButton` whose `popup()` we trigger lives in the
-    // header. Weak ref on the button keeps the closure drop-safe
-    // if the header is torn down before the source panel (though
-    // in practice the window owns both and they drop together).
-    let favorites_menu_weak = favorites_header.button.downgrade();
-    panels
-        .source
-        .manage_favorites_button
-        .connect_clicked(move |_| {
-            if let Some(btn) = favorites_menu_weak.upgrade() {
-                // `MenuButton::popup` activates the attached
-                // popover anchored to the menu button itself, so
-                // the slide-out appears from the header regardless
-                // of which entry point the user clicked.
-                btn.popup();
-            }
-        });
+    wire_manage_favorites_button(panels, favorites_header, favorites);
 
-    let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
-    // `Option<Browser>` — `None` on mDNS startup failure. We still
-    // need the rest of this function to run so the *manually*-
-    // persisted `last_connected` / favorites restore can repopulate
-    // the client UI. Only the discovery poller is skipped in the
-    // `None` branch (there'd be nothing to poll, and `disc_tx` is
-    // already dropped so `disc_rx` would immediately return
-    // `TryRecvError::Disconnected` and spin forever).
-    let browser = match Browser::start(move |event| {
-        // Ignore send errors — means the UI thread dropped the rx,
-        // which only happens on shutdown.
-        let _ = disc_tx.send(event);
-    }) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            tracing::warn!(%e, "mDNS browser failed to start — discovery disabled");
-            panels
-                .source
-                .rtl_tcp_discovered_row
-                .set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
-            None
-        }
-    };
+    let (browser, disc_rx) = start_discovery_browser(panels);
 
     // Tracks the `AdwActionRow` per-server so we can remove it on
     // `ServerWithdrawn` OR when the row goes stale past
@@ -638,6 +597,40 @@ pub(super) fn connect_rtl_tcp_discovery(
 
         drain_discovery_events(&disc_rx, &displayed_rows, &expander, &favorites, &row_deps)
     });
+}
+
+/// Start the mDNS browser + event channel. Returns `None` for the
+/// browser on startup failure (the caller still runs the restore /
+/// favorites paths; only the poller is skipped). Split out per the
+/// 50-NLOC gate (#817).
+fn start_discovery_browser(
+    panels: &SidebarPanels,
+) -> (Option<Browser>, mpsc::Receiver<DiscoveryEvent>) {
+    let (disc_tx, disc_rx) = mpsc::channel::<DiscoveryEvent>();
+    // `Option<Browser>` — `None` on mDNS startup failure. We still
+    // need the rest of this function to run so the *manually*-
+    // persisted `last_connected` / favorites restore can repopulate
+    // the client UI. Only the discovery poller is skipped in the
+    // `None` branch (there'd be nothing to poll, and `disc_tx` is
+    // already dropped so `disc_rx` would immediately return
+    // `TryRecvError::Disconnected` and spin forever).
+    let browser = match Browser::start(move |event| {
+        // Ignore send errors — means the UI thread dropped the rx,
+        // which only happens on shutdown.
+        let _ = disc_tx.send(event);
+    }) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!(%e, "mDNS browser failed to start — discovery disabled");
+            panels
+                .source
+                .rtl_tcp_discovered_row
+                .set_subtitle(DISCOVERY_UNAVAILABLE_SUBTITLE);
+            None
+        }
+    };
+
+    (browser, disc_rx)
 }
 
 /// Drain the mDNS discovery channel for one poll tick. Returns
@@ -4130,4 +4123,35 @@ fn restore_last_connected_endpoint(
     // `DISCOVERY_UNAVAILABLE_SUBTITLE` set in the `Err` branch
     // stays on the expander as the long-term idle state; the
     // restore / favorites paths above already ran unconditionally.
+}
+
+/// "Manage favorites…" button — second entry point into the header favorites popover.
+/// Split out per the 50-NLOC gate (#817).
+fn wire_manage_favorites_button(
+    panels: &SidebarPanels,
+    favorites_header: &FavoritesHeaderHandle,
+    favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+) {
+    // "Manage favorites…" button inside the discovered-servers
+    // expander — a second entry point into the same popover as
+    // the header-bar star button. Wired here because the
+    // `MenuButton` whose `popup()` we trigger lives in the
+    // header. Weak ref on the button keeps the closure drop-safe
+    // if the header is torn down before the source panel (though
+    // in practice the window owns both and they drop together).
+    let favorites_menu_weak = favorites_header.button.downgrade();
+    panels
+        .source
+        .manage_favorites_button
+        .connect_clicked(move |_| {
+            if let Some(btn) = favorites_menu_weak.upgrade() {
+                // `MenuButton::popup` activates the attached
+                // popover anchored to the menu button itself, so
+                // the slide-out appears from the header regardless
+                // of which entry point the user clicked.
+                btn.popup();
+            }
+        });
 }
