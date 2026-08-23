@@ -30,6 +30,8 @@ pub mod spectrum;
 pub mod sstv_viewer;
 pub mod state;
 pub mod status_bar;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod ui_helpers;
 pub mod viewer;
 pub mod window;
