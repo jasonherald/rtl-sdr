@@ -512,12 +512,21 @@ impl ClientRegistry {
             Role::Control => {
                 // Find the live controller (if any) so we can
                 // either deny or displace.
-                let existing_controller = guard
+                let mut live_controllers = guard
                     .iter()
-                    .find(|s| s.role == Role::Control && !s.is_disconnected())
-                    .cloned();
+                    .filter(|s| s.role == Role::Control && !s.is_disconnected());
+                let existing_controller = live_controllers.next().cloned();
+                // A second live Control slot is a takeover that was
+                // admitted but not yet committed (#710). Only one
+                // newcomer may be pending against the incumbent at a
+                // time, or both would commit and leave two live
+                // controllers (#808); the reservation is the slot
+                // list itself, read under this same lock, and it
+                // clears when the newcomer commits (incumbent
+                // disconnected) or is unwound (slot removed).
+                let takeover_pending = live_controllers.next().is_some();
                 if let Some(prev) = existing_controller {
-                    if !request_takeover {
+                    if !request_takeover || takeover_pending {
                         return RoleDecision::ControllerBusy;
                     }
                     // Takeover path, phase 1 of 2: admit the
@@ -558,14 +567,28 @@ impl ClientRegistry {
     /// `prune_disconnected` sweep — keeping it around keeps its
     /// per-client stats visible in the next UI poll so operators
     /// can see "client 7 was kicked by client 12" in the activity
-    /// log. Returns `true` iff a slot with that id was found;
-    /// `false` when it already left (no-op).
-    pub fn commit_takeover(&self, displaced_id: ClientId) -> bool {
+    /// log.
+    ///
+    /// The pair is validated under the slot lock (#808): `newcomer_id`
+    /// must be a live Control slot, `displaced_id` a different live
+    /// Control slot. Anything else — the newcomer unwound, the
+    /// incumbent already gone or already displaced — is a no-op that
+    /// returns `false`, so a stale commit can never displace a
+    /// controller the caller did not actually take over from.
+    pub fn commit_takeover(&self, newcomer_id: ClientId, displaced_id: ClientId) -> bool {
         let Ok(guard) = self.slots.lock() else {
             tracing::error!("commit_takeover: registry slots mutex poisoned");
             return false;
         };
-        match guard.iter().find(|s| s.id == displaced_id) {
+        let live_control = |id: ClientId| {
+            guard
+                .iter()
+                .find(|s| s.id == id && s.role == Role::Control && !s.is_disconnected())
+        };
+        if newcomer_id == displaced_id || live_control(newcomer_id).is_none() {
+            return false;
+        }
+        match live_control(displaced_id) {
             Some(prev) => {
                 prev.mark_disconnected();
                 true
@@ -1545,7 +1568,7 @@ mod tests {
         // The swap is two-phase (#710): the incumbent stays live
         // until the newcomer's workers are up and the caller commits.
         assert!(!slot_a.is_disconnected(), "not displaced before commit");
-        assert!(reg.commit_takeover(a_id));
+        assert!(reg.commit_takeover(b_id, a_id));
 
         // A is still in the registry (stats visible to UI) but
         // flagged disconnected.
@@ -1632,11 +1655,12 @@ mod tests {
             TAKEOVER_TEST_LISTENER_TAKEOVER_CTRL_PORT,
             Role::Control,
         );
+        let b_id = ctrl_b.id;
         assert_eq!(
             reg.register_with_role(ctrl_b, TEST_LISTENER_CAP, true),
             RoleDecision::GrantedViaTakeover { displaced_id: a_id }
         );
-        assert!(reg.commit_takeover(a_id));
+        assert!(reg.commit_takeover(b_id, a_id));
         // Listener survived unscathed.
         assert!(
             !listener.is_disconnected(),
@@ -1672,8 +1696,85 @@ mod tests {
             reg.register_with_role(slot_c, TEST_LISTENER_CAP, false),
             RoleDecision::ControllerBusy
         );
-        // Committing a takeover for a slot that is gone is a no-op.
-        assert!(!reg.commit_takeover(slot_b.id));
+        // Committing a takeover whose newcomer is gone is a no-op.
+        assert!(!reg.commit_takeover(slot_b.id, a_id));
+        assert!(!slot_a.is_disconnected());
+    }
+
+    /// #808: while newcomer B's takeover of A is admitted but not yet
+    /// committed, a competing takeover C is denied — otherwise both
+    /// would commit against A and leave two live controllers.
+    #[test]
+    fn competing_takeover_is_denied_while_one_is_pending() {
+        let (reg, slot_a) = registry_with_controller(TAKEOVER_TEST_ORIG_CTRL_PORT);
+        let a_id = slot_a.id;
+        let slot_b = role_test_slot(&reg, TAKEOVER_TEST_NEW_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot_b.clone(), TEST_LISTENER_CAP, true),
+            RoleDecision::GrantedViaTakeover { displaced_id: a_id }
+        );
+        let slot_c = role_test_slot(&reg, TAKEOVER_TEST_NO_CONFLICT_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot_c.clone(), TEST_LISTENER_CAP, true),
+            RoleDecision::ControllerBusy,
+            "a second takeover must wait for the pending one"
+        );
+        // Once B commits, a takeover of B is possible again.
+        assert!(reg.commit_takeover(slot_b.id, a_id));
+        assert_eq!(
+            reg.register_with_role(slot_c, TEST_LISTENER_CAP, true),
+            RoleDecision::GrantedViaTakeover {
+                displaced_id: slot_b.id
+            }
+        );
+        let live_controllers = reg
+            .snapshot()
+            .iter()
+            .filter(|s| s.role == Role::Control)
+            .count();
+        assert_eq!(live_controllers, 2, "B live + C pending, A displaced");
+    }
+
+    /// #808: an unwound pending takeover frees the reservation.
+    #[test]
+    fn unwound_pending_takeover_frees_the_reservation() {
+        let (reg, slot_a) = registry_with_controller(TAKEOVER_TEST_ORIG_CTRL_PORT);
+        let a_id = slot_a.id;
+        let slot_b = role_test_slot(&reg, TAKEOVER_TEST_NEW_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot_b.clone(), TEST_LISTENER_CAP, true),
+            RoleDecision::GrantedViaTakeover { displaced_id: a_id }
+        );
+        assert!(reg.unwind_admission(&slot_b));
+        let slot_c = role_test_slot(&reg, TAKEOVER_TEST_NO_CONFLICT_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot_c, TEST_LISTENER_CAP, true),
+            RoleDecision::GrantedViaTakeover { displaced_id: a_id }
+        );
+    }
+
+    /// #808: `commit_takeover` validates the pair — a stale incumbent
+    /// id or a newcomer that is not a live Control slot is a no-op.
+    #[test]
+    fn commit_takeover_rejects_a_stale_pair() {
+        let (reg, slot_a) = registry_with_controller(TAKEOVER_TEST_ORIG_CTRL_PORT);
+        let a_id = slot_a.id;
+        let slot_b = role_test_slot(&reg, TAKEOVER_TEST_NEW_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot_b.clone(), TEST_LISTENER_CAP, true),
+            RoleDecision::GrantedViaTakeover { displaced_id: a_id }
+        );
+        const STALE_ID: ClientId = 9_999;
+        assert!(
+            !reg.commit_takeover(slot_b.id, STALE_ID),
+            "unknown incumbent"
+        );
+        assert!(!reg.commit_takeover(STALE_ID, a_id), "unknown newcomer");
+        assert!(!reg.commit_takeover(a_id, a_id), "newcomer must differ");
+        assert!(!slot_a.is_disconnected());
+        assert!(reg.commit_takeover(slot_b.id, a_id));
+        assert!(slot_a.is_disconnected());
+        assert!(!reg.commit_takeover(slot_b.id, a_id), "already committed");
     }
 
     #[test]

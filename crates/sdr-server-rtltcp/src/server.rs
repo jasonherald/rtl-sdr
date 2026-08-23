@@ -1539,7 +1539,7 @@ fn spawn_client_workers(
     // — is the incumbent controller displaced. Every early return
     // above left it in place.
     if let Some(displaced_id) = displaced_id
-        && !registry.commit_takeover(displaced_id)
+        && !registry.commit_takeover(id, displaced_id)
     {
         tracing::debug!(
             client_id = id,
@@ -2411,9 +2411,9 @@ fn broadcaster_worker(
     let mut usb_errors: u32 = 0;
 
     while !shutdown.load(Ordering::Relaxed) {
-        match handle.read_bulk(RtlSdrDevice::BULK_ENDPOINT, &mut scratch, USB_READ_TIMEOUT) {
-            Ok(n) if n > 0 => {
-                usb_errors = 0;
+        let read = handle.read_bulk(RtlSdrDevice::BULK_ENDPOINT, &mut scratch, USB_READ_TIMEOUT);
+        match classify_usb_read(read, &mut usb_errors) {
+            UsbReadOutcome::Data(n) => {
                 registry.broadcast(&scratch[..n]);
                 ticks_since_prune = ticks_since_prune.saturating_add(1);
                 if ticks_since_prune >= BROADCASTER_PRUNE_EVERY_N_TICKS {
@@ -2421,34 +2421,30 @@ fn broadcaster_worker(
                     ticks_since_prune = 0;
                 }
             }
-            Ok(_) | Err(rusb::Error::Timeout) => {
+            UsbReadOutcome::Idle => {
                 // No data — loop and re-check shutdown.
             }
-            Err(e) => match usb_read_failure_verdict(&mut usb_errors, e) {
-                UsbReadVerdict::Retry => {
-                    tracing::warn!(
-                        %e,
-                        consecutive = usb_errors,
-                        "rtl_tcp bulk read error — retrying"
-                    );
-                }
-                UsbReadVerdict::Stop => {
-                    // Dongle unplug (or a sustained run of failed
-                    // transfers) is unrecoverable at the server
-                    // level. Escalate to a global shutdown so the
-                    // accept thread exits, the CLI sees
-                    // `has_stopped() == true`, and connected
-                    // clients' command / writer loops observe the
-                    // flag and tear down.
-                    tracing::error!(
-                        %e,
-                        consecutive = usb_errors,
-                        "rtl_tcp: USB read failure is terminal, stopping server"
-                    );
-                    shutdown.store(true, Ordering::SeqCst);
-                    return;
-                }
-            },
+            UsbReadOutcome::Retry => {
+                tracing::warn!(
+                    consecutive = usb_errors,
+                    "rtl_tcp bulk read error — retrying"
+                );
+            }
+            UsbReadOutcome::Stop => {
+                // Dongle unplug (or a sustained run of failed
+                // transfers) is unrecoverable at the server
+                // level. Escalate to a global shutdown so the
+                // accept thread exits, the CLI sees
+                // `has_stopped() == true`, and connected
+                // clients' command / writer loops observe the
+                // flag and tear down.
+                tracing::error!(
+                    consecutive = usb_errors,
+                    "rtl_tcp: USB read failure is terminal, stopping server"
+                );
+                shutdown.store(true, Ordering::SeqCst);
+                return;
+            }
         }
     }
     // Final prune on exit so the pruned-slots metric doesn't
@@ -2493,29 +2489,47 @@ fn prune_and_reap(registry: &ClientRegistry) {
     }
 }
 
-/// What the broadcaster does after a failed USB bulk read.
+/// What the broadcaster does with one USB bulk-read result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UsbReadVerdict {
-    /// Transient: count it and read again.
+enum UsbReadOutcome {
+    /// `n` bytes to fan out.
+    Data(usize),
+    /// Nothing to do: zero-length read or timeout.
+    Idle,
+    /// Transient failure: counted, read again.
     Retry,
     /// Device gone, or [`MAX_CONSECUTIVE_USB_ERRORS`] failures in a
     /// row: stop the server.
     Stop,
 }
 
-/// librtlsdr's `xfer_errors` rule (#711): `NoDevice` is terminal at
-/// once; anything else is retried until `consecutive_errors` (reset
-/// by the caller on a successful read) reaches
-/// [`MAX_CONSECUTIVE_USB_ERRORS`].
-fn usb_read_failure_verdict(consecutive_errors: &mut u32, e: rusb::Error) -> UsbReadVerdict {
-    if matches!(e, rusb::Error::NoDevice) {
-        return UsbReadVerdict::Stop;
-    }
-    *consecutive_errors = consecutive_errors.saturating_add(1);
-    if *consecutive_errors >= MAX_CONSECUTIVE_USB_ERRORS {
-        UsbReadVerdict::Stop
-    } else {
-        UsbReadVerdict::Retry
+/// librtlsdr's `xfer_errors` rule (#711 / #808): any successful read
+/// — including a zero-length one — resets `consecutive_errors`; a
+/// `Timeout` is neutral; `NoDevice` is terminal at once; any other
+/// error is counted and retried until the budget is spent.
+fn classify_usb_read(
+    result: Result<usize, rusb::Error>,
+    consecutive_errors: &mut u32,
+) -> UsbReadOutcome {
+    match result {
+        Ok(n) => {
+            *consecutive_errors = 0;
+            if n > 0 {
+                UsbReadOutcome::Data(n)
+            } else {
+                UsbReadOutcome::Idle
+            }
+        }
+        Err(rusb::Error::Timeout) => UsbReadOutcome::Idle,
+        Err(rusb::Error::NoDevice) => UsbReadOutcome::Stop,
+        Err(_) => {
+            *consecutive_errors = consecutive_errors.saturating_add(1);
+            if *consecutive_errors >= MAX_CONSECUTIVE_USB_ERRORS {
+                UsbReadOutcome::Stop
+            } else {
+                UsbReadOutcome::Retry
+            }
+        }
     }
 }
 
@@ -3611,6 +3625,35 @@ mod tests {
         assert!(!slot.is_disconnected());
     }
 
+    /// #808: any successful read — even a zero-length one — resets
+    /// the consecutive-error budget; a timeout leaves it untouched.
+    #[test]
+    fn zero_length_usb_read_resets_the_error_budget() {
+        let mut errors = 0_u32;
+        for _ in 1..MAX_CONSECUTIVE_USB_ERRORS {
+            assert_eq!(
+                classify_usb_read(Err(rusb::Error::Io), &mut errors),
+                UsbReadOutcome::Retry
+            );
+        }
+        assert_eq!(
+            classify_usb_read(Err(rusb::Error::Timeout), &mut errors),
+            UsbReadOutcome::Idle
+        );
+        assert_eq!(errors, MAX_CONSECUTIVE_USB_ERRORS - 1, "timeout is neutral");
+        assert_eq!(classify_usb_read(Ok(0), &mut errors), UsbReadOutcome::Idle);
+        assert_eq!(errors, 0, "Ok(0) is a successful read");
+        assert_eq!(
+            classify_usb_read(Err(rusb::Error::Io), &mut errors),
+            UsbReadOutcome::Retry
+        );
+        assert_eq!(
+            classify_usb_read(Ok(7), &mut errors),
+            UsbReadOutcome::Data(7)
+        );
+        assert_eq!(errors, 0);
+    }
+
     /// USB read failures are tolerated up to librtlsdr's consecutive
     /// transfer-error budget; a device loss stops immediately.
     #[test]
@@ -3618,18 +3661,18 @@ mod tests {
         let mut errors = 0_u32;
         for _ in 1..MAX_CONSECUTIVE_USB_ERRORS {
             assert_eq!(
-                usb_read_failure_verdict(&mut errors, rusb::Error::Overflow),
-                UsbReadVerdict::Retry
+                classify_usb_read(Err(rusb::Error::Overflow), &mut errors),
+                UsbReadOutcome::Retry
             );
         }
         assert_eq!(
-            usb_read_failure_verdict(&mut errors, rusb::Error::Pipe),
-            UsbReadVerdict::Stop
+            classify_usb_read(Err(rusb::Error::Pipe), &mut errors),
+            UsbReadOutcome::Stop
         );
         let mut fresh = 0_u32;
         assert_eq!(
-            usb_read_failure_verdict(&mut fresh, rusb::Error::NoDevice),
-            UsbReadVerdict::Stop
+            classify_usb_read(Err(rusb::Error::NoDevice), &mut fresh),
+            UsbReadOutcome::Stop
         );
     }
 }
