@@ -911,78 +911,18 @@ fn on_server_announced(
     // describes (map → row → signal → ctx → map).
     let star_row_ctx = Rc::clone(&favorite_row_ctx);
     star_btn.connect_toggled(move |btn| {
-        let active = btn.is_active();
-        btn.set_icon_name(if active {
-            FAVORITE_ICON_FILLED
-        } else {
-            FAVORITE_ICON_OUTLINE
-        });
-        // Keep the accessible name in sync with
-        // the new state so AT announces the next
-        // action ("Unpin from favorites" after the
-        // user just pinned it, and vice versa).
-        set_favorite_toggle_accessible_name(btn, active);
-        {
-            let mut favs = star_favorites.borrow_mut();
-            if active {
-                // Build a fresh entry with the
-                // current metadata. Replaces any
-                // older entry with the same key
-                // (= metadata refresh on re-star).
-                favs.insert(
-                    star_key.clone(),
-                    sidebar::source_panel::FavoriteEntry {
-                        key: star_key.clone(),
-                        nickname: star_nickname.clone(),
-                        tuner_name: star_tuner_name.clone(),
-                        gain_count: star_gain_count,
-                        last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
-                        // Fresh star — no role preference
-                        // yet; `auth_required` is captured
-                        // from the current mDNS announce's
-                        // TXT record above so
-                        // `apply_rtl_tcp_connect` + the
-                        // startup restore can pre-reveal
-                        // the key row immediately, without
-                        // waiting on a mDNS re-announce.
-                        // Per `CodeRabbit` round 6 on
-                        // PR #408 and issue #396.
-                        requested_role: None,
-                        auth_required: star_auth_required,
-                    },
-                );
-            } else {
-                favs.remove(&star_key);
-            }
-            // Persist immediately. Order within
-            // the persisted list is unspecified —
-            // the slide-out sorts on read.
-            let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
-                favs.values().cloned().collect();
-            crate::sidebar::source_panel::save_favorites(&star_config, &snapshot);
-        }
-        // Rebuild the expander so the row moves
-        // to/from the top per the new favorite
-        // state. Reuses the `displayed_rows` map
-        // (strong refs on the AdwActionRow
-        // widgets) — ordering is the only thing
-        // that changes. The map is held Weak via
-        // `FavoriteRowContext`; upgrade fails
-        // silently if the discovery timer has
-        // already torn down, which means there's
-        // nothing to reorder anyway.
-        if let (Some(expander), Some(rows)) = (
-            star_expander_weak.upgrade(),
-            star_row_ctx.displayed_rows.upgrade(),
-        ) {
-            reorder_discovered_rows(&expander, &rows.borrow(), &star_favorites.borrow());
-        }
-        // Refresh the header-bar favorites popover
-        // so the star-toggle reflects there too.
-        // Upgrade-and-drop inside the rebuild keeps
-        // the closure leak-free per the #329
-        // weak-ref pattern.
-        rebuild_favorites_popover(&star_row_ctx, &star_favorites.borrow());
+        on_discovery_star_toggled(
+            btn,
+            &star_key,
+            &star_nickname,
+            &star_tuner_name,
+            star_gain_count,
+            star_auth_required,
+            &star_favorites,
+            &star_config,
+            &star_expander_weak,
+            &star_row_ctx,
+        );
     });
     row.add_prefix(&star_btn);
 
@@ -1083,6 +1023,98 @@ fn on_server_announced(
     reorder_discovered_rows(&expander, &rows, &favorites.borrow());
 
     expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
+}
+
+/// Toggle body of a discovered-server star button: flip the icon +
+/// accessible name, insert/remove + persist the favorite, and refresh
+/// row order + the header popover. Split out per the 50-NLOC gate
+/// (#817).
+#[allow(clippy::too_many_arguments)]
+fn on_discovery_star_toggled(
+    btn: &gtk4::ToggleButton,
+    star_key: &str,
+    star_nickname: &str,
+    star_tuner_name: &Option<String>,
+    star_gain_count: Option<u32>,
+    star_auth_required: Option<bool>,
+    star_favorites: &Rc<
+        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
+    >,
+    star_config: &std::sync::Arc<sdr_config::ConfigManager>,
+    star_expander_weak: &glib::WeakRef<adw::ExpanderRow>,
+    star_row_ctx: &Rc<FavoriteRowContext>,
+) {
+    let active = btn.is_active();
+    btn.set_icon_name(if active {
+        FAVORITE_ICON_FILLED
+    } else {
+        FAVORITE_ICON_OUTLINE
+    });
+    // Keep the accessible name in sync with
+    // the new state so AT announces the next
+    // action ("Unpin from favorites" after the
+    // user just pinned it, and vice versa).
+    set_favorite_toggle_accessible_name(btn, active);
+    {
+        let mut favs = star_favorites.borrow_mut();
+        if active {
+            // Build a fresh entry with the
+            // current metadata. Replaces any
+            // older entry with the same key
+            // (= metadata refresh on re-star).
+            favs.insert(
+                star_key.to_string(),
+                sidebar::source_panel::FavoriteEntry {
+                    key: star_key.to_string(),
+                    nickname: star_nickname.to_string(),
+                    tuner_name: star_tuner_name.clone(),
+                    gain_count: star_gain_count,
+                    last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
+                    // Fresh star — no role preference
+                    // yet; `auth_required` is captured
+                    // from the current mDNS announce's
+                    // TXT record above so
+                    // `apply_rtl_tcp_connect` + the
+                    // startup restore can pre-reveal
+                    // the key row immediately, without
+                    // waiting on a mDNS re-announce.
+                    // Per `CodeRabbit` round 6 on
+                    // PR #408 and issue #396.
+                    requested_role: None,
+                    auth_required: star_auth_required,
+                },
+            );
+        } else {
+            favs.remove(star_key);
+        }
+        // Persist immediately. Order within
+        // the persisted list is unspecified —
+        // the slide-out sorts on read.
+        let snapshot: Vec<sidebar::source_panel::FavoriteEntry> = favs.values().cloned().collect();
+        crate::sidebar::source_panel::save_favorites(&star_config, &snapshot);
+    }
+    // Rebuild the expander so the row moves
+    // to/from the top per the new favorite
+    // state. Reuses the `displayed_rows` map
+    // (strong refs on the AdwActionRow
+    // widgets) — ordering is the only thing
+    // that changes. The map is held Weak via
+    // `FavoriteRowContext`; upgrade fails
+    // silently if the discovery timer has
+    // already torn down, which means there's
+    // nothing to reorder anyway.
+    if let (Some(expander), Some(rows)) = (
+        star_expander_weak.upgrade(),
+        star_row_ctx.displayed_rows.upgrade(),
+    ) {
+        reorder_discovered_rows(&expander, &rows.borrow(), &star_favorites.borrow());
+    }
+    // Refresh the header-bar favorites popover
+    // so the star-toggle reflects there too.
+    // Upgrade-and-drop inside the rebuild keeps
+    // the closure leak-free per the #329
+    // weak-ref pattern.
+    rebuild_favorites_popover(&star_row_ctx, &star_favorites.borrow());
 }
 
 /// Per-tick stale-row prune + "seen N ago" subtitle refresh for the
