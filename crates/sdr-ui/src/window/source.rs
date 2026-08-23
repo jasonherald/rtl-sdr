@@ -594,9 +594,7 @@ pub(super) fn connect_rtl_tcp_discovery(
     }
 
     restore_last_connected_endpoint(
-        state,
-        config,
-        favorites,
+        &state,
         &config_for_discovery,
         &hostname_row,
         &port_row,
@@ -4042,10 +4040,6 @@ fn refresh_favorite_metadata(
 /// Split out per the 50-NLOC gate (#817).
 fn restore_last_connected_endpoint(
     state: &Rc<AppState>,
-    config: &std::sync::Arc<sdr_config::ConfigManager>,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
     config_for_discovery: &std::sync::Arc<sdr_config::ConfigManager>,
     hostname_row: &adw::EntryRow,
     port_row: &adw::SpinRow,
