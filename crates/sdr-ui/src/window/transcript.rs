@@ -1,5 +1,10 @@
 //! Transcript panel wiring and transcription-session row state.
 
+#[cfg(feature = "sherpa")]
+use crate::sidebar::transcript_panel::DISPLAY_MODE_FINAL_IDX;
+#[cfg(feature = "sherpa")]
+use crate::viewer::plain_toast;
+
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 

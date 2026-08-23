@@ -47,9 +47,6 @@ const DEFAULT_HEIGHT: i32 = 800;
 
 /// FFT sizes — re-exported from display panel (single source of truth).
 use crate::sidebar::display_panel::FFT_SIZES;
-#[cfg(feature = "sherpa")]
-use crate::sidebar::transcript_panel::DISPLAY_MODE_FINAL_IDX;
-
 use crate::sidebar::source_panel::DECIMATION_FACTORS;
 
 mod audio;
