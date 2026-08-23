@@ -515,16 +515,17 @@ impl ClientRegistry {
                     if !request_takeover {
                         return RoleDecision::ControllerBusy;
                     }
-                    // Takeover path: mark the prior controller
-                    // disconnected so its workers exit on their
-                    // next tick. The slot stays in the registry
-                    // until the next `prune_disconnected` sweep or
-                    // an explicit `unwind_admission` — keeping it
-                    // around keeps its per-client stats visible in
-                    // the next UI poll so operators can see
-                    // "client 7 was kicked by client 12" in the
-                    // activity log. #393.
-                    prev.mark_disconnected();
+                    // Takeover path, phase 1 of 2: admit the
+                    // newcomer alongside the incumbent and report
+                    // who it will displace. The incumbent is only
+                    // marked disconnected by `commit_takeover`,
+                    // once the newcomer's workers are up — a
+                    // takeover request that drops mid-setup must
+                    // not leave the dongle with zero controllers
+                    // (#710). Until then `find` keeps resolving the
+                    // incumbent as the live controller, so a
+                    // concurrent plain Control request is still
+                    // `ControllerBusy`. #393.
                     displaced_id = Some(prev.id);
                 }
             }
@@ -544,6 +545,38 @@ impl ClientRegistry {
             Some(displaced_id) => RoleDecision::GrantedViaTakeover { displaced_id },
             None => RoleDecision::Granted,
         }
+    }
+
+    /// Phase 2 of a takeover (#710): mark the displaced controller
+    /// disconnected so its workers exit on their next tick. The
+    /// slot stays in the registry until the next
+    /// `prune_disconnected` sweep — keeping it around keeps its
+    /// per-client stats visible in the next UI poll so operators
+    /// can see "client 7 was kicked by client 12" in the activity
+    /// log. Returns `true` iff a slot with that id was found;
+    /// `false` when it already left (no-op).
+    pub fn commit_takeover(&self, displaced_id: ClientId) -> bool {
+        let Ok(guard) = self.slots.lock() else {
+            tracing::error!("commit_takeover: registry slots mutex poisoned");
+            return false;
+        };
+        match guard.iter().find(|s| s.id == displaced_id) {
+            Some(prev) => {
+                prev.mark_disconnected();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Record `n` USB chunks dropped for `slot` (its queue was full,
+    /// or its writer discarded the backlog behind a stalled socket,
+    /// #709) in both the per-client and the aggregate counters.
+    pub fn record_buffers_dropped(&self, slot: &ClientSlot, n: u64) {
+        if let Ok(mut s) = slot.stats.lock() {
+            s.buffers_dropped = s.buffers_dropped.saturating_add(n);
+        }
+        self.total_buffers_dropped.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Undo a prior [`Self::register_with_role`] `Granted` outcome
@@ -765,11 +798,7 @@ impl ClientRegistry {
                     // disconnects mid-queue.
                 }
                 Err(TrySendError::Full(_)) => {
-                    // Per-slot drop accounting.
-                    if let Ok(mut s) = slot.stats.lock() {
-                        s.buffers_dropped = s.buffers_dropped.saturating_add(1);
-                    }
-                    self.total_buffers_dropped.fetch_add(1, Ordering::Relaxed);
+                    self.record_buffers_dropped(slot.as_ref(), 1);
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     // Writer thread has exited and dropped the
@@ -1501,6 +1530,10 @@ mod tests {
             reg.register_with_role(slot_b.clone(), TEST_LISTENER_CAP, true),
             RoleDecision::GrantedViaTakeover { displaced_id: a_id }
         );
+        // The swap is two-phase (#710): the incumbent stays live
+        // until the newcomer's workers are up and the caller commits.
+        assert!(!slot_a.is_disconnected(), "not displaced before commit");
+        assert!(reg.commit_takeover(a_id));
 
         // A is still in the registry (stats visible to UI) but
         // flagged disconnected.
@@ -1596,6 +1629,7 @@ mod tests {
             reg.register_with_role(ctrl_b, TEST_LISTENER_CAP, true),
             RoleDecision::GrantedViaTakeover { displaced_id: a_id }
         );
+        assert!(reg.commit_takeover(a_id));
         // Listener survived unscathed.
         assert!(
             !listener.is_disconnected(),
@@ -1608,6 +1642,36 @@ mod tests {
         // the is_disconnected filter).
         let snapshot = reg.snapshot();
         assert_eq!(snapshot.len(), 2);
+    }
+
+    /// #710: a takeover that is unwound before commit (the newcomer
+    /// dropped during setup) leaves the incumbent controller in
+    /// place — a remote client cannot knock the live controller off
+    /// the dongle just by asking for takeover and hanging up.
+    #[test]
+    fn takeover_unwound_before_commit_keeps_the_incumbent() {
+        let reg = ClientRegistry::new();
+        let slot_a = role_test_slot(&reg, TAKEOVER_TEST_ORIG_CTRL_PORT, Role::Control);
+        let a_id = slot_a.id;
+        assert_eq!(
+            reg.register_with_role(slot_a.clone(), TEST_LISTENER_CAP, false),
+            RoleDecision::Granted
+        );
+        let slot_b = role_test_slot(&reg, TAKEOVER_TEST_NEW_CTRL_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot_b.clone(), TEST_LISTENER_CAP, true),
+            RoleDecision::GrantedViaTakeover { displaced_id: a_id }
+        );
+        assert!(reg.unwind_admission(&slot_b));
+        assert!(!slot_a.is_disconnected(), "incumbent untouched");
+        // A is still the controller: a plain Control request is busy.
+        let slot_c = role_test_slot(&reg, TAKEOVER_TEST_NO_CONFLICT_PORT, Role::Control);
+        assert_eq!(
+            reg.register_with_role(slot_c, TEST_LISTENER_CAP, false),
+            RoleDecision::ControllerBusy
+        );
+        // Committing a takeover for a slot that is gone is a no-op.
+        assert!(!reg.commit_takeover(slot_b.id));
     }
 
     #[test]
