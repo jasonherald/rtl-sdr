@@ -2651,6 +2651,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             }
         }
 
+        UiToDsp::ClearLrptImageContents(image) => {
+            // Ordered after `SetLrptDownlink` on this queue, so any
+            // held-back rows of the previous profile's decoder have
+            // already been flushed into `image` (CR on PR #806).
+            image.clear();
+        }
+
         UiToDsp::ClearLrptImage => {
             tracing::info!("LRPT image handle cleared — decoder tap is silent");
             state.lrpt_image = None;
@@ -6047,10 +6054,56 @@ mod tests {
         lrpt_decode_tap(&mut slot, Some(&image), &zeros, &mut init_failed, profile);
         assert!(!init_failed);
         assert_eq!(slot.as_ref().map(LrptDecoder::downlink), Some(profile));
+        // A populated slot is reused, not rebuilt.
+        lrpt_decode_tap(&mut slot, Some(&image), &zeros, &mut init_failed, profile);
+        assert!(!init_failed);
+        assert_eq!(slot.as_ref().map(LrptDecoder::downlink), Some(profile));
         // No image handle → no decoder is built.
         let mut no_image: Option<LrptDecoder> = None;
         lrpt_decode_tap(&mut no_image, None, &zeros, &mut init_failed, profile);
         assert!(no_image.is_none());
+    }
+
+    /// AOS ordering: `SetLrptDownlink` flushes the old decoder's
+    /// held-back row group into the shared image, then
+    /// `ClearLrptImageContents` wipes the canvas — in that order on
+    /// the DSP queue, so the previous pass's tail cannot survive onto
+    /// the new pass (CR on PR #806).
+    #[test]
+    fn lrpt_profile_change_then_clear_leaves_an_empty_canvas() {
+        use sdr_dsp::lrpt::LrptMode;
+        /// One JPEG MCU is 8 × 8 px (sdr-core has no `sdr_lrpt` dep).
+        const MCU_SIDE: usize = 8;
+        const APID: u16 = 64;
+        let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        let image = sdr_radio::lrpt_image::LrptImage::new();
+        let mut decoder =
+            LrptDecoder::new(image.clone(), LrptDownlink::new(LrptMode::Oqpsk, false)).unwrap();
+        decoder
+            .assembler_mut()
+            .place_mcu(APID, 0, 0, &[[200_u8; MCU_SIDE]; MCU_SIDE]);
+        state.lrpt_downlink = LrptDownlink::new(LrptMode::Oqpsk, false);
+        state.lrpt_image = Some(image.clone());
+        state.lrpt_decoder = Some(decoder);
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::SetLrptDownlink(LrptDownlink::new(LrptMode::Qpsk, false)),
+        );
+        assert!(
+            image.snapshot_channel(APID).is_some(),
+            "flushed tail lands first"
+        );
+        handle_command(
+            &mut state,
+            &dsp_tx,
+            UiToDsp::ClearLrptImageContents(image.clone()),
+        );
+        assert!(
+            image.snapshot_channel(APID).is_none(),
+            "then the canvas is wiped"
+        );
     }
 
     /// A precoding change alone (same modulation) also drops the

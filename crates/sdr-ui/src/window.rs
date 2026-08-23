@@ -11581,12 +11581,19 @@ fn connect_satellites_panel(
                         state_a.send_dsp(sdr_core::messages::UiToDsp::SetLrptDownlink(
                             crate::lrpt_viewer::lrpt_downlink_for(norad_id),
                         ));
+                        // Wipe the shared canvas on the DSP thread,
+                        // queued AFTER the profile change so a
+                        // changed profile's flush of held-back rows
+                        // lands before the clear rather than after
+                        // it (CR on PR #806).
+                        state_a.send_dsp(sdr_core::messages::UiToDsp::ClearLrptImageContents(
+                            state_a.lrpt_image.clone(),
+                        ));
 
                         crate::lrpt_viewer::open_lrpt_viewer_if_needed(
                             &parent_provider_a,
                             &state_a,
                         );
-                        state_a.lrpt_image.clear();
                         if let Some(view) = state_a.lrpt_viewer.borrow().as_ref() {
                             view.clear();
                         }
