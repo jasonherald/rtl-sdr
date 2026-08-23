@@ -117,6 +117,9 @@ fn export_png_uses_composite_cache_when_active() {
     /// per-APID surface.
     const UNRELATED_APID: u16 = 63;
     const UNRELATED_GREY: u8 = 0x77;
+    /// Cairo ARGB32 layout: 4 bytes per pixel, alpha forced opaque.
+    const BYTES_PER_PIXEL: usize = 4;
+    const OPAQUE_ALPHA: u8 = 0xFF;
     // Per CR round 2 on PR #575: when composite mode is
     // active and the cache is populated, `export_png` must
     // export the composite surface — not the active per-APID
@@ -149,8 +152,8 @@ fn export_png_uses_composite_cache_when_active() {
     );
     let data = surface.data().expect("surface data");
     assert_eq!(
-        &data[0..4],
-        &[COMPOSITE_B, COMPOSITE_G, COMPOSITE_R, 0xFF],
+        &data[..BYTES_PER_PIXEL],
+        &[COMPOSITE_B, COMPOSITE_G, COMPOSITE_R, OPAQUE_ALPHA],
         "first pixel must be the composite RGB, not the {UNRELATED_GREY:#x} greyscale APID"
     );
 }
