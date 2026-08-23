@@ -2,8 +2,8 @@
 
 use sdr_dsp::voice_squelch::VoiceSquelchMode;
 // Re-export so downstream crates that match on the `DspToUi::AptLine`
-// variant (e.g. `sdr-ffi` for its FFI-drop regression test) can
-// reach the payload type without taking a direct `sdr-dsp` dep.
+// variant can reach the payload type without taking a direct
+// `sdr-dsp` dep.
 pub use sdr_dsp::apt::AptLine;
 use sdr_radio::{DeemphasisMode, af_chain::CtcssMode};
 use sdr_types::{DemodMode, Protocol, RtlTcpConnectionState};
@@ -491,10 +491,8 @@ pub enum UiToDsp {
     /// samples downsampled from the post-demod 48 kHz stereo
     /// stream. Distinct from `EnableTranscription` which pushes
     /// 48 kHz interleaved stereo to the sdr-transcription backends;
-    /// this path targets FFI consumers that want a
-    /// speech-recognizer-ready stream (e.g. the macOS `SpeechAnalyzer`
-    /// path for issue #314) without pulling the sdr-transcription
-    /// dependency across the FFI.
+    /// this path targets embedders that want a speech-recognizer-ready
+    /// stream without pulling in the sdr-transcription dependency.
     EnableAudioTap(std::sync::mpsc::SyncSender<Vec<f32>>),
     /// Disable the audio tap enabled by `EnableAudioTap`. No-op when
     /// no tap is active.

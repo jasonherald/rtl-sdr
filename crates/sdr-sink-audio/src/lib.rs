@@ -1,18 +1,14 @@
 #![allow(clippy::doc_markdown, clippy::unnecessary_literal_bound)]
-//! Audio output sink — PipeWire (Linux) / CoreAudio (macOS).
+//! Audio output sink — PipeWire (Linux).
 //!
 //! When the `pipewire` feature is enabled, spawns a PipeWire main loop thread,
 //! creates a playback stream at 48 kHz stereo f32, and feeds audio from the
 //! DSP controller through a bounded channel.
 //!
-//! When the `coreaudio` feature is enabled, opens an AUHAL default-output
-//! AudioUnit and feeds audio through the same shared ring buffer pattern as
-//! the PipeWire backend.
-//!
-//! When neither backend feature is enabled, provides a stub that logs a
+//! When the `pipewire` feature is disabled, provides a stub that logs a
 //! warning.
 
-// Shared SPSC ring buffer used by both real backends. The stub backend
+// Shared SPSC ring buffer used by the PipeWire backend. The stub backend
 // doesn't need it, but it's cheap to compile in unconditionally — about
 // 200 lines of plain Rust with no external deps.
 mod ring;
@@ -24,45 +20,30 @@ mod ring;
 // Exactly one backend module compiles in based on cfg + feature flags:
 //
 //   • Linux + `pipewire` feature  → pw_impl
-//   • macOS + `coreaudio` feature → coreaudio_impl
 //   • everything else             → stub_impl (logs and discards)
 //
-// `sdr-core/Cargo.toml` enables the right feature per `target_os` so
+// `sdr-core/Cargo.toml` enables the feature per `target_os` so
 // downstream crates don't have to think about it. The stub fallback
-// keeps `cargo build --workspace` working on bare Linux/macOS without
-// either feature flag (e.g., for fast feature-less syntax checks).
+// keeps `cargo build --workspace` working without the feature flag
+// (e.g., for fast feature-less syntax checks). The CoreAudio backend
+// was removed along with the macOS port surface (#838; see the
+// `mac-archive` branch).
 
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 mod pw_impl;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 pub use pw_impl::{AudioDevice, AudioSink, list_audio_sinks};
 
-#[cfg(all(target_os = "macos", feature = "coreaudio"))]
-mod coreaudio_impl;
-#[cfg(all(target_os = "macos", feature = "coreaudio"))]
-pub use coreaudio_impl::{AudioDevice, AudioSink, list_audio_sinks};
-
-// Fallback stub: any target without an explicit backend feature lands
-// here. The workspace baseline `cargo build` on macOS used this until
-// the `coreaudio` feature shipped (now wired via sdr-core); it remains
-// the fallback for unusual build configurations and for the workspace
-// no-default-features check.
-#[cfg(not(any(
-    all(target_os = "linux", feature = "pipewire"),
-    all(target_os = "macos", feature = "coreaudio"),
-)))]
+// Fallback stub: any target without the backend feature lands here —
+// unusual build configurations and the workspace no-default-features
+// check.
+#[cfg(not(all(target_os = "linux", feature = "pipewire")))]
 mod stub_impl;
-#[cfg(not(any(
-    all(target_os = "linux", feature = "pipewire"),
-    all(target_os = "macos", feature = "coreaudio"),
-)))]
+#[cfg(not(all(target_os = "linux", feature = "pipewire")))]
 pub use stub_impl::AudioSink;
 
 /// Audio device info (stub backend).
-#[cfg(not(any(
-    all(target_os = "linux", feature = "pipewire"),
-    all(target_os = "macos", feature = "coreaudio"),
-)))]
+#[cfg(not(all(target_os = "linux", feature = "pipewire")))]
 #[derive(Clone, Debug)]
 pub struct AudioDevice {
     /// Human-readable name.
@@ -72,10 +53,7 @@ pub struct AudioDevice {
 }
 
 /// Stub `list_audio_sinks` — returns only "Default".
-#[cfg(not(any(
-    all(target_os = "linux", feature = "pipewire"),
-    all(target_os = "macos", feature = "coreaudio"),
-)))]
+#[cfg(not(all(target_os = "linux", feature = "pipewire")))]
 #[must_use]
 pub fn list_audio_sinks() -> Vec<AudioDevice> {
     vec![AudioDevice {

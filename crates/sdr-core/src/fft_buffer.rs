@@ -1,9 +1,8 @@
 //! Lock-based shared FFT display buffer.
 //!
 //! Single-producer (the DSP thread) / single-consumer (the rendering side —
-//! the GTK main loop today, the macOS Metal renderer through `sdr-ffi`
-//! tomorrow) primitive that lets the consumer pull the latest FFT frame
-//! without per-frame allocation.
+//! the GTK main loop) primitive that lets the consumer pull the latest FFT
+//! frame without per-frame allocation.
 //!
 //! The DSP thread writes new frames into the buffer via [`SharedFftBuffer::write`]
 //! (crate-private — only the controller calls it). The consumer drains via

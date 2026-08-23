@@ -24,11 +24,9 @@ whisper-openblas = ["whisper", "sdr-transcription/whisper-openblas"]
 sherpa-cpu = ["sherpa", "sdr-transcription/sherpa-cpu"]
 sherpa-cuda = ["sherpa", "sdr-transcription/sherpa-cuda"]
 
-# sdr-ui is the GTK4 + libadwaita frontend and builds only on Linux. On other
-# platforms (macOS, Windows) the crate compiles to an empty rlib via the
-# top-of-file `#![cfg(target_os = "linux")]` gate in `src/lib.rs`. The macOS
-# frontend lives in `apps/macos/` (SwiftUI) and consumes the engine through
-# the planned `sdr-core` + `sdr-ffi` crates instead.
+# sdr-ui is the GTK4 + libadwaita frontend and builds only on Linux. On
+# other platforms the crate compiles to an empty rlib via the top-of-file
+# `#![cfg(target_os = "linux")]` gate in `src/lib.rs`.
 
 [dependencies]
 # The headless engine. sdr-core owns the DSP controller, the message

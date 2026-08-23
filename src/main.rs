@@ -1,11 +1,9 @@
-// The `sdr` binary is the GTK4 + libadwaita frontend, which is currently
-// Linux-only and gated behind the `gtk-frontend` cargo feature. On
-// non-Linux platforms (macOS, Windows) — or on Linux without the
-// `gtk-frontend` feature — we provide a stub `main()` that prints a
-// message and exits non-zero so the workspace still builds end-to-end
-// on every platform without surprising linker failures. The macOS
-// native frontend lives in `apps/macos/` (SwiftUI) and runs against
-// the `sdr-core` engine via the `sdr-ffi` C ABI.
+// The `sdr` binary is the GTK4 + libadwaita frontend, which is
+// Linux-only and gated behind the `gtk-frontend` cargo feature. On any
+// other platform — or on Linux without the `gtk-frontend` feature — we
+// provide a stub `main()` that prints a message and exits non-zero so
+// the workspace still builds end-to-end without surprising linker
+// failures.
 
 #[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 use gtk4::glib;
@@ -167,10 +165,7 @@ fn main() -> glib::ExitCode {
 
 #[cfg(any(not(target_os = "linux"), not(feature = "gtk-frontend")))]
 fn main() -> std::process::ExitCode {
-    eprintln!("sdr-rs: the GTK4 frontend is currently Linux-only.");
-    eprintln!();
-    eprintln!("macOS support via a native SwiftUI app is in progress");
-    eprintln!("(see https://github.com/jasonherald/rtl-sdr/issues/228).");
+    eprintln!("sdr-rs: the GTK4 frontend is Linux-only.");
     eprintln!();
     eprintln!("On Linux, install GTK4 + libadwaita and run `cargo run --release`");
     eprintln!("(the `gtk-frontend` feature is enabled by default).");

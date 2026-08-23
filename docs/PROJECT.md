@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project is a Rust port of [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus), a C++ software-defined radio application. The port targets a reduced scope: Linux and macOS only, RTL-SDR USB hardware + TCP/UDP network I/O, and a GTK4 UI with Paper design principles. All features are built natively -- no plugin/module system.
+This project is a Rust port of [SDR++](https://github.com/AlexandreRouma/SDRPlusPlus), a C++ software-defined radio application. The port targets a reduced scope: Linux only (the macOS port surface was removed in #838; see the `mac-archive` branch), RTL-SDR USB hardware + TCP/UDP network I/O, and a GTK4 UI with Paper design principles. All features are built natively -- no plugin/module system.
 
 The original C++ project includes `librtlsdr` (the USB driver library), which is also being ported to pure Rust using the `rusb` crate.
 
@@ -24,7 +24,7 @@ crates/
   sdr-source-rtlsdr/   # RTL-SDR source module using librtlsdr-rs
   sdr-source-network/  # TCP client + UDP receiver for IQ input
   sdr-source-file/     # WAV file IQ playback (testing/replay)
-  sdr-sink-audio/      # PipeWire (Linux) + CoreAudio (macOS)
+  sdr-sink-audio/      # PipeWire (Linux)
   sdr-sink-network/    # TCP/UDP audio output
   sdr-radio/           # Radio decoder: demod selection, IF/AF chains, mode switching
   sdr-config/          # JSON config persistence (serde_json)
@@ -134,7 +134,7 @@ which used to be `crates/sdr-rtlsdr/` in this workspace before the spinout.
 
 | C++ File | Rust Target | Purpose |
 |---|---|---|
-| `sink_modules/audio_sink/src/main.cpp` | `sdr-sink-audio/src/lib.rs` | RtAudio replaced by PipeWire (Linux) / CoreAudio (macOS) |
+| `sink_modules/audio_sink/src/main.cpp` | `sdr-sink-audio/src/lib.rs` | RtAudio replaced by PipeWire (Linux) |
 | `sink_modules/network_sink/src/main.cpp` | `sdr-sink-network/src/lib.rs` | TCP/UDP int16 audio output, mono/stereo modes |
 
 ### Radio Decoder
@@ -188,7 +188,6 @@ C++ uses VOLK (SIMD library) for vectorized math. Rust approach: write scalar lo
 ### 6. Native Platform Audio
 
 - **Linux**: `pipewire-rs` (native PipeWire bindings)
-- **macOS**: `coreaudio-rs`
 - Selected at compile time via `#[cfg(target_os)]`
 
 ### 7. Custom Complex Type
@@ -311,7 +310,6 @@ The [`librtlsdr-rs`](https://crates.io/crates/librtlsdr-rs) crate (spun out as a
 | JSON config | `serde`, `serde_json` | Config persistence |
 | USB | `rusb` | Pure Rust libusb wrapper (for librtlsdr-rs) |
 | Audio (Linux) | `pipewire-rs` | Native PipeWire |
-| Audio (macOS) | `coreaudio-rs` | CoreAudio |
 | WAV files | `hound` | WAV reading for file source |
 | Networking | `std::net` | TCP/UDP (no async needed) |
 | Error handling | `thiserror` (libs), `anyhow` (bin) | Per project convention |
@@ -385,7 +383,7 @@ The [`librtlsdr-rs`](https://crates.io/crates/librtlsdr-rs) crate (spun out as a
 - `sdr-source-rtlsdr`: Source module wrapping `librtlsdr-rs` with uint8→f32 conversion
 - `sdr-source-network`: TCP client and UDP receiver with int8/16/32/f32 format conversion
 - `sdr-source-file`: WAV IQ playback using `hound` crate
-- `sdr-sink-audio`: PipeWire (Linux) / CoreAudio (macOS) with device enumeration and sample rate selection
+- `sdr-sink-audio`: PipeWire (Linux) with device enumeration and sample rate selection
 - `sdr-sink-network`: TCP/UDP int16 audio output, mono/stereo modes
 - Network loopback integration test
 
@@ -429,10 +427,9 @@ The [`librtlsdr-rs`](https://crates.io/crates/librtlsdr-rs) crate (spun out as a
 
 **Deliverables**:
 - Linux `.desktop` file and application icon
-- macOS `.app` bundle via `cargo-bundle`
 - Makefile `install` target
 - Performance profiling and hot-path optimization
 - README and architecture documentation
-- CI/CD: build + test on Linux and macOS
+- CI/CD: build + test on Linux
 
 **Milestone**: Release-ready application.

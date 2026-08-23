@@ -1,7 +1,6 @@
 //! Lock-based SPSC ring buffer for interleaved audio samples.
 //!
-//! Used by both backend implementations (`pw_impl` for PipeWire on Linux,
-//! `coreaudio_impl` for AUHAL on macOS). Pre-allocated at startup; the
+//! Used by the `pw_impl` PipeWire backend. Pre-allocated at startup; the
 //! mutex is held only for memcpy duration (single-digit microseconds in
 //! practice), so it never blocks the audio I/O thread for a meaningful
 //! length of time. The reader uses `try_lock` and returns "0 samples"
@@ -48,8 +47,8 @@ impl AudioRingBuffer {
     /// arithmetic and would panic on the first call against a zero-cap
     /// ring; failing fast at construction surfaces the bug at the call
     /// site instead of inside the audio I/O thread later. The constant
-    /// callers (`pw_impl::RING_CAPACITY`, `coreaudio_impl::RING_CAPACITY`)
-    /// always pass non-zero values, so in practice this assert only
+    /// caller (`pw_impl::RING_CAPACITY`) always passes a non-zero
+    /// value, so in practice this assert only
     /// fires for tests or future callers that compute capacity dynamically.
     pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "AudioRingBuffer capacity must be non-zero");

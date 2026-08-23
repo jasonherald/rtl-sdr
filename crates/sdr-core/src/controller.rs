@@ -439,10 +439,9 @@ struct DspState {
 
     /// Generic audio tap — when Some, post-demod audio is downsampled
     /// to 16 kHz mono f32 and dropped into this channel. Distinct
-    /// from `transcription_tx` so FFI consumers (e.g. the macOS
-    /// `SpeechAnalyzer` driver for issue #314) can receive
-    /// recognizer-ready samples without the sdr-transcription
-    /// dependency cross-compiling into the FFI surface.
+    /// from `transcription_tx` so embedders can receive
+    /// recognizer-ready samples without pulling in the
+    /// sdr-transcription dependency.
     audio_tap_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
 
     /// Decimation phase carried across `stereo_48k_to_mono_16k`
@@ -1610,9 +1609,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
                 if old_mode != mode {
                     state.transcription_tx = None;
                     // Same hard-boundary treatment for the generic
-                    // audio tap. The SpeechAnalyzer session on the
-                    // Mac side treats every mode change as an
-                    // utterance boundary — letting post-switch
+                    // audio tap. A recognizer session downstream
+                    // treats every mode change as an utterance
+                    // boundary — letting post-switch
                     // audio leak into the old session until the
                     // UI round-trip sends DisableAudioTap would
                     // corrupt the transcript across the mode
@@ -2798,10 +2797,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::EnableAudioTap(tx) => {
             // Generic audio tap — post-demod, pre-volume, resampled to
             // 16 kHz mono and dropped into `tx`. Distinct from the
-            // transcription tap above so FFI consumers (e.g. macOS
-            // `SpeechAnalyzer` for issue #314) receive recognizer-ready
-            // samples without pulling the sdr-transcription dep across
-            // the FFI.
+            // transcription tap above so embedders receive
+            // recognizer-ready samples without pulling in the
+            // sdr-transcription dep.
             state.audio_tap_tx = Some(tx);
             // Reset the decimation phase so a new tap session starts
             // at clean 3:1 alignment — otherwise a stale phase from
@@ -4513,7 +4511,7 @@ fn process_iq_block(
                         // set the volume slider. `try_send` with
                         // `TrySendError::Full` → drop the chunk rather
                         // than block — the DSP thread MUST NOT stall on
-                        // a slow consumer. `SpeechAnalyzer` can tolerate
+                        // a slow consumer. A recognizer can tolerate
                         // occasional frame drops; audio underruns are
                         // much worse.
                         if let Some(ref tx) = state.audio_tap_tx {
@@ -4612,8 +4610,7 @@ fn process_iq_block(
                             state.audio_buf[..audio_count].fill(sdr_types::Stereo::default());
                         }
 
-                        // Send to the audio sink (PipeWire on Linux,
-                        // CoreAudio on macOS).
+                        // Send to the selected audio sink.
                         if audio_count > 0 {
                             state.audio_frames_written = state
                                 .audio_frames_written

@@ -1,7 +1,7 @@
 [package]
 name = "sdr-core"
 version = "0.1.0"
-description = "Headless SDR engine — owns the DSP controller and exposes a single Rust API consumed by both the GTK frontend and the planned macOS SwiftUI app via sdr-ffi."
+description = "Headless SDR engine — owns the DSP controller and exposes the Rust API the GTK frontend drives."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,13 +12,9 @@ repository.workspace = true
 #   • the source/sink instantiation that used to live inline in the GTK
 #     UI's startup path
 #   • the message enums (UiToDsp / DspToUi) and the SharedFftBuffer
-#     primitives that both consumers (GTK now, SwiftUI via sdr-ffi later)
-#     pull events through
+#     primitives that consumers pull events through
 #
-# Both UI consumers depend on sdr-core. sdr-core depends on no UI code.
-# It is fully cross-platform (compiles on macOS today as part of the
-# workspace baseline, even though the audio sink it links is the stub
-# until M3 lands the CoreAudio backend).
+# The UI depends on sdr-core. sdr-core depends on no UI code.
 
 [dependencies]
 sdr-acars.workspace = true
@@ -48,23 +44,16 @@ num-complex.workspace = true
 dirs-next.workspace = true
 
 # Audio sink. The base dep is unconditional so `controller.rs`'s
-# `use sdr_sink_audio::AudioSink;` resolves on every target — including
-# Windows / BSD / etc. that fall through to the no-backend stub. The
-# target-specific entries below ADD the right backend feature on Linux
-# (PipeWire) and macOS (CoreAudio); Cargo merges per-target dep entries
-# into the base dep, so on Linux the effective entry is
-# `sdr-sink-audio = { ..., features = ["pipewire"] }`, on macOS it's
-# `["coreaudio"]`, and on every other target the feature list is empty
-# and the crate's `lib.rs` cfg dispatch resolves to the stub backend.
+# `use sdr_sink_audio::AudioSink;` resolves on every target; anything
+# that is not Linux falls through to the no-backend stub. The
+# target-specific entry below ADDs the PipeWire backend feature on
+# Linux; Cargo merges per-target dep entries into the base dep.
 sdr-sink-audio.workspace = true
 sdr-transcription.workspace = true
 slowrx.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sdr-sink-audio = { workspace = true, features = ["pipewire"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-sdr-sink-audio = { workspace = true, features = ["coreaudio"] }
 
 [dev-dependencies]
 arrayvec = { workspace = true }

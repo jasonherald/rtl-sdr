@@ -50,8 +50,7 @@ pub const DEFAULT_NETWORK_SINK_PROTOCOL: Protocol = Protocol::TcpClient;
 /// engine restart) recreates the right variant.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AudioSinkType {
-    /// `PipeWire` (Linux) or `CoreAudio` (macOS) — the local
-    /// audio device.
+    /// `PipeWire` — the local audio device.
     #[default]
     Local,
     /// TCP server / UDP unicast — see
