@@ -108,9 +108,7 @@ fn wire_region_and_custom_rows(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     toast_overlay: &adw::ToastOverlay,
 ) {
-    use crate::sidebar::aviation_panel::{
-        rebuild_channel_rows, region_combo_index, region_from_combo_index,
-    };
+    use crate::sidebar::aviation_panel::{rebuild_channel_rows, region_combo_index};
     use sdr_core::acars_airband_lock::{AcarsRegion, validate_custom_channels};
 
     // Read the persisted region, dispatch it to DSP at startup,
@@ -198,9 +196,7 @@ fn on_acars_region_selected(
     channel_rows_cell: &Rc<std::cell::RefCell<Vec<adw::ActionRow>>>,
     custom_row_for_dispatch: &adw::EntryRow,
 ) {
-    use crate::sidebar::aviation_panel::{
-        rebuild_channel_rows, region_combo_index, region_from_combo_index,
-    };
+    use crate::sidebar::aviation_panel::{region_combo_index, region_from_combo_index};
     use sdr_core::acars_airband_lock::AcarsRegion;
 
     // Guard against transient ComboRow indices. The model
