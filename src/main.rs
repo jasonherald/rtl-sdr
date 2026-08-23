@@ -165,10 +165,7 @@ fn main() -> glib::ExitCode {
 
 #[cfg(any(not(target_os = "linux"), not(feature = "gtk-frontend")))]
 fn main() -> std::process::ExitCode {
-    eprintln!("sdr-rs: the GTK4 frontend is currently Linux-only.");
-    eprintln!();
-    eprintln!("macOS support via a native SwiftUI app is in progress");
-    eprintln!("(see https://github.com/jasonherald/rtl-sdr/issues/228).");
+    eprintln!("sdr-rs: the GTK4 frontend is Linux-only.");
     eprintln!();
     eprintln!("On Linux, install GTK4 + libadwaita and run `cargo run --release`");
     eprintln!("(the `gtk-frontend` feature is enabled by default).");

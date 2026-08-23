@@ -1,9 +1,8 @@
 //! Public engine facade.
 //!
 //! [`Engine`] owns the DSP controller thread and exposes a single Rust API
-//! consumed by both the GTK UI (today) and the planned macOS `SwiftUI` app
-//! (via `sdr-ffi`, M2). Neither consumer touches the DSP thread or the
-//! channel internals directly — they go through `Engine`.
+//! consumed by the GTK UI. The consumer never touches the DSP thread or the
+//! channel internals directly — it goes through `Engine`.
 //!
 //! ## Design notes
 //!
@@ -16,8 +15,7 @@
 //! - **One-shot subscription**: events are channel-based for backwards
 //!   compatibility with the GTK pump. The first call to `subscribe` returns
 //!   `Some(_)`; every subsequent call returns `None`. Multi-consumer fan-out
-//!   is out of scope — both real consumers (GTK and `sdr-ffi`) live in
-//!   different processes / build configurations and never coexist.
+//!   is out of scope — the GTK pump is the only real consumer.
 //!
 //! - **FFT delivery is pull-based**: the DSP thread writes new frames into
 //!   a [`SharedFftBuffer`] and the consumer drains via [`Engine::pull_fft`]
@@ -29,8 +27,8 @@
 //!   and [`Engine::fft_buffer`] getters that hand the underlying
 //!   `Sender<UiToDsp>` and `Arc<SharedFftBuffer>` to callers that prefer
 //!   to wire them directly into existing channel/buffer plumbing. These
-//!   are convenience methods, not the canonical API — `sdr-ffi` will not
-//!   use them. They keep the GTK side's existing `AppState` /
+//!   are convenience methods, not the canonical API. They keep the GTK
+//!   side's existing `AppState` /
 //!   `glib::timeout_add_local` patterns intact so the M1 PR doesn't have
 //!   to refactor every panel binding to use a different command path.
 
@@ -68,9 +66,9 @@ pub enum EngineError {
 /// drop-order hazard of holding a `JoinHandle` alongside the only sender
 /// — joining without first closing the channel would deadlock.
 ///
-/// `shutdown` is provided as an explicit form for callers (notably the
-/// future `sdr-ffi` consumer) that want a deterministic teardown signal,
-/// but in v1 it is functionally equivalent to dropping the engine.
+/// `shutdown` is provided as an explicit form for callers that want a
+/// deterministic teardown signal, but in v1 it is functionally
+/// equivalent to dropping the engine.
 pub struct Engine {
     cmd_tx: mpsc::Sender<UiToDsp>,
     /// One-shot subscription slot. `subscribe()` takes the receiver out.
@@ -95,10 +93,9 @@ impl Engine {
     /// accept the path and store it for future use but do not yet
     /// read or write it — the DSP controller comes up with hardcoded
     /// defaults (see `crates/sdr-core/src/controller.rs`). Threading
-    /// this argument through now means the FFI surface can take a
-    /// path from the host (`sdr_core_create(config_path_utf8, ...)`)
-    /// without a future ABI change. An empty `PathBuf` is accepted
-    /// and treated as "in-memory / no persistence".
+    /// this argument through now means a future host embedding can
+    /// pass a path without an API change. An empty `PathBuf` is
+    /// accepted and treated as "in-memory / no persistence".
     ///
     /// The DSP thread is **not yet running the source**: send
     /// [`UiToDsp::Start`] via [`Engine::send_command`] to begin sample flow.
@@ -153,8 +150,8 @@ impl Engine {
 
     /// Take the event receiver. Returns `Some(_)` exactly once per
     /// `Engine`; subsequent calls return `None`. The caller chooses how
-    /// to drain it (a GTK timeout, an `sdr-ffi` dispatcher thread, an
-    /// async task, …).
+    /// to drain it (a GTK timeout, a dispatcher thread, an async
+    /// task, …).
     ///
     /// Locks an internal mutex briefly; never blocks beyond that.
     pub fn subscribe(&self) -> Option<mpsc::Receiver<DspToUi>> {
@@ -202,9 +199,8 @@ impl Engine {
     /// causes the thread's `recv_timeout` loop to see Disconnected).
     ///
     /// In v1 this is informational — the same teardown happens implicitly
-    /// on drop. The method exists so future consumers (notably the
-    /// `sdr-ffi` Swift wrapper) can declare an explicit "engine done"
-    /// hand-off without changing the API later.
+    /// on drop. The method exists so future consumers can declare an
+    /// explicit "engine done" hand-off without changing the API later.
     ///
     /// # Errors
     ///

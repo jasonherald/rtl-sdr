@@ -5,10 +5,10 @@
 //! creates a playback stream at 48 kHz stereo f32, and feeds audio from the
 //! DSP controller through a bounded channel.
 //!
-//! When neither backend feature is enabled, provides a stub that logs a
+//! When the `pipewire` feature is disabled, provides a stub that logs a
 //! warning.
 
-// Shared SPSC ring buffer used by both real backends. The stub backend
+// Shared SPSC ring buffer used by the PipeWire backend. The stub backend
 // doesn't need it, but it's cheap to compile in unconditionally — about
 // 200 lines of plain Rust with no external deps.
 mod ring;
@@ -26,8 +26,8 @@ mod ring;
 // downstream crates don't have to think about it. The stub fallback
 // keeps `cargo build --workspace` working without the feature flag
 // (e.g., for fast feature-less syntax checks). The CoreAudio backend
-// left with the macOS port surface (#838; see the `mac-archive`
-// branch).
+// was removed along with the macOS port surface (#838; see the
+// `mac-archive` branch).
 
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 mod pw_impl;
