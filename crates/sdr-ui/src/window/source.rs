@@ -423,35 +423,7 @@ pub(super) fn connect_rtl_tcp_discovery(
 
     let (browser, disc_rx) = start_discovery_browser(panels);
 
-    // Tracks the `AdwActionRow` per-server so we can remove it on
-    // `ServerWithdrawn` OR when the row goes stale past
-    // `STALE_ROW_GRACE`. Keyed by full DNS-SD instance name (stable
-    // across nickname changes). Value carries the row widget + the
-    // last `DiscoveredServer` payload seen for that instance —
-    // `server.last_seen` drives both staleness pruning and the
-    // per-tick freshness indicator rendered in the row subtitle.
-    let displayed_rows: Rc<RefCell<HashMap<String, (adw::ActionRow, DiscoveredServer)>>> =
-        Rc::new(RefCell::new(HashMap::new()));
-
-    // Auxiliary map: favorite_key (hostname:port) → weak ref on
-    // the currently-rendered discovery-row star `ToggleButton`.
-    // Let the favorites-popover Unstar handler find and flip the
-    // matching discovery toggle immediately rather than waiting
-    // for the next mDNS re-announce — without this, the filled
-    // star would stay rendered while the map says otherwise, and
-    // the first user click on the stale star would fire
-    // `toggled` with `active=false` (wasted click from the
-    // user's perspective: they wanted to re-pin).
-    //
-    // Weak refs only — the `ToggleButton`s are strongly owned by
-    // their parent `AdwActionRow`s (as prefix widgets) which are
-    // strongly owned by `displayed_rows`. Stale entries
-    // (rows that have since been removed from `displayed_rows`)
-    // fail to upgrade and self-clean at lookup time; no explicit
-    // prune necessary at the <50-server scale this map is sized
-    // for.
-    let discovered_star_buttons: Rc<RefCell<HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    let (displayed_rows, discovered_star_buttons) = new_discovery_maps();
 
     // Weak ref on the expander so the timeout closure doesn't keep
     // the window alive after close — upgrade() returns None on a
@@ -531,6 +503,24 @@ pub(super) fn connect_rtl_tcp_discovery(
         &row_deps,
         &expander_weak,
     );
+}
+
+/// Fresh (rows, star-buttons) map pair for the discovery poller. The
+/// row map is keyed by full DNS-SD instance name (stable across
+/// nickname changes) and carries the last `DiscoveredServer` payload
+/// for staleness pruning; the auxiliary map lets the favorites-popover
+/// Unstar handler find and flip the matching in-list star toggle.
+/// Weak refs only — the `ToggleButton`s are strongly owned by their
+/// rows. Split out per the 50-NLOC gate (#817).
+#[allow(clippy::type_complexity)]
+fn new_discovery_maps() -> (
+    Rc<RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>>,
+    Rc<RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>>,
+) {
+    (
+        Rc::new(RefCell::new(std::collections::HashMap::new())),
+        Rc::new(RefCell::new(std::collections::HashMap::new())),
+    )
 }
 
 /// Assemble the discovery-row dependency bundle. Split out per the
@@ -3873,32 +3863,12 @@ fn wire_discovered_connect_button(
     host: &str,
     deps: &Rc<DiscoveredRowDeps>,
 ) {
-    let DiscoveredRowDeps {
-        hostname_row,
-        port_row,
-        protocol_row,
-        device_row,
-        role_row,
-        auth_key_row,
-        state,
-        config: config_for_discovery,
-        ..
-    } = deps.as_ref();
-
     let connect_btn = gtk4::Button::with_label("Connect");
     connect_btn.add_css_class("suggested-action");
     connect_btn.set_valign(gtk4::Align::Center);
 
     let click_host = host.to_string();
     let click_port = server.port;
-    let hr = hostname_row.clone();
-    let pr = port_row.clone();
-    let protor = protocol_row.clone();
-    let dr = device_row.clone();
-    let rr = role_row.clone();
-    let akr = auth_key_row.clone();
-    let st = Rc::clone(&state);
-    let cfg = std::sync::Arc::clone(&config_for_discovery);
     // Friendly nickname for the persisted snapshot.
     // Prefer the TXT nickname if the responder set
     // one, fall back to the DNS-SD instance name.
@@ -3907,6 +3877,7 @@ fn wire_discovered_connect_button(
     } else {
         server.txt.nickname.clone()
     };
+    let deps_c = Rc::clone(deps);
     connect_btn.connect_clicked(move |_| {
         // Shared ordering-sensitive flow lives in
         // `apply_rtl_tcp_connect` — see its doc for
@@ -3917,24 +3888,17 @@ fn wire_discovered_connect_button(
             &click_host,
             click_port,
             &click_nickname,
-            &hr,
-            &pr,
-            &protor,
-            &dr,
-            &rr,
-            &akr,
-            &st,
-            &cfg,
+            &deps_c.hostname_row,
+            &deps_c.port_row,
+            &deps_c.protocol_row,
+            &deps_c.device_row,
+            &deps_c.role_row,
+            &deps_c.auth_key_row,
+            &deps_c.state,
+            &deps_c.config,
         );
     });
     row.add_suffix(&connect_btn);
-    // If this server is already favorited, refresh
-    // the persisted metadata (tuner name, gain
-    // count, nickname, last-seen) off the fresh
-    // announce. Keeps the favorites slide-out's
-    // display honest when the user revisits it
-    // after the server has been renamed /
-    // re-announced with updated TXT records.
 }
 
 /// Star toggle for a discovered row: initial pin state, weak-map registration, and the toggle wiring.
