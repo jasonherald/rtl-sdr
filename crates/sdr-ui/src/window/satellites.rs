@@ -220,15 +220,14 @@ pub(super) fn connect_satellites_panel(
     set_playing: &Rc<dyn Fn(bool)>,
     status_bar: &Rc<StatusBar>,
 ) {
-    use sdr_sat::{GroundStation, KNOWN_SATELLITES, Pass, TleCache};
+    use sdr_sat::{KNOWN_SATELLITES, Pass, TleCache};
     use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
         AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
-        SatellitesPanelWeak, enumerate_upcoming_passes, format_last_refresh, format_pass_subtitle,
-        format_pass_title, load_auto_record_apt, load_auto_record_audio,
-        load_auto_record_composites, load_auto_record_quality, load_notify_lead_min,
-        load_station_alt_m, load_station_lat_deg, load_station_lon_deg, load_watched_satellites,
-        norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
+        SatellitesPanelWeak, format_last_refresh, format_pass_title, load_auto_record_apt,
+        load_auto_record_audio, load_auto_record_composites, load_auto_record_quality,
+        load_notify_lead_min, load_station_alt_m, load_station_lat_deg, load_station_lon_deg,
+        load_watched_satellites, norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
         save_auto_record_composites, save_f64, save_tle_last_refresh,
     };
     use sidebar::satellites_recorder::{
@@ -337,74 +336,14 @@ pub(super) fn connect_satellites_panel(
             let Some(panel) = panel_weak_recompute.upgrade() else {
                 return;
             };
-            // Drop the previous pass rows — these are throwaway,
-            // built fresh per recompute.
-            for entry in displayed_recompute.borrow_mut().drain(..) {
-                panel.passes_group.remove(&entry.row);
-            }
-            // `passes_status_row` is the always-present empty-state
-            // placeholder. We toggle its *visibility* rather than
-            // detach + reattach. Once a widget is unparented, its
-            // last strong ref lives only on the SatellitesPanel
-            // struct — and that struct is dropped when
-            // `build_window` returns. Toggling visibility keeps the
-            // row parented (and therefore alive) for the lifetime
-            // of the window.
-            let station = GroundStation::new(
-                panel.lat_row.value(),
-                panel.lon_row.value(),
-                panel.alt_row.value(),
+            rebuild_pass_rows(
+                &panel,
+                &cache_recompute,
+                &displayed_recompute,
+                &tune_for_recompute,
+                &watched_for_recompute,
+                &config_for_recompute,
             );
-            let now = chrono::Utc::now();
-            let passes = enumerate_upcoming_passes(&cache_recompute, &station, now);
-
-            if passes.is_empty() {
-                panel.passes_status_row.set_visible(true);
-                return;
-            }
-
-            panel.passes_status_row.set_visible(false);
-            let mut new_rows = Vec::with_capacity(passes.len());
-            for pass in passes {
-                let row = adw::ActionRow::builder()
-                    .title(format_pass_title(&pass, now))
-                    .subtitle(format_pass_subtitle(&pass))
-                    .build();
-                // Per-row play button — one-click tune to the
-                // satellite's downlink with the right demod / BW.
-                // Skipped when the satellite isn't in the catalog
-                // (impossible in practice but the lookup type is
-                // `Option`, so we fail closed — no button rather
-                // than a button that does nothing).
-                // Per-row play button: ignore the 4th element
-                // (`Option<ImagingProtocol>`) — manual tune is a
-                // user-initiated action and works on any catalog
-                // entry. Only the auto-record path filters on
-                // `Some(protocol)`.
-                attach_pass_play_button(&row, &pass, &tune_for_recompute);
-                // 🔔 watch-toggle (#510) — per-satellite, NOT
-                // per-pass. Toggling on row N flips the user's
-                // subscription for THIS satellite. Mirrored across
-                // sibling rows in the toggle handler so two rows
-                // of the same satellite (NOAA 19 typically has 4-6
-                // passes per day) stay in sync. `None` for
-                // off-catalog passes — no NORAD id, no
-                // notification target, no button.
-                let bell_btn = build_pass_bell_button(
-                    &row,
-                    &pass,
-                    &watched_for_recompute,
-                    &config_for_recompute,
-                    &displayed_recompute,
-                );
-                panel.passes_group.add(&row);
-                new_rows.push(DisplayedPass {
-                    row,
-                    pass,
-                    bell_btn,
-                });
-            }
-            *displayed_recompute.borrow_mut() = new_rows;
         })
     } else {
         // No cache → no enumeration. Lat/lon/alt notify handlers
@@ -2363,6 +2302,87 @@ pub(super) fn connect_satellites_panel(
             glib::ControlFlow::Continue
         });
     }
+}
+
+/// Rebuild the upcoming-passes list: drop the previous rows, run a
+/// fresh SGP4 enumeration for the panel's ground station, and build
+/// one row (title/subtitle + play + bell) per pass. Split out per the
+/// 50-NLOC gate (#817).
+fn rebuild_pass_rows(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    cache: &std::sync::Arc<sdr_sat::TleCache>,
+    displayed: &Rc<RefCell<Vec<DisplayedPass>>>,
+    tune: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    watched: &Rc<RefCell<std::collections::HashSet<u32>>>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    use sdr_sat::GroundStation;
+    use sidebar::satellites_panel::{
+        enumerate_upcoming_passes, format_pass_subtitle, format_pass_title,
+    };
+
+    // Drop the previous pass rows — these are throwaway,
+    // built fresh per recompute.
+    for entry in displayed.borrow_mut().drain(..) {
+        panel.passes_group.remove(&entry.row);
+    }
+    // `passes_status_row` is the always-present empty-state
+    // placeholder. We toggle its *visibility* rather than
+    // detach + reattach. Once a widget is unparented, its
+    // last strong ref lives only on the SatellitesPanel
+    // struct — and that struct is dropped when
+    // `build_window` returns. Toggling visibility keeps the
+    // row parented (and therefore alive) for the lifetime
+    // of the window.
+    let station = GroundStation::new(
+        panel.lat_row.value(),
+        panel.lon_row.value(),
+        panel.alt_row.value(),
+    );
+    let now = chrono::Utc::now();
+    let passes = enumerate_upcoming_passes(&cache, &station, now);
+
+    if passes.is_empty() {
+        panel.passes_status_row.set_visible(true);
+        return;
+    }
+
+    panel.passes_status_row.set_visible(false);
+    let mut new_rows = Vec::with_capacity(passes.len());
+    for pass in passes {
+        let row = adw::ActionRow::builder()
+            .title(format_pass_title(&pass, now))
+            .subtitle(format_pass_subtitle(&pass))
+            .build();
+        // Per-row play button — one-click tune to the
+        // satellite's downlink with the right demod / BW.
+        // Skipped when the satellite isn't in the catalog
+        // (impossible in practice but the lookup type is
+        // `Option`, so we fail closed — no button rather
+        // than a button that does nothing).
+        // Per-row play button: ignore the 4th element
+        // (`Option<ImagingProtocol>`) — manual tune is a
+        // user-initiated action and works on any catalog
+        // entry. Only the auto-record path filters on
+        // `Some(protocol)`.
+        attach_pass_play_button(&row, &pass, &tune);
+        // 🔔 watch-toggle (#510) — per-satellite, NOT
+        // per-pass. Toggling on row N flips the user's
+        // subscription for THIS satellite. Mirrored across
+        // sibling rows in the toggle handler so two rows
+        // of the same satellite (NOAA 19 typically has 4-6
+        // passes per day) stay in sync. `None` for
+        // off-catalog passes — no NORAD id, no
+        // notification target, no button.
+        let bell_btn = build_pass_bell_button(&row, &pass, &watched, &config, &displayed);
+        panel.passes_group.add(&row);
+        new_rows.push(DisplayedPass {
+            row,
+            pass,
+            bell_btn,
+        });
+    }
+    *displayed.borrow_mut() = new_rows;
 }
 
 /// 🔔 watch-toggle (#510) — per-satellite, NOT per-pass. Toggling on
