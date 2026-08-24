@@ -210,37 +210,21 @@ struct DisplayedPass {
 /// the window is destroyed; same lifecycle pattern as the DSP
 /// poll loop.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(super) fn connect_satellites_panel(
-    panels: &SidebarPanels,
+
+/// Restore persisted panel values BEFORE the caller wires
+/// change-notify handlers, matching the scanner-panel pattern:
+/// `set_value` on a SpinRow fires `value-changed`, so wiring first
+/// would trigger spurious saves + recomputes during window
+/// construction.
+fn seed_persisted_panel_values(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    state: &Rc<AppState>,
-    toast_overlay: &adw::ToastOverlay,
-    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
-    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
-    set_playing: &Rc<dyn Fn(bool)>,
-    status_bar: &Rc<StatusBar>,
 ) {
-    use sdr_sat::{Pass, TleCache};
-    use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
-        AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
-        SatellitesPanelWeak, format_last_refresh, format_pass_title, load_auto_record_apt,
-        load_auto_record_audio, load_auto_record_composites, load_auto_record_quality,
-        load_notify_lead_min, load_station_alt_m, load_station_lat_deg, load_station_lon_deg,
-        load_watched_satellites, norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
-        save_auto_record_composites, save_f64,
+        format_last_refresh, load_auto_record_apt, load_auto_record_audio,
+        load_auto_record_composites, load_auto_record_quality, load_notify_lead_min,
+        load_station_alt_m, load_station_lat_deg, load_station_lon_deg,
     };
-    use sidebar::satellites_recorder::{Action as RecorderAction, AutoRecorder, SavedTune};
-
-    // Borrow the panel for synchronous setup, then capture only
-    // weak refs in long-lived closures. Cloning the strong panel
-    // into a closure stored on its own widget creates a refcount
-    // cycle (widget → handler → closure → cloned panel → widget)
-    // that prevents teardown — see `SatellitesPanelWeak`'s doc for
-    // the full chain.
-    let panel = &panels.satellites;
-    let panel_weak: SatellitesPanelWeak = panel.downgrade();
-
     // Restore persisted values BEFORE wiring change-notify handlers,
     // matching the scanner-panel pattern: `set_value` on a SpinRow
     // fires `value-changed`, so wiring first would trigger spurious
@@ -274,6 +258,38 @@ pub(super) fn connect_satellites_panel(
     panel
         .last_refresh_row
         .set_subtitle(&format_last_refresh(config));
+}
+
+pub(super) fn connect_satellites_panel(
+    panels: &SidebarPanels,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    state: &Rc<AppState>,
+    toast_overlay: &adw::ToastOverlay,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    set_playing: &Rc<dyn Fn(bool)>,
+    status_bar: &Rc<StatusBar>,
+) {
+    use sdr_sat::{Pass, TleCache};
+    use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
+    use sidebar::satellites_panel::{
+        AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
+        SatellitesPanelWeak, format_pass_title, load_notify_lead_min, load_watched_satellites,
+        norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
+        save_auto_record_composites, save_f64,
+    };
+    use sidebar::satellites_recorder::{Action as RecorderAction, AutoRecorder, SavedTune};
+
+    // Borrow the panel for synchronous setup, then capture only
+    // weak refs in long-lived closures. Cloning the strong panel
+    // into a closure stored on its own widget creates a refcount
+    // cycle (widget → handler → closure → cloned panel → widget)
+    // that prevents teardown — see `SatellitesPanelWeak`'s doc for
+    // the full chain.
+    let panel = &panels.satellites;
+    let panel_weak: SatellitesPanelWeak = panel.downgrade();
+
+    seed_persisted_panel_values(panel, config);
 
     {
         let config_lead = std::sync::Arc::clone(config);
