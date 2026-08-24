@@ -436,7 +436,7 @@ pub fn project_scanner_channels(
 
 /// Clamp a bookmark's bandwidth into the demod mode's legal range
 /// before it reaches the scanner. The Radio panel clamps interactive
-/// edits via the SpinRow range, but a bookmark saved under a
+/// edits via the `SpinRow` range, but a bookmark saved under a
 /// different mode (or edited on disk) can carry an out-of-range
 /// value; the VFO would accept it while NFM ignores it, letting the
 /// DSP state diverge from the UI. The normalized value flows to both
