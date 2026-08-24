@@ -617,15 +617,144 @@ struct TickDeps {
 /// closure applies against the live UI / DSP / filesystem. Captures
 /// the panel weakly so the source returns `ControlFlow::Break` once
 /// the panel is dropped.
+
+/// Per-tick [`SavedTune`] snapshot: centre frequency + user-dragged
+/// VFO offset, demod mode, and the radio/scanner/doppler widget states
+/// that AOS force-disables and LOS restores (#555/#556). f64 SpinRow
+/// values are rounded at this boundary so the snapshot carries clean
+/// integers — no per-restore rounding.
+fn snapshot_saved_tune(deps: &TickDeps) -> sidebar::satellites_recorder::SavedTune {
+    use sidebar::satellites_recorder::SavedTune;
+    // Round f64 SpinRow value to u32 at the snapshot
+    // boundary so SavedTune carries a clean integer for
+    // the eventual restore — no per-restore rounding.
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "user-set bandwidth is non-negative and \
+                  fits in u32 for any realistic SDR channel \
+                  width; the SpinRow's own min is positive"
+    )]
+    let bandwidth_hz_u32 = deps.bandwidth_row.value().round() as u32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "squelch SpinRow value is in dBFS, bounded by the row's \
+                  configured min/max (well within f32 range)"
+    )]
+    let squelch_db_f32 = deps.squelch_level_row.value() as f32;
+    SavedTune {
+        freq_hz: deps.state.center_frequency.get(),
+        vfo_offset_hz: deps.spectrum.vfo_offset_hz(),
+        mode: deps.state.demod_mode.get(),
+        bandwidth_hz: bandwidth_hz_u32,
+        was_running: deps.state.is_running.get(),
+        scanner_running: deps.scanner_switch.is_active(),
+        squelch_enabled: deps.squelch_enabled_row.is_active(),
+        auto_squelch_enabled: deps.auto_squelch_row.is_active(),
+        squelch_db: squelch_db_f32,
+        ctcss_mode: sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(
+            deps.ctcss_row.selected(),
+        ),
+        fm_if_nr_enabled: deps.fm_if_nr_row.is_active(),
+        deemphasis_idx: deps.deemphasis_row.selected(),
+        notch_enabled: deps.notch_enabled_row.is_active(),
+        doppler_enabled: deps.doppler_switch.is_active(),
+    }
+}
+
+/// Apply one tick's recorder actions, honouring the ACARS-disengage
+/// gate (issue #589): when a `StartAutoRecord` lands while ACARS is
+/// engaged, the whole batch is stashed and replayed by the
+/// `AcarsEnabledChanged(Ok(false))` arm in `handle_dsp_message` once
+/// the controller acks the disengage.
+fn dispatch_recorder_actions(deps: &TickDeps, actions: Vec<sidebar::satellites_recorder::Action>) {
+    use sidebar::satellites_recorder::Action as RecorderAction;
+    // ACARS-disengage gate (issue #589): if any action
+    // in this tick is `StartAutoRecord` AND ACARS is
+    // currently engaged, stash the **whole batch** and
+    // dispatch `SetAcarsEnabled(false)`. The
+    // `AcarsEnabledChanged(Ok(false))` arm in
+    // `handle_dsp_message` will drain the batch and
+    // replay every action through `(deps.interpret)` once
+    // the controller acks the disengage.
+    //
+    // Stashing the whole batch (not just
+    // `StartAutoRecord`) makes the disengage ack a real
+    // gate: same-tick siblings like
+    // `StartAutoAudioRecord` and `ResetImagingDecoders`
+    // would otherwise execute while the source was
+    // still on airband geometry, capturing audio from
+    // the wrong frequency until the disengage lands.
+    // CR round 1 on PR #591.
+    let needs_acars_gate = deps.state.acars_enabled.get()
+        && actions
+            .iter()
+            .any(|a| matches!(a, RecorderAction::StartAutoRecord { .. }));
+    if needs_acars_gate {
+        tracing::info!(
+            "auto-record AOS: gating {} action(s) on ACARS disengage ack",
+            actions.len()
+        );
+        deps.state.acars_was_engaged_pre_pass.set(true);
+        *deps.state.pending_aos_actions.borrow_mut() = Some(actions);
+        deps.state.send_dsp(UiToDsp::SetAcarsEnabled(false));
+    } else {
+        for action in actions {
+            (deps.interpret)(action);
+        }
+    }
+}
+
+/// #510 — pre-pass desktop alerts. Walk the displayed pass list, map
+/// each to `(norad_id, &Pass)`, feed the pure scheduler, then perform
+/// the notification I/O its actions request. The lead time is read
+/// fresh from config on every tick so a user edit takes effect
+/// immediately without restarting the timer.
+fn run_notify_tick(
+    deps: &TickDeps,
+    notify_scheduler: &RefCell<sidebar::satellites_notify::NotifyScheduler>,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    use sdr_sat::Pass;
+    use sidebar::satellites_notify::Action as NotifyAction;
+    use sidebar::satellites_panel::{load_notify_lead_min, norad_id_for_pass};
+    // #510 — pre-pass desktop alerts. Walk the displayed
+    // pass list, map each to (norad_id, &Pass), feed the
+    // scheduler. Pure function in / pure actions out;
+    // notification I/O happens in the action loop below.
+    let lead_min = load_notify_lead_min(&deps.config);
+    let lead = chrono::Duration::minutes(i64::from(lead_min));
+    let watched_snapshot = deps.watched.borrow().clone();
+    let notify_actions = {
+        let displayed_borrow = deps.displayed.borrow();
+        let pairs: Vec<(u32, &Pass)> = displayed_borrow
+            .iter()
+            .filter_map(|e| norad_id_for_pass(&e.pass).map(|id| (id, &e.pass)))
+            .collect();
+        notify_scheduler
+            .borrow_mut()
+            .tick(now, lead, lead_min, pairs, |id| {
+                watched_snapshot.contains(&id)
+            })
+    };
+    for action in notify_actions {
+        match action {
+            NotifyAction::Fire {
+                norad_id,
+                pass,
+                lead_min,
+            } => {
+                crate::notify::send_pass_alert(&pass, norad_id, lead_min);
+            }
+        }
+    }
+}
+
 fn arm_recorder_tick(deps: TickDeps) {
     let recorder = RefCell::new(sidebar::satellites_recorder::AutoRecorder::new());
     let notify_scheduler = RefCell::new(sidebar::satellites_notify::NotifyScheduler::new());
     use sdr_sat::Pass;
-    use sidebar::satellites_notify::Action as NotifyAction;
-    use sidebar::satellites_panel::{
-        AutoRecordQuality, format_pass_title, load_notify_lead_min, norad_id_for_pass,
-    };
-    use sidebar::satellites_recorder::{Action as RecorderAction, SavedTune};
+    use sidebar::satellites_panel::{AutoRecordQuality, format_pass_title};
 
     let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
         let Some(panel) = deps.panel_weak.upgrade() else {
@@ -660,41 +789,7 @@ fn arm_recorder_tick(deps: TickDeps) {
         // recording (matches `auto_record_on`'s
         // "in-flight pass keeps running" semantics).
         let audio_record_on = panel.auto_record_audio_switch.is_active();
-        // Round f64 SpinRow value to u32 at the snapshot
-        // boundary so SavedTune carries a clean integer for
-        // the eventual restore — no per-restore rounding.
-        #[allow(
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation,
-            reason = "user-set bandwidth is non-negative and \
-                      fits in u32 for any realistic SDR channel \
-                      width; the SpinRow's own min is positive"
-        )]
-        let bandwidth_hz_u32 = deps.bandwidth_row.value().round() as u32;
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "squelch SpinRow value is in dBFS, bounded by the row's \
-                      configured min/max (well within f32 range)"
-        )]
-        let squelch_db_f32 = deps.squelch_level_row.value() as f32;
-        let now_tune = SavedTune {
-            freq_hz: deps.state.center_frequency.get(),
-            vfo_offset_hz: deps.spectrum.vfo_offset_hz(),
-            mode: deps.state.demod_mode.get(),
-            bandwidth_hz: bandwidth_hz_u32,
-            was_running: deps.state.is_running.get(),
-            scanner_running: deps.scanner_switch.is_active(),
-            squelch_enabled: deps.squelch_enabled_row.is_active(),
-            auto_squelch_enabled: deps.auto_squelch_row.is_active(),
-            squelch_db: squelch_db_f32,
-            ctcss_mode: sidebar::radio_panel::RadioPanel::ctcss_mode_from_index(
-                deps.ctcss_row.selected(),
-            ),
-            fm_if_nr_enabled: deps.fm_if_nr_row.is_active(),
-            deemphasis_idx: deps.deemphasis_row.selected(),
-            notch_enabled: deps.notch_enabled_row.is_active(),
-            doppler_enabled: deps.doppler_switch.is_active(),
-        };
+        let now_tune = snapshot_saved_tune(&deps);
         // Read the user's selected quality tier on every
         // tick — cheap (just a ComboRow.selected() call), and
         // means a mid-pass change applies immediately to the
@@ -709,71 +804,9 @@ fn arm_recorder_tick(deps: TickDeps) {
             min_elev_deg,
             now_tune,
         );
-        // ACARS-disengage gate (issue #589): if any action
-        // in this tick is `StartAutoRecord` AND ACARS is
-        // currently engaged, stash the **whole batch** and
-        // dispatch `SetAcarsEnabled(false)`. The
-        // `AcarsEnabledChanged(Ok(false))` arm in
-        // `handle_dsp_message` will drain the batch and
-        // replay every action through `(deps.interpret)` once
-        // the controller acks the disengage.
-        //
-        // Stashing the whole batch (not just
-        // `StartAutoRecord`) makes the disengage ack a real
-        // gate: same-tick siblings like
-        // `StartAutoAudioRecord` and `ResetImagingDecoders`
-        // would otherwise execute while the source was
-        // still on airband geometry, capturing audio from
-        // the wrong frequency until the disengage lands.
-        // CR round 1 on PR #591.
-        let needs_acars_gate = deps.state.acars_enabled.get()
-            && actions
-                .iter()
-                .any(|a| matches!(a, RecorderAction::StartAutoRecord { .. }));
-        if needs_acars_gate {
-            tracing::info!(
-                "auto-record AOS: gating {} action(s) on ACARS disengage ack",
-                actions.len()
-            );
-            deps.state.acars_was_engaged_pre_pass.set(true);
-            *deps.state.pending_aos_actions.borrow_mut() = Some(actions);
-            deps.state.send_dsp(UiToDsp::SetAcarsEnabled(false));
-        } else {
-            for action in actions {
-                (deps.interpret)(action);
-            }
-        }
+        dispatch_recorder_actions(&deps, actions);
 
-        // #510 — pre-pass desktop alerts. Walk the displayed
-        // pass list, map each to (norad_id, &Pass), feed the
-        // scheduler. Pure function in / pure actions out;
-        // notification I/O happens in the action loop below.
-        let lead_min = load_notify_lead_min(&deps.config);
-        let lead = chrono::Duration::minutes(i64::from(lead_min));
-        let watched_snapshot = deps.watched.borrow().clone();
-        let notify_actions = {
-            let displayed_borrow = deps.displayed.borrow();
-            let pairs: Vec<(u32, &Pass)> = displayed_borrow
-                .iter()
-                .filter_map(|e| norad_id_for_pass(&e.pass).map(|id| (id, &e.pass)))
-                .collect();
-            notify_scheduler
-                .borrow_mut()
-                .tick(now, lead, lead_min, pairs, |id| {
-                    watched_snapshot.contains(&id)
-                })
-        };
-        for action in notify_actions {
-            match action {
-                NotifyAction::Fire {
-                    norad_id,
-                    pass,
-                    lead_min,
-                } => {
-                    crate::notify::send_pass_alert(&pass, norad_id, lead_min);
-                }
-            }
-        }
+        run_notify_tick(&deps, &notify_scheduler, now);
 
         if needs_recompute {
             (deps.recompute)();
