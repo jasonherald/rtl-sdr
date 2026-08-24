@@ -2780,10 +2780,8 @@ fn doppler_trigger_tick(
     state: &Rc<AppState>,
     status_bar: &Rc<StatusBar>,
 ) -> glib::ControlFlow {
-    use crate::doppler_tracker::{
-        Candidate, FREQ_MATCH_TOLERANCE_HZ, pick_active_satellite, should_tick,
-    };
-    use sdr_sat::{GroundStation, KNOWN_SATELLITES, Satellite, track};
+    use crate::doppler_tracker::{FREQ_MATCH_TOLERANCE_HZ, pick_active_satellite, should_tick};
+    use sdr_sat::{GroundStation, KNOWN_SATELLITES};
 
     let mut t = tracker.borrow_mut();
     // Lifecycle gate: master + running. While stopped,
@@ -2813,31 +2811,7 @@ fn doppler_trigger_tick(
     // with its currently-evaluated elevation. Iterate
     // in `KNOWN_SATELLITES` order so the spec §2
     // tie-break (earlier entry wins) is deterministic.
-    let mut candidates: Vec<Candidate> = Vec::new();
-    for sat in KNOWN_SATELLITES {
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "catalog downlinks sit in the 100s of MHz, well \
-                      below f64's 2^53 mantissa ceiling"
-        )]
-        let downlink = sat.downlink_hz as f64;
-        if (downlink - current_freq).abs() > FREQ_MATCH_TOLERANCE_HZ {
-            continue;
-        }
-        let Ok((line1, line2)) = cache.cached_tle_for(sat.norad_id) else {
-            continue;
-        };
-        let Ok(parsed) = Satellite::from_tle(sat.name, &line1, &line2) else {
-            continue;
-        };
-        let Ok(track) = track(&station, &parsed, now) else {
-            continue;
-        };
-        candidates.push(Candidate {
-            satellite: sat,
-            elevation_deg: track.elevation_deg,
-        });
-    }
+    let candidates = overhead_candidates(&station, now, current_freq, cache);
 
     let new_active = pick_active_satellite(t.master_enabled(), &candidates);
     // Capture pre-`set_active` state so we can:
@@ -2919,4 +2893,46 @@ fn doppler_trigger_tick(
         }
     }
     glib::ControlFlow::Continue
+}
+
+/// Build the Doppler candidate list: every catalog entry whose
+/// downlink is within ±`FREQ_MATCH_TOLERANCE_HZ` of the radio's
+/// current centre frequency, paired with its currently-evaluated
+/// elevation. Iterates in `KNOWN_SATELLITES` order so the spec §2
+/// tie-break (earlier entry wins) is deterministic.
+fn overhead_candidates(
+    station: &sdr_sat::GroundStation,
+    now: chrono::DateTime<chrono::Utc>,
+    current_freq: f64,
+    cache: &std::sync::Arc<sdr_sat::TleCache>,
+) -> Vec<crate::doppler_tracker::Candidate> {
+    use crate::doppler_tracker::{Candidate, FREQ_MATCH_TOLERANCE_HZ};
+    use sdr_sat::{KNOWN_SATELLITES, Satellite, track};
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for sat in KNOWN_SATELLITES {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "catalog downlinks sit in the 100s of MHz, well \
+                      below f64's 2^53 mantissa ceiling"
+        )]
+        let downlink = sat.downlink_hz as f64;
+        if (downlink - current_freq).abs() > FREQ_MATCH_TOLERANCE_HZ {
+            continue;
+        }
+        let Ok((line1, line2)) = cache.cached_tle_for(sat.norad_id) else {
+            continue;
+        };
+        let Ok(parsed) = Satellite::from_tle(sat.name, &line1, &line2) else {
+            continue;
+        };
+        let Ok(track) = track(station, &parsed, now) else {
+            continue;
+        };
+        candidates.push(Candidate {
+            satellite: sat,
+            elevation_deg: track.elevation_deg,
+        });
+    }
+    candidates
 }
