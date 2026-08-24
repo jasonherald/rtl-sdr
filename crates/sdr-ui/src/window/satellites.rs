@@ -230,9 +230,7 @@ pub(super) fn connect_satellites_panel(
         load_watched_satellites, norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
         save_auto_record_composites, save_f64,
     };
-    use sidebar::satellites_recorder::{
-        Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
-    };
+    use sidebar::satellites_recorder::{Action as RecorderAction, AutoRecorder, SavedTune};
 
     // Borrow the panel for synchronous setup, then capture only
     // weak refs in long-lived closures. Cloning the strong panel
@@ -801,7 +799,7 @@ struct RecorderDeps {
 /// Interpret one [`RecorderAction`] from the auto-record state
 /// machine's tick.
 fn interpret_recorder_action(deps: &RecorderDeps, action: sidebar::satellites_recorder::Action) {
-    use sidebar::satellites_recorder::{Action as RecorderAction, SavedTune, ToastKind};
+    use sidebar::satellites_recorder::{Action as RecorderAction, ToastKind};
 
     match action {
         RecorderAction::StartAutoRecord {
