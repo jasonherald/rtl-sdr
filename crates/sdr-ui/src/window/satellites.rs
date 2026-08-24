@@ -2066,55 +2066,58 @@ fn compute_apt_rotate_180_for_pass(
     norad_id: u32,
     aos: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    let Some(cache) = cache else {
-        return false;
-    };
-    // Look up by stable NORAD id (not display name) so a catalog
-    // rename doesn't silently break this path. Per CR round 2 on
-    // PR #571.
-    let Some(known) = sdr_sat::KNOWN_SATELLITES
+    cache
+        .and_then(|c| apt_pass_is_ascending(c, norad_id, aos))
+        .unwrap_or(false)
+}
+
+/// Fallible core of [`compute_apt_rotate_180_for_pass`]. Looks the
+/// satellite up by stable NORAD id (not display name) so a catalog
+/// rename doesn't silently break this path (CR round 2 on PR #571);
+/// each failure logs its own debug line before propagating `None`.
+fn apt_pass_is_ascending(
+    cache: &std::sync::Arc<sdr_sat::TleCache>,
+    norad_id: u32,
+    aos: chrono::DateTime<chrono::Utc>,
+) -> Option<bool> {
+    let known = sdr_sat::KNOWN_SATELLITES
         .iter()
         .find(|s| s.norad_id == norad_id)
-    else {
-        tracing::debug!(
-            norad_id,
-            "APT rotate-180: satellite not in catalog; defaulting to no rotation",
-        );
-        return false;
-    };
-    let (line1, line2) = match cache.cached_tle_for(known.norad_id) {
-        Ok(t) => t,
-        Err(e) => {
+        .or_else(|| {
+            tracing::debug!(
+                norad_id,
+                "APT rotate-180: satellite not in catalog; defaulting to no rotation",
+            );
+            None
+        })?;
+    let (line1, line2) = cache
+        .cached_tle_for(known.norad_id)
+        .inspect_err(|e| {
             tracing::debug!(
                 norad_id,
                 error = %e,
                 "APT rotate-180: TLE unavailable; defaulting to no rotation",
             );
-            return false;
-        }
-    };
-    let parsed = match sdr_sat::Satellite::from_tle(known.name, &line1, &line2) {
-        Ok(s) => s,
-        Err(e) => {
+        })
+        .ok()?;
+    let parsed = sdr_sat::Satellite::from_tle(known.name, &line1, &line2)
+        .inspect_err(|e| {
             tracing::debug!(
                 norad_id,
                 error = %e,
                 "APT rotate-180: TLE parse failed; defaulting to no rotation",
             );
-            return false;
-        }
-    };
-    match sdr_sat::is_ascending(&parsed, aos) {
-        Ok(asc) => asc,
-        Err(e) => {
+        })
+        .ok()?;
+    sdr_sat::is_ascending(&parsed, aos)
+        .inspect_err(|e| {
             tracing::debug!(
                 norad_id,
                 error = %e,
                 "APT rotate-180: SGP4 propagate failed; defaulting to no rotation",
             );
-            false
-        }
-    }
+        })
+        .ok()
 }
 
 /// ZIP code → lat/lon shortcut. Both `apply` (apply-button click /
