@@ -35,14 +35,15 @@ use super::{
 pub(super) fn handle_rtl_tcp_state_toast(
     state_val: &sdr_types::RtlTcpConnectionState,
     prev_disc: u8,
-    app_state: &Rc<AppState>,
-    toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
-    role_row_weak: &glib::WeakRef<adw::ComboRow>,
-    auth_key_row_weak: &glib::WeakRef<adw::PasswordEntryRow>,
-    hostname_row_weak: &glib::WeakRef<adw::EntryRow>,
-    port_row_weak: &glib::WeakRef<adw::SpinRow>,
-    pending_controller_busy_toasts: &Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
+    ctx: &super::dsp_events::DspEventCtx,
 ) {
+    let app_state = &ctx.state;
+    let toast_overlay_weak = &ctx.toast_overlay_weak;
+    let role_row_weak = &ctx.rtl_tcp_role_row_weak;
+    let auth_key_row_weak = &ctx.rtl_tcp_auth_key_row_weak;
+    let hostname_row_weak = &ctx.rtl_tcp_hostname_row_weak;
+    let port_row_weak = &ctx.rtl_tcp_port_row_weak;
+    let pending_controller_busy_toasts = &ctx.pending_controller_busy_toasts;
     use sdr_types::RtlTcpConnectionState;
 
     // Sweep any still-live ControllerBusy toasts on any

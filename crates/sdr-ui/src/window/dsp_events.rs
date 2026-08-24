@@ -436,16 +436,10 @@ fn on_vfo_offset_changed(ctx: &DspEventCtx, offset: f64) {
 fn on_rtl_tcp_connection_state(ctx: &DspEventCtx, conn_state: &sdr_types::RtlTcpConnectionState) {
     let DspEventCtx {
         state,
-        toast_overlay_weak,
         status_bar,
         rtl_tcp_status_row_weak,
         rtl_tcp_disconnect_button_weak,
         rtl_tcp_retry_button_weak,
-        rtl_tcp_role_row_weak,
-        rtl_tcp_auth_key_row_weak,
-        rtl_tcp_hostname_row_weak,
-        rtl_tcp_port_row_weak,
-        pending_controller_busy_toasts,
         ..
     } = ctx;
     tracing::debug!(?conn_state, "rtl_tcp connection state");
@@ -469,17 +463,7 @@ fn on_rtl_tcp_connection_state(ctx: &DspEventCtx, conn_state: &sdr_types::RtlTcp
     let now_disc = crate::state::rtl_tcp_state_discriminant(conn_state);
     if prev_disc != now_disc {
         state.last_rtl_tcp_state_disc.set(now_disc);
-        handle_rtl_tcp_state_toast(
-            conn_state,
-            prev_disc,
-            state,
-            toast_overlay_weak,
-            rtl_tcp_role_row_weak,
-            rtl_tcp_auth_key_row_weak,
-            rtl_tcp_hostname_row_weak,
-            rtl_tcp_port_row_weak,
-            pending_controller_busy_toasts,
-        );
+        handle_rtl_tcp_state_toast(conn_state, prev_disc, ctx);
     }
     // Status-bar role badge (#396) — show the role the
     // SERVER admitted us into, never the role the user
