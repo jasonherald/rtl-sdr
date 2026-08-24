@@ -2541,10 +2541,9 @@ pub(super) fn connect_doppler_tracker(
     status_bar: &Rc<StatusBar>,
 ) {
     use crate::doppler_tracker::{
-        Candidate, DopplerTracker, FREQ_MATCH_TOLERANCE_HZ, compute_doppler_offset_hz,
-        pick_active_satellite, should_tick,
+        DopplerTracker, FREQ_MATCH_TOLERANCE_HZ, compute_doppler_offset_hz, should_tick,
     };
-    use sdr_sat::{GroundStation, KNOWN_SATELLITES, Satellite, track};
+    use sdr_sat::{GroundStation, Satellite};
 
     // Read the widget's current state — it was already restored
     // (and a persistence handler wired) by `restore_doppler_switch`,
@@ -2619,140 +2618,7 @@ pub(super) fn connect_doppler_tracker(
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            let mut t = tracker.borrow_mut();
-            // Lifecycle gate: master + running. While stopped,
-            // no candidate rebuild + no `set_active` transition,
-            // so a satellite setting below the horizon mid-stop
-            // doesn't fire a spurious disengage dispatch into a
-            // stopped DSP. On resume, this tick re-evaluates and
-            // engages / disengages naturally against the live
-            // geometry. Per #567.
-            if !should_tick(t.master_enabled(), state.is_running.get()) {
-                return glib::ControlFlow::Continue;
-            }
-            // Build the ground station from the live panel
-            // values — the user can edit lat/lon/alt mid-pass
-            // and the tracker should follow.
-            let station = GroundStation::new(
-                panel.lat_row.value(),
-                panel.lon_row.value(),
-                panel.alt_row.value(),
-            );
-            let now = chrono::Utc::now();
-            let current_freq = state.center_frequency.get();
-
-            // Build the candidate list: every catalog entry
-            // whose downlink is within ±FREQ_MATCH_TOLERANCE_HZ
-            // of the radio's current centre frequency, paired
-            // with its currently-evaluated elevation. Iterate
-            // in `KNOWN_SATELLITES` order so the spec §2
-            // tie-break (earlier entry wins) is deterministic.
-            let mut candidates: Vec<Candidate> = Vec::new();
-            for sat in KNOWN_SATELLITES {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "catalog downlinks sit in the 100s of MHz, well \
-                              below f64's 2^53 mantissa ceiling"
-                )]
-                let downlink = sat.downlink_hz as f64;
-                if (downlink - current_freq).abs() > FREQ_MATCH_TOLERANCE_HZ {
-                    continue;
-                }
-                let Ok((line1, line2)) = cache.cached_tle_for(sat.norad_id) else {
-                    continue;
-                };
-                let Ok(parsed) = Satellite::from_tle(sat.name, &line1, &line2) else {
-                    continue;
-                };
-                let Ok(track) = track(&station, &parsed, now) else {
-                    continue;
-                };
-                candidates.push(Candidate {
-                    satellite: sat,
-                    elevation_deg: track.elevation_deg,
-                });
-            }
-
-            let new_active = pick_active_satellite(t.master_enabled(), &candidates);
-            // Capture pre-`set_active` state so we can:
-            //   1. Flush back to the prior user reference on a
-            //      Some → None disengage (`set_active` resets
-            //      `user_reference_offset_hz` to 0 on any change,
-            //      so reading it AFTER would always give 0).
-            //   2. Decide whether this is a fresh engagement
-            //      (None → Some) vs. a satellite swap
-            //      (Some(A) → Some(B)) — only the former should
-            //      seed `user_reference_offset_hz` from the live
-            //      spectrum offset. On a swap, the live offset
-            //      is `prior_user_ref + prior_doppler`; reseeding
-            //      with that would copy the previous pass's
-            //      Doppler into the new pass's baseline (a
-            //      double-count). Per CR round 4 on PR #554.
-            let prior_user_ref = t.user_reference_offset_hz();
-            let prior_active_some = t.active().is_some();
-            let changed = t.set_active(new_active);
-            if changed {
-                if new_active.is_some() {
-                    if prior_active_some {
-                        // Some(A) → Some(B) satellite swap.
-                        // Restore the pre-swap user_reference
-                        // (which `set_active` just reset to 0)
-                        // so it survives the satellite change.
-                        // Per CR round 5 on PR #554.
-                        t.set_user_reference_offset_hz(prior_user_ref);
-                    } else {
-                        // None → Some fresh engagement. Seed
-                        // `user_reference_offset_hz` from the
-                        // synchronously-tracked DSP baseline on
-                        // `AppState` so this pass's Doppler tracks
-                        // ON TOP of any offset the user had set
-                        // before AOS — and so disengage at LOS
-                        // restores that exact value via the
-                        // Some → None flush path.
-                        //
-                        // Round 6 deferred this seed because the
-                        // only available source was `spectrum.vfo_offset_hz()`,
-                        // which lags DSP echoes — auto-record's
-                        // AOS-side `SetVfoOffset(0.0)` would not yet
-                        // be reflected when the trigger tick fired,
-                        // so we'd capture the stale pre-AOS value.
-                        // Round 7 added `state.last_dispatched_vfo_offset_hz`,
-                        // which the `connect_vfo_offset_changed`
-                        // callback updates on every DSP echo (and
-                        // every direct user-drag dispatch). That
-                        // gives us the synchronously-tracked source
-                        // of truth the deferral was waiting for.
-                        // Per CR round 9 on PR #554.
-                        let baseline = state.last_dispatched_vfo_offset_hz.get();
-                        t.set_user_reference_offset_hz(baseline);
-                    }
-                    // No dispatch here — the next 4 Hz tick will
-                    // dispatch `live = user_reference + doppler`.
-                } else {
-                    // Disengaged — flush the live offset back to
-                    // the pre-engage user reference (captured
-                    // before `set_active` reset it) and clear
-                    // the status badge.
-                    //
-                    // We don't need to explicitly clear the
-                    // tracker's `user_reference_offset_hz` here
-                    // — `set_active(None)` already did it on
-                    // line 216 of `doppler_tracker.rs` (the
-                    // `if changed { self.user_reference_offset_hz = 0.0; }`
-                    // branch), and the
-                    // `satellite_to_none_resets_user_reference_offset`
-                    // unit test pins that invariant. The
-                    // `prior_user_ref` we dispatch is the value
-                    // captured pre-`set_active`, so DSP gets the
-                    // user's pre-engage baseline; the tracker's
-                    // own field is already 0 for the next
-                    // engagement. Per CR round 8 on PR #554.
-                    drop(t);
-                    state.dispatch_vfo_offset(prior_user_ref);
-                    status_bar.update_doppler(None);
-                }
-            }
-            glib::ControlFlow::Continue
+            doppler_trigger_tick(&panel, &tracker, &cache, &state, &status_bar)
         });
     }
 
@@ -2855,4 +2721,156 @@ pub(super) fn connect_doppler_tracker(
             glib::ControlFlow::Continue
         });
     }
+}
+
+/// One 1 Hz trigger-tick of the Doppler tracker: rebuild the
+/// overhead-candidate list from fresh TLE propagation, elect the
+/// active satellite, and apply the activation / deactivation edge to
+/// the VFO + status bar. Split out per the 50-NLOC gate (#817).
+fn doppler_trigger_tick(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    tracker: &Rc<RefCell<crate::doppler_tracker::DopplerTracker>>,
+    cache: &std::sync::Arc<sdr_sat::TleCache>,
+    state: &Rc<AppState>,
+    status_bar: &Rc<StatusBar>,
+) -> glib::ControlFlow {
+    use crate::doppler_tracker::{
+        Candidate, FREQ_MATCH_TOLERANCE_HZ, pick_active_satellite, should_tick,
+    };
+    use sdr_sat::{GroundStation, KNOWN_SATELLITES, Satellite, track};
+
+    let mut t = tracker.borrow_mut();
+    // Lifecycle gate: master + running. While stopped,
+    // no candidate rebuild + no `set_active` transition,
+    // so a satellite setting below the horizon mid-stop
+    // doesn't fire a spurious disengage dispatch into a
+    // stopped DSP. On resume, this tick re-evaluates and
+    // engages / disengages naturally against the live
+    // geometry. Per #567.
+    if !should_tick(t.master_enabled(), state.is_running.get()) {
+        return glib::ControlFlow::Continue;
+    }
+    // Build the ground station from the live panel
+    // values — the user can edit lat/lon/alt mid-pass
+    // and the tracker should follow.
+    let station = GroundStation::new(
+        panel.lat_row.value(),
+        panel.lon_row.value(),
+        panel.alt_row.value(),
+    );
+    let now = chrono::Utc::now();
+    let current_freq = state.center_frequency.get();
+
+    // Build the candidate list: every catalog entry
+    // whose downlink is within ±FREQ_MATCH_TOLERANCE_HZ
+    // of the radio's current centre frequency, paired
+    // with its currently-evaluated elevation. Iterate
+    // in `KNOWN_SATELLITES` order so the spec §2
+    // tie-break (earlier entry wins) is deterministic.
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for sat in KNOWN_SATELLITES {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "catalog downlinks sit in the 100s of MHz, well \
+                      below f64's 2^53 mantissa ceiling"
+        )]
+        let downlink = sat.downlink_hz as f64;
+        if (downlink - current_freq).abs() > FREQ_MATCH_TOLERANCE_HZ {
+            continue;
+        }
+        let Ok((line1, line2)) = cache.cached_tle_for(sat.norad_id) else {
+            continue;
+        };
+        let Ok(parsed) = Satellite::from_tle(sat.name, &line1, &line2) else {
+            continue;
+        };
+        let Ok(track) = track(&station, &parsed, now) else {
+            continue;
+        };
+        candidates.push(Candidate {
+            satellite: sat,
+            elevation_deg: track.elevation_deg,
+        });
+    }
+
+    let new_active = pick_active_satellite(t.master_enabled(), &candidates);
+    // Capture pre-`set_active` state so we can:
+    //   1. Flush back to the prior user reference on a
+    //      Some → None disengage (`set_active` resets
+    //      `user_reference_offset_hz` to 0 on any change,
+    //      so reading it AFTER would always give 0).
+    //   2. Decide whether this is a fresh engagement
+    //      (None → Some) vs. a satellite swap
+    //      (Some(A) → Some(B)) — only the former should
+    //      seed `user_reference_offset_hz` from the live
+    //      spectrum offset. On a swap, the live offset
+    //      is `prior_user_ref + prior_doppler`; reseeding
+    //      with that would copy the previous pass's
+    //      Doppler into the new pass's baseline (a
+    //      double-count). Per CR round 4 on PR #554.
+    let prior_user_ref = t.user_reference_offset_hz();
+    let prior_active_some = t.active().is_some();
+    let changed = t.set_active(new_active);
+    if changed {
+        if new_active.is_some() {
+            if prior_active_some {
+                // Some(A) → Some(B) satellite swap.
+                // Restore the pre-swap user_reference
+                // (which `set_active` just reset to 0)
+                // so it survives the satellite change.
+                // Per CR round 5 on PR #554.
+                t.set_user_reference_offset_hz(prior_user_ref);
+            } else {
+                // None → Some fresh engagement. Seed
+                // `user_reference_offset_hz` from the
+                // synchronously-tracked DSP baseline on
+                // `AppState` so this pass's Doppler tracks
+                // ON TOP of any offset the user had set
+                // before AOS — and so disengage at LOS
+                // restores that exact value via the
+                // Some → None flush path.
+                //
+                // Round 6 deferred this seed because the
+                // only available source was `spectrum.vfo_offset_hz()`,
+                // which lags DSP echoes — auto-record's
+                // AOS-side `SetVfoOffset(0.0)` would not yet
+                // be reflected when the trigger tick fired,
+                // so we'd capture the stale pre-AOS value.
+                // Round 7 added `state.last_dispatched_vfo_offset_hz`,
+                // which the `connect_vfo_offset_changed`
+                // callback updates on every DSP echo (and
+                // every direct user-drag dispatch). That
+                // gives us the synchronously-tracked source
+                // of truth the deferral was waiting for.
+                // Per CR round 9 on PR #554.
+                let baseline = state.last_dispatched_vfo_offset_hz.get();
+                t.set_user_reference_offset_hz(baseline);
+            }
+            // No dispatch here — the next 4 Hz tick will
+            // dispatch `live = user_reference + doppler`.
+        } else {
+            // Disengaged — flush the live offset back to
+            // the pre-engage user reference (captured
+            // before `set_active` reset it) and clear
+            // the status badge.
+            //
+            // We don't need to explicitly clear the
+            // tracker's `user_reference_offset_hz` here
+            // — `set_active(None)` already did it on
+            // line 216 of `doppler_tracker.rs` (the
+            // `if changed { self.user_reference_offset_hz = 0.0; }`
+            // branch), and the
+            // `satellite_to_none_resets_user_reference_offset`
+            // unit test pins that invariant. The
+            // `prior_user_ref` we dispatch is the value
+            // captured pre-`set_active`, so DSP gets the
+            // user's pre-engage baseline; the tracker's
+            // own field is already 0 for the next
+            // engagement. Per CR round 8 on PR #554.
+            drop(t);
+            state.dispatch_vfo_offset(prior_user_ref);
+            status_bar.update_doppler(None);
+        }
+    }
+    glib::ControlFlow::Continue
 }
