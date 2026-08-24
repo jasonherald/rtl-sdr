@@ -10,74 +10,96 @@ use libadwaita::prelude::*;
 
 use super::{AppState, Duration, Rc, RefCell, SidebarPanels, adw, glib, sidebar};
 
-/// Re-enable every transcription settings row that gets locked during
-/// an active session.
-///
-/// Single source of truth for the row-unlock side of the four
-/// session-end paths in [`connect_transcript_panel`]:
-///
-/// 1. `TranscriptionEvent::Error` arm in the timeout closure
-/// 2. `TryRecvError::Disconnected` arm in the timeout closure
-/// 3. Synchronous `engine.start()` failure in `connect_active_notify`
-/// 4. Normal stop (off branch of `connect_active_notify`)
-///
-/// Takes weak refs so paths 1 and 2 (which hold weak refs to avoid
-/// keeping widgets alive past their UI lifetime) can call it directly.
-/// Paths 3 and 4 hold strong refs and pass `&strong.downgrade()` —
-/// the temporary lives through the function call.
-///
-/// Tolerant of any individual weak ref failing to upgrade (window close
-/// race) — each row is checked independently so a partially-dropped UI
-/// still recovers what it can.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn unlock_transcription_session_rows(
-    model_row: &glib::WeakRef<adw::ComboRow>,
-    #[cfg(feature = "whisper")] silence_row: &glib::WeakRef<adw::SpinRow>,
-    noise_gate_row: &glib::WeakRef<adw::SpinRow>,
-    audio_enhancement_row: &glib::WeakRef<adw::ComboRow>,
-    #[cfg(feature = "sherpa")] display_mode_row: &glib::WeakRef<adw::ComboRow>,
-    #[cfg(feature = "sherpa")] vad_threshold_row: &glib::WeakRef<adw::SpinRow>,
-    #[cfg(feature = "sherpa")] auto_break_row: &glib::WeakRef<adw::SwitchRow>,
-    #[cfg(feature = "sherpa")] auto_break_min_open_row: &glib::WeakRef<adw::SpinRow>,
-    #[cfg(feature = "sherpa")] auto_break_tail_row: &glib::WeakRef<adw::SpinRow>,
-    #[cfg(feature = "sherpa")] auto_break_min_segment_row: &glib::WeakRef<adw::SpinRow>,
-) {
-    if let Some(row) = model_row.upgrade() {
-        row.set_sensitive(true);
-    }
+/// Weak handles to every transcription settings row that gets locked
+/// during an active session. Single source of truth for the
+/// row-unlock side of the four session-end paths in
+/// [`connect_transcript_panel`]: the `Error` arm, the unexpected
+/// channel disconnect, the start-failure path, and the user stop.
+pub(super) struct SessionRowWeaks {
+    model_row: glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "whisper")]
-    if let Some(row) = silence_row.upgrade() {
-        row.set_sensitive(true);
-    }
-    if let Some(row) = noise_gate_row.upgrade() {
-        row.set_sensitive(true);
-    }
-    if let Some(row) = audio_enhancement_row.upgrade() {
-        row.set_sensitive(true);
-    }
+    silence_row: glib::WeakRef<adw::SpinRow>,
+    noise_gate_row: glib::WeakRef<adw::SpinRow>,
+    audio_enhancement_row: glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "sherpa")]
-    if let Some(row) = display_mode_row.upgrade() {
-        row.set_sensitive(true);
-    }
+    display_mode_row: glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "sherpa")]
-    if let Some(row) = vad_threshold_row.upgrade() {
-        row.set_sensitive(true);
-    }
+    vad_threshold_row: glib::WeakRef<adw::SpinRow>,
     #[cfg(feature = "sherpa")]
-    if let Some(row) = auto_break_row.upgrade() {
-        row.set_sensitive(true);
-    }
+    auto_break_row: glib::WeakRef<adw::SwitchRow>,
     #[cfg(feature = "sherpa")]
-    if let Some(row) = auto_break_min_open_row.upgrade() {
-        row.set_sensitive(true);
-    }
+    auto_break_min_open_row: glib::WeakRef<adw::SpinRow>,
     #[cfg(feature = "sherpa")]
-    if let Some(row) = auto_break_tail_row.upgrade() {
-        row.set_sensitive(true);
-    }
+    auto_break_tail_row: glib::WeakRef<adw::SpinRow>,
     #[cfg(feature = "sherpa")]
-    if let Some(row) = auto_break_min_segment_row.upgrade() {
-        row.set_sensitive(true);
+    auto_break_min_segment_row: glib::WeakRef<adw::SpinRow>,
+}
+
+impl SessionRowWeaks {
+    pub(super) fn from_panel(t: &sidebar::transcript_panel::TranscriptPanel) -> Self {
+        Self {
+            model_row: t.model_row.downgrade(),
+            #[cfg(feature = "whisper")]
+            silence_row: t.silence_row.downgrade(),
+            noise_gate_row: t.noise_gate_row.downgrade(),
+            audio_enhancement_row: t.audio_enhancement_row.downgrade(),
+            #[cfg(feature = "sherpa")]
+            display_mode_row: t.display_mode_row.downgrade(),
+            #[cfg(feature = "sherpa")]
+            vad_threshold_row: t.vad_threshold_row.downgrade(),
+            #[cfg(feature = "sherpa")]
+            auto_break_row: t.auto_break_row.downgrade(),
+            #[cfg(feature = "sherpa")]
+            auto_break_min_open_row: t.auto_break_min_open_row.downgrade(),
+            #[cfg(feature = "sherpa")]
+            auto_break_tail_row: t.auto_break_tail_row.downgrade(),
+            #[cfg(feature = "sherpa")]
+            auto_break_min_segment_row: t.auto_break_min_segment_row.downgrade(),
+        }
+    }
+
+    /// Re-enable every locked row. Weak upgrades no-op for widgets
+    /// the window teardown already dropped.
+    pub(super) fn unlock(&self) {
+        for row in self.spin_rows() {
+            if let Some(row) = row.upgrade() {
+                row.set_sensitive(true);
+            }
+        }
+        for row in self.combo_rows() {
+            if let Some(row) = row.upgrade() {
+                row.set_sensitive(true);
+            }
+        }
+        #[cfg(feature = "sherpa")]
+        if let Some(row) = self.auto_break_row.upgrade() {
+            row.set_sensitive(true);
+        }
+    }
+
+    fn spin_rows(&self) -> Vec<&glib::WeakRef<adw::SpinRow>> {
+        vec![
+            #[cfg(feature = "whisper")]
+            &self.silence_row,
+            &self.noise_gate_row,
+            #[cfg(feature = "sherpa")]
+            &self.vad_threshold_row,
+            #[cfg(feature = "sherpa")]
+            &self.auto_break_min_open_row,
+            #[cfg(feature = "sherpa")]
+            &self.auto_break_tail_row,
+            #[cfg(feature = "sherpa")]
+            &self.auto_break_min_segment_row,
+        ]
+    }
+
+    fn combo_rows(&self) -> Vec<&glib::WeakRef<adw::ComboRow>> {
+        vec![
+            &self.model_row,
+            &self.audio_enhancement_row,
+            #[cfg(feature = "sherpa")]
+            &self.display_mode_row,
+        ]
     }
 }
 
@@ -156,6 +178,7 @@ pub(super) fn connect_transcript_panel(
     let state_clone = Rc::clone(state);
     let engine_clone = Rc::clone(&engine);
     let panel_for_session = transcript.clone();
+    let session_rows = Rc::new(SessionRowWeaks::from_panel(transcript));
     let status_label = transcript.status_label.clone();
     let progress_bar = transcript.progress_bar.clone();
     let text_view = transcript.text_view.clone();
@@ -169,11 +192,14 @@ pub(super) fn connect_transcript_panel(
     // backend fires TranscriptionEvent::Error mid-session. Weak so the
     // timeout closure doesn't keep widgets alive past their UI lifetime.
     let enable_row_weak = transcript.enable_row.downgrade();
+    // Re-read per event inside the tick (mid-session display-mode /
+    // model introspection) — the only row weaks the event loop still
+    // needs individually; the lock/unlock set lives in
+    // `SessionRowWeaks`.
+    #[cfg(feature = "sherpa")]
     let model_row_weak = model_row.downgrade();
-    #[cfg(feature = "whisper")]
-    let silence_row_weak = silence_row.downgrade();
-    let noise_gate_row_weak = noise_gate_row.downgrade();
-    let audio_enhancement_row_weak = audio_enhancement_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let auto_break_min_segment_row_weak = transcript.auto_break_min_segment_row.downgrade();
     #[cfg(feature = "sherpa")]
     let display_mode_row = transcript.display_mode_row.clone();
     #[cfg(feature = "sherpa")]
@@ -194,16 +220,6 @@ pub(super) fn connect_transcript_panel(
     let live_line_label = transcript.live_line_label.clone();
     #[cfg(feature = "sherpa")]
     let display_mode_row_weak = display_mode_row.downgrade();
-    #[cfg(feature = "sherpa")]
-    let vad_threshold_row_weak = vad_threshold_row.downgrade();
-    #[cfg(feature = "sherpa")]
-    let auto_break_row_weak = auto_break_row.downgrade();
-    #[cfg(feature = "sherpa")]
-    let auto_break_min_open_row_weak = auto_break_min_open_row.downgrade();
-    #[cfg(feature = "sherpa")]
-    let auto_break_tail_row_weak = auto_break_tail_row.downgrade();
-    #[cfg(feature = "sherpa")]
-    let auto_break_min_segment_row_weak = auto_break_min_segment_row.downgrade();
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
@@ -320,21 +336,10 @@ pub(super) fn connect_transcript_panel(
                     let progress_weak = progress_bar.downgrade();
                     let tv_weak = text_view.downgrade();
                     let enable_row_weak = enable_row_weak.clone();
-                    let model_row_weak = model_row_weak.clone();
-                    #[cfg(feature = "whisper")]
-                    let silence_row_weak = silence_row_weak.clone();
-                    let noise_gate_row_weak = noise_gate_row_weak.clone();
-                    let audio_enhancement_row_weak = audio_enhancement_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let display_mode_row_weak = display_mode_row_weak.clone();
                     #[cfg(feature = "sherpa")]
-                    let vad_threshold_row_weak = vad_threshold_row_weak.clone();
-                    #[cfg(feature = "sherpa")]
-                    let auto_break_row_weak = auto_break_row_weak.clone();
-                    #[cfg(feature = "sherpa")]
-                    let auto_break_min_open_row_weak = auto_break_min_open_row_weak.clone();
-                    #[cfg(feature = "sherpa")]
-                    let auto_break_tail_row_weak = auto_break_tail_row_weak.clone();
+                    let model_row_weak = model_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let auto_break_min_segment_row_weak =
                         auto_break_min_segment_row_weak.clone();
@@ -345,6 +350,7 @@ pub(super) fn connect_transcript_panel(
                     // `state_clone.pending_channel_marker` from
                     // the `TranscriptionEvent::Text` arm below.
                     let state_for_marker = Rc::clone(&state_clone);
+                    let session_rows = Rc::clone(&session_rows);
 
                     glib::timeout_add_local(Duration::from_millis(100), move || {
                         // Upgrade once per tick. If any widget has been
@@ -476,25 +482,7 @@ pub(super) fn connect_transcript_panel(
                                         // Mirror the synchronous start()
                                         // failure teardown so the UI
                                         // isn't left locked.
-                                        unlock_transcription_session_rows(
-                                            &model_row_weak,
-                                            #[cfg(feature = "whisper")]
-                                            &silence_row_weak,
-                                            &noise_gate_row_weak,
-                                            &audio_enhancement_row_weak,
-                                            #[cfg(feature = "sherpa")]
-                                            &display_mode_row_weak,
-                                            #[cfg(feature = "sherpa")]
-                                            &vad_threshold_row_weak,
-                                            #[cfg(feature = "sherpa")]
-                                            &auto_break_row_weak,
-                                            #[cfg(feature = "sherpa")]
-                                            &auto_break_min_open_row_weak,
-                                            #[cfg(feature = "sherpa")]
-                                            &auto_break_tail_row_weak,
-                                            #[cfg(feature = "sherpa")]
-                                            &auto_break_min_segment_row_weak,
-                                        );
+                                        session_rows.unlock();
                                         if let Some(enable) = enable_row_weak.upgrade() {
                                             enable.set_active(false);
                                         }
@@ -552,25 +540,7 @@ pub(super) fn connect_transcript_panel(
                                     tracing::warn!(
                                         "transcription event channel disconnected unexpectedly"
                                     );
-                                    unlock_transcription_session_rows(
-                                        &model_row_weak,
-                                        #[cfg(feature = "whisper")]
-                                        &silence_row_weak,
-                                        &noise_gate_row_weak,
-                                        &audio_enhancement_row_weak,
-                                        #[cfg(feature = "sherpa")]
-                                        &display_mode_row_weak,
-                                        #[cfg(feature = "sherpa")]
-                                        &vad_threshold_row_weak,
-                                        #[cfg(feature = "sherpa")]
-                                        &auto_break_row_weak,
-                                        #[cfg(feature = "sherpa")]
-                                        &auto_break_min_open_row_weak,
-                                        #[cfg(feature = "sherpa")]
-                                        &auto_break_tail_row_weak,
-                                        #[cfg(feature = "sherpa")]
-                                        &auto_break_min_segment_row_weak,
-                                    );
+                                    session_rows.unlock();
                                     if let Some(enable) = enable_row_weak.upgrade() {
                                         enable.set_active(false);
                                     }
@@ -592,25 +562,7 @@ pub(super) fn connect_transcript_panel(
                 }
                 Err(e) => {
                     tracing::warn!("failed to start transcription: {e}");
-                    unlock_transcription_session_rows(
-                        &model_row.downgrade(),
-                        #[cfg(feature = "whisper")]
-                        &silence_row.downgrade(),
-                        &noise_gate_row.downgrade(),
-                        &audio_enhancement_row.downgrade(),
-                        #[cfg(feature = "sherpa")]
-                        &display_mode_row.downgrade(),
-                        #[cfg(feature = "sherpa")]
-                        &vad_threshold_row.downgrade(),
-                        #[cfg(feature = "sherpa")]
-                        &auto_break_row.downgrade(),
-                        #[cfg(feature = "sherpa")]
-                        &auto_break_min_open_row.downgrade(),
-                        #[cfg(feature = "sherpa")]
-                        &auto_break_tail_row.downgrade(),
-                        #[cfg(feature = "sherpa")]
-                        &auto_break_min_segment_row.downgrade(),
-                    );
+                    session_rows.unlock();
                     // Reset the toggle FIRST (the else branch clears
                     // status_label as part of its normal teardown), then
                     // set the error text so the user actually sees it.
@@ -623,25 +575,7 @@ pub(super) fn connect_transcript_panel(
                 }
             }
         } else {
-            unlock_transcription_session_rows(
-                &model_row.downgrade(),
-                #[cfg(feature = "whisper")]
-                &silence_row.downgrade(),
-                &noise_gate_row.downgrade(),
-                &audio_enhancement_row.downgrade(),
-                #[cfg(feature = "sherpa")]
-                &display_mode_row.downgrade(),
-                #[cfg(feature = "sherpa")]
-                &vad_threshold_row.downgrade(),
-                #[cfg(feature = "sherpa")]
-                &auto_break_row.downgrade(),
-                #[cfg(feature = "sherpa")]
-                &auto_break_min_open_row.downgrade(),
-                #[cfg(feature = "sherpa")]
-                &auto_break_tail_row.downgrade(),
-                #[cfg(feature = "sherpa")]
-                &auto_break_min_segment_row.downgrade(),
-            );
+            session_rows.unlock();
             state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
             // Drop any pending channel-marker so a stray scanner
             // hop that landed during the live session doesn't
