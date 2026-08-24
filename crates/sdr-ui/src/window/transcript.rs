@@ -394,41 +394,17 @@ pub(super) fn connect_transcript_panel(
                                         }
                                     }
                                     TranscriptionEvent::Text { timestamp, text } => {
-                                        // Drain the pending channel-marker
-                                        // (#517) BEFORE inserting the
-                                        // transcribed text — the marker
-                                        // belongs ABOVE the text it
-                                        // precedes. Lazy emission means
-                                        // markers only land when there's
-                                        // actual audio to attribute, so
-                                        // a quiet channel never produces
-                                        // a divider.
-                                        if let Some((switched_at, channel_name)) = state_for_marker
-                                            .pending_channel_marker
-                                            .borrow_mut()
-                                            .take()
-                                        {
-                                            sidebar::transcript_panel::push_channel_marker(
-                                                &tv,
-                                                switched_at,
-                                                &channel_name,
-                                            );
-                                        }
-                                        let buf = tv.buffer();
-                                        let mut end = buf.end_iter();
-                                        buf.insert(&mut end, &format!("[{timestamp}] {text}\n"));
-                                        let mark = buf.create_mark(None, &buf.end_iter(), false);
-                                        tv.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
-                                        buf.delete_mark(&mark);
-
+                                        append_transcribed_line(
+                                            &tv,
+                                            &state_for_marker,
+                                            &timestamp,
+                                            &text,
+                                        );
                                         // An utterance committed — the live
                                         // line is now stale. Clear and hide
                                         // it so the next Partial starts fresh.
                                         #[cfg(feature = "sherpa")]
-                                        if let Some(label) = live_line_weak.upgrade() {
-                                            label.set_text("");
-                                            label.set_visible(false);
-                                        }
+                                        clear_live_line(&live_line_weak);
                                     }
                                     TranscriptionEvent::Error(msg) => {
                                         // Fatal — backend has exited.
@@ -550,6 +526,33 @@ pub(super) fn connect_transcript_panel(
     });
 
     engine
+}
+
+/// Append a finalized utterance to the transcript log. Drains the
+/// pending channel-marker (#517) BEFORE inserting — the marker
+/// belongs ABOVE the text it precedes, and lazy emission means
+/// markers only land when there's actual audio to attribute (a
+/// quiet channel never produces a divider). Auto-scrolls to the end.
+fn append_transcribed_line(tv: &gtk4::TextView, state: &Rc<AppState>, timestamp: &str, text: &str) {
+    if let Some((switched_at, channel_name)) = state.pending_channel_marker.borrow_mut().take() {
+        sidebar::transcript_panel::push_channel_marker(tv, switched_at, &channel_name);
+    }
+    let buf = tv.buffer();
+    let mut end = buf.end_iter();
+    buf.insert(&mut end, &format!("[{timestamp}] {text}\n"));
+    let mark = buf.create_mark(None, &buf.end_iter(), false);
+    tv.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
+    buf.delete_mark(&mark);
+}
+
+/// Clear + hide the live partial line (stale once an utterance
+/// commits or the session ends).
+#[cfg(feature = "sherpa")]
+fn clear_live_line(live_line: &glib::WeakRef<gtk4::Label>) {
+    if let Some(label) = live_line.upgrade() {
+        label.set_text("");
+        label.set_visible(false);
+    }
 }
 
 /// Paint a sherpa partial into the live line — but only when (a) the
