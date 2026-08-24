@@ -1299,70 +1299,96 @@ fn on_save_apt_png(deps: &RecorderDeps, path: std::path::PathBuf) {
     // None and we no-op. Per CR round 3 on PR #571.
     let exported_window_weak = deps.state.apt_viewer_window.borrow().as_ref().cloned();
     view.export_png_full_async(path_for_export, mode, rotate_180, move |result| {
-        let (export_ok, msg) = match result {
-            Ok(()) => {
-                tracing::info!(
-                    rotate_180,
-                    ?mode,
-                    "auto-record PNG saved to {}",
-                    path_for_msg.display()
-                );
-                (
-                    true,
-                    format!("Pass complete — image saved to {}", path_for_msg.display()),
-                )
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "auto-record PNG export to {} failed: {e}",
-                    path_for_msg.display()
-                );
-                (false, format!("Pass complete but PNG save failed: {e}"))
-            }
-        };
-        post_toast(&toast_overlay_for_complete, &msg);
-        // Close the APT viewer window now that the PNG
-        // is on disk — resets the viewer for the next
-        // pass instead of carrying stale lines forward.
-        // Per a user request during PR #554 live
-        // testing.
-        //
-        // Only close on a successful export — if the
-        // save failed (Cairo error, disk full, etc.)
-        // the user probably wants to inspect the
-        // in-memory image and manually retry the
-        // export. Per CR round 9 on PR #554.
-        if export_ok {
-            // Use the WeakRef we snapshotted at export
-            // start (not the current `state.apt_viewer_window`)
-            // so a viewer reopen during the async save
-            // can't trick us into closing the wrong
-            // window. Upgrade-or-skip — if the user
-            // already closed it, the upgrade returns None
-            // and we simply do nothing. Per CR round 3 on
-            // PR #571.
-            if let Some(window) = exported_window_weak
-                .as_ref()
-                .and_then(glib::WeakRef::upgrade)
-            {
-                tracing::info!("auto-record LOS: closing APT viewer window after PNG save",);
-                window.close();
-            }
-        }
-        // Clear the recording-pass info now that the
-        // export is done — but ONLY if the slot still
-        // holds the same pass we just saved. If a new
-        // AOS overwrote it while we were encoding, that
-        // new pass owns the slot now and clearing it
-        // would silently break the next LOS-side
-        // rotate-180 lookup. Per CR round 4 on PR #571.
-        {
-            let mut slot = state_for_complete.apt_recording_pass.borrow_mut();
-            if *slot == exported_pass {
-                *slot = None;
-            }
-        }
+        on_apt_export_complete(
+            result,
+            &path_for_msg,
+            rotate_180,
+            mode,
+            &toast_overlay_for_complete,
+            &state_for_complete,
+            exported_window_weak.as_ref(),
+            exported_pass,
+        );
     });
+}
+
+/// Completion side of the async APT PNG export: toast the outcome,
+/// close the viewer window we snapshotted at export start on success
+/// (a reopen mid-export must not close the wrong window — CR round 3
+/// on PR #571), and clear the recording-pass slot only when it still
+/// holds the exported pass (a new AOS may own it — CR round 4 on
+/// PR #571).
+#[allow(clippy::too_many_arguments)]
+fn on_apt_export_complete(
+    result: Result<(), crate::viewer::ViewerError>,
+    path_for_msg: &std::path::Path,
+    rotate_180: bool,
+    mode: sdr_radio::apt_image::BrightnessMode,
+    toast_overlay: &glib::WeakRef<adw::ToastOverlay>,
+    state: &Rc<AppState>,
+    exported_window_weak: Option<&glib::WeakRef<adw::Window>>,
+    exported_pass: Option<(u32, chrono::DateTime<chrono::Utc>)>,
+) {
+    let (export_ok, msg) = match result {
+        Ok(()) => {
+            tracing::info!(
+                rotate_180,
+                ?mode,
+                "auto-record PNG saved to {}",
+                path_for_msg.display()
+            );
+            (
+                true,
+                format!("Pass complete — image saved to {}", path_for_msg.display()),
+            )
+        }
+        Err(e) => {
+            tracing::warn!(
+                "auto-record PNG export to {} failed: {e}",
+                path_for_msg.display()
+            );
+            (false, format!("Pass complete but PNG save failed: {e}"))
+        }
+    };
+    post_toast(toast_overlay, &msg);
+    // Close the APT viewer window now that the PNG
+    // is on disk — resets the viewer for the next
+    // pass instead of carrying stale lines forward.
+    // Per a user request during PR #554 live
+    // testing.
+    //
+    // Only close on a successful export — if the
+    // save failed (Cairo error, disk full, etc.)
+    // the user probably wants to inspect the
+    // in-memory image and manually retry the
+    // export. Per CR round 9 on PR #554.
+    if export_ok {
+        // Use the WeakRef we snapshotted at export
+        // start (not the current `state.apt_viewer_window`)
+        // so a viewer reopen during the async save
+        // can't trick us into closing the wrong
+        // window. Upgrade-or-skip — if the user
+        // already closed it, the upgrade returns None
+        // and we simply do nothing. Per CR round 3 on
+        // PR #571.
+        if let Some(window) = exported_window_weak.and_then(glib::WeakRef::upgrade) {
+            tracing::info!("auto-record LOS: closing APT viewer window after PNG save",);
+            window.close();
+        }
+    }
+    // Clear the recording-pass info now that the
+    // export is done — but ONLY if the slot still
+    // holds the same pass we just saved. If a new
+    // AOS overwrote it while we were encoding, that
+    // new pass owns the slot now and clearing it
+    // would silently break the next LOS-side
+    // rotate-180 lookup. Per CR round 4 on PR #571.
+    {
+        let mut slot = state.apt_recording_pass.borrow_mut();
+        if *slot == exported_pass {
+            *slot = None;
+        }
+    }
 }
 
 /// LOS save for an LRPT pass: one PNG per APID (plus the optional
