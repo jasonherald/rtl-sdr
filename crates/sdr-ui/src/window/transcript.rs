@@ -328,21 +328,21 @@ pub(super) fn connect_transcript_panel(
                             return glib::ControlFlow::Break;
                         };
 
-                        if let Some(flow) = drain_transcription_events(
-                            &event_rx,
-                            &status,
-                            &progress,
-                            &tv,
-                            &state_for_marker,
-                            &session_rows,
-                            &enable_row_weak,
+                        let ui = SessionTickUi {
+                            status,
+                            progress,
+                            tv,
+                            enable_row: enable_row_weak.clone(),
+                            session_rows: Rc::clone(&session_rows),
+                            state: Rc::clone(&state_for_marker),
                             #[cfg(feature = "sherpa")]
-                            &model_row_weak,
+                            model_row: model_row_weak.clone(),
                             #[cfg(feature = "sherpa")]
-                            &display_mode_row_weak,
+                            display_mode_row: display_mode_row_weak.clone(),
                             #[cfg(feature = "sherpa")]
-                            &live_line_weak,
-                        ) {
+                            live_line: live_line_weak.clone(),
+                        };
+                        if let Some(flow) = drain_transcription_events(&event_rx, &ui) {
                             return flow;
                         }
                         glib::ControlFlow::Continue
@@ -395,15 +395,7 @@ pub(super) fn connect_transcript_panel(
 #[allow(clippy::too_many_arguments)]
 fn drain_transcription_events(
     event_rx: &std::sync::mpsc::Receiver<sdr_transcription::TranscriptionEvent>,
-    status: &gtk4::Label,
-    progress: &gtk4::ProgressBar,
-    tv: &gtk4::TextView,
-    state_for_marker: &Rc<AppState>,
-    session_rows: &SessionRowWeaks,
-    enable_row_weak: &glib::WeakRef<adw::SwitchRow>,
-    #[cfg(feature = "sherpa")] model_row_weak: &glib::WeakRef<adw::ComboRow>,
-    #[cfg(feature = "sherpa")] display_mode_row_weak: &glib::WeakRef<adw::ComboRow>,
-    #[cfg(feature = "sherpa")] live_line_weak: &glib::WeakRef<gtk4::Label>,
+    ui: &SessionTickUi,
 ) -> Option<glib::ControlFlow> {
     use sdr_transcription::TranscriptionEvent;
 
@@ -411,24 +403,20 @@ fn drain_transcription_events(
         match event_rx.try_recv() {
             Ok(event) => match event {
                 TranscriptionEvent::Downloading { progress_pct } => {
-                    status.set_text(&format!("Downloading model ({progress_pct}%)..."));
-                    status.set_visible(true);
-                    progress.set_fraction(f64::from(progress_pct) / 100.0);
-                    progress.set_visible(true);
+                    ui.status
+                        .set_text(&format!("Downloading model ({progress_pct}%)..."));
+                    ui.status.set_visible(true);
+                    ui.progress.set_fraction(f64::from(progress_pct) / 100.0);
+                    ui.progress.set_visible(true);
                 }
                 TranscriptionEvent::Ready => {
-                    status.set_text("Listening...");
-                    status.set_css_classes(&["success"]);
-                    progress.set_visible(false);
+                    ui.status.set_text("Listening...");
+                    ui.status.set_css_classes(&["success"]);
+                    ui.progress.set_visible(false);
                 }
                 TranscriptionEvent::Partial { text } => {
                     #[cfg(feature = "sherpa")]
-                    show_live_partial(
-                        &text,
-                        &model_row_weak,
-                        &display_mode_row_weak,
-                        &live_line_weak,
-                    );
+                    show_live_partial(&text, &ui.model_row, &ui.display_mode_row, &ui.live_line);
                     #[cfg(not(feature = "sherpa"))]
                     {
                         // Whisper never emits Partial, but
@@ -438,27 +426,19 @@ fn drain_transcription_events(
                     }
                 }
                 TranscriptionEvent::Text { timestamp, text } => {
-                    append_transcribed_line(&tv, &state_for_marker, &timestamp, &text);
+                    append_transcribed_line(&ui.tv, &ui.state, &timestamp, &text);
                     // An utterance committed — the live
                     // line is now stale. Clear and hide
                     // it so the next Partial starts fresh.
                     #[cfg(feature = "sherpa")]
-                    clear_live_line(&live_line_weak);
+                    clear_live_line(&ui.live_line);
                 }
                 TranscriptionEvent::Error(msg) => {
                     // Fatal — backend has exited.
                     // Mirror the synchronous start()
                     // failure teardown so the UI
                     // isn't left locked.
-                    teardown_failed_session(
-                        &session_rows,
-                        &enable_row_weak,
-                        &status,
-                        &progress,
-                        &msg,
-                        #[cfg(feature = "sherpa")]
-                        &live_line_weak,
-                    );
+                    teardown_failed_session(ui, &msg);
                     return Some(glib::ControlFlow::Break);
                 }
             },
@@ -489,7 +469,7 @@ fn drain_transcription_events(
                 //   UI doesn't strand the user with locked
                 //   controls and a stale "Listening..."
                 //   status.
-                let was_user_stop = enable_row_weak.upgrade().is_none_or(|e| !e.is_active());
+                let was_user_stop = ui.enable_row.upgrade().is_none_or(|e| !e.is_active());
 
                 if was_user_stop {
                     tracing::debug!("transcription event channel closed (user stop)");
@@ -497,15 +477,7 @@ fn drain_transcription_events(
                 }
 
                 tracing::warn!("transcription event channel disconnected unexpectedly");
-                teardown_failed_session(
-                    &session_rows,
-                    &enable_row_weak,
-                    &status,
-                    &progress,
-                    "Transcription stopped unexpectedly",
-                    #[cfg(feature = "sherpa")]
-                    &live_line_weak,
-                );
+                teardown_failed_session(ui, "Transcription stopped unexpectedly");
                 return Some(glib::ControlFlow::Break);
             }
         }
@@ -532,28 +504,39 @@ fn lock_session_rows(t: &sidebar::transcript_panel::TranscriptPanel) {
     }
 }
 
+/// Per-tick view of an active session's widgets + shared state, built
+/// once per poll from the weak captures. Collapses the event-drain
+/// and teardown signatures.
+struct SessionTickUi {
+    status: gtk4::Label,
+    progress: gtk4::ProgressBar,
+    tv: gtk4::TextView,
+    enable_row: glib::WeakRef<adw::SwitchRow>,
+    session_rows: Rc<SessionRowWeaks>,
+    state: Rc<AppState>,
+    #[cfg(feature = "sherpa")]
+    model_row: glib::WeakRef<adw::ComboRow>,
+    #[cfg(feature = "sherpa")]
+    display_mode_row: glib::WeakRef<adw::ComboRow>,
+    #[cfg(feature = "sherpa")]
+    live_line: glib::WeakRef<gtk4::Label>,
+}
+
 /// Mid-session failure teardown, shared by the `Error` event arm and
 /// the spontaneous channel-disconnect arm: unlock the settings rows,
 /// snap the toggle off, surface the error on the status label, and
 /// clear any stale live partial.
-fn teardown_failed_session(
-    session_rows: &SessionRowWeaks,
-    enable_row: &glib::WeakRef<adw::SwitchRow>,
-    status: &gtk4::Label,
-    progress: &gtk4::ProgressBar,
-    msg: &str,
-    #[cfg(feature = "sherpa")] live_line: &glib::WeakRef<gtk4::Label>,
-) {
-    session_rows.unlock();
-    if let Some(enable) = enable_row.upgrade() {
+fn teardown_failed_session(ui: &SessionTickUi, msg: &str) {
+    ui.session_rows.unlock();
+    if let Some(enable) = ui.enable_row.upgrade() {
         enable.set_active(false);
     }
-    status.set_text(msg);
-    status.set_css_classes(&["error"]);
-    status.set_visible(true);
-    progress.set_visible(false);
+    ui.status.set_text(msg);
+    ui.status.set_css_classes(&["error"]);
+    ui.status.set_visible(true);
+    ui.progress.set_visible(false);
     #[cfg(feature = "sherpa")]
-    clear_live_line(live_line);
+    clear_live_line(&ui.live_line);
 }
 
 /// Append a finalized utterance to the transcript log. Drains the
