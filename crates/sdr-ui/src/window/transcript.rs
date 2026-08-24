@@ -113,6 +113,14 @@ impl SessionRowWeaks {
 /// session-rows set is the lock/unlock surface.
 struct SessionDeps {
     engine: Rc<RefCell<sdr_transcription::TranscriptionEngine>>,
+    /// Liveness token of the CURRENT session's 100 ms event tick.
+    /// `start` installs a fresh `Cell(true)`; `stop` takes it and
+    /// flips it false. A stale tick from a previous session sees
+    /// `false` on its next fire and breaks immediately — without
+    /// this, a detached worker's late `Disconnected` could read the
+    /// NEW session's `enable_row` and tear the new session down as a
+    /// spontaneous death. Per CR round 1 on PR #844.
+    session_alive: Rc<RefCell<Option<Rc<std::cell::Cell<bool>>>>>,
     state: Rc<AppState>,
     panel: sidebar::transcript_panel::TranscriptPanel,
     session_rows: Rc<SessionRowWeaks>,
@@ -144,6 +152,7 @@ pub(super) fn connect_transcript_panel(
 
     let deps = SessionDeps {
         engine: Rc::clone(&engine),
+        session_alive: Rc::new(RefCell::new(None)),
         state: Rc::clone(state),
         panel: transcript.clone(),
         session_rows: Rc::new(SessionRowWeaks::from_panel(transcript)),
@@ -269,8 +278,17 @@ fn begin_session_event_loop(
     let live_line_weak = deps.panel.live_line_label.downgrade();
     let state_for_marker = Rc::clone(&deps.state);
     let session_rows = Rc::clone(&deps.session_rows);
+    let alive = Rc::new(std::cell::Cell::new(true));
+    *deps.session_alive.borrow_mut() = Some(Rc::clone(&alive));
 
     glib::timeout_add_local(Duration::from_millis(100), move || {
+        // Session-identity guard: if `stop` already invalidated this
+        // session, break without touching any widget — the enable
+        // row and locked rows now belong to a newer session (or to
+        // no session). Per CR round 1 on PR #844.
+        if !alive.get() {
+            return glib::ControlFlow::Break;
+        }
         // Upgrade once per tick. If any widget has been dropped
         // (e.g. window closed), stop the timeout immediately so we
         // don't resurrect dead UI.
@@ -321,6 +339,9 @@ fn attach_session_audio_tap(deps: &SessionDeps) {
 /// Session-stop half of the enable toggle: unlock the rows, detach
 /// the DSP tap, shut the backend down, and clear the status area.
 fn stop_transcription_session(deps: &SessionDeps) {
+    if let Some(alive) = deps.session_alive.borrow_mut().take() {
+        alive.set(false);
+    }
     deps.session_rows.unlock();
     deps.state
         .send_dsp(crate::messages::UiToDsp::DisableTranscription);
