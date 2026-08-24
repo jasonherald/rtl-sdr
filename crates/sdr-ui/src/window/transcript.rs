@@ -199,8 +199,6 @@ pub(super) fn connect_transcript_panel(
     #[cfg(feature = "sherpa")]
     let model_row_weak = model_row.downgrade();
     #[cfg(feature = "sherpa")]
-    let auto_break_min_segment_row_weak = transcript.auto_break_min_segment_row.downgrade();
-    #[cfg(feature = "sherpa")]
     let display_mode_row = transcript.display_mode_row.clone();
     #[cfg(feature = "sherpa")]
     let vad_threshold_row = transcript.vad_threshold_row.clone();
@@ -340,9 +338,6 @@ pub(super) fn connect_transcript_panel(
                     let display_mode_row_weak = display_mode_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let model_row_weak = model_row_weak.clone();
-                    #[cfg(feature = "sherpa")]
-                    let auto_break_min_segment_row_weak =
-                        auto_break_min_segment_row_weak.clone();
                     #[cfg(feature = "sherpa")]
                     let live_line_weak = live_line_weak.clone();
                     // State handle for the lazy channel-marker
