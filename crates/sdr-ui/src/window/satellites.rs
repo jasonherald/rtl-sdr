@@ -773,6 +773,94 @@ fn arm_recorder_tick(deps: TickDeps) {
     });
 }
 
+/// Wire the auto-record machinery: the pure [`AutoRecorder`] state
+/// machine, its action interpreter (stashed weakly on `AppState` so
+/// the `AcarsEnabledChanged(Ok(false))` arm in `handle_dsp_message`
+/// can replay deferred AOS actions — issue #589 / CR round 1 on
+/// PR #591; the strong owner is the tick source), and the 1 Hz tick
+/// that drives it. The tick is only armed when a TLE cache exists —
+/// without one `displayed` stays empty forever and the timer would
+/// tick uselessly.
+#[allow(clippy::too_many_arguments)]
+fn wire_recorder(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    toast_overlay: &adw::ToastOverlay,
+    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    set_playing: &Rc<dyn Fn(bool)>,
+    panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
+    displayed: &Rc<RefCell<Vec<DisplayedPass>>>,
+    recompute: &Rc<dyn Fn()>,
+    watched: &Rc<RefCell<std::collections::HashSet<u32>>>,
+    cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
+) {
+    let notify_scheduler = Rc::new(RefCell::new(
+        sidebar::satellites_notify::NotifyScheduler::new(),
+    ));
+    // 1 Hz countdown ticker. Only scheduled when the cache is
+    // available — without it `displayed` stays empty forever and
+    // the timer would tick uselessly. Captures the panel weakly
+    // so the source returns `ControlFlow::Break` once any panel
+    // widget has been dropped (otherwise GLib runs it forever,
+    // holding a strong chain into the `displayed` vec and its
+    // widgets).
+    // Auto-record-on-pass state machine (#482b). Driven from the
+    // same 1 Hz tick that updates pass-row countdowns — no second
+    // GLib source. The recorder itself is pure (returns
+    // `Vec<RecorderAction>`); the closure below interprets each
+    // action against the live UI / DSP / filesystem.
+    let recorder: Rc<RefCell<sidebar::satellites_recorder::AutoRecorder>> = Rc::new(RefCell::new(
+        sidebar::satellites_recorder::AutoRecorder::new(),
+    ));
+
+    let interpret_action = build_recorder_interpreter(
+        panels,
+        state,
+        cache,
+        toast_overlay,
+        tune_to_satellite,
+        set_playing,
+    );
+
+    // Stash a `Weak` handle to the interpreter on AppState so
+    // the `AcarsEnabledChanged(Ok(false))` arm in
+    // `handle_dsp_message` can replay deferred AOS actions
+    // without needing the closure plumbed through its parameter
+    // list. Stored weakly to avoid an `AppState` ↔ closure
+    // retain cycle (the closure captures `Rc<AppState>`
+    // transitively); the strong owner is the recorder tick
+    // `glib::timeout_add_local`. Issue #589 / CR round 1 on
+    // PR #591.
+    *state.recorder_action_interpreter.borrow_mut() = Some(Rc::downgrade(&interpret_action));
+
+    if cache.is_some() {
+        arm_recorder_tick(TickDeps {
+            panel_weak: panel_weak.clone(),
+            state: Rc::clone(state),
+            displayed: Rc::clone(&displayed),
+            recompute: Rc::clone(&recompute),
+            recorder: Rc::clone(&recorder),
+            interpret: Rc::clone(&interpret_action),
+            spectrum: Rc::clone(spectrum_handle),
+            config: std::sync::Arc::clone(config),
+            watched: Rc::clone(&watched),
+            notify_scheduler: Rc::clone(&notify_scheduler),
+            bandwidth_row: panels.radio.bandwidth_row.clone(),
+            scanner_switch: panels.scanner.master_switch.clone(),
+            squelch_enabled_row: panels.radio.squelch_enabled_row.clone(),
+            auto_squelch_row: panels.radio.auto_squelch_row.clone(),
+            squelch_level_row: panels.radio.squelch_level_row.clone(),
+            ctcss_row: panels.radio.ctcss_row.clone(),
+            fm_if_nr_row: panels.radio.fm_if_nr_row.clone(),
+            deemphasis_row: panels.radio.deemphasis_row.clone(),
+            notch_enabled_row: panels.radio.notch_enabled_row.clone(),
+            doppler_switch: panels.satellites.doppler_switch.clone(),
+        });
+    }
+}
+
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -783,9 +871,7 @@ pub(super) fn connect_satellites_panel(
     set_playing: &Rc<dyn Fn(bool)>,
     status_bar: &Rc<StatusBar>,
 ) {
-    use sidebar::satellites_notify::NotifyScheduler;
     use sidebar::satellites_panel::{SatellitesPanelWeak, load_watched_satellites};
-    use sidebar::satellites_recorder::AutoRecorder;
 
     // Borrow the panel for synchronous setup, then capture only
     // weak refs in long-lived closures. Cloning the strong panel
@@ -811,8 +897,6 @@ pub(super) fn connect_satellites_panel(
     // 1 Hz tick that drives the scheduler.
     let watched: Rc<RefCell<std::collections::HashSet<u32>>> =
         Rc::new(RefCell::new(load_watched_satellites(config)));
-    let notify_scheduler: Rc<RefCell<NotifyScheduler>> =
-        Rc::new(RefCell::new(NotifyScheduler::new()));
 
     let recompute = build_recompute(
         cache.as_ref(),
@@ -854,64 +938,20 @@ pub(super) fn connect_satellites_panel(
 
     wire_zip_lookup(panel, &panel_weak);
 
-    // 1 Hz countdown ticker. Only scheduled when the cache is
-    // available — without it `displayed` stays empty forever and
-    // the timer would tick uselessly. Captures the panel weakly
-    // so the source returns `ControlFlow::Break` once any panel
-    // widget has been dropped (otherwise GLib runs it forever,
-    // holding a strong chain into the `displayed` vec and its
-    // widgets).
-    // Auto-record-on-pass state machine (#482b). Driven from the
-    // same 1 Hz tick that updates pass-row countdowns — no second
-    // GLib source. The recorder itself is pure (returns
-    // `Vec<RecorderAction>`); the closure below interprets each
-    // action against the live UI / DSP / filesystem.
-    let recorder: Rc<RefCell<AutoRecorder>> = Rc::new(RefCell::new(AutoRecorder::new()));
-
-    let interpret_action = build_recorder_interpreter(
+    wire_recorder(
         panels,
         state,
-        cache.as_ref(),
+        config,
         toast_overlay,
+        spectrum_handle,
         tune_to_satellite,
         set_playing,
+        &panel_weak,
+        &displayed,
+        &recompute,
+        &watched,
+        cache.as_ref(),
     );
-
-    // Stash a `Weak` handle to the interpreter on AppState so
-    // the `AcarsEnabledChanged(Ok(false))` arm in
-    // `handle_dsp_message` can replay deferred AOS actions
-    // without needing the closure plumbed through its parameter
-    // list. Stored weakly to avoid an `AppState` ↔ closure
-    // retain cycle (the closure captures `Rc<AppState>`
-    // transitively); the strong owner is the recorder tick
-    // `glib::timeout_add_local`. Issue #589 / CR round 1 on
-    // PR #591.
-    *state.recorder_action_interpreter.borrow_mut() = Some(Rc::downgrade(&interpret_action));
-
-    if cache.is_some() {
-        arm_recorder_tick(TickDeps {
-            panel_weak: panel_weak.clone(),
-            state: Rc::clone(state),
-            displayed: Rc::clone(&displayed),
-            recompute: Rc::clone(&recompute),
-            recorder: Rc::clone(&recorder),
-            interpret: Rc::clone(&interpret_action),
-            spectrum: Rc::clone(spectrum_handle),
-            config: std::sync::Arc::clone(config),
-            watched: Rc::clone(&watched),
-            notify_scheduler: Rc::clone(&notify_scheduler),
-            bandwidth_row: panels.radio.bandwidth_row.clone(),
-            scanner_switch: panels.scanner.master_switch.clone(),
-            squelch_enabled_row: panels.radio.squelch_enabled_row.clone(),
-            auto_squelch_row: panels.radio.auto_squelch_row.clone(),
-            squelch_level_row: panels.radio.squelch_level_row.clone(),
-            ctcss_row: panels.radio.ctcss_row.clone(),
-            fm_if_nr_row: panels.radio.fm_if_nr_row.clone(),
-            deemphasis_row: panels.radio.deemphasis_row.clone(),
-            notch_enabled_row: panels.radio.notch_enabled_row.clone(),
-            doppler_switch: panels.satellites.doppler_switch.clone(),
-        });
-    }
 }
 
 /// Everything the auto-recorder action interpreter needs, captured
