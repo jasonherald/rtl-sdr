@@ -921,10 +921,10 @@ fn on_recorder_aos(
 
     match protocol {
         sdr_sat::ImagingProtocol::Apt => {
-            aos_apt(deps, &satellite, norad_id, freq_hz, mode, bandwidth_hz);
+            aos_apt(deps, norad_id, freq_hz, mode, bandwidth_hz);
         }
         sdr_sat::ImagingProtocol::Lrpt => {
-            aos_lrpt(deps, &satellite, norad_id, freq_hz, mode, bandwidth_hz);
+            aos_lrpt(deps, norad_id, freq_hz, mode, bandwidth_hz);
         }
         sdr_sat::ImagingProtocol::Sstv => {
             aos_sstv(deps, norad_id, freq_hz, mode, bandwidth_hz);
@@ -936,7 +936,6 @@ fn on_recorder_aos(
 /// gate (#817).
 fn aos_apt(
     deps: &RecorderDeps,
-    satellite: &str,
     norad_id: u32,
     freq_hz: u64,
     mode: sdr_types::DemodMode,
@@ -1028,7 +1027,6 @@ fn aos_apt(
 /// gate (#817).
 fn aos_lrpt(
     deps: &RecorderDeps,
-    satellite: &str,
     norad_id: u32,
     freq_hz: u64,
     mode: sdr_types::DemodMode,
