@@ -328,120 +328,22 @@ pub(super) fn connect_transcript_panel(
                             return glib::ControlFlow::Break;
                         };
 
-                        loop {
-                            match event_rx.try_recv() {
-                                Ok(event) => match event {
-                                    TranscriptionEvent::Downloading { progress_pct } => {
-                                        status.set_text(&format!(
-                                            "Downloading model ({progress_pct}%)..."
-                                        ));
-                                        status.set_visible(true);
-                                        progress.set_fraction(f64::from(progress_pct) / 100.0);
-                                        progress.set_visible(true);
-                                    }
-                                    TranscriptionEvent::Ready => {
-                                        status.set_text("Listening...");
-                                        status.set_css_classes(&["success"]);
-                                        progress.set_visible(false);
-                                    }
-                                    TranscriptionEvent::Partial { text } => {
-                                        #[cfg(feature = "sherpa")]
-                                        show_live_partial(
-                                            &text,
-                                            &model_row_weak,
-                                            &display_mode_row_weak,
-                                            &live_line_weak,
-                                        );
-                                        #[cfg(not(feature = "sherpa"))]
-                                        {
-                                            // Whisper never emits Partial, but
-                                            // the enum variant is compiled in.
-                                            // Defensive no-op.
-                                            let _ = text;
-                                        }
-                                    }
-                                    TranscriptionEvent::Text { timestamp, text } => {
-                                        append_transcribed_line(
-                                            &tv,
-                                            &state_for_marker,
-                                            &timestamp,
-                                            &text,
-                                        );
-                                        // An utterance committed — the live
-                                        // line is now stale. Clear and hide
-                                        // it so the next Partial starts fresh.
-                                        #[cfg(feature = "sherpa")]
-                                        clear_live_line(&live_line_weak);
-                                    }
-                                    TranscriptionEvent::Error(msg) => {
-                                        // Fatal — backend has exited.
-                                        // Mirror the synchronous start()
-                                        // failure teardown so the UI
-                                        // isn't left locked.
-                                        teardown_failed_session(
-                                            &session_rows,
-                                            &enable_row_weak,
-                                            &status,
-                                            &progress,
-                                            &msg,
-                                            #[cfg(feature = "sherpa")]
-                                            &live_line_weak,
-                                        );
-                                        return glib::ControlFlow::Break;
-                                    }
-                                },
-                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    // Distinguish a normal user-initiated stop
-                                    // from a spontaneous backend death:
-                                    //
-                                    // - User stop: the off branch of
-                                    //   enable_row.connect_active_notify already
-                                    //   ran (it dropped audio_tx, which is what
-                                    //   caused the worker to exit and drop
-                                    //   event_tx, which we're now seeing as
-                                    //   Disconnected). The toggle is already
-                                    //   inactive and all the rows have been
-                                    //   re-enabled. Nothing to do here — the
-                                    //   off branch did the cleanup. Without
-                                    //   this check the disconnect arm overwrote
-                                    //   the off branch's clean state with a
-                                    //   spurious "Transcription stopped
-                                    //   unexpectedly" error message on every
-                                    //   normal stop.
-                                    //
-                                    // - Spontaneous death: the worker dropped
-                                    //   event_tx without the user clicking
-                                    //   anything. The toggle is still active.
-                                    //   Mirror the Error arm's teardown so the
-                                    //   UI doesn't strand the user with locked
-                                    //   controls and a stale "Listening..."
-                                    //   status.
-                                    let was_user_stop =
-                                        enable_row_weak.upgrade().is_none_or(|e| !e.is_active());
-
-                                    if was_user_stop {
-                                        tracing::debug!(
-                                            "transcription event channel closed (user stop)"
-                                        );
-                                        return glib::ControlFlow::Break;
-                                    }
-
-                                    tracing::warn!(
-                                        "transcription event channel disconnected unexpectedly"
-                                    );
-                                    teardown_failed_session(
-                                        &session_rows,
-                                        &enable_row_weak,
-                                        &status,
-                                        &progress,
-                                        "Transcription stopped unexpectedly",
-                                        #[cfg(feature = "sherpa")]
-                                        &live_line_weak,
-                                    );
-                                    return glib::ControlFlow::Break;
-                                }
-                            }
+                        if let Some(flow) = drain_transcription_events(
+                            &event_rx,
+                            &status,
+                            &progress,
+                            &tv,
+                            &state_for_marker,
+                            &session_rows,
+                            &enable_row_weak,
+                            #[cfg(feature = "sherpa")]
+                            &model_row_weak,
+                            #[cfg(feature = "sherpa")]
+                            &display_mode_row_weak,
+                            #[cfg(feature = "sherpa")]
+                            &live_line_weak,
+                        ) {
+                            return flow;
                         }
                         glib::ControlFlow::Continue
                     });
@@ -483,6 +385,132 @@ pub(super) fn connect_transcript_panel(
     });
 
     engine
+}
+
+/// Drain pending backend events for one poll tick of an active
+/// transcription session. Returns `Some(Break)` on a terminal event
+/// (fatal error, channel disconnect) and `None` when the queue is
+/// drained and polling should continue. Split out per the 50-NLOC
+/// gate (#817).
+#[allow(clippy::too_many_arguments)]
+fn drain_transcription_events(
+    event_rx: &std::sync::mpsc::Receiver<sdr_transcription::TranscriptionEvent>,
+    status: &gtk4::Label,
+    progress: &gtk4::ProgressBar,
+    tv: &gtk4::TextView,
+    state_for_marker: &Rc<AppState>,
+    session_rows: &SessionRowWeaks,
+    enable_row_weak: &glib::WeakRef<adw::SwitchRow>,
+    #[cfg(feature = "sherpa")] model_row_weak: &glib::WeakRef<adw::ComboRow>,
+    #[cfg(feature = "sherpa")] display_mode_row_weak: &glib::WeakRef<adw::ComboRow>,
+    #[cfg(feature = "sherpa")] live_line_weak: &glib::WeakRef<gtk4::Label>,
+) -> Option<glib::ControlFlow> {
+    use sdr_transcription::TranscriptionEvent;
+
+    loop {
+        match event_rx.try_recv() {
+            Ok(event) => match event {
+                TranscriptionEvent::Downloading { progress_pct } => {
+                    status.set_text(&format!("Downloading model ({progress_pct}%)..."));
+                    status.set_visible(true);
+                    progress.set_fraction(f64::from(progress_pct) / 100.0);
+                    progress.set_visible(true);
+                }
+                TranscriptionEvent::Ready => {
+                    status.set_text("Listening...");
+                    status.set_css_classes(&["success"]);
+                    progress.set_visible(false);
+                }
+                TranscriptionEvent::Partial { text } => {
+                    #[cfg(feature = "sherpa")]
+                    show_live_partial(
+                        &text,
+                        &model_row_weak,
+                        &display_mode_row_weak,
+                        &live_line_weak,
+                    );
+                    #[cfg(not(feature = "sherpa"))]
+                    {
+                        // Whisper never emits Partial, but
+                        // the enum variant is compiled in.
+                        // Defensive no-op.
+                        let _ = text;
+                    }
+                }
+                TranscriptionEvent::Text { timestamp, text } => {
+                    append_transcribed_line(&tv, &state_for_marker, &timestamp, &text);
+                    // An utterance committed — the live
+                    // line is now stale. Clear and hide
+                    // it so the next Partial starts fresh.
+                    #[cfg(feature = "sherpa")]
+                    clear_live_line(&live_line_weak);
+                }
+                TranscriptionEvent::Error(msg) => {
+                    // Fatal — backend has exited.
+                    // Mirror the synchronous start()
+                    // failure teardown so the UI
+                    // isn't left locked.
+                    teardown_failed_session(
+                        &session_rows,
+                        &enable_row_weak,
+                        &status,
+                        &progress,
+                        &msg,
+                        #[cfg(feature = "sherpa")]
+                        &live_line_weak,
+                    );
+                    return Some(glib::ControlFlow::Break);
+                }
+            },
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Distinguish a normal user-initiated stop
+                // from a spontaneous backend death:
+                //
+                // - User stop: the off branch of
+                //   enable_row.connect_active_notify already
+                //   ran (it dropped audio_tx, which is what
+                //   caused the worker to exit and drop
+                //   event_tx, which we're now seeing as
+                //   Disconnected). The toggle is already
+                //   inactive and all the rows have been
+                //   re-enabled. Nothing to do here — the
+                //   off branch did the cleanup. Without
+                //   this check the disconnect arm overwrote
+                //   the off branch's clean state with a
+                //   spurious "Transcription stopped
+                //   unexpectedly" error message on every
+                //   normal stop.
+                //
+                // - Spontaneous death: the worker dropped
+                //   event_tx without the user clicking
+                //   anything. The toggle is still active.
+                //   Mirror the Error arm's teardown so the
+                //   UI doesn't strand the user with locked
+                //   controls and a stale "Listening..."
+                //   status.
+                let was_user_stop = enable_row_weak.upgrade().is_none_or(|e| !e.is_active());
+
+                if was_user_stop {
+                    tracing::debug!("transcription event channel closed (user stop)");
+                    return Some(glib::ControlFlow::Break);
+                }
+
+                tracing::warn!("transcription event channel disconnected unexpectedly");
+                teardown_failed_session(
+                    &session_rows,
+                    &enable_row_weak,
+                    &status,
+                    &progress,
+                    "Transcription stopped unexpectedly",
+                    #[cfg(feature = "sherpa")]
+                    &live_line_weak,
+                );
+                return Some(glib::ControlFlow::Break);
+            }
+        }
+    }
+    None
 }
 
 /// Disable every transcription settings row for the duration of a
