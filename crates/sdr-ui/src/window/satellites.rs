@@ -1473,148 +1473,27 @@ fn on_save_lrpt_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
         // `pass_decoded_nothing` below, since there's
         // nothing to retry. Per CR round 9 on PR #554
         // + silent-pass cleanup 2026-05-08.
-        let (result_msg, save_ok) = gio::spawn_blocking(move || {
-        if snapshots.is_empty() {
-            tracing::warn!(
-                "auto-record SaveLrptPass but no APIDs were decoded — pass produced no imagery",
-            );
-            return (
-                format!(
-                    "Pass complete, but no LRPT channels decoded — nothing saved to {}",
-                    dir.display()
-                ),
-                false,
-            );
-        }
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            // Per-pass directory created up
-            // front so a disk-full / permissions
-            // failure surfaces as a single
-            // observable error rather than `N`
-            // per-channel warnings. Per
-            // CodeRabbit round 1 on PR #543.
-            tracing::warn!(
-                "auto-record SaveLrptPass: failed to create directory {dir:?}: {e}",
-            );
-            return (
-                format!("Pass complete but couldn't create {}: {e}", dir.display()),
-                false,
-            );
-        }
-        let mut saved = 0_usize;
-        let mut errors: Vec<String> = Vec::new();
-        for (apid, snap) in snapshots {
-            let path = dir.join(format!("apid{apid}.png"));
-            match crate::lrpt_viewer::write_greyscale_png(
-                &path,
-                &snap.pixels,
-                sdr_lrpt::image::IMAGE_WIDTH,
-                snap.lines,
-            ) {
-                Ok(()) => {
-                    tracing::info!(
-                        ?path,
-                        apid,
-                        lines = snap.lines,
-                        "auto-record LRPT channel saved",
-                    );
-                    saved += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "auto-record LRPT export for APID {apid} to {path:?} failed: {e}",
-                    );
-                    errors.push(format!("APID {apid}: {e}"));
-                }
-            }
-        }
-        // Composite PNGs alongside the per-APID
-        // files. Filename is `composite-{slug}.png`
-        // where `slug` is the recipe name with
-        // spaces replaced by `-` and path
-        // separators replaced by `_` so the disk
-        // layout is portable across filesystems.
-        //
-        // The RGB interleave runs HERE — inside the
-        // `gio::spawn_blocking` worker — so the
-        // ~30 ms per-recipe per-pixel walk doesn't
-        // block the GTK main thread. The assembler
-        // lock was released after the cheap channel
-        // memcpy in the snapshot phase above. Per
-        // CR round 1 on PR #575.
-        for (recipe, snap) in composite_snapshots {
-            let rgb = sdr_lrpt::image::assemble_rgb_composite(
-                &snap.r_pixels,
-                &snap.g_pixels,
-                &snap.b_pixels,
-                snap.height,
-            );
-            let width = sdr_lrpt::image::IMAGE_WIDTH;
-            let height = snap.height;
-            let slug = recipe
-                .name
-                .replace(' ', "-")
-                .replace(['/', '\\'], "_");
-            let path = dir.join(format!("composite-{slug}.png"));
-            match crate::lrpt_viewer::write_rgb_png(&path, &rgb, width, height) {
-                Ok(()) => {
-                    tracing::info!(
-                        ?path,
-                        recipe = recipe.name,
-                        width,
-                        height,
-                        "auto-record LRPT composite saved",
-                    );
-                    saved += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "auto-record LRPT composite {} to {path:?} failed: {e}",
-                        recipe.name,
-                    );
-                    errors.push(format!("Composite {}: {e}", recipe.name));
-                }
-            }
-        }
-        let msg = if errors.is_empty() {
-            format!(
-                "Pass complete — {saved} LRPT file(s) saved to {}",
-                dir.display()
-            )
-        } else {
-            format!(
-                "Pass complete — {saved} file(s) saved, {} failed: {}",
-                errors.len(),
-                errors.join("; ")
-            )
-        };
-        // Treat "at least one channel saved" as
-        // success for close-purposes — partial-
-        // success outcomes still produced disk
-        // artifacts the user can inspect.
-        (msg, saved > 0)
-    })
-    .await
-    .unwrap_or_else(|e| {
-        // `gio::spawn_blocking`'s join error is a
-        // panic payload (`Box<dyn Any + Send>`),
-        // which doesn't implement `Display`.
-        // Format via `Debug` on the worker side
-        // and just report a generic message to
-        // the user — a panicking PNG encoder is
-        // a logic bug, not something the user
-        // can act on.
-        tracing::warn!(
-            "auto-record SaveLrptPass: worker thread panicked: {e:?}",
-        );
-        (
-            format!(
-                "Pass complete but PNG worker panicked (target was {})",
-                dir_for_msg.display()
-            ),
-            false,
-        )
-    });
+        let (result_msg, save_ok) =
+            gio::spawn_blocking(move || save_lrpt_files(&dir, snapshots, composite_snapshots))
+                .await
+                .unwrap_or_else(|e| {
+                    // `gio::spawn_blocking`'s join error is a
+                    // panic payload (`Box<dyn Any + Send>`),
+                    // which doesn't implement `Display`.
+                    // Format via `Debug` on the worker side
+                    // and just report a generic message to
+                    // the user — a panicking PNG encoder is
+                    // a logic bug, not something the user
+                    // can act on.
+                    tracing::warn!("auto-record SaveLrptPass: worker thread panicked: {e:?}",);
+                    (
+                        format!(
+                            "Pass complete but PNG worker panicked (target was {})",
+                            dir_for_msg.display()
+                        ),
+                        false,
+                    )
+                });
         post_toast(&toast_overlay_weak_for_save, &result_msg);
         // Mark the LRPT pass as no-longer-recording for
         // the close-to-tray Quit-confirmation predicate.
@@ -1705,6 +1584,136 @@ fn on_save_lrpt_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
             window.close();
         }
     });
+}
+
+/// Save one LRPT pass to disk: per-pass directory, one greyscale PNG
+/// per decoded APID, and the enabled RGB composites alongside.
+/// Returns the toast message plus a "close-worthy" success flag —
+/// at least one file saved counts (partial-success outcomes still
+/// produced disk artifacts the user can inspect). Runs inside
+/// `gio::spawn_blocking`: the ~30 ms per-recipe RGB interleave and
+/// all PNG encoding stay off the GTK main thread (CR round 1 on
+/// PR #575).
+fn save_lrpt_files(
+    dir: &std::path::Path,
+    snapshots: Vec<(u16, sdr_lrpt::image::ChannelBuffer)>,
+    composite_snapshots: Vec<(
+        crate::lrpt_viewer::CompositeRecipe,
+        sdr_lrpt::image::CompositeSnapshot,
+    )>,
+) -> (String, bool) {
+    if snapshots.is_empty() {
+        tracing::warn!(
+            "auto-record SaveLrptPass but no APIDs were decoded — pass produced no imagery",
+        );
+        return (
+            format!(
+                "Pass complete, but no LRPT channels decoded — nothing saved to {}",
+                dir.display()
+            ),
+            false,
+        );
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        // Per-pass directory created up
+        // front so a disk-full / permissions
+        // failure surfaces as a single
+        // observable error rather than `N`
+        // per-channel warnings. Per
+        // CodeRabbit round 1 on PR #543.
+        tracing::warn!("auto-record SaveLrptPass: failed to create directory {dir:?}: {e}",);
+        return (
+            format!("Pass complete but couldn't create {}: {e}", dir.display()),
+            false,
+        );
+    }
+    let mut saved = 0_usize;
+    let mut errors: Vec<String> = Vec::new();
+    for (apid, snap) in snapshots {
+        let path = dir.join(format!("apid{apid}.png"));
+        match crate::lrpt_viewer::write_greyscale_png(
+            &path,
+            &snap.pixels,
+            sdr_lrpt::image::IMAGE_WIDTH,
+            snap.lines,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    ?path,
+                    apid,
+                    lines = snap.lines,
+                    "auto-record LRPT channel saved",
+                );
+                saved += 1;
+            }
+            Err(e) => {
+                tracing::warn!("auto-record LRPT export for APID {apid} to {path:?} failed: {e}",);
+                errors.push(format!("APID {apid}: {e}"));
+            }
+        }
+    }
+    // Composite PNGs alongside the per-APID
+    // files. Filename is `composite-{slug}.png`
+    // where `slug` is the recipe name with
+    // spaces replaced by `-` and path
+    // separators replaced by `_` so the disk
+    // layout is portable across filesystems.
+    //
+    // The RGB interleave runs HERE — inside the
+    // `gio::spawn_blocking` worker — so the
+    // ~30 ms per-recipe per-pixel walk doesn't
+    // block the GTK main thread. The assembler
+    // lock was released after the cheap channel
+    // memcpy in the snapshot phase above. Per
+    // CR round 1 on PR #575.
+    for (recipe, snap) in composite_snapshots {
+        let rgb = sdr_lrpt::image::assemble_rgb_composite(
+            &snap.r_pixels,
+            &snap.g_pixels,
+            &snap.b_pixels,
+            snap.height,
+        );
+        let width = sdr_lrpt::image::IMAGE_WIDTH;
+        let height = snap.height;
+        let slug = recipe.name.replace(' ', "-").replace(['/', '\\'], "_");
+        let path = dir.join(format!("composite-{slug}.png"));
+        match crate::lrpt_viewer::write_rgb_png(&path, &rgb, width, height) {
+            Ok(()) => {
+                tracing::info!(
+                    ?path,
+                    recipe = recipe.name,
+                    width,
+                    height,
+                    "auto-record LRPT composite saved",
+                );
+                saved += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "auto-record LRPT composite {} to {path:?} failed: {e}",
+                    recipe.name,
+                );
+                errors.push(format!("Composite {}: {e}", recipe.name));
+            }
+        }
+    }
+    let msg = if errors.is_empty() {
+        format!(
+            "Pass complete — {saved} LRPT file(s) saved to {}",
+            dir.display()
+        )
+    } else {
+        format!(
+            "Pass complete — {saved} file(s) saved, {} failed: {}",
+            errors.len(),
+            errors.join("; ")
+        )
+    };
+    // Treat "at least one channel saved" as
+    // success for close-purposes — partial-
+    // success outcomes still produced disk
+    // artifacts the user can inspect.
+    (msg, saved > 0)
 }
 
 /// LOS save for an SSTV pass: drain completed frames (+ retained
