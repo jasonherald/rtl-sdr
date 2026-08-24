@@ -4,6 +4,23 @@
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
+/// Shared favorites map: stable `hostname:port` key → rich
+/// [`sidebar::source_panel::FavoriteEntry`]. Single instance owned by
+/// `connect_sidebar_panels`, mutated by the role picker and the
+/// discovery re-announce path.
+type FavoritesMap =
+    Rc<RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>>;
+
+/// Live discovered-server rows keyed by server key, plus the announce
+/// snapshot each row was rendered from.
+type DisplayedRowsMap =
+    Rc<RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>>;
+
+/// Weak handles to each discovered row's star `ToggleButton`, keyed by
+/// server key, for unstar-refresh sync.
+type StarButtonsMap =
+    Rc<RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>>;
+
 use super::{
     AppState, Browser, DECIMATION_FACTORS, DEVICE_FILE, DEVICE_NETWORK, DEVICE_RTLSDR,
     DEVICE_RTLTCP, DiscoveredServer, DiscoveryEvent, Duration, FavoritesHeaderHandle,
@@ -374,8 +391,7 @@ struct DiscoveredRowDeps {
     state: Rc<AppState>,
     config: std::sync::Arc<sdr_config::ConfigManager>,
     favorite_row_ctx: Rc<FavoriteRowContext>,
-    discovered_star_buttons:
-        Rc<RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>>,
+    discovered_star_buttons: StarButtonsMap,
     expander_weak: glib::WeakRef<adw::ExpanderRow>,
 }
 
@@ -415,9 +431,7 @@ pub(super) fn connect_rtl_tcp_discovery(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     favorites_header: &FavoritesHeaderHandle,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites: &FavoritesMap,
 ) {
     wire_manage_favorites_button(panels, favorites_header);
 
@@ -511,10 +525,7 @@ pub(super) fn connect_rtl_tcp_discovery(
 /// Weak refs only — the `ToggleButton`s are strongly owned by their
 /// rows. Split out per the 50-NLOC gate (#817).
 #[allow(clippy::type_complexity)]
-fn new_discovery_maps() -> (
-    Rc<RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>>,
-    Rc<RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>>,
-) {
+fn new_discovery_maps() -> (DisplayedRowsMap, StarButtonsMap) {
     (
         Rc::new(RefCell::new(std::collections::HashMap::new())),
         Rc::new(RefCell::new(std::collections::HashMap::new())),
@@ -528,9 +539,7 @@ fn build_row_deps(
     state: &Rc<AppState>,
     config_for_discovery: &std::sync::Arc<sdr_config::ConfigManager>,
     favorite_row_ctx: &Rc<FavoriteRowContext>,
-    discovered_star_buttons: &Rc<
-        RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>,
-    >,
+    discovered_star_buttons: &StarButtonsMap,
     expander_weak: &glib::WeakRef<adw::ExpanderRow>,
 ) -> Rc<DiscoveredRowDeps> {
     Rc::new(DiscoveredRowDeps {
@@ -583,12 +592,8 @@ fn wire_favorites_popover_refresh(
 fn arm_discovery_poller(
     browser: Option<Browser>,
     disc_rx: mpsc::Receiver<DiscoveryEvent>,
-    displayed_rows: &Rc<
-        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
-    >,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    displayed_rows: &DisplayedRowsMap,
+    favorites: &FavoritesMap,
     row_deps: &Rc<DiscoveredRowDeps>,
     expander_weak: &glib::WeakRef<adw::ExpanderRow>,
 ) {
@@ -628,19 +633,13 @@ fn arm_discovery_poller(
 #[allow(clippy::too_many_arguments)]
 fn build_favorite_row_ctx(
     favorites_popover_weak: &FavoritesPopoverWeak,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites: &FavoritesMap,
     config_for_discovery: &std::sync::Arc<sdr_config::ConfigManager>,
     state: &Rc<AppState>,
     panels: &SidebarPanels,
     expander_weak: &glib::WeakRef<adw::ExpanderRow>,
-    displayed_rows: &Rc<
-        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
-    >,
-    discovered_star_buttons: &Rc<
-        RefCell<std::collections::HashMap<String, glib::WeakRef<gtk4::ToggleButton>>>,
-    >,
+    displayed_rows: &DisplayedRowsMap,
+    discovered_star_buttons: &StarButtonsMap,
 ) -> Rc<FavoriteRowContext> {
     Rc::new(FavoriteRowContext {
         popover: favorites_popover_weak.clone(),
@@ -701,13 +700,9 @@ fn start_discovery_browser(
 /// (#817).
 fn drain_discovery_events(
     disc_rx: &mpsc::Receiver<DiscoveryEvent>,
-    displayed_rows: &Rc<
-        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
-    >,
+    displayed_rows: &DisplayedRowsMap,
     expander: &adw::ExpanderRow,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites: &FavoritesMap,
     row_deps: &Rc<DiscoveredRowDeps>,
 ) -> glib::ControlFlow {
     loop {
@@ -763,13 +758,9 @@ fn drain_discovery_events(
 /// favorites-first ordering. Split out per the 50-NLOC gate (#817).
 fn on_server_announced(
     server: DiscoveredServer,
-    displayed_rows: &Rc<
-        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
-    >,
+    displayed_rows: &DisplayedRowsMap,
     expander: &adw::ExpanderRow,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites: &FavoritesMap,
     deps: &Rc<DiscoveredRowDeps>,
 ) {
     use std::time::Instant;
@@ -848,6 +839,33 @@ fn on_server_announced(
     expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
 }
 
+/// Announce-derived metadata of one discovered server, captured at
+/// star-button wiring time so a fresh star persists nickname/tuner/
+/// gain/auth alongside the key.
+struct StarredServerInfo {
+    key: String,
+    nickname: String,
+    tuner_name: Option<String>,
+    gain_count: Option<u32>,
+    auth_required: Option<bool>,
+}
+
+impl StarredServerInfo {
+    /// Fresh favorite record for this server, stamped with the
+    /// current time as `last_seen`.
+    fn to_favorite_entry(&self) -> sidebar::source_panel::FavoriteEntry {
+        sidebar::source_panel::FavoriteEntry {
+            key: self.key.clone(),
+            nickname: self.nickname.clone(),
+            tuner_name: self.tuner_name.clone(),
+            gain_count: self.gain_count,
+            last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
+            requested_role: None,
+            auth_required: self.auth_required,
+        }
+    }
+}
+
 /// Toggle body of a discovered-server star button: flip the icon +
 /// accessible name, insert/remove + persist the favorite, and refresh
 /// row order + the header popover. Split out per the 50-NLOC gate
@@ -855,18 +873,13 @@ fn on_server_announced(
 #[allow(clippy::too_many_arguments)]
 fn on_discovery_star_toggled(
     btn: &gtk4::ToggleButton,
-    star_key: &str,
-    star_nickname: &str,
-    star_tuner_name: Option<&str>,
-    star_gain_count: Option<u32>,
-    star_auth_required: Option<bool>,
-    star_favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    info: &StarredServerInfo,
+    star_favorites: &FavoritesMap,
     star_config: &std::sync::Arc<sdr_config::ConfigManager>,
     star_expander_weak: &glib::WeakRef<adw::ExpanderRow>,
     star_row_ctx: &Rc<FavoriteRowContext>,
 ) {
+    let star_key = info.key.as_str();
     let active = btn.is_active();
     btn.set_icon_name(if active {
         FAVORITE_ICON_FILLED
@@ -885,28 +898,10 @@ fn on_discovery_star_toggled(
             // current metadata. Replaces any
             // older entry with the same key
             // (= metadata refresh on re-star).
-            favs.insert(
-                star_key.to_string(),
-                sidebar::source_panel::FavoriteEntry {
-                    key: star_key.to_string(),
-                    nickname: star_nickname.to_string(),
-                    tuner_name: star_tuner_name.map(str::to_owned),
-                    gain_count: star_gain_count,
-                    last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
-                    // Fresh star — no role preference
-                    // yet; `auth_required` is captured
-                    // from the current mDNS announce's
-                    // TXT record above so
-                    // `apply_rtl_tcp_connect` + the
-                    // startup restore can pre-reveal
-                    // the key row immediately, without
-                    // waiting on a mDNS re-announce.
-                    // Per `CodeRabbit` round 6 on
-                    // PR #408 and issue #396.
-                    requested_role: None,
-                    auth_required: star_auth_required,
-                },
-            );
+            // `to_favorite_entry` stamps the current time and carries
+            // the announce-derived auth hint — see its doc and CR
+            // round 6 on PR #408 / issue #396.
+            favs.insert(star_key.to_string(), info.to_favorite_entry());
         } else {
             favs.remove(star_key);
         }
@@ -943,12 +938,7 @@ fn on_discovery_star_toggled(
 /// Per-tick stale-row prune + "seen N ago" subtitle refresh for the
 /// discovery expander (3-minute grace; healthy responders re-announce
 /// well within it). Split out per the 50-NLOC gate (#817).
-fn prune_stale_discovery_rows(
-    displayed_rows: &Rc<
-        RefCell<std::collections::HashMap<String, (adw::ActionRow, DiscoveredServer)>>,
-    >,
-    expander: &adw::ExpanderRow,
-) {
+fn prune_stale_discovery_rows(displayed_rows: &DisplayedRowsMap, expander: &adw::ExpanderRow) {
     use std::time::Instant;
 
     let mut rows = displayed_rows.borrow_mut();
@@ -1080,23 +1070,35 @@ pub(super) fn set_favorite_toggle_accessible_name(btn: &gtk4::ToggleButton, is_f
 ///
 /// Caller-owned follow-ups (popover `popdown`, etc.) happen after
 /// this helper returns.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "each arg is a distinct widget / state handle the caller owns in its own shape (strong Rc clone vs weak-upgraded strong). Bundling into a struct would duplicate FavoriteRowContext for the favorites caller and invent a mirror struct for the discovery caller, trading argument count for two near-identical shim types."
-)]
+/// Borrowed handles to the six source-panel rows the RTL-TCP connect
+/// path rewrites. Both callers (favorites Connect button, discovered-
+/// row Connect button) build this shim from the row handles they
+/// already own — strong clones or weak-upgraded strongs alike.
+pub(super) struct RtlTcpConnectRows<'a> {
+    pub(super) hostname_row: &'a adw::EntryRow,
+    pub(super) port_row: &'a adw::SpinRow,
+    pub(super) protocol_row: &'a adw::ComboRow,
+    pub(super) device_row: &'a adw::ComboRow,
+    pub(super) role_row: &'a adw::ComboRow,
+    pub(super) auth_key_row: &'a adw::PasswordEntryRow,
+}
+
 pub(super) fn apply_rtl_tcp_connect(
     host: &str,
     port: u16,
     nickname: &str,
-    hostname_row: &adw::EntryRow,
-    port_row: &adw::SpinRow,
-    protocol_row: &adw::ComboRow,
-    device_row: &adw::ComboRow,
-    role_row: &adw::ComboRow,
-    auth_key_row: &adw::PasswordEntryRow,
+    rows: &RtlTcpConnectRows<'_>,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
+    let &RtlTcpConnectRows {
+        hostname_row,
+        port_row,
+        protocol_row,
+        device_row,
+        role_row,
+        auth_key_row,
+    } = rows;
     let already_rtl_tcp = device_row.selected() == DEVICE_RTLTCP;
     // Guard the programmatic row rewrites so the per-field
     // handlers don't clobber `KEY_SOURCE_NETWORK_*` (which belong
@@ -1223,7 +1225,7 @@ impl FavoritesPopoverWeak {
 /// the timer is running and correctly fails when it isn't.
 pub(super) struct FavoriteRowContext {
     popover: FavoritesPopoverWeak,
-    favorites: Rc<RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>>,
+    favorites: FavoritesMap,
     config: std::sync::Arc<sdr_config::ConfigManager>,
     state: Rc<AppState>,
     hostname_row: glib::WeakRef<adw::EntryRow>,
@@ -1648,9 +1650,7 @@ pub(super) fn connect_source_panel(
     toast_overlay: &adw::ToastOverlay,
     server_running: Rc<std::cell::Cell<bool>>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites: &FavoritesMap,
 ) {
     wire_sample_rate_and_device_rows(panels, state, config);
 
@@ -2582,12 +2582,14 @@ fn on_favorite_connect_clicked(
         &host,
         port,
         connect_nickname,
-        &hostname_row,
-        &port_row,
-        &protocol_row,
-        &device_row,
-        &role_row,
-        &auth_key_row,
+        &RtlTcpConnectRows {
+            hostname_row: &hostname_row,
+            port_row: &port_row,
+            protocol_row: &protocol_row,
+            device_row: &device_row,
+            role_row: &role_row,
+            auth_key_row: &auth_key_row,
+        },
         &connect_ctx.state,
         &connect_ctx.config,
     );
@@ -2763,12 +2765,14 @@ fn wire_discovered_connect_button(
             &click_host,
             click_port,
             &click_nickname,
-            &deps_c.hostname_row,
-            &deps_c.port_row,
-            &deps_c.protocol_row,
-            &deps_c.device_row,
-            &deps_c.role_row,
-            &deps_c.auth_key_row,
+            &RtlTcpConnectRows {
+                hostname_row: &deps_c.hostname_row,
+                port_row: &deps_c.port_row,
+                protocol_row: &deps_c.protocol_row,
+                device_row: &deps_c.device_row,
+                role_row: &deps_c.role_row,
+                auth_key_row: &deps_c.auth_key_row,
+            },
             &deps_c.state,
             &deps_c.config,
         );
@@ -2781,9 +2785,7 @@ fn wire_discovered_connect_button(
 fn build_discovery_star_button(
     row: &adw::ActionRow,
     server: &DiscoveredServer,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites: &FavoritesMap,
     deps: &Rc<DiscoveredRowDeps>,
 ) {
     let DiscoveredRowDeps {
@@ -2840,9 +2842,7 @@ fn build_discovery_star_button(
 fn wire_discovery_star_toggle(
     star_btn: &gtk4::ToggleButton,
     server: &DiscoveredServer,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites: &FavoritesMap,
     deps: &Rc<DiscoveredRowDeps>,
 ) {
     let DiscoveredRowDeps {
@@ -2885,14 +2885,17 @@ fn wire_discovery_star_toggle(
     // `FavoriteRowContext.displayed_rows` docstring
     // describes (map → row → signal → ctx → map).
     let star_row_ctx = Rc::clone(favorite_row_ctx);
+    let star_info = StarredServerInfo {
+        key: star_key,
+        nickname: star_nickname,
+        tuner_name: star_tuner_name,
+        gain_count: star_gain_count,
+        auth_required: star_auth_required,
+    };
     star_btn.connect_toggled(move |btn| {
         on_discovery_star_toggled(
             btn,
-            &star_key,
-            &star_nickname,
-            star_tuner_name.as_deref(),
-            star_gain_count,
-            star_auth_required,
+            &star_info,
             &star_favorites,
             &star_config,
             &star_expander_weak,
@@ -2905,9 +2908,7 @@ fn wire_discovery_star_toggle(
 /// Split out per the 50-NLOC gate (#817).
 fn refresh_favorite_metadata(
     server: &DiscoveredServer,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites: &FavoritesMap,
     deps: &Rc<DiscoveredRowDeps>,
 ) {
     let DiscoveredRowDeps {
@@ -3434,9 +3435,7 @@ fn wire_role_and_server_key_rows(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    favorites: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites: &FavoritesMap,
     last_good_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
 ) {
     // Connection-role picker (#396). The selector flips between
@@ -3499,9 +3498,7 @@ fn on_rtl_tcp_role_selected(
     config_for_role: &std::sync::Arc<sdr_config::ConfigManager>,
     hostname_for_role: &adw::EntryRow,
     port_for_role: &adw::SpinRow,
-    favorites_for_role: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites_for_role: &FavoritesMap,
     last_good_for_role: &Rc<RefCell<Option<Vec<u8>>>>,
 ) {
     use crate::sidebar::source_panel::{
@@ -4422,9 +4419,7 @@ fn persist_role_preference(
     config_for_role: &std::sync::Arc<sdr_config::ConfigManager>,
     hostname_for_role: &adw::EntryRow,
     port_for_role: &adw::SpinRow,
-    favorites_for_role: &Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    >,
+    favorites_for_role: &FavoritesMap,
     fav_role: crate::sidebar::source_panel::FavoriteRole,
 ) {
     use crate::sidebar::source_panel::{KEY_RTL_TCP_CLIENT_LAST_ROLE, save_favorites};
