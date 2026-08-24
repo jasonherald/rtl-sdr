@@ -506,7 +506,7 @@ pub(super) fn connect_satellites_panel(
         });
     }
 
-    wire_zip_lookup(panel, &panel_weak, &recompute, config);
+    wire_zip_lookup(panel, &panel_weak);
 
     // 1 Hz countdown ticker. Only scheduled when the cache is
     // available — without it `displayed` stays empty forever and
@@ -2102,8 +2102,6 @@ pub(super) fn connect_satellites_panel(
 fn wire_zip_lookup(
     panel: &sidebar::satellites_panel::SatellitesPanel,
     panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
-    recompute: &Rc<dyn Fn()>,
-    config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
     // ZIP code → lat/lon shortcut. We wire BOTH `apply` (apply
     // button click / Enter when apply-button is sensitive) and
@@ -2156,33 +2154,8 @@ fn wire_zip_lookup(
                 // since it barely matters for pass prediction
                 // anyway, and we'd rather populate lat/lon than
                 // leave the user staring at an error toast.
-                let result = gio::spawn_blocking(move || -> Result<
-                    (sdr_sat::PostalLocation, Result<f64, String>),
-                    sdr_sat::PostalLookupError,
-                > {
-                    let loc = sdr_sat::lookup_us_zip(&zip_for_task)?;
-                    // Elevation lookup is best-effort — a failure here
-                    // shouldn't fail the whole flow, but we DO want
-                    // the provider error to reach the UI so the user
-                    // can see why altitude didn't update. Pass it
-                    // back as `Err(String)` (cheap to send across
-                    // thread, decoupled from `ElevationLookupError`'s
-                    // type, and the log already scrubbed lat/lon).
-                    let elevation = match sdr_sat::lookup_elevation_m(loc.lat_deg, loc.lon_deg)
-                    {
-                        Ok(m) => Ok(m),
-                        Err(e) => {
-                            // Don't include lat/lon in the log — that's user
-                            // location data. The error message itself is
-                            // safe (it's the upstream HTTP error / parse
-                            // error / dataset-coverage error).
-                            tracing::warn!("elevation lookup failed: {e}");
-                            Err(e.to_string())
-                        }
-                    };
-                    Ok((loc, elevation))
-                })
-                .await;
+                let result =
+                    gio::spawn_blocking(move || lookup_zip_and_elevation(&zip_for_task)).await;
 
                 in_flight_done.set(false);
                 let Some(panel) = panel_weak_done.upgrade() else {
@@ -2191,35 +2164,7 @@ fn wire_zip_lookup(
                 panel.zip_row.set_sensitive(true);
 
                 match result {
-                    Ok(Ok((loc, elevation))) => {
-                        // Order matters slightly: setting lat/lon/alt
-                        // fires `value-notify`, which persists the
-                        // value and triggers `recompute`. Three
-                        // recomputes back-to-back is fine —
-                        // sub-millisecond each.
-                        panel.lat_row.set_value(loc.lat_deg);
-                        panel.lon_row.set_value(loc.lon_deg);
-                        let where_text = if loc.region.is_empty() {
-                            loc.place
-                        } else {
-                            format!("{place}, {region}", place = loc.place, region = loc.region)
-                        };
-                        let status = match elevation {
-                            Ok(alt_m) => {
-                                panel.alt_row.set_value(alt_m);
-                                format!("Resolved: {where_text} ({alt_m:.0} m)")
-                            }
-                            Err(e) => {
-                                // Leave altitude alone but
-                                // surface the provider error
-                                // so the user knows what to
-                                // try next (e.g. retry on a
-                                // bad network).
-                                format!("Resolved: {where_text} (altitude unchanged: {e})")
-                            }
-                        };
-                        panel.zip_status_row.set_title(&status);
-                    }
+                    Ok(Ok((loc, elevation))) => apply_zip_result(&panel, loc, elevation),
                     Ok(Err(e)) => {
                         // Don't include the ZIP in the log — user
                         // location data, already surfaced inline in
@@ -2252,6 +2197,55 @@ fn wire_zip_lookup(
             .zip_row
             .connect_entry_activated(move |entry| run(entry.clone()));
     }
+}
+
+/// Chain the ZIP → lat/lon and elevation lookups on the worker
+/// thread so the UI side gets one result. ZIP failure is fatal for
+/// the run; elevation failure is logged (without lat/lon — user
+/// location data) and demoted to `Err(String)` so the provider error
+/// still reaches the UI while lat/lon populate anyway — altitude is
+/// best-effort and barely matters for pass prediction.
+#[allow(clippy::type_complexity)]
+fn lookup_zip_and_elevation(
+    zip: &str,
+) -> Result<(sdr_sat::PostalLocation, Result<f64, String>), sdr_sat::PostalLookupError> {
+    let loc = sdr_sat::lookup_us_zip(zip)?;
+    let elevation = match sdr_sat::lookup_elevation_m(loc.lat_deg, loc.lon_deg) {
+        Ok(m) => Ok(m),
+        Err(e) => {
+            tracing::warn!("elevation lookup failed: {e}");
+            Err(e.to_string())
+        }
+    };
+    Ok((loc, elevation))
+}
+
+/// Apply a successful ZIP lookup to the station rows. Order matters
+/// slightly: setting lat/lon/alt fires `value-notify`, which persists
+/// the value and triggers `recompute`; three recomputes back-to-back
+/// are sub-millisecond each. An elevation failure leaves altitude
+/// alone but surfaces the provider error so the user knows what to
+/// try next.
+fn apply_zip_result(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    loc: sdr_sat::PostalLocation,
+    elevation: Result<f64, String>,
+) {
+    panel.lat_row.set_value(loc.lat_deg);
+    panel.lon_row.set_value(loc.lon_deg);
+    let where_text = if loc.region.is_empty() {
+        loc.place
+    } else {
+        format!("{place}, {region}", place = loc.place, region = loc.region)
+    };
+    let status = match elevation {
+        Ok(alt_m) => {
+            panel.alt_row.set_value(alt_m);
+            format!("Resolved: {where_text} ({alt_m:.0} m)")
+        }
+        Err(e) => format!("Resolved: {where_text} (altitude unchanged: {e})"),
+    };
+    panel.zip_status_row.set_title(&status);
 }
 
 /// Force-refresh every catalog satellite's TLE. `force_refresh` — NOT
