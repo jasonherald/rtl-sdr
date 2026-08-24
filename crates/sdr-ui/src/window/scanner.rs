@@ -237,8 +237,8 @@ pub(super) fn connect_scanner_panel(
     let scanner = &panels.scanner;
 
     wire_scanner_master_switch(panels, state, config, spectrum_handle, scanner);
-
     wire_scanner_lockout_button(state, scanner);
+    wire_scanner_timing_rows(panels, state, config, scanner);
 }
 
 /// Master switch -> `SetScannerEnabled` (notify-driven so F8 / force-disable / DSP syncs all fire it).
@@ -318,7 +318,6 @@ fn wire_scanner_master_switch(
     // construction — plus `build_window` re-seeds the scanner
     // right after `connect_sidebar_panels` returns, which would
     // pile on a second redundant dispatch per slider.
-    wire_scanner_timing_rows(panels, state, config, scanner);
 }
 
 /// Lockout button -> LockoutScannerChannel(active key).

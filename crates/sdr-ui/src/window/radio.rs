@@ -190,9 +190,7 @@ pub(super) fn connect_radio_panel(
     scanner_force_disable: &Rc<ScannerForceDisable>,
 ) {
     wire_bandwidth_rows(panels, state, scanner_force_disable);
-
     wire_squelch_rows(panels, state);
-
     wire_af_rows(panels, state);
 }
 

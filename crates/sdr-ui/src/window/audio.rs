@@ -129,8 +129,8 @@ pub(super) fn connect_volume_persistence(
 /// Connect audio panel controls to DSP commands.
 pub(super) fn connect_audio_panel(panels: &SidebarPanels, state: &Rc<AppState>) {
     wire_sink_selector(panels, state);
-
     wire_network_sink_config(panels, state);
+    wire_recording_toggles(panels, state);
 }
 
 /// Audio device + sink-type selectors (issue #247).
@@ -244,8 +244,6 @@ fn wire_network_sink_config(panels: &SidebarPanels, state: &Rc<AppState>) {
             .network_protocol_row
             .connect_selected_notify(move |_| push());
     }
-
-    wire_recording_toggles(panels, state);
 }
 
 /// Audio recording switch row (the IQ recording toggle is wired in

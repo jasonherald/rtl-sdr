@@ -541,12 +541,8 @@ fn wire_share_auth_controls(
         widgets_weak,
     );
 
-    wire_auth_reveal_copy(
-        panels,
-        current_auth_key,
-        auth_key_revealed,
-        &toast_overlay_weak,
-    );
+    wire_auth_reveal_copy(panels, current_auth_key, auth_key_revealed);
+    wire_auth_copy_button(panels, current_auth_key, &toast_overlay_weak);
 
     wire_auth_regenerate(
         panels,
@@ -1640,7 +1636,6 @@ fn wire_auth_reveal_copy(
     panels: &SidebarPanels,
     current_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
     auth_key_revealed: &Rc<std::cell::Cell<bool>>,
-    toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
 ) {
     // Reveal / conceal button — flips the subtitle between the
     // masked placeholder and the full hex-encoded key. Pure UI
@@ -1679,8 +1674,6 @@ fn wire_auth_reveal_copy(
                 btn.update_property(&[gtk4::accessible::Property::Label("Reveal key")]);
             }
         });
-
-    wire_auth_copy_button(panels, current_auth_key, toast_overlay_weak);
 }
 
 /// Regenerate button: new key to keyring + live server + advertiser refresh.

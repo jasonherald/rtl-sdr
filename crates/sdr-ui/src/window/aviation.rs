@@ -16,10 +16,10 @@ pub(super) fn connect_aviation_panel(
     toast_overlay: &adw::ToastOverlay,
 ) {
     // ─── Region selector seed + signal (issue #581 / #592) ───
-    wire_region_and_custom_rows(panel, state, config, toast_overlay);
-
+    wire_region_row(panel, state, config);
+    wire_custom_channels_row(panel, state, config, toast_overlay);
     wire_acars_enable_switch(panel, state);
-
+    wire_acars_status_tick(panel, state);
     wire_acars_output_rows(panel, state, config);
 }
 
@@ -101,11 +101,10 @@ pub(super) fn format_relative_age(ts: std::time::SystemTime) -> String {
 
 /// Region combo + custom-channels CSV row (seed-then-wire).
 /// Split out per the 50-NLOC gate (#817).
-fn wire_region_and_custom_rows(
+fn wire_region_row(
     panel: &sidebar::aviation_panel::AviationPanel,
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    toast_overlay: &adw::ToastOverlay,
 ) {
     use crate::sidebar::aviation_panel::{rebuild_channel_rows, region_combo_index};
 
@@ -160,7 +159,6 @@ fn wire_region_and_custom_rows(
     }
 
     // ─── Custom-channels apply handler (issue #592) ───
-    wire_custom_channels_row(panel, state, config, toast_overlay);
 }
 
 /// Resolve the persisted ACARS region from config. `"custom"` is a
@@ -286,7 +284,6 @@ fn wire_acars_enable_switch(panel: &sidebar::aviation_panel::AviationPanel, stat
     }
 
     // ─── 4 Hz tick: AppState → switch row + status subtitle + per-channel rows ───
-    wire_acars_status_tick(panel, state);
 }
 
 /// ACARS output-formatter rows (station ID, JSONL log, network feeder) — seed then wire then initial dispatch.
@@ -367,7 +364,7 @@ fn wire_acars_output_rows(
     }
 
     wire_jsonl_output_rows(panel, state, config);
-
+    wire_jsonl_path_row(panel, state, config);
     wire_network_output_rows(panel, state, config);
 }
 
@@ -508,8 +505,6 @@ fn wire_jsonl_output_rows(
             row.set_subtitle(&subtitle);
         });
     }
-
-    wire_jsonl_path_row(panel, state, config);
 }
 
 /// Network feeder toggle + address row + initial dispatch.
