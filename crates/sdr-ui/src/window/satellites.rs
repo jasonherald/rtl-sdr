@@ -918,52 +918,8 @@ fn on_recorder_aos(
     // doesn't hijack the user's audio chain (mirrors
     // the AOS side-effect-isolation rule from CR
     // round 1 on PR #541).
-    let force_audio_chain_off = || {
-        if deps.radio.squelch_enabled_row.is_active() {
-            deps.radio.squelch_enabled_row.set_active(false);
-        }
-        if deps.radio.auto_squelch_row.is_active() {
-            deps.radio.auto_squelch_row.set_active(false);
-        }
-        let off_idx = sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(CtcssMode::Off);
-        if deps.radio.ctcss_row.selected() != off_idx {
-            deps.radio.ctcss_row.set_selected(off_idx);
-        }
-        if deps.radio.fm_if_nr_row.is_active() {
-            deps.radio.fm_if_nr_row.set_active(false);
-        }
-        // De-emphasis ComboRow index 0 = "None". Both
-        // US 75 µs (cutoff ~2122 Hz) and EU 50 µs
-        // (cutoff ~3183 Hz) attenuate the 2400 Hz APT
-        // subcarrier that lives in the demodulated
-        // audio. Force to "None" so the AF chain
-        // passes the subcarrier through flat. Per
-        // silent-fail investigation following the
-        // NOAA 15 pass.
-        let deemp_off_idx: u32 = 0;
-        if deps.radio.deemphasis_row.selected() != deemp_off_idx {
-            deps.radio.deemphasis_row.set_selected(deemp_off_idx);
-        }
-        // Notch: a user-set notch frequency anywhere in
-        // the 1.5-3 kHz audio band (the typical "remove
-        // a hum" use case) would null the APT subcarrier.
-        // Force off; LOS restore reapplies the persisted
-        // value via the same notify chain.
-        if deps.radio.notch_enabled_row.is_active() {
-            deps.radio.notch_enabled_row.set_active(false);
-        }
-        // Doppler tracker: 4 Hz `SetVfoOffset` ticks can
-        // disrupt QPSK Costas lock and the APT line-rate
-        // clock. The ±3.5 kHz worst-case shift fits
-        // inside every imaging-protocol channel filter,
-        // so disabling for the pass loses no functional
-        // value and removes a known disruption source.
-        // Per silent-fail investigation following the
-        // NOAA 15 pass.
-        if deps.doppler_switch.is_active() {
-            deps.doppler_switch.set_active(false);
-        }
-    };
+    let force_audio_chain_off = || force_audio_chain_off(deps);
+
     match protocol {
         sdr_sat::ImagingProtocol::Apt => {
             // **Order is load-bearing.** Force the
@@ -1174,6 +1130,62 @@ fn on_recorder_aos(
             let aos = chrono::Utc::now();
             *deps.state.sstv_recording_pass.borrow_mut() = Some((norad_id, aos));
         }
+    }
+}
+
+/// Force every audio-chain gate off for an imaging pass: squelch,
+/// auto-squelch, CTCSS, FM IF NR, de-emphasis, notch, and the Doppler
+/// tracker — each through the widget's own notify chain so LOS
+/// restore replays the persisted values the same way a user flip
+/// would. De-emphasis (US 75 µs cutoff ~2122 Hz / EU 50 µs
+/// ~3183 Hz) and an audio-band notch would both attenuate the
+/// 2400 Hz APT subcarrier; the Doppler tracker's 4 Hz `SetVfoOffset`
+/// ticks can disrupt QPSK Costas lock and the APT line-rate clock
+/// (per the NOAA 15 silent-fail investigation).
+fn force_audio_chain_off(deps: &RecorderDeps) {
+    if deps.radio.squelch_enabled_row.is_active() {
+        deps.radio.squelch_enabled_row.set_active(false);
+    }
+    if deps.radio.auto_squelch_row.is_active() {
+        deps.radio.auto_squelch_row.set_active(false);
+    }
+    let off_idx = sidebar::radio_panel::RadioPanel::ctcss_index_from_mode(CtcssMode::Off);
+    if deps.radio.ctcss_row.selected() != off_idx {
+        deps.radio.ctcss_row.set_selected(off_idx);
+    }
+    if deps.radio.fm_if_nr_row.is_active() {
+        deps.radio.fm_if_nr_row.set_active(false);
+    }
+    // De-emphasis ComboRow index 0 = "None". Both
+    // US 75 µs (cutoff ~2122 Hz) and EU 50 µs
+    // (cutoff ~3183 Hz) attenuate the 2400 Hz APT
+    // subcarrier that lives in the demodulated
+    // audio. Force to "None" so the AF chain
+    // passes the subcarrier through flat. Per
+    // silent-fail investigation following the
+    // NOAA 15 pass.
+    let deemp_off_idx: u32 = 0;
+    if deps.radio.deemphasis_row.selected() != deemp_off_idx {
+        deps.radio.deemphasis_row.set_selected(deemp_off_idx);
+    }
+    // Notch: a user-set notch frequency anywhere in
+    // the 1.5-3 kHz audio band (the typical "remove
+    // a hum" use case) would null the APT subcarrier.
+    // Force off; LOS restore reapplies the persisted
+    // value via the same notify chain.
+    if deps.radio.notch_enabled_row.is_active() {
+        deps.radio.notch_enabled_row.set_active(false);
+    }
+    // Doppler tracker: 4 Hz `SetVfoOffset` ticks can
+    // disrupt QPSK Costas lock and the APT line-rate
+    // clock. The ±3.5 kHz worst-case shift fits
+    // inside every imaging-protocol channel filter,
+    // so disabling for the pass loses no functional
+    // value and removes a known disruption source.
+    // Per silent-fail investigation following the
+    // NOAA 15 pass.
+    if deps.doppler_switch.is_active() {
+        deps.doppler_switch.set_active(false);
     }
 }
 
