@@ -358,6 +358,34 @@ fn wire_auto_record_persistence(
     }
 }
 
+
+/// Build the shared TLE cache. `None` means the platform refused us a
+/// cache directory (rare; sandboxed minimal environments) — the caller
+/// disables TLE-specific UI but keeps ground-station persistence, ZIP
+/// lookup, and the auto-record toggle wired, since those don't depend
+/// on TLEs.
+fn init_tle_cache(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+) -> Option<std::sync::Arc<sdr_sat::TleCache>> {
+    // `Option<Arc<TleCache>>`. `None` means the platform refused us
+    // a cache directory (rare; sandboxed minimal environments).
+    // Disable TLE-specific UI but keep ground-station persistence,
+    // ZIP lookup, and the auto-record toggle wired — those don't
+    // depend on TLEs and shouldn't go inert just because the cache
+    // is gone.
+    match sdr_sat::TleCache::new() {
+        Ok(c) => Some(std::sync::Arc::new(c)),
+        Err(e) => {
+            tracing::warn!("Satellites panel: TLE cache unavailable — {e}");
+            panel.refresh_button.set_sensitive(false);
+            panel
+                .last_refresh_row
+                .set_subtitle("Cache directory unavailable");
+            None
+        }
+    }
+}
+
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -368,7 +396,7 @@ pub(super) fn connect_satellites_panel(
     set_playing: &Rc<dyn Fn(bool)>,
     status_bar: &Rc<StatusBar>,
 ) {
-    use sdr_sat::{Pass, TleCache};
+    use sdr_sat::Pass;
     use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
         AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
@@ -390,23 +418,7 @@ pub(super) fn connect_satellites_panel(
 
     wire_notify_lead_persistence(panel, config);
 
-    // `Option<Arc<TleCache>>`. `None` means the platform refused us
-    // a cache directory (rare; sandboxed minimal environments).
-    // Disable TLE-specific UI but keep ground-station persistence,
-    // ZIP lookup, and the auto-record toggle wired — those don't
-    // depend on TLEs and shouldn't go inert just because the cache
-    // is gone.
-    let cache: Option<std::sync::Arc<TleCache>> = match TleCache::new() {
-        Ok(c) => Some(std::sync::Arc::new(c)),
-        Err(e) => {
-            tracing::warn!("Satellites panel: TLE cache unavailable — {e}");
-            panel.refresh_button.set_sensitive(false);
-            panel
-                .last_refresh_row
-                .set_subtitle("Cache directory unavailable");
-            None
-        }
-    };
+    let cache = init_tle_cache(panel);
 
     let displayed: Rc<RefCell<Vec<DisplayedPass>>> = Rc::new(RefCell::new(Vec::new()));
 
