@@ -401,7 +401,7 @@ fn build_recompute(
     // unavailable it's a no-op so the lat/lon/alt notify handlers
     // can call it without branching. When the cache is available
     // it does the real pass-enumeration + row-rebuild work.
-    if let Some(cache) = cache {
+    let recompute: Rc<dyn Fn()> = if let Some(cache) = cache {
         let cache_recompute = std::sync::Arc::clone(cache);
         let panel_weak_recompute = panel_weak.clone();
         let displayed_recompute = Rc::clone(&displayed);
@@ -426,7 +426,11 @@ fn build_recompute(
         // still call this on every change; making it a no-op
         // keeps the call sites branch-free.
         Rc::new(|| {})
-    }
+    };
+    // Initial paint — show passes immediately if we already have
+    // cached TLEs from a prior session. (No-op when cache is None.)
+    recompute();
+    recompute
 }
 
 /// Lat / lon / alt — persist on change and re-run pass enumeration.
@@ -477,11 +481,16 @@ fn wire_station_rows(
 // already disabled above.
 fn wire_tle_refresh_button(
     panel: &sidebar::satellites_panel::SatellitesPanel,
-    cache_outer: &std::sync::Arc<sdr_sat::TleCache>,
+    cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
     recompute: &Rc<dyn Fn()>,
 ) {
+    let Some(cache_outer) = cache else {
+        // No cache — the button was already disabled by
+        // `init_tle_cache`; nothing to wire.
+        return;
+    };
     let cache_refresh = std::sync::Arc::clone(cache_outer);
     let config_refresh = std::sync::Arc::clone(config);
     let panel_weak_refresh = panel_weak.clone();
@@ -853,6 +862,24 @@ fn wire_recorder(
     }
 }
 
+/// Doppler-correction tracker wiring (#521). `restore_doppler_switch`
+/// runs ALWAYS — the persisted master-switch value survives a launch
+/// even when the TLE cache is unavailable (CR round 1 on PR #554);
+/// `connect_doppler_tracker` runs only with a cache, since without
+/// TLEs there is no SGP4 state for the behavior to evaluate.
+fn wire_doppler(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
+    status_bar: &Rc<StatusBar>,
+) {
+    restore_doppler_switch(panels, config);
+    if let Some(cache_doppler) = cache {
+        connect_doppler_tracker(panels, state, cache_doppler, status_bar);
+    }
+}
+
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -901,8 +928,6 @@ pub(super) fn connect_satellites_panel(
 
     // Initial paint — show passes immediately if we already have
     // cached TLEs from a prior session. (No-op if cache is None.)
-    recompute();
-
     wire_station_rows(panel, config, &recompute);
 
     wire_auto_record_persistence(panel, config);
@@ -919,14 +944,9 @@ pub(super) fn connect_satellites_panel(
     //      cache is available — without TLEs we can't propagate
     //      SGP4 to evaluate the trigger or compute the offset,
     //      so there's nothing for the *behavior* to do.
-    restore_doppler_switch(panels, config);
-    if let Some(cache_doppler) = cache.as_ref() {
-        connect_doppler_tracker(panels, state, cache_doppler, status_bar);
-    }
+    wire_doppler(panels, state, config, cache.as_ref(), status_bar);
 
-    if let Some(cache_outer) = cache.as_ref() {
-        wire_tle_refresh_button(panel, cache_outer, config, &panel_weak, &recompute);
-    }
+    wire_tle_refresh_button(panel, cache.as_ref(), config, &panel_weak, &recompute);
 
     wire_zip_lookup(panel, &panel_weak);
 
