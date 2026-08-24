@@ -223,15 +223,14 @@ fn on_acars_region_selected(
         );
         return;
     }
-    // Custom slot: hydrate from saved config (or the
-    // current EntryRow text if the user just typed
-    // something but hasn't pressed Enter yet). Empty
-    // list is fine — the variant is dispatched as
-    // `Custom([])` and the apply handler later
-    // replaces it with a real list.
+    // Custom slot: hydrate from saved config. With no saved
+    // channels yet, dispatching `Custom([])` would be stored by
+    // the (disabled) DSP side and then reject the next enable
+    // request with `AcarsEnableError::ChannelBankInit` — so keep
+    // the previous region live and only reveal the EntryRow; the
+    // apply handler dispatches once a validated non-empty list
+    // exists. Per CR round 1 on PR #844.
     if matches!(region, AcarsRegion::Custom(_)) {
-        let saved = crate::acars_config::read_acars_custom_channels(config);
-        region = AcarsRegion::Custom(saved.into_boxed_slice());
         // Make the EntryRow visible immediately on
         // selection — the visibility-binding closure in
         // the panel builder also fires on this same
@@ -239,6 +238,14 @@ fn on_acars_region_selected(
         // here would require ordering guarantees we
         // don't have. Cheap idempotent set is fine.
         custom_row_for_dispatch.set_visible(true);
+        let saved = crate::acars_config::read_acars_custom_channels(config);
+        if saved.is_empty() {
+            tracing::info!(
+                "acars region: Custom selected with no saved channels — awaiting EntryRow apply"
+            );
+            return;
+        }
+        region = AcarsRegion::Custom(saved.into_boxed_slice());
     }
     crate::acars_config::save_acars_channel_set(config, region.config_id());
     // Rebuild channel rows to match the new region's
@@ -302,7 +309,10 @@ fn wire_acars_output_rows(
     // DSP would briefly hold three different values until
     // the user touches the row. CR round 5 on PR #595.
     let raw_station_id = crate::acars_config::read_acars_station_id(config);
-    let normalized_station_id: String = raw_station_id.chars().take(8).collect();
+    let normalized_station_id: String = raw_station_id
+        .chars()
+        .take(crate::acars_config::ACARS_STATION_ID_MAX_CHARS)
+        .collect();
     if normalized_station_id != raw_station_id {
         crate::acars_config::save_acars_station_id(config, &normalized_station_id);
     }
@@ -330,7 +340,7 @@ fn wire_acars_output_rows(
     seed_output_toggle_subtitle(
         &panel.jsonl_enable_row,
         &panel.jsonl_path_row.text(),
-        "~/sdr-recordings/acars.jsonl",
+        crate::acars_config::ACARS_JSONL_DEFAULT_PATH,
     );
     seed_output_toggle_subtitle(
         &panel.network_enable_row,
@@ -488,7 +498,7 @@ fn wire_jsonl_output_rows(
             // Subtitle reflects current path or "Off".
             let subtitle = if active {
                 if path.is_empty() {
-                    "~/sdr-recordings/acars.jsonl".to_string()
+                    crate::acars_config::ACARS_JSONL_DEFAULT_PATH.to_string()
                 } else {
                     path
                 }
@@ -695,7 +705,7 @@ fn wire_jsonl_path_row(
             // path. CR round 2 on PR #595.
             if enable_row.is_active() {
                 let subtitle = if value.is_empty() {
-                    "~/sdr-recordings/acars.jsonl".to_string()
+                    crate::acars_config::ACARS_JSONL_DEFAULT_PATH.to_string()
                 } else {
                     value
                 };

@@ -254,7 +254,10 @@ pub fn build_aviation_panel(channel_count: usize) -> AviationPanel {
     station_id_row.connect_changed(|row| {
         let text = row.text();
         if text.chars().count() > 8 {
-            let truncated: String = text.chars().take(8).collect();
+            let truncated: String = text
+                .chars()
+                .take(crate::acars_config::ACARS_STATION_ID_MAX_CHARS)
+                .collect();
             row.set_text(&truncated);
         }
     });

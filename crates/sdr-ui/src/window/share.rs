@@ -156,13 +156,6 @@ pub(super) fn connect_server_panel(
         .connect_selected_notify(apply_server_bandwidth_advisory);
 }
 
-/// Extracted out of `connect_server_panel` so the parent function
-/// stays under clippy's `too_many_lines` limit. Handles exactly one
-/// thing: the `share_row.connect_active_notify` wiring, with its
-/// downstream start/stop effects (build `ServerConfig`, call
-/// `Server::start`, optionally attach an `Advertiser`, lock or
-/// unlock the panel controls, reapply visibility, and surface any
-/// error via a toast while flipping the switch back to off).
 /// Weak refs to every widget the share-switch handler reads or
 /// mutates. Mirrors the `ServerStatusWidgetsWeak` pattern: the
 /// closure attached to `share_row.connect_active_notify` would
@@ -1227,14 +1220,9 @@ pub(super) const DIRECT_SAMPLING_Q_BRANCH: i32 = 2;
 pub(super) const SERVER_BUFFER_CAPACITY_DEFAULT: usize = 0;
 
 /// Read the server panel widget values and build a `ServerConfig`
-/// off them. Takes the full `ServerPanel` by reference so the arg
-/// list stays short and the fn signature documents the "this reads
-/// EVERY relevant row" contract clearly.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "spin-row values are bounded to u16/u32 ranges at the widget level"
-)]
+/// off them. Takes the widget bundle by reference so the arg list
+/// stays short and the fn signature documents the "this reads EVERY
+/// relevant row" contract clearly.
 /// Build a `ServerConfig` from the panel's current widget state.
 ///
 /// **`auth_key` parameter policy**: caller passes the pending
@@ -1246,6 +1234,11 @@ pub(super) const SERVER_BUFFER_CAPACITY_DEFAULT: usize = 0;
 /// server-start moment. Single source of truth: the key shown
 /// by the Reveal button is exactly what `Server::start`
 /// receives. Per `CodeRabbit` round 1 on PR #406.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "spin-row values are bounded to u16/u32 ranges at the widget level"
+)]
 pub(super) fn build_server_config_from_panel(
     panel: &ServerSwitchWidgets,
     pending_auth_key: Option<Vec<u8>>,
