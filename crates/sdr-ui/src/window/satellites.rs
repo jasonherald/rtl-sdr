@@ -2780,8 +2780,8 @@ fn doppler_trigger_tick(
     state: &Rc<AppState>,
     status_bar: &Rc<StatusBar>,
 ) -> glib::ControlFlow {
-    use crate::doppler_tracker::{FREQ_MATCH_TOLERANCE_HZ, pick_active_satellite, should_tick};
-    use sdr_sat::{GroundStation, KNOWN_SATELLITES};
+    use crate::doppler_tracker::{pick_active_satellite, should_tick};
+    use sdr_sat::GroundStation;
 
     let mut t = tracker.borrow_mut();
     // Lifecycle gate: master + running. While stopped,
