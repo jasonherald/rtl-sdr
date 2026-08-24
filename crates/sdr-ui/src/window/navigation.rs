@@ -65,6 +65,7 @@ pub(super) fn connect_navigation_panel(
 
 /// Bookmark-selected navigation: restore the full tuning profile.
 /// Split out per the 50-NLOC gate (#817).
+#[allow(clippy::too_many_arguments)]
 fn wire_bookmark_navigation(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -142,14 +143,14 @@ fn navigate_to_bookmark(
     // Canonical 13-step mirror sequence — single source of
     // truth shared with the satellite tune path. Per #509.
     tune_to_target(
-        &state_nav,
-        &fs,
-        &dd,
-        &spectrum_nav,
-        &force_disable_nav,
-        &bandwidth_row_nav,
-        &radio_nav,
-        &sb,
+        state_nav,
+        fs,
+        dd,
+        spectrum_nav,
+        force_disable_nav,
+        bandwidth_row_nav,
+        radio_nav,
+        sb,
         freq,
         mode,
         bw,
@@ -162,11 +163,11 @@ fn navigate_to_bookmark(
     // need this.
     restore_bookmark_profile(
         bookmark,
-        &state_nav,
-        &radio_nav,
-        &source_nav_gain,
-        &source_nav_agc,
-        &volume_button_nav,
+        state_nav,
+        radio_nav,
+        source_nav_gain,
+        source_nav_agc,
+        volume_button_nav,
     );
 
     tracing::info!(

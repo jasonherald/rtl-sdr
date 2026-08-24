@@ -182,7 +182,7 @@ fn wire_sink_selector(panels: &SidebarPanels, state: &Rc<AppState>) {
         });
 }
 
-/// Network host/port/protocol triple -> SetNetworkSinkConfig.
+/// Network host/port/protocol triple -> `SetNetworkSinkConfig`.
 /// Split out per the 50-NLOC gate (#817).
 fn wire_network_sink_config(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Helper closure-builder: any change to the network host /

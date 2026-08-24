@@ -435,15 +435,15 @@ fn on_share_row_toggled(
         }
         start_shared_server(
             &widgets,
-            &current_key_for_share,
-            &running,
-            &server_running,
-            &toast_overlay_weak,
-            &reentry_guard,
-            &share_row_weak,
+            current_key_for_share,
+            running,
+            server_running,
+            toast_overlay_weak,
+            reentry_guard,
+            share_row_weak,
         );
     } else {
-        stop_shared_server(&widgets, &running, &server_running);
+        stop_shared_server(&widgets, running, server_running);
     }
 }
 
@@ -508,13 +508,13 @@ fn stop_shared_server(
     // re-selection triggered by the user's next action sees
     // the coherent post-stop state.
     server_running.set(false);
-    set_controls_locked(&widgets, false);
+    set_controls_locked(widgets, false);
     widgets.status_row.set_visible(false);
     widgets.activity_log_row.set_visible(false);
     widgets.clients_row.set_visible(false);
-    reset_status_rows(&widgets);
-    reset_activity_log(&widgets);
-    reset_clients_list(&widgets);
+    reset_status_rows(widgets);
+    reset_activity_log(widgets);
+    reset_clients_list(widgets);
 }
 
 /// Auth controls of the Share panel (#394/#395): require-key toggle,
@@ -586,7 +586,7 @@ fn start_shared_server(
     // `Server::start` receives. Per `CodeRabbit` round 1
     // on PR #406.
     let pending_auth_key = current_key_for_share.borrow().clone();
-    let config = build_server_config_from_panel(&widgets, pending_auth_key);
+    let config = build_server_config_from_panel(widgets, pending_auth_key);
     match Server::start(config) {
         Ok(server) => {
             // If advertising is on, build the TXT record
@@ -615,7 +615,7 @@ fn start_shared_server(
             } else {
                 None
             };
-            set_controls_locked(&widgets, true);
+            set_controls_locked(widgets, true);
             widgets.status_row.set_visible(true);
             widgets.activity_log_row.set_visible(true);
             widgets.clients_row.set_visible(true);
@@ -1484,8 +1484,8 @@ fn wire_auth_require_toggle(
     // honors it via the pending-key plumbing.
     let key_row_for_toggle = panels.server.auth_key_row.downgrade();
     let reveal_button_for_toggle = panels.server.auth_key_reveal_button.downgrade();
-    let current_key_for_toggle = Rc::clone(&current_auth_key);
-    let revealed_for_toggle = Rc::clone(&auth_key_revealed);
+    let current_key_for_toggle = Rc::clone(current_auth_key);
+    let revealed_for_toggle = Rc::clone(auth_key_revealed);
     let auth_toggle_guard_for_handler = Rc::clone(&auth_toggle_reentry_guard);
     panels
         .server
@@ -1534,12 +1534,12 @@ fn on_auth_require_toggled(
     if row.is_active() {
         let ok = enable_auth_requirement(
             widgets.as_ref(),
-            &running_for_auth_toggle,
-            &toast_overlay_for_auth_toggle,
-            &current_key_for_toggle,
-            &revealed_for_toggle,
+            running_for_auth_toggle,
+            toast_overlay_for_auth_toggle,
+            current_key_for_toggle,
+            revealed_for_toggle,
             &key_row,
-            &reveal_button_for_toggle,
+            reveal_button_for_toggle,
         );
         if !ok {
             // Revert the switch. UI stays on the pre-toggle
@@ -1552,10 +1552,10 @@ fn on_auth_require_toggled(
     } else {
         let ok = disable_auth_requirement(
             widgets.as_ref(),
-            &running_for_auth_toggle,
-            &toast_overlay_for_auth_toggle,
-            &current_key_for_toggle,
-            &revealed_for_toggle,
+            running_for_auth_toggle,
+            toast_overlay_for_auth_toggle,
+            current_key_for_toggle,
+            revealed_for_toggle,
             &key_row,
         );
         if !ok {
@@ -1653,8 +1653,8 @@ fn wire_auth_reveal_copy(
     // masked placeholder and the full hex-encoded key. Pure UI
     // state; doesn't touch keyring or server.
     let key_row_for_reveal = panels.server.auth_key_row.downgrade();
-    let current_key_for_reveal = Rc::clone(&current_auth_key);
-    let revealed_for_reveal = Rc::clone(&auth_key_revealed);
+    let current_key_for_reveal = Rc::clone(current_auth_key);
+    let revealed_for_reveal = Rc::clone(auth_key_revealed);
     panels
         .server
         .auth_key_reveal_button
@@ -1725,8 +1725,8 @@ fn wire_auth_regenerate(
     // doesn't change — `apply_live_auth_change` skips the
     // advertiser rebuild when passed `widgets = None`.
     let key_row_for_regen = panels.server.auth_key_row.downgrade();
-    let current_key_for_regen = Rc::clone(&current_auth_key);
-    let revealed_for_regen = Rc::clone(&auth_key_revealed);
+    let current_key_for_regen = Rc::clone(current_auth_key);
+    let revealed_for_regen = Rc::clone(auth_key_revealed);
     panels
         .server
         .auth_key_regenerate_button
@@ -1840,6 +1840,11 @@ fn render_uptime_and_rate_rows(
 
 /// Frequency / sample-rate / gain / DSP portion of the panel read.
 /// Split out per the 50-NLOC gate (#817).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "spin-row values are bounded to u16/u32 ranges at the widget level"
+)]
 fn read_server_dsp_settings(
     panel: &ServerSwitchWidgets,
     pending_auth_key: Option<Vec<u8>>,
@@ -1957,6 +1962,11 @@ fn wire_auth_copy_button(
 
 /// Gain / PPM / bias-T portion of the server-config read.
 /// Split out per the 50-NLOC gate (#817).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "spin-row values are bounded to u16/u32 ranges at the widget level"
+)]
 fn read_server_gain_settings(
     panel: &ServerSwitchWidgets,
     pending_auth_key: Option<Vec<u8>>,

@@ -138,7 +138,7 @@ pub(super) fn build_layout(
         transcript_panel,
         left_stack,
         right_stack,
-        content_box,
+        &content_box,
         spectrum_handle,
         status_bar,
     )
@@ -161,7 +161,7 @@ fn wire_resize_drag_gesture(
     let drag_gesture = gtk4::GestureDrag::new();
 
     let split_view_weak = split_view.downgrade();
-    let start_fraction_begin = std::rc::Rc::clone(&start_fraction);
+    let start_fraction_begin = std::rc::Rc::clone(start_fraction);
     drag_gesture.connect_drag_begin(move |_, _, _| {
         if let Some(sv) = split_view_weak.upgrade() {
             start_fraction_begin.set(sv.sidebar_width_fraction());
@@ -169,7 +169,7 @@ fn wire_resize_drag_gesture(
     });
 
     let split_view_weak = split_view.downgrade();
-    let start_fraction_update = std::rc::Rc::clone(&start_fraction);
+    let start_fraction_update = std::rc::Rc::clone(start_fraction);
     drag_gesture.connect_drag_update(move |_, offset_x, _| {
         let Some(sv) = split_view_weak.upgrade() else {
             return;
@@ -860,7 +860,7 @@ fn build_panel_stacks(
     (left_stack, right_stack)
 }
 
-/// Nested AdwOverlaySplitViews + resize handles + activity bars around the content box.
+/// Nested `AdwOverlaySplitViews` + resize handles + activity bars around the content box.
 /// Split out per the 50-NLOC gate (#817).
 #[allow(clippy::too_many_arguments)]
 fn build_split_views(
@@ -870,7 +870,7 @@ fn build_split_views(
     transcript_panel: sidebar::transcript_panel::TranscriptPanel,
     left_stack: gtk4::Stack,
     right_stack: gtk4::Stack,
-    content_box: gtk4::Box,
+    content_box: &gtk4::Box,
     spectrum_handle: spectrum::SpectrumHandle,
     status_bar: StatusBar,
 ) -> LayoutHandles {
@@ -887,7 +887,7 @@ fn build_split_views(
     // panel up to its 360 px floor when the math would otherwise
     // leave it narrower. User-driven resize + persistence come from
     // the drag handle wired below (#429).
-    let right_split_view = build_right_split(config, &right_stack, &content_box);
+    let right_split_view = build_right_split(config, &right_stack, content_box);
 
     let left_split_view = build_left_split(config, &left_stack, &right_split_view);
 
@@ -921,10 +921,10 @@ fn build_split_views(
     }
 }
 
-/// Volume ScaleButton with a11y label (value wiring lives in build_window).
+/// Volume `ScaleButton` with a11y label (value wiring lives in `build_window`).
 /// Split out per the 50-NLOC gate (#817).
-/// Volume ScaleButton with a11y label (value wiring lives in
-/// build_window). Split out per the 50-NLOC gate (#817).
+/// Volume `ScaleButton` with a11y label (value wiring lives in
+/// `build_window`). Split out per the 50-NLOC gate (#817).
 fn build_volume_button() -> gtk4::ScaleButton {
     // Volume button (ScaleButton with audio icons)
     let volume_button = gtk4::ScaleButton::new(

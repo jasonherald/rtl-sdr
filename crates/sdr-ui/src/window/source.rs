@@ -104,8 +104,8 @@ pub(super) fn handle_rtl_tcp_state_toast(
     }
 }
 
-/// Sweep still-live ControllerBusy toasts on any transition that
-/// isn't re-entering ControllerBusy (CR round 11 on PR #408). Split
+/// Sweep still-live `ControllerBusy` toasts on any transition that
+/// isn't re-entering `ControllerBusy` (CR round 11 on PR #408). Split
 /// out per the 50-NLOC gate (#817).
 fn dismiss_stale_controller_busy_toasts(
     pending_controller_busy_toasts: &Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
@@ -316,6 +316,7 @@ pub(super) fn apply_rtl_tcp_connection_state(
 /// Dispatch half of [`apply_rtl_tcp_connect`]: role + auth-key config,
 /// device selection, canonical `SetNetworkConfig`, and last-connected
 /// persistence. Split out per the 50-NLOC gate (#817).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_rtl_tcp_connect(
     host: &str,
     port: u16,
@@ -553,7 +554,7 @@ fn wire_favorites_popover_refresh(
     favorites_header: &FavoritesHeaderHandle,
     favorite_row_ctx: &Rc<FavoriteRowContext>,
 ) {
-    rebuild_favorites_popover(&favorite_row_ctx, &favorite_row_ctx.favorites.borrow());
+    rebuild_favorites_popover(favorite_row_ctx, &favorite_row_ctx.favorites.borrow());
 
     // Rebuild on every popover show so the "seen Xm ago" subtitles
     // reflect current wall-clock time. Without this, the ages
@@ -569,7 +570,7 @@ fn wire_favorites_popover_refresh(
     // `Rc<FavoriteRowContext>`; no retain cycle because
     // `FavoriteRowContext.popover` is weak.
     {
-        let ctx_for_show = Rc::clone(&favorite_row_ctx);
+        let ctx_for_show = Rc::clone(favorite_row_ctx);
         favorites_header.popover.connect_show(move |_| {
             rebuild_favorites_popover(&ctx_for_show, &ctx_for_show.favorites.borrow());
         });
@@ -738,7 +739,7 @@ fn drain_discovery_events(
         };
         match event {
             DiscoveryEvent::ServerAnnounced(server) => {
-                on_server_announced(server, &displayed_rows, &expander, &favorites, &row_deps);
+                on_server_announced(server, displayed_rows, expander, favorites, row_deps);
             }
             DiscoveryEvent::ServerWithdrawn { instance_name } => {
                 let mut rows = displayed_rows.borrow_mut();
@@ -841,7 +842,7 @@ fn on_server_announced(
     rows.insert(server.instance_name.clone(), (row, server));
     // Reorder after insert so favorites float to
     // the top of the new view.
-    reorder_discovered_rows(&expander, &rows, &favorites.borrow());
+    reorder_discovered_rows(expander, &rows, &favorites.borrow());
 
     expander.set_subtitle(&format!("{} server(s) visible", rows.len()));
 }
@@ -855,7 +856,7 @@ fn on_discovery_star_toggled(
     btn: &gtk4::ToggleButton,
     star_key: &str,
     star_nickname: &str,
-    star_tuner_name: &Option<String>,
+    star_tuner_name: Option<&str>,
     star_gain_count: Option<u32>,
     star_auth_required: Option<bool>,
     star_favorites: &Rc<
@@ -888,7 +889,7 @@ fn on_discovery_star_toggled(
                 sidebar::source_panel::FavoriteEntry {
                     key: star_key.to_string(),
                     nickname: star_nickname.to_string(),
-                    tuner_name: star_tuner_name.clone(),
+                    tuner_name: star_tuner_name.map(str::to_owned),
                     gain_count: star_gain_count,
                     last_seen_unix: Some(sidebar::source_panel::now_unix_seconds()),
                     // Fresh star — no role preference
@@ -912,7 +913,7 @@ fn on_discovery_star_toggled(
         // the persisted list is unspecified —
         // the slide-out sorts on read.
         let snapshot: Vec<sidebar::source_panel::FavoriteEntry> = favs.values().cloned().collect();
-        crate::sidebar::source_panel::save_favorites(&star_config, &snapshot);
+        crate::sidebar::source_panel::save_favorites(star_config, &snapshot);
     }
     // Rebuild the expander so the row moves
     // to/from the top per the new favorite
@@ -935,7 +936,7 @@ fn on_discovery_star_toggled(
     // Upgrade-and-drop inside the rebuild keeps
     // the closure leak-free per the #329
     // weak-ref pattern.
-    rebuild_favorites_popover(&star_row_ctx, &star_favorites.borrow());
+    rebuild_favorites_popover(star_row_ctx, &star_favorites.borrow());
 }
 
 /// Per-tick stale-row prune + "seen N ago" subtitle refresh for the
@@ -2334,7 +2335,7 @@ fn on_rtl_tcp_connected(
     }
 }
 
-/// Second ControllerBusy toast offering the Listen fallback (AdwToast exposes only one action button).
+/// Second `ControllerBusy` toast offering the Listen fallback (`AdwToast` exposes only one action button).
 /// Split out per the 50-NLOC gate (#817).
 fn wire_listener_fallback_toast(
     app_state: &Rc<AppState>,
@@ -2544,7 +2545,7 @@ fn on_favorite_connect_clicked(
     connect_key: &str,
     connect_nickname: &str,
 ) {
-    let Some((host, port)) = parse_host_port(&connect_key) else {
+    let Some((host, port)) = parse_host_port(connect_key) else {
         // Corrupt key shouldn't happen in practice —
         // `favorite_key(server)` always produces
         // `hostname:port`. Log rather than silently dropping
@@ -2579,7 +2580,7 @@ fn on_favorite_connect_clicked(
     apply_rtl_tcp_connect(
         &host,
         port,
-        &connect_nickname,
+        connect_nickname,
         &hostname_row,
         &port_row,
         &protocol_row,
@@ -2627,7 +2628,7 @@ fn attach_favorite_copy_unstar_buttons(
     attach_favorite_unstar_button(row, entry, ctx);
 }
 
-/// Sweep still-live toasts from a prior ControllerBusy entry so the overlay does not stack pairs.
+/// Sweep still-live toasts from a prior `ControllerBusy` entry so the overlay does not stack pairs.
 /// Split out per the 50-NLOC gate (#817).
 fn sweep_prior_controller_busy_toasts(
     pending_controller_busy_toasts: &Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
@@ -2728,7 +2729,7 @@ fn attach_favorite_unstar_button(
     row.add_suffix(&unstar_btn);
 }
 
-/// Connect button on a discovered row: hydrate the endpoint triple and run apply_rtl_tcp_connect.
+/// Connect button on a discovered row: hydrate the endpoint triple and run `apply_rtl_tcp_connect`.
 /// Split out per the 50-NLOC gate (#817).
 fn wire_discovered_connect_button(
     row: &adw::ActionRow,
@@ -2800,7 +2801,7 @@ fn build_discovery_star_button(
     // the server's TXT nickname, which the operator
     // can edit — keying favorites off it would
     // silently drop the star on any rename.
-    let star_key = favorite_key(&server);
+    let star_key = favorite_key(server);
     let starred_initially = favorites.borrow().contains_key(&star_key);
     star_btn.set_active(starred_initially);
     if starred_initially {
@@ -2820,7 +2821,7 @@ fn build_discovery_star_button(
     // prior (stale) weak ref under the same key
     // — e.g. from a re-announce rebuild of the
     // row, where the old button was dropped.
-    let star_key_for_map = favorite_key(&server);
+    let star_key_for_map = favorite_key(server);
     discovered_star_buttons
         .borrow_mut()
         .insert(star_key_for_map, star_btn.downgrade());
@@ -2873,8 +2874,8 @@ fn wire_discovery_star_toggle(
     // consistent so freshly-starred favorites
     // carry the same hint as refreshed ones.
     let star_auth_required = server.txt.auth_required;
-    let star_favorites = Rc::clone(&favorites);
-    let star_config = std::sync::Arc::clone(&config_for_discovery);
+    let star_favorites = Rc::clone(favorites);
+    let star_config = std::sync::Arc::clone(config_for_discovery);
     let star_expander_weak = expander_weak.clone();
     // Closure captures `star_row_ctx` only — reaches
     // `displayed_rows` via its `Weak` field inside.
@@ -2882,13 +2883,13 @@ fn wire_discovery_star_toggle(
     // here would reintroduce the retain cycle the
     // `FavoriteRowContext.displayed_rows` docstring
     // describes (map → row → signal → ctx → map).
-    let star_row_ctx = Rc::clone(&favorite_row_ctx);
+    let star_row_ctx = Rc::clone(favorite_row_ctx);
     star_btn.connect_toggled(move |btn| {
         on_discovery_star_toggled(
             btn,
             &star_key,
             &star_nickname,
-            &star_tuner_name,
+            star_tuner_name.as_deref(),
             star_gain_count,
             star_auth_required,
             &star_favorites,
@@ -2914,7 +2915,7 @@ fn refresh_favorite_metadata(
         ..
     } = deps.as_ref();
 
-    let fav_key = favorite_key(&server);
+    let fav_key = favorite_key(server);
     {
         let mut favs = favorites.borrow_mut();
         if favs.contains_key(&fav_key) {
@@ -2945,13 +2946,13 @@ fn refresh_favorite_metadata(
             );
             let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
                 favs.values().cloned().collect();
-            crate::sidebar::source_panel::save_favorites(&config_for_discovery, &snapshot);
+            crate::sidebar::source_panel::save_favorites(config_for_discovery, &snapshot);
             // Refresh the header-bar popover's
             // rendering of this entry (age + tuner
             // metadata). Cheap — it rebuilds the
             // whole list but at favorites scale
             // that's trivial.
-            rebuild_favorites_popover(&favorite_row_ctx, &favs);
+            rebuild_favorites_popover(favorite_row_ctx, &favs);
         }
     }
 }
@@ -2990,10 +2991,10 @@ fn restore_last_connected_endpoint(
     // surprise the user on every restart. Per `CodeRabbit` round
     // 2 on PR #558.
     let restored_source_is_rtl_tcp =
-        sidebar::source_panel::load_source_device_index(&config_for_discovery)
+        sidebar::source_panel::load_source_device_index(config_for_discovery)
             == sidebar::source_panel::DEVICE_RTLTCP;
     if restored_source_is_rtl_tcp
-        && let Some(last) = crate::sidebar::source_panel::load_last_connected(&config_for_discovery)
+        && let Some(last) = crate::sidebar::source_panel::load_last_connected(config_for_discovery)
     {
         // Same guarded-rewrite idiom as `apply_rtl_tcp_connect`:
         // hydrating the last-connected RTL-TCP server must not
@@ -3250,7 +3251,7 @@ fn wire_gain_and_agc_rows(
     wire_agc_type_selector(panels, state, config);
 }
 
-/// rtl_tcp client role + auth-key rows with last-good-bytes cache and per-server restore (#396).
+/// `rtl_tcp` client role + auth-key rows with last-good-bytes cache and per-server restore (#396).
 /// Split out per the 50-NLOC gate (#817).
 fn wire_rtl_tcp_client_rows(
     panels: &SidebarPanels,
@@ -3465,7 +3466,7 @@ fn wire_role_and_server_key_rows(
     let hostname_for_role = panels.source.hostname_row.clone();
     let port_for_role = panels.source.port_row.clone();
     let favorites_for_role = Rc::clone(favorites);
-    let last_good_for_role = Rc::clone(&last_good_auth_key);
+    let last_good_for_role = Rc::clone(last_good_auth_key);
     panels
         .source
         .rtl_tcp_role_row
@@ -3744,7 +3745,7 @@ fn wire_server_key_entry(
     // DSP.
     let state_auth = Rc::clone(state);
     let role_for_auth = panels.source.rtl_tcp_role_row.clone();
-    let last_good_for_auth = Rc::clone(&last_good_auth_key);
+    let last_good_for_auth = Rc::clone(last_good_auth_key);
     panels
         .source
         .rtl_tcp_auth_key_row
@@ -4290,7 +4291,7 @@ fn restore_agc_type_selection(
     }
 }
 
-/// Startup restore of the rtl_tcp client role + auth key (#396).
+/// Startup restore of the `rtl_tcp` client role + auth key (#396).
 /// Split out per the 50-NLOC gate (#817).
 fn restore_rtl_tcp_client_state(
     panels: &SidebarPanels,
@@ -4341,79 +4342,76 @@ fn restore_rtl_tcp_client_state(
             panels,
             state,
             last_good_auth_key,
-            &last_connected,
-            &favorite_entry,
+            last_connected.as_ref(),
+            favorite_entry.as_ref(),
             persisted_role,
         );
     }
+}
 
-    /// Auth-key half of the rtl_tcp client restore: keyring load, last-good seed, and key-row reveal.
-    /// Split out per the 50-NLOC gate (#817).
-    fn restore_saved_auth_key(
-        panels: &SidebarPanels,
-        state: &Rc<AppState>,
-        last_good_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
-        last_connected: &Option<crate::sidebar::source_panel::LastConnectedServer>,
-        favorite_entry: &Option<sidebar::source_panel::FavoriteEntry>,
-        persisted_role: crate::sidebar::source_panel::FavoriteRole,
-    ) {
-        // Load the saved per-server auth key for the last-
-        // connected endpoint, if any. Also cache that server's
-        // stable id on `AppState` so the first post-Play
-        // `AuthRequired` / `AuthFailed` / `Connected` arm
-        // already has it and the keyring save / clear paths
-        // target the right entry without waiting on the first
-        // `apply_rtl_tcp_connect` call.
-        //
-        // Auth-row visibility + text is resolved deterministically
-        // using the same two-input rule as `apply_rtl_tcp_connect`
-        // (per `CodeRabbit` round 5 on PR #408): reveal the row
-        // when EITHER the favorite advertises `auth_required ==
-        // Some(true)` (server requires a key; user should see the
-        // field up-front even on a fresh session with no saved
-        // key) OR a saved key exists in the keyring (we want to
-        // show the pre-loaded value so the user knows the
-        // session will auto-auth). Set text from the saved key,
-        // or clear when none — so a prior-session auth-required
-        // server whose key the user later cleared doesn't leak
-        // stale text into the field on the next launch.
-        let mut auth_key: Option<Vec<u8>> = None;
-        if let Some(srv) = last_connected.as_ref() {
-            *state.rtl_tcp_active_server.borrow_mut() = format!("{}:{}", srv.host, srv.port);
-            auth_key = load_client_auth_key_from_keyring(&srv.host, srv.port);
-            // Seed the round-9 last-good cache with the
-            // startup-restored bytes so a subsequent malformed-
-            // hex role flip (round 9's fallback path) preserves
-            // the auth DSP just received. Without this the
-            // cache would stay `None` until the user first
-            // edited the auth field, opening a window where a
-            // role flip with malformed text in the row silently
-            // clears DSP auth. Per `CodeRabbit` round 10 on
-            // PR #408.
-            last_good_auth_key.borrow_mut().clone_from(&auth_key);
-            let has_auth_required = matches!(
-                favorite_entry.as_ref().and_then(|f| f.auth_required),
-                Some(true)
-            );
-            let should_reveal = has_auth_required || auth_key.is_some();
+/// Auth-key half of the `rtl_tcp` client restore: keyring load, last-good seed, and key-row reveal.
+/// Split out per the 50-NLOC gate (#817).
+fn restore_saved_auth_key(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    last_good_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
+    last_connected: Option<&crate::sidebar::source_panel::LastConnectedServer>,
+    favorite_entry: Option<&sidebar::source_panel::FavoriteEntry>,
+    persisted_role: crate::sidebar::source_panel::FavoriteRole,
+) {
+    // Load the saved per-server auth key for the last-
+    // connected endpoint, if any. Also cache that server's
+    // stable id on `AppState` so the first post-Play
+    // `AuthRequired` / `AuthFailed` / `Connected` arm
+    // already has it and the keyring save / clear paths
+    // target the right entry without waiting on the first
+    // `apply_rtl_tcp_connect` call.
+    //
+    // Auth-row visibility + text is resolved deterministically
+    // using the same two-input rule as `apply_rtl_tcp_connect`
+    // (per `CodeRabbit` round 5 on PR #408): reveal the row
+    // when EITHER the favorite advertises `auth_required ==
+    // Some(true)` (server requires a key; user should see the
+    // field up-front even on a fresh session with no saved
+    // key) OR a saved key exists in the keyring (we want to
+    // show the pre-loaded value so the user knows the
+    // session will auto-auth). Set text from the saved key,
+    // or clear when none — so a prior-session auth-required
+    // server whose key the user later cleared doesn't leak
+    // stale text into the field on the next launch.
+    let mut auth_key: Option<Vec<u8>> = None;
+    if let Some(srv) = last_connected {
+        *state.rtl_tcp_active_server.borrow_mut() = format!("{}:{}", srv.host, srv.port);
+        auth_key = load_client_auth_key_from_keyring(&srv.host, srv.port);
+        // Seed the round-9 last-good cache with the
+        // startup-restored bytes so a subsequent malformed-
+        // hex role flip (round 9's fallback path) preserves
+        // the auth DSP just received. Without this the
+        // cache would stay `None` until the user first
+        // edited the auth field, opening a window where a
+        // role flip with malformed text in the row silently
+        // clears DSP auth. Per `CodeRabbit` round 10 on
+        // PR #408.
+        last_good_auth_key.borrow_mut().clone_from(&auth_key);
+        let has_auth_required = matches!(favorite_entry.and_then(|f| f.auth_required), Some(true));
+        let should_reveal = has_auth_required || auth_key.is_some();
+        panels
+            .source
+            .rtl_tcp_auth_key_row
+            .set_visible(should_reveal);
+        if let Some(bytes) = auth_key.as_ref() {
             panels
                 .source
                 .rtl_tcp_auth_key_row
-                .set_visible(should_reveal);
-            if let Some(bytes) = auth_key.as_ref() {
-                panels
-                    .source
-                    .rtl_tcp_auth_key_row
-                    .set_text(&crate::sidebar::server_panel::auth_key_to_hex(bytes));
-            } else {
-                panels.source.rtl_tcp_auth_key_row.set_text("");
-            }
+                .set_text(&crate::sidebar::server_panel::auth_key_to_hex(bytes));
+        } else {
+            panels.source.rtl_tcp_auth_key_row.set_text("");
         }
-        state.send_dsp(UiToDsp::SetRtlTcpClientConfig {
-            requested_role: persisted_role.as_wire_role(),
-            auth_key,
-        });
     }
+    state.send_dsp(UiToDsp::SetRtlTcpClientConfig {
+        requested_role: persisted_role.as_wire_role(),
+        auth_key,
+    });
 }
 
 /// Two-tier role persistence: global default + per-favorite override.
@@ -4493,6 +4491,6 @@ fn persist_role_preference(
     if dirty {
         let snapshot: Vec<sidebar::source_panel::FavoriteEntry> =
             favorites_for_role.borrow().values().cloned().collect();
-        save_favorites(&config_for_role, &snapshot);
+        save_favorites(config_for_role, &snapshot);
     }
 }

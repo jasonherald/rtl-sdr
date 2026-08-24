@@ -231,7 +231,7 @@ fn on_acars_region_selected(
     // `Custom([])` and the apply handler later
     // replaces it with a real list.
     if matches!(region, AcarsRegion::Custom(_)) {
-        let saved = crate::acars_config::read_acars_custom_channels(&config);
+        let saved = crate::acars_config::read_acars_custom_channels(config);
         region = AcarsRegion::Custom(saved.into_boxed_slice());
         // Make the EntryRow visible immediately on
         // selection — the visibility-binding closure in
@@ -241,7 +241,7 @@ fn on_acars_region_selected(
         // don't have. Cheap idempotent set is fine.
         custom_row_for_dispatch.set_visible(true);
     }
-    crate::acars_config::save_acars_channel_set(&config, region.config_id());
+    crate::acars_config::save_acars_channel_set(config, region.config_id());
     // Rebuild channel rows to match the new region's
     // channel count — borrow_mut + adw mutation must
     // happen before send_dsp because the 4 Hz tick will

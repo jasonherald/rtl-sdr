@@ -15,6 +15,10 @@ use super::{AppState, Duration, Rc, RefCell, SidebarPanels, adw, glib, sidebar};
 /// row-unlock side of the four session-end paths in
 /// [`connect_transcript_panel`]: the `Error` arm, the unexpected
 /// channel disconnect, the start-failure path, and the user stop.
+#[allow(
+    clippy::struct_field_names,
+    reason = "fields deliberately mirror the panel widget names they weakly reference"
+)]
 pub(super) struct SessionRowWeaks {
     model_row: glib::WeakRef<adw::ComboRow>,
     #[cfg(feature = "whisper")]

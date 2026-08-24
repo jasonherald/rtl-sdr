@@ -63,34 +63,34 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
             // be sent in normal operation.
         }
         DspToUi::SignalLevel(level) => on_signal_level(ctx, level),
-        DspToUi::Error(err_msg) => on_error(ctx, err_msg),
+        DspToUi::Error(err_msg) => on_error(ctx, &err_msg),
         DspToUi::SourceStopped => on_source_stopped(ctx),
         DspToUi::SampleRateChanged(rate) => on_sample_rate_changed(ctx, rate),
         DspToUi::DisplayBandwidth(raw_rate) => on_display_bandwidth(ctx, raw_rate),
-        DspToUi::DeviceInfo(info) => on_device_info(ctx, info),
-        DspToUi::GainList(gains) => on_gain_list(ctx, gains),
-        DspToUi::AudioRecordingStarted(path) => on_audio_recording_started(ctx, path),
+        DspToUi::DeviceInfo(info) => on_device_info(ctx, &info),
+        DspToUi::GainList(gains) => on_gain_list(ctx, &gains),
+        DspToUi::AudioRecordingStarted(path) => on_audio_recording_started(ctx, &path),
         DspToUi::AudioRecordingStopped => on_audio_recording_stopped(ctx),
-        DspToUi::IqRecordingStarted(path) => on_iq_recording_started(ctx, path),
+        DspToUi::IqRecordingStarted(path) => on_iq_recording_started(ctx, &path),
         DspToUi::IqRecordingStopped => on_iq_recording_stopped(ctx),
         DspToUi::DemodModeChanged(new_mode) => on_demod_mode_changed(ctx, new_mode),
         DspToUi::BandwidthChanged(bw) => on_bandwidth_changed(ctx, bw),
         DspToUi::VfoOffsetChanged(offset) => on_vfo_offset_changed(ctx, offset),
         DspToUi::CtcssSustainedChanged(sustained) => on_ctcss_sustained_changed(ctx, sustained),
         DspToUi::VoiceSquelchOpenChanged(open) => on_voice_squelch_open_changed(ctx, open),
-        DspToUi::RtlTcpConnectionState(conn_state) => on_rtl_tcp_connection_state(ctx, conn_state),
-        DspToUi::NetworkSinkStatus(status) => on_network_sink_status(ctx, status),
+        DspToUi::RtlTcpConnectionState(conn_state) => on_rtl_tcp_connection_state(ctx, &conn_state),
+        DspToUi::NetworkSinkStatus(status) => on_network_sink_status(ctx, &status),
         // --- Scanner (#317) ---
         msg @ DspToUi::ScannerActiveChannelChanged { .. } => {
             on_scanner_active_channel_changed(ctx, msg);
         }
         DspToUi::ScannerStateChanged(scanner_state) => on_scanner_state_changed(ctx, scanner_state),
         DspToUi::ScannerEmptyRotation => on_scanner_empty_rotation(ctx),
-        DspToUi::AptLine(line) => on_apt_line(ctx, line),
+        DspToUi::AptLine(line) => on_apt_line(ctx, &line),
         DspToUi::SstvVisDetected { mode_label } => {
             on_sstv_vis_detected(ctx, mode_label);
         }
-        DspToUi::SstvLineDecoded(_line_index) => on_sstv_line_decoded(ctx, _line_index),
+        DspToUi::SstvLineDecoded(line_index) => on_sstv_line_decoded(ctx, line_index),
         DspToUi::SstvImageComplete {
             width,
             height,
@@ -99,7 +99,7 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
             on_sstv_image_complete(ctx, width, height, pixels);
         }
         DspToUi::ScannerMutexStopped(reason) => on_scanner_mutex_stopped(ctx, reason),
-        DspToUi::AcarsMessage(msg) => on_acars_message(ctx, msg),
+        DspToUi::AcarsMessage(msg) => on_acars_message(ctx, &msg),
         DspToUi::AcarsChannelStats(ch_stats) => on_acars_channel_stats(ctx, ch_stats),
         DspToUi::AcarsEnabledChanged(result) => on_acars_enabled_changed(ctx, result),
         // Output-writer errors (issue #578). Handler wired in Task 8;
@@ -107,7 +107,7 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
         // message as a toast so the user sees misconfigured paths / DNS
         // failures without having to consult the log.
         DspToUi::AcarsOutputError { kind, message } => {
-            on_acars_output_error(ctx, kind, message);
+            on_acars_output_error(ctx, kind, &message);
         }
     }
 }
@@ -190,7 +190,7 @@ fn on_source_stopped(ctx: &DspEventCtx) {
 
 /// `DspToUi::GainList` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_gain_list(ctx: &DspEventCtx, gains: Vec<f64>) {
+fn on_gain_list(ctx: &DspEventCtx, gains: &[f64]) {
     let DspEventCtx { gain_row, .. } = ctx;
     if let (Some(&min), Some(&max)) = (gains.first(), gains.last()) {
         tracing::info!(
@@ -207,7 +207,7 @@ fn on_gain_list(ctx: &DspEventCtx, gains: Vec<f64>) {
 
 /// `DspToUi::AudioRecordingStarted` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_audio_recording_started(ctx: &DspEventCtx, path: std::path::PathBuf) {
+fn on_audio_recording_started(ctx: &DspEventCtx, path: &std::path::Path) {
     let DspEventCtx {
         state,
         toast_overlay_weak,
@@ -248,7 +248,7 @@ fn on_audio_recording_stopped(ctx: &DspEventCtx) {
 
 /// `DspToUi::IqRecordingStarted` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_iq_recording_started(ctx: &DspEventCtx, path: std::path::PathBuf) {
+fn on_iq_recording_started(ctx: &DspEventCtx, path: &std::path::Path) {
     let DspEventCtx {
         state,
         toast_overlay_weak,
@@ -439,7 +439,7 @@ fn on_vfo_offset_changed(ctx: &DspEventCtx, offset: f64) {
 
 /// `DspToUi::RtlTcpConnectionState` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_rtl_tcp_connection_state(ctx: &DspEventCtx, conn_state: sdr_types::RtlTcpConnectionState) {
+fn on_rtl_tcp_connection_state(ctx: &DspEventCtx, conn_state: &sdr_types::RtlTcpConnectionState) {
     let DspEventCtx {
         state,
         toast_overlay_weak,
@@ -463,7 +463,7 @@ fn on_rtl_tcp_connection_state(ctx: &DspEventCtx, conn_state: sdr_types::RtlTcpC
         rtl_tcp_disconnect_button_weak.upgrade(),
         rtl_tcp_retry_button_weak.upgrade(),
     ) {
-        apply_rtl_tcp_connection_state(&status_row, &disconnect, &retry, &conn_state);
+        apply_rtl_tcp_connection_state(&status_row, &disconnect, &retry, conn_state);
     }
     // #396 toast surface: fire toast + manipulate widgets
     // on the EDGE of every transition into a role-denial
@@ -472,11 +472,11 @@ fn on_rtl_tcp_connection_state(ctx: &DspEventCtx, conn_state: sdr_types::RtlTcpC
     // uses a u8-discriminant cell on AppState so we don't
     // re-fire the toast on every same-state republish.
     let prev_disc = state.last_rtl_tcp_state_disc.get();
-    let now_disc = crate::state::rtl_tcp_state_discriminant(&conn_state);
+    let now_disc = crate::state::rtl_tcp_state_discriminant(conn_state);
     if prev_disc != now_disc {
         state.last_rtl_tcp_state_disc.set(now_disc);
         handle_rtl_tcp_state_toast(
-            &conn_state,
+            conn_state,
             prev_disc,
             state,
             toast_overlay_weak,
@@ -502,7 +502,7 @@ fn on_rtl_tcp_connection_state(ctx: &DspEventCtx, conn_state: sdr_types::RtlTcpC
     // unknown (legacy server, or pre-#392 RTLX build
     // that doesn't write the field). Hide the badge
     // when unknown AND in every non-Connected state.
-    status_bar.update_role(rtl_tcp_role_badge(&conn_state));
+    status_bar.update_role(rtl_tcp_role_badge(conn_state));
 }
 
 /// Map the server-granted role to the status-bar badge: `Some(true)`
@@ -771,7 +771,7 @@ fn on_scanner_empty_rotation(ctx: &DspEventCtx) {
 
 /// `DspToUi::AptLine` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_apt_line(ctx: &DspEventCtx, line: Box<sdr_core::messages::AptLine>) {
+fn on_apt_line(ctx: &DspEventCtx, line: &sdr_core::messages::AptLine) {
     let DspEventCtx { state, .. } = ctx;
     // Route the freshly-decoded APT line into the open
     // viewer, if any. When no viewer is open we silently
@@ -780,7 +780,7 @@ fn on_apt_line(ctx: &DspEventCtx, line: Box<sdr_core::messages::AptLine>) {
     // lines from that moment on, rather than having to
     // pre-arm before AOS.
     if let Some(view) = state.apt_viewer.borrow().as_ref() {
-        view.push_line(&line);
+        view.push_line(line);
     }
 }
 
@@ -888,7 +888,7 @@ fn on_scanner_mutex_stopped(ctx: &DspEventCtx, reason: sdr_core::messages::Scann
 
 /// `DspToUi::AcarsMessage` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_acars_message(ctx: &DspEventCtx, msg: Box<sdr_acars::AcarsMessage>) {
+fn on_acars_message(ctx: &DspEventCtx, msg: &sdr_acars::AcarsMessage) {
     let DspEventCtx { state, .. } = ctx;
     // Bounded ring: pop oldest if at cap.
     let cap = crate::acars_config::default_recent_keep() as usize;
@@ -939,8 +939,8 @@ fn on_acars_message(ctx: &DspEventCtx, msg: Box<sdr_acars::AcarsMessage>) {
         let adj = handles.scrolled_window.vadjustment();
         let was_at_top = (adj.value() - adj.lower()).abs() < 1.0;
 
-        append_acars_viewer_row(handles, &msg, &adj, was_at_top);
-        update_acars_aircraft_index(handles, &msg);
+        append_acars_viewer_row(handles, msg, &adj, was_at_top);
+        update_acars_aircraft_index(handles, msg);
     }
 
     tracing::trace!(
@@ -960,7 +960,7 @@ fn on_acars_enabled_changed(
     match result {
         Ok(true) => on_acars_engaged(ctx),
         Ok(false) => on_acars_disengaged(ctx),
-        Err(err) => on_acars_enable_error(ctx, err),
+        Err(err) => on_acars_enable_error(ctx, &err),
     }
 }
 
@@ -1144,7 +1144,7 @@ fn drain_deferred_aos_actions(ctx: &DspEventCtx) {
 }
 
 /// Engage/disengage failure of [`on_acars_enabled_changed`].
-fn on_acars_enable_error(ctx: &DspEventCtx, err: sdr_core::acars_airband_lock::AcarsEnableError) {
+fn on_acars_enable_error(ctx: &DspEventCtx, err: &sdr_core::acars_airband_lock::AcarsEnableError) {
     let DspEventCtx {
         state,
         toast_overlay_weak,
@@ -1232,13 +1232,13 @@ fn on_signal_level(ctx: &DspEventCtx, level: f32) {
 
 /// `DspToUi::Error` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_error(ctx: &DspEventCtx, err_msg: String) {
+fn on_error(ctx: &DspEventCtx, err_msg: &str) {
     let DspEventCtx {
         toast_overlay_weak, ..
     } = ctx;
     tracing::warn!(error = %err_msg, "DSP error");
     if let Some(overlay) = toast_overlay_weak.upgrade() {
-        let toast = plain_toast(&err_msg);
+        let toast = plain_toast(err_msg);
         overlay.add_toast(toast);
     }
 }
@@ -1263,7 +1263,7 @@ fn on_display_bandwidth(ctx: &DspEventCtx, raw_rate: f64) {
 
 /// `DspToUi::DeviceInfo` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_device_info(_ctx: &DspEventCtx, info: String) {
+fn on_device_info(_ctx: &DspEventCtx, info: &str) {
     tracing::info!(device_info = %info, "device info received");
 }
 
@@ -1285,14 +1285,14 @@ fn on_voice_squelch_open_changed(ctx: &DspEventCtx, open: bool) {
 
 /// `DspToUi::NetworkSinkStatus` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_network_sink_status(ctx: &DspEventCtx, status: sdr_core::sink_slot::NetworkSinkStatus) {
+fn on_network_sink_status(ctx: &DspEventCtx, status: &sdr_core::sink_slot::NetworkSinkStatus) {
     let DspEventCtx {
         network_sink_status_row_weak,
         ..
     } = ctx;
     tracing::debug!(?status, "network sink status");
     if let Some(row) = network_sink_status_row_weak.upgrade() {
-        apply_network_sink_status(&row, &status);
+        apply_network_sink_status(&row, status);
     }
 }
 
@@ -1308,7 +1308,7 @@ fn append_acars_viewer_row(
     let collapse_active = handles.collapse_button.is_active();
     let mut collapsed_into: Option<u32> = None;
     if collapse_active {
-        collapsed_into = try_collapse_into_existing(&handles.store, &msg);
+        collapsed_into = try_collapse_into_existing(&handles.store, msg);
     }
 
     if let Some(idx) = collapsed_into {
@@ -1355,7 +1355,7 @@ fn update_acars_aircraft_index(
     {
         let mut idx = handles.aircraft_index.borrow_mut();
         if let Some(obj) = idx.get(&msg.aircraft) {
-            obj.record_message(&msg);
+            obj.record_message(msg);
             // O(n) over ~50 aircraft is fine; Clear
             // invalidates positions otherwise so we
             // re-find each time rather than tracking
@@ -1386,7 +1386,7 @@ fn on_acars_channel_stats(ctx: &DspEventCtx, ch_stats: Box<[sdr_acars::ChannelSt
 
 /// `DspToUi::AcarsOutputError` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_acars_output_error(ctx: &DspEventCtx, kind: &'static str, message: String) {
+fn on_acars_output_error(ctx: &DspEventCtx, kind: &'static str, message: &str) {
     let DspEventCtx {
         toast_overlay_weak, ..
     } = ctx;

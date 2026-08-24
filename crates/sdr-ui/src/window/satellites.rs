@@ -191,29 +191,9 @@ struct DisplayedPass {
     bell_btn: Option<gtk4::ToggleButton>,
 }
 
-/// Wire the Satellites scheduler panel to its config-persistence
-/// layer, the [`sdr_sat::TleCache`], and a 1 Hz countdown timer.
-///
-/// Two pieces of shared state plumb the handlers together:
-///
-/// * `displayed: Rc<RefCell<Vec<DisplayedPass>>>` — the list of
-///   pass rows currently in `passes_group`. Walked by the 1 Hz
-///   ticker (to update title-line countdowns) and rebuilt by
-///   `recompute` whenever lat/lon/alt changes or a TLE refresh
-///   completes.
-/// * `cache: Arc<TleCache>` — `Arc` (not `Rc`) because the
-///   refresh button hands a clone to `gio::spawn_blocking`, which
-///   requires `Send`. `TleCache` is `Send + Sync`.
-///
-/// The 1 Hz timer holds a `glib::WeakRef<adw::PreferencesGroup>`
-/// to the passes group so it returns `ControlFlow::Break` once
-/// the window is destroyed; same lifecycle pattern as the DSP
-/// poll loop.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-
 /// Restore persisted panel values BEFORE the caller wires
 /// change-notify handlers, matching the scanner-panel pattern:
-/// `set_value` on a SpinRow fires `value-changed`, so wiring first
+/// `set_value` on a `SpinRow` fires `value-changed`, so wiring first
 /// would trigger spurious saves + recomputes during window
 /// construction.
 fn seed_persisted_panel_values(
@@ -260,7 +240,7 @@ fn seed_persisted_panel_values(
         .set_subtitle(&format_last_refresh(config));
 }
 
-/// Persist the notify-lead SpinRow on change.
+/// Persist the notify-lead `SpinRow` on change.
 fn wire_notify_lead_persistence(
     panel: &sidebar::satellites_panel::SatellitesPanel,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -404,9 +384,9 @@ fn build_recompute(
     let recompute: Rc<dyn Fn()> = if let Some(cache) = cache {
         let cache_recompute = std::sync::Arc::clone(cache);
         let panel_weak_recompute = panel_weak.clone();
-        let displayed_recompute = Rc::clone(&displayed);
+        let displayed_recompute = Rc::clone(displayed);
         let tune_for_recompute = Rc::clone(tune_to_satellite);
-        let watched_for_recompute = Rc::clone(&watched);
+        let watched_for_recompute = Rc::clone(watched);
         let config_for_recompute = std::sync::Arc::clone(config);
         Rc::new(move || {
             let Some(panel) = panel_weak_recompute.upgrade() else {
@@ -449,7 +429,7 @@ fn wire_station_rows(
     // satellites takes well under a millisecond.
     {
         let config_lat = std::sync::Arc::clone(config);
-        let recompute_lat = Rc::clone(&recompute);
+        let recompute_lat = Rc::clone(recompute);
         panel.lat_row.connect_value_notify(move |row| {
             save_f64(&config_lat, KEY_STATION_LAT_DEG, row.value());
             recompute_lat();
@@ -457,7 +437,7 @@ fn wire_station_rows(
     }
     {
         let config_lon = std::sync::Arc::clone(config);
-        let recompute_lon = Rc::clone(&recompute);
+        let recompute_lon = Rc::clone(recompute);
         panel.lon_row.connect_value_notify(move |row| {
             save_f64(&config_lon, KEY_STATION_LON_DEG, row.value());
             recompute_lon();
@@ -465,7 +445,7 @@ fn wire_station_rows(
     }
     {
         let config_alt = std::sync::Arc::clone(config);
-        let recompute_alt = Rc::clone(&recompute);
+        let recompute_alt = Rc::clone(recompute);
         panel.alt_row.connect_value_notify(move |row| {
             save_f64(&config_alt, KEY_STATION_ALT_M, row.value());
             recompute_alt();
@@ -494,7 +474,7 @@ fn wire_tle_refresh_button(
     let cache_refresh = std::sync::Arc::clone(cache_outer);
     let config_refresh = std::sync::Arc::clone(config);
     let panel_weak_refresh = panel_weak.clone();
-    let recompute_refresh = Rc::clone(&recompute);
+    let recompute_refresh = Rc::clone(recompute);
     panel.refresh_button.connect_clicked(move |_| {
         let Some(panel) = panel_weak_refresh.upgrade() else {
             return;
@@ -611,16 +591,9 @@ struct TickDeps {
     doppler_switch: adw::SwitchRow,
 }
 
-/// Schedule the 1 Hz countdown ticker + auto-record state machine
-/// (#482b). One GLib source drives both: pass-row countdown titles and
-/// the pure `AutoRecorder::tick`, whose actions the `interpret`
-/// closure applies against the live UI / DSP / filesystem. Captures
-/// the panel weakly so the source returns `ControlFlow::Break` once
-/// the panel is dropped.
-
 /// Per-tick [`SavedTune`] snapshot: centre frequency + user-dragged
 /// VFO offset, demod mode, and the radio/scanner/doppler widget states
-/// that AOS force-disables and LOS restores (#555/#556). f64 SpinRow
+/// that AOS force-disables and LOS restores (#555/#556). f64 `SpinRow`
 /// values are rounded at this boundary so the snapshot carries clean
 /// integers — no per-restore rounding.
 fn snapshot_saved_tune(deps: &TickDeps) -> sidebar::satellites_recorder::SavedTune {
@@ -750,11 +723,18 @@ fn run_notify_tick(
     }
 }
 
+/// Schedule the 1 Hz countdown ticker + auto-record state machine
+/// (#482b). One `GLib` source drives both: pass-row countdown titles and
+/// the pure `AutoRecorder::tick`, whose actions the `interpret`
+/// closure applies against the live UI / DSP / filesystem. Captures
+/// the panel weakly so the source returns `ControlFlow::Break` once
+/// the panel is dropped.
 fn arm_recorder_tick(deps: TickDeps) {
-    let recorder = RefCell::new(sidebar::satellites_recorder::AutoRecorder::new());
-    let notify_scheduler = RefCell::new(sidebar::satellites_notify::NotifyScheduler::new());
     use sdr_sat::Pass;
     use sidebar::satellites_panel::{AutoRecordQuality, format_pass_title};
+
+    let recorder = RefCell::new(sidebar::satellites_recorder::AutoRecorder::new());
+    let notify_scheduler = RefCell::new(sidebar::satellites_notify::NotifyScheduler::new());
 
     let _ = glib::timeout_add_local(SATELLITES_COUNTDOWN_TICK, move || {
         let Some(panel) = deps.panel_weak.upgrade() else {
@@ -875,12 +855,12 @@ fn wire_recorder(
         arm_recorder_tick(TickDeps {
             panel_weak: panel_weak.clone(),
             state: Rc::clone(state),
-            displayed: Rc::clone(&displayed),
-            recompute: Rc::clone(&recompute),
+            displayed: Rc::clone(displayed),
+            recompute: Rc::clone(recompute),
             interpret: Rc::clone(&interpret_action),
             spectrum: Rc::clone(spectrum_handle),
             config: std::sync::Arc::clone(config),
-            watched: Rc::clone(&watched),
+            watched: Rc::clone(watched),
             bandwidth_row: panels.radio.bandwidth_row.clone(),
             scanner_switch: panels.scanner.master_switch.clone(),
             squelch_enabled_row: panels.radio.squelch_enabled_row.clone(),
@@ -913,6 +893,25 @@ fn wire_doppler(
     }
 }
 
+/// Wire the Satellites scheduler panel to its config-persistence
+/// layer, the [`sdr_sat::TleCache`], and a 1 Hz countdown timer.
+///
+/// Two pieces of shared state plumb the handlers together:
+///
+/// * `displayed: Rc<RefCell<Vec<DisplayedPass>>>` — the list of
+///   pass rows currently in `passes_group`. Walked by the 1 Hz
+///   ticker (to update title-line countdowns) and rebuilt by
+///   `recompute` whenever lat/lon/alt changes or a TLE refresh
+///   completes.
+/// * `cache: Arc<TleCache>` — `Arc` (not `Rc`) because the
+///   refresh button hands a clone to `gio::spawn_blocking`, which
+///   requires `Send`. `TleCache` is `Send + Sync`.
+///
+/// The 1 Hz timer holds a `glib::WeakRef<adw::PreferencesGroup>`
+/// to the passes group so it returns `ControlFlow::Break` once
+/// the window is destroyed; same lifecycle pattern as the DSP
+/// poll loop.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -1031,7 +1030,7 @@ fn interpret_recorder_action(deps: &RecorderDeps, action: sidebar::satellites_re
         } => {
             on_recorder_aos(
                 deps,
-                satellite,
+                &satellite,
                 norad_id,
                 freq_hz,
                 mode,
@@ -1088,7 +1087,7 @@ fn interpret_recorder_action(deps: &RecorderDeps, action: sidebar::satellites_re
 #[allow(clippy::too_many_arguments)]
 fn on_recorder_aos(
     deps: &RecorderDeps,
-    satellite: String,
+    satellite: &str,
     norad_id: u32,
     freq_hz: u64,
     mode: sdr_types::DemodMode,
@@ -1610,12 +1609,6 @@ fn on_apt_export_complete(
     }
 }
 
-/// LOS save for an LRPT pass: one PNG per APID (plus the optional
-/// RGB composite) into the pass directory, off the main loop.
-/// Split out of [`interpret_recorder_action`] per the 50-NLOC gate
-/// (#817).
-#[allow(clippy::too_many_arguments)]
-
 /// Log a warning when a Meteor-M pass delivered fewer AVHRR APIDs than
 /// the satellite's expected set — the Roscosmos transmission schedule
 /// occasionally changes which channels are on (see #645).
@@ -1652,6 +1645,10 @@ fn warn_missing_lrpt_apids(
     }
 }
 
+/// LOS save for an LRPT pass: one PNG per APID (plus the optional
+/// RGB composite) into the pass directory, off the main loop.
+/// Split out of [`interpret_recorder_action`] per the 50-NLOC gate
+/// (#817).
 fn on_save_lrpt_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
     // Walk every APID present in the SHARED `LrptImage`
     // (the DSP-side decoder's destination — the source
@@ -1918,7 +1915,7 @@ fn save_lrpt_files(
             false,
         );
     }
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         // Per-pass directory created up
         // front so a disk-full / permissions
         // failure surfaces as a single
@@ -2049,19 +2046,13 @@ fn save_lrpt_composites(
     }
 }
 
-/// LOS save for an SSTV pass: drain completed frames (+ retained
-/// prior batches) into per-pass directories.
-/// Split out of [`interpret_recorder_action`] per the 50-NLOC gate
-/// (#817).
-#[allow(clippy::too_many_arguments)]
-
 /// Fallback [`SstvSaveOutcome`] when the `spawn_blocking` PNG worker
 /// panics. Re-constructs the full retain list from the backups: prior
 /// pending batches (preserved as-is) plus the current pass re-keyed to
 /// its dir, so neither is silently dropped by the failure-path drain.
 /// Per CR round 7 #25 on PR #599.
 fn sstv_panic_outcome(
-    e: Box<dyn std::any::Any + Send>,
+    e: &(dyn std::any::Any + Send),
     pending_batches_backup: Vec<PendingSstvExport>,
     current_images_backup: Vec<sdr_radio::sstv_image::CompletedSstvImage>,
     dir: &std::path::Path,
@@ -2221,6 +2212,10 @@ fn on_sstv_save_complete(
     }
 }
 
+/// LOS save for an SSTV pass: drain completed frames (+ retained
+/// prior batches) into per-pass directories.
+/// Split out of [`interpret_recorder_action`] per the 50-NLOC gate
+/// (#817).
 fn on_save_sstv_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
     // Per-pass auto-record save. Each pass's images are
     // written into their own `sstv-iss-{ts}` directory.
@@ -2289,7 +2284,7 @@ fn on_save_sstv_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
             retained,
         } = join.unwrap_or_else(|e| {
             sstv_panic_outcome(
-                e,
+                &*e,
                 pending_batches_backup,
                 current_images_backup,
                 &dir_backup,
@@ -2604,7 +2599,7 @@ fn on_zip_lookup_requested(
     panel.zip_status_row.set_title("Looking up…");
 
     let panel_weak_done = panel_weak_zip.clone();
-    let in_flight_done = Rc::clone(&in_flight_run);
+    let in_flight_done = Rc::clone(in_flight_run);
     let zip_for_task = zip.clone();
     glib::spawn_future_local(async move {
         // Chain the two lookups on the worker thread so the
@@ -2798,7 +2793,7 @@ fn rebuild_pass_rows(
         panel.alt_row.value(),
     );
     let now = chrono::Utc::now();
-    let passes = enumerate_upcoming_passes(&cache, &station, now);
+    let passes = enumerate_upcoming_passes(cache, &station, now);
 
     if passes.is_empty() {
         panel.passes_status_row.set_visible(true);
@@ -2823,7 +2818,7 @@ fn rebuild_pass_rows(
         // user-initiated action and works on any catalog
         // entry. Only the auto-record path filters on
         // `Some(protocol)`.
-        attach_pass_play_button(&row, &pass, &tune);
+        attach_pass_play_button(&row, &pass, tune);
         // 🔔 watch-toggle (#510) — per-satellite, NOT
         // per-pass. Toggling on row N flips the user's
         // subscription for THIS satellite. Mirrored across
@@ -2832,7 +2827,7 @@ fn rebuild_pass_rows(
         // passes per day) stay in sync. `None` for
         // off-catalog passes — no NORAD id, no
         // notification target, no button.
-        let bell_btn = build_pass_bell_button(&row, &pass, &watched, &config, &displayed);
+        let bell_btn = build_pass_bell_button(&row, &pass, watched, config, displayed);
         panel.passes_group.add(&row);
         new_rows.push(DisplayedPass {
             row,
@@ -2925,7 +2920,7 @@ fn on_pass_bell_toggled(
             set.remove(&norad_id)
         };
         if changed {
-            save_watched_satellites(&config, &set);
+            save_watched_satellites(config, &set);
         }
     }
     // Mirror across sibling rows. `set_active`
@@ -3158,7 +3153,7 @@ fn wire_doppler_master_switch(
     state: &Rc<AppState>,
     status_bar: &Rc<StatusBar>,
 ) {
-    let tracker = Rc::clone(&tracker);
+    let tracker = Rc::clone(tracker);
     let state = Rc::clone(state);
     let status_bar = Rc::clone(status_bar);
     panels

@@ -248,7 +248,7 @@ pub(super) fn connect_scanner_panel(
     wire_scanner_lockout_button(state, scanner);
 }
 
-/// Master switch -> SetScannerEnabled (notify-driven so F8 / force-disable / DSP syncs all fire it).
+/// Master switch -> `SetScannerEnabled` (notify-driven so F8 / force-disable / DSP syncs all fire it).
 /// Split out per the 50-NLOC gate (#817).
 fn wire_scanner_master_switch(
     panels: &SidebarPanels,
