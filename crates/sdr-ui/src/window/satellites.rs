@@ -1629,6 +1629,34 @@ fn save_lrpt_files(
     }
     let mut saved = 0_usize;
     let mut errors: Vec<String> = Vec::new();
+    save_lrpt_channels(dir, snapshots, &mut saved, &mut errors);
+    save_lrpt_composites(dir, composite_snapshots, &mut saved, &mut errors);
+    let msg = if errors.is_empty() {
+        format!(
+            "Pass complete — {saved} LRPT file(s) saved to {}",
+            dir.display()
+        )
+    } else {
+        format!(
+            "Pass complete — {saved} file(s) saved, {} failed: {}",
+            errors.len(),
+            errors.join("; ")
+        )
+    };
+    // Treat "at least one channel saved" as
+    // success for close-purposes — partial-
+    // success outcomes still produced disk
+    // artifacts the user can inspect.
+    (msg, saved > 0)
+}
+
+/// Per-APID greyscale saves for an LRPT pass.
+fn save_lrpt_channels(
+    dir: &std::path::Path,
+    snapshots: Vec<(u16, sdr_lrpt::image::ChannelBuffer)>,
+    saved: &mut usize,
+    errors: &mut Vec<String>,
+) {
     for (apid, snap) in snapshots {
         let path = dir.join(format!("apid{apid}.png"));
         match crate::lrpt_viewer::write_greyscale_png(
@@ -1644,7 +1672,7 @@ fn save_lrpt_files(
                     lines = snap.lines,
                     "auto-record LRPT channel saved",
                 );
-                saved += 1;
+                *saved += 1;
             }
             Err(e) => {
                 tracing::warn!("auto-record LRPT export for APID {apid} to {path:?} failed: {e}",);
@@ -1652,8 +1680,26 @@ fn save_lrpt_files(
             }
         }
     }
+}
+
+/// Composite RGB saves for an LRPT pass. Filename is
+/// `composite-{slug}.png` where `slug` is the recipe name with spaces
+/// replaced by `-` and path separators by `_` so the disk layout is
+/// portable across filesystems. The RGB interleave runs here — inside
+/// the `gio::spawn_blocking` worker — so the ~30 ms per-recipe
+/// per-pixel walk doesn't block the GTK main thread; the assembler
+/// lock was already released after the cheap channel memcpy in the
+/// snapshot phase (CR round 1 on PR #575).
+fn save_lrpt_composites(
+    dir: &std::path::Path,
+    composite_snapshots: Vec<(
+        crate::lrpt_viewer::CompositeRecipe,
+        sdr_lrpt::image::CompositeSnapshot,
+    )>,
+    saved: &mut usize,
+    errors: &mut Vec<String>,
+) {
     // Composite PNGs alongside the per-APID
-    // files. Filename is `composite-{slug}.png`
     // where `slug` is the recipe name with
     // spaces replaced by `-` and path
     // separators replaced by `_` so the disk
@@ -1686,7 +1732,7 @@ fn save_lrpt_files(
                     height,
                     "auto-record LRPT composite saved",
                 );
-                saved += 1;
+                *saved += 1;
             }
             Err(e) => {
                 tracing::warn!(
@@ -1697,23 +1743,6 @@ fn save_lrpt_files(
             }
         }
     }
-    let msg = if errors.is_empty() {
-        format!(
-            "Pass complete — {saved} LRPT file(s) saved to {}",
-            dir.display()
-        )
-    } else {
-        format!(
-            "Pass complete — {saved} file(s) saved, {} failed: {}",
-            errors.len(),
-            errors.join("; ")
-        )
-    };
-    // Treat "at least one channel saved" as
-    // success for close-purposes — partial-
-    // success outcomes still produced disk
-    // artifacts the user can inspect.
-    (msg, saved > 0)
 }
 
 /// LOS save for an SSTV pass: drain completed frames (+ retained
