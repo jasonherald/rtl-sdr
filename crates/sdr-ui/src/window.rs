@@ -497,18 +497,8 @@ pub fn build_window(
         RIGHT_SIDEBAR_DEFAULT_WIDTH as u32,
     );
 
-    wire_activity_bar_clicks(
-        &left_activity_bar,
-        &left_stack,
-        &left_split_view,
-        session.left_selected,
-    );
-    wire_activity_bar_clicks(
-        &right_activity_bar,
-        &right_stack,
-        &right_split_view,
-        session.right_selected,
-    );
+    wire_activity_bar_clicks(&left_activity_bar, &left_stack, &left_split_view);
+    wire_activity_bar_clicks(&right_activity_bar, &right_stack, &right_split_view);
 
     // Persistence — wire AFTER the seed so the initial sets don't
     // round-trip back through config. `save_*` writes are cheap

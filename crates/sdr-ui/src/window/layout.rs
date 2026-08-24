@@ -5,8 +5,8 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
 use super::{
-    AppState, DEFAULT_WIDTH, Rc, RefCell, SidebarPanels, StatusBar, UiToDsp, adw, gio, glib,
-    header, sidebar, spectrum, status_bar,
+    AppState, DEFAULT_WIDTH, Rc, SidebarPanels, StatusBar, UiToDsp, adw, gio, glib, header,
+    sidebar, spectrum, status_bar,
 };
 
 /// Sidebar collapse breakpoint width in pixels.
@@ -661,9 +661,6 @@ pub(super) fn build_toolbar_view(header: &adw::HeaderBar, content: &gtk4::Box) -
 ///   "I'm still in Radio, I just closed the panel for a second") and
 ///   toggles the split view's sidebar show/hide.
 ///
-/// `initial_selected` must match the stack's initial visible child
-/// and the button the caller pre-activated via `set_active(true)`.
-///
 /// The `:checked` CSS pseudo-class (driven by `ToggleButton::active`)
 /// renders the accent tint — no manual CSS class juggling needed.
 ///
@@ -678,12 +675,8 @@ pub(super) fn wire_activity_bar_clicks(
     bar: &sidebar::ActivityBar,
     stack: &gtk4::Stack,
     split_view: &adw::OverlaySplitView,
-    initial_selected: &'static str,
 ) {
-    let selected: Rc<RefCell<&'static str>> = Rc::new(RefCell::new(initial_selected));
-
     for (&name, btn) in &bar.buttons {
-        let selected = Rc::clone(&selected);
         let bar_buttons: Vec<(&'static str, glib::WeakRef<gtk4::ToggleButton>)> = bar
             .buttons
             .iter()
@@ -692,8 +685,17 @@ pub(super) fn wire_activity_bar_clicks(
         let stack_weak = stack.downgrade();
         let split_view_weak = split_view.downgrade();
         btn.connect_clicked(move |clicked_btn| {
-            let prev = *selected.borrow();
-            if prev == name {
+            // The stack itself is the single source of truth for
+            // "which activity is selected" — no shadow copy to
+            // drift when another code path (keyboard shortcut,
+            // header button) swaps the visible child. Per CR
+            // round 1 on PR #844 and the crate's no-Rc<RefCell>
+            // guidance.
+            let already_selected = stack_weak
+                .upgrade()
+                .and_then(|stk| stk.visible_child_name())
+                .is_some_and(|current| current == name);
+            if already_selected {
                 // Clicking the already-selected icon toggles the
                 // panel open/closed. The icon's `active` property
                 // tracks the panel's NEW visibility — active
@@ -737,7 +739,6 @@ pub(super) fn wire_activity_bar_clicks(
                 if let Some(sv) = split_view_weak.upgrade() {
                     sv.set_show_sidebar(true);
                 }
-                *selected.borrow_mut() = name;
             }
         });
     }
