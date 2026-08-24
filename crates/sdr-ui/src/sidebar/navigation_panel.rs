@@ -415,20 +415,52 @@ pub fn project_scanner_channels(
     bookmarks
         .iter()
         .filter(|b| b.scan_enabled)
-        .map(|b| sdr_scanner::ScannerChannel {
-            key: sdr_scanner::ChannelKey {
-                name: b.name.clone(),
-                frequency_hz: b.frequency,
-            },
-            demod_mode: parse_demod_mode(&b.demod_mode),
-            bandwidth: b.bandwidth,
-            ctcss: b.ctcss_mode,
-            voice_squelch: b.voice_squelch_mode,
-            priority: b.priority,
-            dwell_ms: b.dwell_ms_override.unwrap_or(default_dwell_ms),
-            hang_ms: b.hang_ms_override.unwrap_or(default_hang_ms),
+        .map(|b| {
+            let demod_mode = parse_demod_mode(&b.demod_mode);
+            sdr_scanner::ScannerChannel {
+                key: sdr_scanner::ChannelKey {
+                    name: b.name.clone(),
+                    frequency_hz: b.frequency,
+                },
+                demod_mode,
+                bandwidth: clamp_bandwidth_for_mode(b.bandwidth, demod_mode, &b.name),
+                ctcss: b.ctcss_mode,
+                voice_squelch: b.voice_squelch_mode,
+                priority: b.priority,
+                dwell_ms: b.dwell_ms_override.unwrap_or(default_dwell_ms),
+                hang_ms: b.hang_ms_override.unwrap_or(default_hang_ms),
+            }
         })
         .collect()
+}
+
+/// Clamp a bookmark's bandwidth into the demod mode's legal range
+/// before it reaches the scanner. The Radio panel clamps interactive
+/// edits via the SpinRow range, but a bookmark saved under a
+/// different mode (or edited on disk) can carry an out-of-range
+/// value; the VFO would accept it while NFM ignores it, letting the
+/// DSP state diverge from the UI. The normalized value flows to both
+/// the `UpdateScannerChannels` dispatch and the axis-lock UI, which
+/// consume this projection. Per CR round 2 on PR #844.
+fn clamp_bandwidth_for_mode(bandwidth: f64, mode: sdr_types::DemodMode, name: &str) -> f64 {
+    let (Ok(min_bw), Ok(max_bw)) = (
+        sdr_radio::demod::min_bandwidth_for_mode(mode),
+        sdr_radio::demod::max_bandwidth_for_mode(mode),
+    ) else {
+        // No defined range for this mode — pass through unchanged.
+        return bandwidth;
+    };
+    let clamped = bandwidth.clamp(min_bw, max_bw);
+    if (clamped - bandwidth).abs() > f64::EPSILON {
+        tracing::warn!(
+            name,
+            ?mode,
+            bandwidth,
+            clamped,
+            "scanner channel bandwidth out of range for mode; clamped"
+        );
+    }
+    clamped
 }
 
 /// Compute the (min, max) frequency envelope of a scanner channel
