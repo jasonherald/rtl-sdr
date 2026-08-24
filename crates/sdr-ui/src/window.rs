@@ -75,7 +75,8 @@ use layout::{
 };
 use navigation::connect_navigation_panel;
 use radio::{
-    connect_radio_panel, update_bandwidth_reset_sensitivity, update_bandwidth_row_range_for_mode,
+    connect_distance_estimator_persistence, connect_radio_panel,
+    update_bandwidth_reset_sensitivity, update_bandwidth_row_range_for_mode,
     update_vfo_reset_button_visibility,
 };
 use satellites::connect_satellites_panel;
@@ -88,7 +89,7 @@ use source::{
     apply_rtl_tcp_connection_state, connect_rtl_tcp_discovery, connect_source_panel,
     connect_source_rtlsdr_probe, handle_rtl_tcp_state_toast,
 };
-use transcript::{connect_distance_estimator_persistence, connect_transcript_panel};
+use transcript::connect_transcript_panel;
 
 /// Interval in milliseconds for polling the DSP→UI channel.
 const DSP_POLL_INTERVAL_MS: u64 = 16;

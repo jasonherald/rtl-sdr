@@ -451,3 +451,56 @@ fn wire_gate_rows(panels: &SidebarPanels, state: &Rc<AppState>) {
             state_vs_thresh.send_dsp(UiToDsp::SetVoiceSquelchThreshold(row.value() as f32));
         });
 }
+
+/// Load saved transmitter ERP and receiver calibration offset
+/// into the Radio panel's FSPL distance estimator rows, and wire
+/// value-change handlers to persist any edits back to the config
+/// (ticket #164). The distance display refresh wiring lives
+/// inside `build_radio_panel` — this function is only about
+/// config ↔ row synchronisation.
+pub(super) fn connect_distance_estimator_persistence(
+    panels: &SidebarPanels,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    use sidebar::radio_panel::{KEY_RADIO_DISTANCE_CALIBRATION_DB, KEY_RADIO_DISTANCE_ERP_WATTS};
+
+    // Seed the rows with the saved values (clamped to the spin
+    // rows' own adjustment bounds via their `set_value`). The
+    // default spin row values were already applied at
+    // `build_radio_panel` time, so `config.read` here only
+    // overrides when a saved value exists.
+    let saved_erp = config.read(|v| {
+        v.get(KEY_RADIO_DISTANCE_ERP_WATTS)
+            .and_then(serde_json::Value::as_f64)
+    });
+    let saved_cal = config.read(|v| {
+        v.get(KEY_RADIO_DISTANCE_CALIBRATION_DB)
+            .and_then(serde_json::Value::as_f64)
+    });
+    if let Some(erp) = saved_erp {
+        panels.radio.erp_row.set_value(erp);
+    }
+    if let Some(cal) = saved_cal {
+        panels.radio.calibration_row.set_value(cal);
+    }
+
+    // Persist-on-change. Uses `value_notify` (not the adjustment's
+    // `value_changed`) to match the signal the in-panel distance
+    // refresh handler is already listening to — both fire on the
+    // same user edit.
+    let config_erp = std::sync::Arc::clone(config);
+    panels.radio.erp_row.connect_value_notify(move |row| {
+        config_erp.write(|v| {
+            v[KEY_RADIO_DISTANCE_ERP_WATTS] = serde_json::json!(row.value());
+        });
+    });
+    let config_cal = std::sync::Arc::clone(config);
+    panels
+        .radio
+        .calibration_row
+        .connect_value_notify(move |row| {
+            config_cal.write(|v| {
+                v[KEY_RADIO_DISTANCE_CALIBRATION_DB] = serde_json::json!(row.value());
+            });
+        });
+}
