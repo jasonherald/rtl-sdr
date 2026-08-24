@@ -444,45 +444,35 @@ fn drain_transcription_events(
             },
             Err(std::sync::mpsc::TryRecvError::Empty) => break,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // Distinguish a normal user-initiated stop
-                // from a spontaneous backend death:
-                //
-                // - User stop: the off branch of
-                //   enable_row.connect_active_notify already
-                //   ran (it dropped audio_tx, which is what
-                //   caused the worker to exit and drop
-                //   event_tx, which we're now seeing as
-                //   Disconnected). The toggle is already
-                //   inactive and all the rows have been
-                //   re-enabled. Nothing to do here — the
-                //   off branch did the cleanup. Without
-                //   this check the disconnect arm overwrote
-                //   the off branch's clean state with a
-                //   spurious "Transcription stopped
-                //   unexpectedly" error message on every
-                //   normal stop.
-                //
-                // - Spontaneous death: the worker dropped
-                //   event_tx without the user clicking
-                //   anything. The toggle is still active.
-                //   Mirror the Error arm's teardown so the
-                //   UI doesn't strand the user with locked
-                //   controls and a stale "Listening..."
-                //   status.
-                let was_user_stop = ui.enable_row.upgrade().is_none_or(|e| !e.is_active());
-
-                if was_user_stop {
-                    tracing::debug!("transcription event channel closed (user stop)");
-                    return Some(glib::ControlFlow::Break);
-                }
-
-                tracing::warn!("transcription event channel disconnected unexpectedly");
-                teardown_failed_session(ui, "Transcription stopped unexpectedly");
+                on_transcription_channel_closed(ui);
                 return Some(glib::ControlFlow::Break);
             }
         }
     }
     None
+}
+
+/// Channel-disconnect handling: distinguish a normal user stop from a
+/// spontaneous backend death.
+///
+/// - User stop: the off branch of `enable_row.connect_active_notify`
+///   already ran (it dropped `audio_tx`, which made the worker exit
+///   and drop `event_tx` — the disconnect we're seeing). The toggle
+///   is inactive and the rows are re-enabled; doing anything more
+///   would overwrite that clean state with a spurious error message
+///   on every normal stop.
+/// - Spontaneous death: the worker dropped `event_tx` without the
+///   user clicking anything (toggle still active). Mirror the Error
+///   arm's teardown so the UI doesn't strand the user with locked
+///   controls and a stale "Listening..." status.
+fn on_transcription_channel_closed(ui: &SessionTickUi) {
+    let was_user_stop = ui.enable_row.upgrade().is_none_or(|e| !e.is_active());
+    if was_user_stop {
+        tracing::debug!("transcription event channel closed (user stop)");
+        return;
+    }
+    tracing::warn!("transcription event channel disconnected unexpectedly");
+    teardown_failed_session(ui, "Transcription stopped unexpectedly");
 }
 
 /// Disable every transcription settings row for the duration of a
