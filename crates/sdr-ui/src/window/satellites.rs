@@ -429,6 +429,46 @@ fn build_recompute(
     }
 }
 
+/// Lat / lon / alt — persist on change and re-run pass enumeration.
+/// Cheap: a single SGP4 sweep across ~7 satellites takes well under a
+/// millisecond.
+fn wire_station_rows(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    recompute: &Rc<dyn Fn()>,
+) {
+    use sidebar::satellites_panel::{
+        KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG, save_f64,
+    };
+    // Lat / lon / alt — persist on change and re-run pass
+    // enumeration. Cheap: a single SGP4 sweep across ~7
+    // satellites takes well under a millisecond.
+    {
+        let config_lat = std::sync::Arc::clone(config);
+        let recompute_lat = Rc::clone(&recompute);
+        panel.lat_row.connect_value_notify(move |row| {
+            save_f64(&config_lat, KEY_STATION_LAT_DEG, row.value());
+            recompute_lat();
+        });
+    }
+    {
+        let config_lon = std::sync::Arc::clone(config);
+        let recompute_lon = Rc::clone(&recompute);
+        panel.lon_row.connect_value_notify(move |row| {
+            save_f64(&config_lon, KEY_STATION_LON_DEG, row.value());
+            recompute_lon();
+        });
+    }
+    {
+        let config_alt = std::sync::Arc::clone(config);
+        let recompute_alt = Rc::clone(&recompute);
+        panel.alt_row.connect_value_notify(move |row| {
+            save_f64(&config_alt, KEY_STATION_ALT_M, row.value());
+            recompute_alt();
+        });
+    }
+}
+
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -442,9 +482,8 @@ pub(super) fn connect_satellites_panel(
     use sdr_sat::Pass;
     use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
-        AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
-        SatellitesPanelWeak, format_pass_title, load_notify_lead_min, load_watched_satellites,
-        norad_id_for_pass, save_f64,
+        AutoRecordQuality, SatellitesPanelWeak, format_pass_title, load_notify_lead_min,
+        load_watched_satellites, norad_id_for_pass,
     };
     use sidebar::satellites_recorder::{Action as RecorderAction, AutoRecorder, SavedTune};
 
@@ -488,33 +527,7 @@ pub(super) fn connect_satellites_panel(
     // cached TLEs from a prior session. (No-op if cache is None.)
     recompute();
 
-    // Lat / lon / alt — persist on change and re-run pass
-    // enumeration. Cheap: a single SGP4 sweep across ~7
-    // satellites takes well under a millisecond.
-    {
-        let config_lat = std::sync::Arc::clone(config);
-        let recompute_lat = Rc::clone(&recompute);
-        panel.lat_row.connect_value_notify(move |row| {
-            save_f64(&config_lat, KEY_STATION_LAT_DEG, row.value());
-            recompute_lat();
-        });
-    }
-    {
-        let config_lon = std::sync::Arc::clone(config);
-        let recompute_lon = Rc::clone(&recompute);
-        panel.lon_row.connect_value_notify(move |row| {
-            save_f64(&config_lon, KEY_STATION_LON_DEG, row.value());
-            recompute_lon();
-        });
-    }
-    {
-        let config_alt = std::sync::Arc::clone(config);
-        let recompute_alt = Rc::clone(&recompute);
-        panel.alt_row.connect_value_notify(move |row| {
-            save_f64(&config_alt, KEY_STATION_ALT_M, row.value());
-            recompute_alt();
-        });
-    }
+    wire_station_rows(panel, config, &recompute);
 
     wire_auto_record_persistence(panel, config);
 
