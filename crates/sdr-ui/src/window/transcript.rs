@@ -156,10 +156,21 @@ pub(super) fn connect_distance_estimator_persistence(
         });
 }
 
-/// Connect transcript panel controls to DSP commands.
-///
-/// Returns the engine handle so it can be stopped on window close.
-#[allow(clippy::too_many_lines)]
+/// Everything a transcription session's start/stop paths need,
+/// captured once by the enable-row handler. The panel handle carries
+/// the status area, transcript log, and every settings row; the
+/// session-rows set is the lock/unlock surface.
+struct SessionDeps {
+    engine: Rc<RefCell<sdr_transcription::TranscriptionEngine>>,
+    state: Rc<AppState>,
+    panel: sidebar::transcript_panel::TranscriptPanel,
+    session_rows: Rc<SessionRowWeaks>,
+    #[cfg(feature = "sherpa")]
+    squelch_enabled_row: adw::SwitchRow,
+    #[cfg(feature = "sherpa")]
+    toast_overlay: glib::WeakRef<adw::ToastOverlay>,
+}
+
 pub(super) fn connect_transcript_panel(
     transcript: &sidebar::transcript_panel::TranscriptPanel,
     state: &Rc<AppState>,
@@ -170,221 +181,208 @@ pub(super) fn connect_transcript_panel(
     squelch_enabled_row: &adw::SwitchRow,
     #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))] toast_overlay: &adw::ToastOverlay,
 ) -> Rc<RefCell<sdr_transcription::TranscriptionEngine>> {
-    use sdr_transcription::TranscriptionEngine;
-
-    let engine: Rc<RefCell<TranscriptionEngine>> =
-        Rc::new(RefCell::new(TranscriptionEngine::new()));
-
-    let state_clone = Rc::clone(state);
-    let engine_clone = Rc::clone(&engine);
-    let panel_for_session = transcript.clone();
-    let session_rows = Rc::new(SessionRowWeaks::from_panel(transcript));
-    let status_label = transcript.status_label.clone();
-    let progress_bar = transcript.progress_bar.clone();
-    let text_view = transcript.text_view.clone();
-    // Weak refs used by the async event-loop closure to drive the same
-    // teardown the synchronous error path does (see below) when the
-    // backend fires TranscriptionEvent::Error mid-session. Weak so the
-    // timeout closure doesn't keep widgets alive past their UI lifetime.
-    let enable_row_weak = transcript.enable_row.downgrade();
-    // Re-read per event inside the tick (mid-session display-mode /
-    // model introspection) — the only row weaks the event loop still
-    // needs individually; the lock/unlock set lives in
-    // `SessionRowWeaks`.
-    #[cfg(feature = "sherpa")]
-    let model_row_weak = transcript.model_row.downgrade();
-    #[cfg(feature = "sherpa")]
-    let squelch_enabled_row_for_session = squelch_enabled_row.clone();
-    #[cfg(feature = "sherpa")]
-    let toast_overlay_for_session = toast_overlay.downgrade();
-    #[cfg(feature = "sherpa")]
-    let live_line_label = transcript.live_line_label.clone();
-    #[cfg(feature = "sherpa")]
-    let display_mode_row_weak = transcript.display_mode_row.downgrade();
-    #[cfg(feature = "sherpa")]
-    let live_line_weak = live_line_label.downgrade();
+    let engine = Rc::new(RefCell::new(sdr_transcription::TranscriptionEngine::new()));
 
     #[cfg(feature = "sherpa")]
-    wire_sherpa_model_reload(transcript, &status_label, &progress_bar, config);
+    wire_sherpa_model_reload(
+        transcript,
+        &transcript.status_label,
+        &transcript.progress_bar,
+        config,
+    );
 
+    let deps = SessionDeps {
+        engine: Rc::clone(&engine),
+        state: Rc::clone(state),
+        panel: transcript.clone(),
+        session_rows: Rc::new(SessionRowWeaks::from_panel(transcript)),
+        #[cfg(feature = "sherpa")]
+        squelch_enabled_row: squelch_enabled_row.clone(),
+        #[cfg(feature = "sherpa")]
+        toast_overlay: toast_overlay.downgrade(),
+    };
     transcript.enable_row.connect_active_notify(move |row| {
         if row.is_active() {
-            // Read the selected model index once at the top of the
-            // session-start branch; the Auto Break eligibility check
-            // below needs it, and the BackendConfig construction
-            // below reuses it.
-            let model_idx = panel_for_session.model_row.selected() as usize;
-
-            // Auto Break is eligible ONLY when all three conditions
-            // hold: (1) the toggle itself is on, (2) the current demod
-            // mode is NFM, and (3) the selected sherpa model is offline
-            // (Moonshine, Parakeet). The toggle is persisted, so
-            // without this computed gate it would still report "on"
-            // after a restart into WFM, or after the user switched to
-            // streaming Zipformer and the row went invisible — either
-            // of which would produce an unsupported session
-            // (streaming Zipformer rejects AutoBreak at session start;
-            // non-NFM modes never emit squelch edges so the state
-            // machine sits in Idle forever). Compute the effective
-            // value once here and use it for both the precondition
-            // check and the BackendConfig assignment.
-            #[cfg(feature = "sherpa")]
-            let auto_break_enabled = {
-                let selected_is_offline = sdr_transcription::SherpaModel::ALL
-                    .get(model_idx)
-                    .copied()
-                    .is_some_and(|m| !m.supports_partials());
-                panel_for_session.auto_break_row.is_active()
-                    && state_clone.demod_mode.get() == sdr_types::DemodMode::Nfm
-                    && selected_is_offline
-            };
-
-            // Auto Break precondition: squelch must be enabled so the
-            // radio produces the open/close transitions the state
-            // machine needs for segmentation. Without squelch enabled,
-            // the session would sit in Idle indefinitely producing
-            // zero transcripts — silent failure mode. Block session
-            // start with an actionable toast.
-            #[cfg(feature = "sherpa")]
-            if auto_break_enabled && !squelch_enabled_row_for_session.is_active() {
-                let toast = plain_toast(
-                    "Auto Break needs squelch enabled to detect transmission boundaries. \
-                     Enable squelch in the radio panel, or turn off Auto Break to use VAD.",
-                );
-                if let Some(overlay) = toast_overlay_for_session.upgrade() {
-                    overlay.add_toast(toast);
-                }
-                // Revert the enable toggle so the user can take action first.
-                // The OFF branch of the handler is a safe no-op on an
-                // inactive session (it just drops any backend channels).
-                row.set_active(false);
-                return;
-            }
-
-            // Lock model and tuning controls while transcription is active.
-            // All settings lock during a session for mid-session fault
-            // tolerance — walks back PR 4's earlier display_mode_row
-            // exception. User stops, changes, starts.
-            lock_session_rows(&panel_for_session);
-
-            // Read tuning slider values.
-            #[cfg(feature = "whisper")]
-            let auto_break_enabled = false;
-            let config = build_backend_config(&panel_for_session, model_idx, auto_break_enabled);
-
-            // Scope the borrow so it's dropped before any potential re-entry
-            // from row.set_active(false) on error.
-            let start_result = engine_clone.borrow_mut().start(config);
-            match start_result {
-                Ok(event_rx) => {
-                    if let Some(audio_tx) = engine_clone.borrow().audio_sender() {
-                        state_clone
-                            .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
-                    }
-                    // Drop any channel-marker buffered while
-                    // transcription was off — the first text
-                    // event after re-enable should attribute to
-                    // the *next* hop, not whichever channel the
-                    // scanner happened to land on during the
-                    // off period. Per CodeRabbit round 1 on PR
-                    // #558.
-                    *state_clone.pending_channel_marker.borrow_mut() = None;
-
-                    status_label.set_text("Starting...");
-                    status_label.set_visible(true);
-
-                    // Weak refs for the entire timeout source — see the
-                    // weak-ref decl block at the top of connect_transcript_panel
-                    // for the rationale (don't keep widgets alive past their
-                    // UI lifetime through the glib timeout source).
-                    let status_weak = status_label.downgrade();
-                    let progress_weak = progress_bar.downgrade();
-                    let tv_weak = text_view.downgrade();
-                    let enable_row_weak = enable_row_weak.clone();
-                    #[cfg(feature = "sherpa")]
-                    let display_mode_row_weak = display_mode_row_weak.clone();
-                    #[cfg(feature = "sherpa")]
-                    let model_row_weak = model_row_weak.clone();
-                    #[cfg(feature = "sherpa")]
-                    let live_line_weak = live_line_weak.clone();
-                    // State handle for the lazy channel-marker
-                    // emission (#517) — the closure consumes
-                    // `state_clone.pending_channel_marker` from
-                    // the `TranscriptionEvent::Text` arm below.
-                    let state_for_marker = Rc::clone(&state_clone);
-                    let session_rows = Rc::clone(&session_rows);
-
-                    glib::timeout_add_local(Duration::from_millis(100), move || {
-                        // Upgrade once per tick. If any widget has been
-                        // dropped (e.g. window closed), stop the timeout
-                        // immediately so we don't resurrect dead UI.
-                        let Some(status) = status_weak.upgrade() else {
-                            return glib::ControlFlow::Break;
-                        };
-                        let Some(progress) = progress_weak.upgrade() else {
-                            return glib::ControlFlow::Break;
-                        };
-                        let Some(tv) = tv_weak.upgrade() else {
-                            return glib::ControlFlow::Break;
-                        };
-
-                        let ui = SessionTickUi {
-                            status,
-                            progress,
-                            tv,
-                            enable_row: enable_row_weak.clone(),
-                            session_rows: Rc::clone(&session_rows),
-                            state: Rc::clone(&state_for_marker),
-                            #[cfg(feature = "sherpa")]
-                            model_row: model_row_weak.clone(),
-                            #[cfg(feature = "sherpa")]
-                            display_mode_row: display_mode_row_weak.clone(),
-                            #[cfg(feature = "sherpa")]
-                            live_line: live_line_weak.clone(),
-                        };
-                        if let Some(flow) = drain_transcription_events(&event_rx, &ui) {
-                            return flow;
-                        }
-                        glib::ControlFlow::Continue
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("failed to start transcription: {e}");
-                    session_rows.unlock();
-                    // Reset the toggle FIRST (the else branch clears
-                    // status_label as part of its normal teardown), then
-                    // set the error text so the user actually sees it.
-                    // Otherwise the failure is silent — only in stderr.
-                    row.set_active(false);
-                    status_label.set_text(&e.to_string());
-                    status_label.set_css_classes(&["error"]);
-                    status_label.set_visible(true);
-                    progress_bar.set_visible(false);
-                }
-            }
+            start_transcription_session(&deps, row);
         } else {
-            session_rows.unlock();
-            state_clone.send_dsp(crate::messages::UiToDsp::DisableTranscription);
-            // Drop any pending channel-marker so a stray scanner
-            // hop that landed during the live session doesn't
-            // poison the next enable's first text event. Per
-            // CodeRabbit round 1 on PR #558.
-            *state_clone.pending_channel_marker.borrow_mut() = None;
-            engine_clone.borrow_mut().shutdown_nonblocking();
-            status_label.set_text("");
-            status_label.set_visible(false);
-            progress_bar.set_visible(false);
-            // Clear any stale partial on stop so the previous session's
-            // last in-progress text doesn't linger on screen.
-            #[cfg(feature = "sherpa")]
-            {
-                live_line_label.set_text("");
-                live_line_label.set_visible(false);
-            }
+            stop_transcription_session(&deps);
         }
     });
 
     engine
+}
+
+/// Session-start half of the enable toggle: eligibility guards, row
+/// locking, backend config, and the engine start with its event loop.
+fn start_transcription_session(deps: &SessionDeps, row: &adw::SwitchRow) {
+    // Read the selected model index once at the top of the
+    // session-start branch; the Auto Break eligibility check needs
+    // it, and the BackendConfig construction reuses it.
+    let model_idx = deps.panel.model_row.selected() as usize;
+
+    #[cfg(feature = "sherpa")]
+    let auto_break_enabled = auto_break_eligible(deps, model_idx);
+    #[cfg(feature = "whisper")]
+    let auto_break_enabled = false;
+
+    // Auto Break precondition: squelch must be enabled so the
+    // radio produces the open/close transitions the state
+    // machine needs for segmentation. Without squelch enabled,
+    // the session would sit in Idle indefinitely producing
+    // zero transcripts — silent failure mode. Block session
+    // start with an actionable toast.
+    #[cfg(feature = "sherpa")]
+    if auto_break_enabled && !deps.squelch_enabled_row.is_active() {
+        let toast = plain_toast(
+            "Auto Break needs squelch enabled to detect transmission boundaries. \
+             Enable squelch in the radio panel, or turn off Auto Break to use VAD.",
+        );
+        if let Some(overlay) = deps.toast_overlay.upgrade() {
+            overlay.add_toast(toast);
+        }
+        // Revert the enable toggle so the user can take action first.
+        // The OFF branch of the handler is a safe no-op on an
+        // inactive session (it just drops any backend channels).
+        row.set_active(false);
+        return;
+    }
+
+    // Lock model and tuning controls while transcription is active.
+    // All settings lock during a session for mid-session fault
+    // tolerance — walks back PR 4's earlier display_mode_row
+    // exception. User stops, changes, starts.
+    lock_session_rows(&deps.panel);
+
+    let config = build_backend_config(&deps.panel, model_idx, auto_break_enabled);
+
+    // Scope the borrow so it's dropped before any potential re-entry
+    // from row.set_active(false) on error.
+    let start_result = deps.engine.borrow_mut().start(config);
+    match start_result {
+        Ok(event_rx) => begin_session_event_loop(deps, event_rx),
+        Err(e) => {
+            tracing::warn!("failed to start transcription: {e}");
+            deps.session_rows.unlock();
+            // Reset the toggle FIRST (the off branch clears
+            // status_label as part of its normal teardown), then
+            // set the error text so the user actually sees it.
+            // Otherwise the failure is silent — only in stderr.
+            row.set_active(false);
+            deps.panel.status_label.set_text(&e.to_string());
+            deps.panel.status_label.set_css_classes(&["error"]);
+            deps.panel.status_label.set_visible(true);
+            deps.panel.progress_bar.set_visible(false);
+        }
+    }
+}
+
+/// Auto Break is eligible ONLY when all three conditions hold:
+/// (1) the toggle itself is on, (2) the current demod mode is NFM,
+/// and (3) the selected sherpa model is offline (Moonshine,
+/// Parakeet). The toggle is persisted, so without this computed gate
+/// it would still report "on" after a restart into WFM, or after the
+/// user switched to streaming Zipformer and the row went invisible —
+/// either of which would produce an unsupported session (streaming
+/// Zipformer rejects AutoBreak at session start; non-NFM modes never
+/// emit squelch edges so the state machine sits in Idle forever).
+#[cfg(feature = "sherpa")]
+fn auto_break_eligible(deps: &SessionDeps, model_idx: usize) -> bool {
+    let selected_is_offline = sdr_transcription::SherpaModel::ALL
+        .get(model_idx)
+        .copied()
+        .is_some_and(|m| !m.supports_partials());
+    deps.panel.auto_break_row.is_active()
+        && deps.state.demod_mode.get() == sdr_types::DemodMode::Nfm
+        && selected_is_offline
+}
+
+/// Hook the freshly-started backend into the DSP audio tap and arm
+/// the 100 ms event-drain tick.
+fn begin_session_event_loop(
+    deps: &SessionDeps,
+    event_rx: std::sync::mpsc::Receiver<sdr_transcription::TranscriptionEvent>,
+) {
+    if let Some(audio_tx) = deps.engine.borrow().audio_sender() {
+        deps.state
+            .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
+    }
+    // Drop any channel-marker buffered while transcription was off —
+    // the first text event after re-enable should attribute to the
+    // *next* hop, not whichever channel the scanner happened to land
+    // on during the off period. Per CodeRabbit round 1 on PR #558.
+    *deps.state.pending_channel_marker.borrow_mut() = None;
+
+    deps.panel.status_label.set_text("Starting...");
+    deps.panel.status_label.set_visible(true);
+
+    // Weak refs for the entire timeout source — don't keep widgets
+    // alive past their UI lifetime through the glib timeout source.
+    let status_weak = deps.panel.status_label.downgrade();
+    let progress_weak = deps.panel.progress_bar.downgrade();
+    let tv_weak = deps.panel.text_view.downgrade();
+    let enable_row_weak = deps.panel.enable_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let model_row_weak = deps.panel.model_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let display_mode_row_weak = deps.panel.display_mode_row.downgrade();
+    #[cfg(feature = "sherpa")]
+    let live_line_weak = deps.panel.live_line_label.downgrade();
+    let state_for_marker = Rc::clone(&deps.state);
+    let session_rows = Rc::clone(&deps.session_rows);
+
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        // Upgrade once per tick. If any widget has been dropped
+        // (e.g. window closed), stop the timeout immediately so we
+        // don't resurrect dead UI.
+        let (Some(status), Some(progress), Some(tv)) = (
+            status_weak.upgrade(),
+            progress_weak.upgrade(),
+            tv_weak.upgrade(),
+        ) else {
+            return glib::ControlFlow::Break;
+        };
+        let ui = SessionTickUi {
+            status,
+            progress,
+            tv,
+            enable_row: enable_row_weak.clone(),
+            session_rows: Rc::clone(&session_rows),
+            state: Rc::clone(&state_for_marker),
+            #[cfg(feature = "sherpa")]
+            model_row: model_row_weak.clone(),
+            #[cfg(feature = "sherpa")]
+            display_mode_row: display_mode_row_weak.clone(),
+            #[cfg(feature = "sherpa")]
+            live_line: live_line_weak.clone(),
+        };
+        if let Some(flow) = drain_transcription_events(&event_rx, &ui) {
+            return flow;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// Session-stop half of the enable toggle: unlock the rows, detach
+/// the DSP tap, shut the backend down, and clear the status area.
+fn stop_transcription_session(deps: &SessionDeps) {
+    deps.session_rows.unlock();
+    deps.state
+        .send_dsp(crate::messages::UiToDsp::DisableTranscription);
+    // Drop any pending channel-marker so a stray scanner hop that
+    // landed during the live session doesn't poison the next
+    // enable's first text event. Per CodeRabbit round 1 on PR #558.
+    *deps.state.pending_channel_marker.borrow_mut() = None;
+    deps.engine.borrow_mut().shutdown_nonblocking();
+    deps.panel.status_label.set_text("");
+    deps.panel.status_label.set_visible(false);
+    deps.panel.progress_bar.set_visible(false);
+    // Clear any stale partial on stop so the previous session's last
+    // in-progress text doesn't linger on screen.
+    #[cfg(feature = "sherpa")]
+    {
+        deps.panel.live_line_label.set_text("");
+        deps.panel.live_line_label.set_visible(false);
+    }
 }
 
 /// Drain pending backend events for one poll tick of an active
