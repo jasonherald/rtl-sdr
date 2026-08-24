@@ -2059,6 +2059,30 @@ fn on_restore_tune(deps: &RecorderDeps, saved: sidebar::satellites_recorder::Sav
     // idempotent on equal value); the toggles are
     // guarded against no-op writes for cleaner
     // tracing logs.
+    restore_audio_chain(deps, &saved);
+    // Re-arm the scanner if it was running pre-AOS.
+    // The AOS-side `deps.tune` call goes through
+    // `tune_to_satellite`, which fires
+    // `ScannerForceDisable::trigger("satellite tune")`
+    // as a manual-tune side effect — without this
+    // restore, an active pre-AOS scan would be left
+    // permanently off after the pass. Same idiom as
+    // `was_running`: snapshot the user's pre-AOS
+    // state, return them to it. `set_active(true)`
+    // fires the switch's notify handler, which
+    // dispatches `SetScannerEnabled(true)` to the
+    // engine — same path a manual flip takes.
+    if saved.scanner_running && !deps.scanner_switch.is_active() {
+        tracing::info!("auto-record: re-arming scanner (was running pre-AOS)");
+        deps.scanner_switch.set_active(true);
+    }
+}
+
+/// Restore the audio-chain widgets the AOS path forced off — squelch
+/// gates, CTCSS, FM IF NR, de-emphasis, notch, and the Doppler
+/// master switch — from the pre-AOS snapshot, through each widget's
+/// own notify chain (the same path a user flip takes).
+fn restore_audio_chain(deps: &RecorderDeps, saved: &sidebar::satellites_recorder::SavedTune) {
     #[allow(
         clippy::cast_possible_truncation,
         reason = "saved.squelch_db came from the same SpinRow we're \
@@ -2106,22 +2130,6 @@ fn on_restore_tune(deps: &RecorderDeps, saved: sidebar::satellites_recorder::Sav
     // automatic correction again.
     if saved.doppler_enabled != deps.doppler_switch.is_active() {
         deps.doppler_switch.set_active(saved.doppler_enabled);
-    }
-    // Re-arm the scanner if it was running pre-AOS.
-    // The AOS-side `deps.tune` call goes through
-    // `tune_to_satellite`, which fires
-    // `ScannerForceDisable::trigger("satellite tune")`
-    // as a manual-tune side effect — without this
-    // restore, an active pre-AOS scan would be left
-    // permanently off after the pass. Same idiom as
-    // `was_running`: snapshot the user's pre-AOS
-    // state, return them to it. `set_active(true)`
-    // fires the switch's notify handler, which
-    // dispatches `SetScannerEnabled(true)` to the
-    // engine — same path a manual flip takes.
-    if saved.scanner_running && !deps.scanner_switch.is_active() {
-        tracing::info!("auto-record: re-arming scanner (was running pre-AOS)");
-        deps.scanner_switch.set_active(true);
     }
 }
 
