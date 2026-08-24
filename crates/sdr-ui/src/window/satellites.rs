@@ -514,6 +514,65 @@ fn wire_tle_refresh_button(
     });
 }
 
+/// Build the recorder-action interpreter: a parent-window resolver for
+/// the auto-open-viewer side effect plus a [`RecorderDeps`] bundle,
+/// wrapped in a closure that dispatches each [`RecorderAction`]
+/// through `interpret_recorder_action`.
+fn build_recorder_interpreter(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
+    toast_overlay: &adw::ToastOverlay,
+    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    set_playing: &Rc<dyn Fn(bool)>,
+) -> Rc<dyn Fn(sidebar::satellites_recorder::Action)> {
+    use sidebar::satellites_recorder::Action as RecorderAction;
+    // Parent-window resolver for the auto-open-viewer side effect.
+    // Walks up the widget tree from the satellites page; falls
+    // back to `None` if the widget has been detached, in which
+    // case the open is silently skipped. Holds a `WeakRef` so the
+    // 1 Hz timer's `panel_weak.upgrade() == None` exit gate can
+    // actually fire — a strong clone here would keep the panel
+    // widget alive and the timer would never break.
+    let parent_provider_for_recorder: Rc<dyn Fn() -> Option<gtk4::Window>> = {
+        let widget_weak = panels.satellites.widget.downgrade();
+        Rc::new(move || {
+            widget_weak
+                .upgrade()
+                .and_then(|w| w.root())
+                .and_then(|r| r.downcast::<gtk4::Window>().ok())
+        })
+    };
+
+    {
+        let deps = Rc::new(RecorderDeps {
+            state: Rc::clone(state),
+            tune: Rc::clone(tune_to_satellite),
+            set_playing: Rc::clone(set_playing),
+            // Optional TLE cache — used by the SavePng wiring to
+            // compute `is_ascending` for the rotate-180 flag (B2 of
+            // the noaa-apt parity work). `None` when the host
+            // platform refused us a cache directory; the rotate path
+            // falls back to "no rotation" in that case.
+            cache: cache.map(std::sync::Arc::clone),
+            // Weak refs for the same lifecycle reason as
+            // `parent_provider_for_recorder` — strong clones would
+            // pin the widgets alive past window close.
+            toast_overlay: toast_overlay.downgrade(),
+            parent_provider: Rc::clone(&parent_provider_for_recorder),
+            // Scanner master switch handle for the LOS-side restore;
+            // radio panel rows for the AOS audio-chain force-off +
+            // LOS restore (#555/#556). Set-active fires the widgets'
+            // own notify handlers — the same path a user flip takes.
+            scanner_switch: panels.scanner.master_switch.clone(),
+            radio: panels.radio.clone(),
+            doppler_switch: panels.satellites.doppler_switch.clone(),
+            auto_record_composites_switch: panels.satellites.auto_record_composites_switch.clone(),
+        });
+        Rc::new(move |action: RecorderAction| interpret_recorder_action(&deps, action))
+    }
+}
+
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -613,50 +672,14 @@ pub(super) fn connect_satellites_panel(
     // action against the live UI / DSP / filesystem.
     let recorder: Rc<RefCell<AutoRecorder>> = Rc::new(RefCell::new(AutoRecorder::new()));
 
-    // Parent-window resolver for the auto-open-viewer side effect.
-    // Walks up the widget tree from the satellites page; falls
-    // back to `None` if the widget has been detached, in which
-    // case the open is silently skipped. Holds a `WeakRef` so the
-    // 1 Hz timer's `panel_weak.upgrade() == None` exit gate can
-    // actually fire — a strong clone here would keep the panel
-    // widget alive and the timer would never break.
-    let parent_provider_for_recorder: Rc<dyn Fn() -> Option<gtk4::Window>> = {
-        let widget_weak = panel.widget.downgrade();
-        Rc::new(move || {
-            widget_weak
-                .upgrade()
-                .and_then(|w| w.root())
-                .and_then(|r| r.downcast::<gtk4::Window>().ok())
-        })
-    };
-
-    let interpret_action: Rc<dyn Fn(RecorderAction)> = {
-        let deps = Rc::new(RecorderDeps {
-            state: Rc::clone(state),
-            tune: Rc::clone(tune_to_satellite),
-            set_playing: Rc::clone(set_playing),
-            // Optional TLE cache — used by the SavePng wiring to
-            // compute `is_ascending` for the rotate-180 flag (B2 of
-            // the noaa-apt parity work). `None` when the host
-            // platform refused us a cache directory; the rotate path
-            // falls back to "no rotation" in that case.
-            cache: cache.as_ref().map(std::sync::Arc::clone),
-            // Weak refs for the same lifecycle reason as
-            // `parent_provider_for_recorder` — strong clones would
-            // pin the widgets alive past window close.
-            toast_overlay: toast_overlay.downgrade(),
-            parent_provider: Rc::clone(&parent_provider_for_recorder),
-            // Scanner master switch handle for the LOS-side restore;
-            // radio panel rows for the AOS audio-chain force-off +
-            // LOS restore (#555/#556). Set-active fires the widgets'
-            // own notify handlers — the same path a user flip takes.
-            scanner_switch: panels.scanner.master_switch.clone(),
-            radio: panels.radio.clone(),
-            doppler_switch: panels.satellites.doppler_switch.clone(),
-            auto_record_composites_switch: panel.auto_record_composites_switch.clone(),
-        });
-        Rc::new(move |action: RecorderAction| interpret_recorder_action(&deps, action))
-    };
+    let interpret_action = build_recorder_interpreter(
+        panels,
+        state,
+        cache.as_ref(),
+        toast_overlay,
+        tune_to_satellite,
+        set_playing,
+    );
 
     // Stash a `Weak` handle to the interpreter on AppState so
     // the `AcarsEnabledChanged(Ok(false))` arm in
