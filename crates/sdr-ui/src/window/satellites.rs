@@ -2378,7 +2378,7 @@ fn build_pass_bell_button(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     displayed: &Rc<RefCell<Vec<DisplayedPass>>>,
 ) -> Option<gtk4::ToggleButton> {
-    use sidebar::satellites_panel::{norad_id_for_pass, save_watched_satellites};
+    use sidebar::satellites_panel::norad_id_for_pass;
 
     let norad_id = norad_id_for_pass(pass)?;
     let initial_active = watched.borrow().contains(&norad_id);
