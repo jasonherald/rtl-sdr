@@ -246,13 +246,22 @@ fn apply_profile_to_bookmark(
         sidebar::source_panel::AgcType::Hardware
     ));
     bm.agc_type = Some(profile.agc_type);
-    bm.volume = profile.volume;
+    // `capture_tuning_profile` deliberately leaves `volume` and
+    // `high_pass` as `None` (they live outside the Radio panel).
+    // Preserve the bookmark's existing values in that case instead
+    // of wiping them — the header `ScaleButton` persistence
+    // contract depends on it. Per CR round 1 on PR #844.
+    if profile.volume.is_some() {
+        bm.volume = profile.volume;
+    }
     bm.deemphasis = Some(profile.deemphasis);
     bm.nb_enabled = Some(profile.nb_enabled);
     bm.nb_level = Some(profile.nb_level);
     bm.fm_if_nr = Some(profile.fm_if_nr);
     bm.wfm_stereo = Some(profile.wfm_stereo);
-    bm.high_pass = profile.high_pass;
+    if profile.high_pass.is_some() {
+        bm.high_pass = profile.high_pass;
+    }
     bm.ctcss_mode = profile.ctcss_mode;
     bm.ctcss_threshold = profile.ctcss_threshold;
     bm.voice_squelch_mode = profile.voice_squelch_mode;

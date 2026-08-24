@@ -100,6 +100,7 @@ pub(super) fn refresh_scanner_axis_lock(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     spectrum_handle: &spectrum::SpectrumHandle,
     status_row: &adw::ActionRow,
+    active_key: Option<&sdr_scanner::ChannelKey>,
 ) -> ScannerAxisRefreshOutcome {
     let default_dwell_ms = sidebar::scanner_panel::load_default_dwell_ms(config);
     let default_hang_ms = sidebar::scanner_panel::load_default_hang_ms(config);
@@ -118,30 +119,22 @@ pub(super) fn refresh_scanner_axis_lock(
         // `ScannerActiveChannelChanged` event arrived — a
         // visually jarring blink during live editing. Per
         // `CodeRabbit` round 2 on PR #562.
-        let prior_active = spectrum_handle
-            .scanner_axis_lock()
-            .and_then(|lock| lock.active_channel_hz.zip(lock.active_channel_bw_hz));
         spectrum_handle.enter_scanner_mode(min_hz, max_hz);
-        // Reapply only if the prior active channel still exists
-        // in the refreshed scanner set. If the user just
-        // disabled or deleted the bookmark that was the active
-        // channel, reinstating its highlight would resurrect a
-        // channel that's no longer being sampled — the
-        // highlight would linger until the next DSP hop event
-        // arrived. Match by exact (frequency, bandwidth) tuple
-        // — same fields the prior tuple was sourced from, so
-        // float equality is safe (identical bit patterns
-        // round-trip through the SpectrumHandle store). Per
-        // `CodeRabbit` round 4 on PR #562.
-        let outcome = if let Some((freq_hz, bw_hz)) = prior_active {
-            #[allow(clippy::cast_precision_loss)]
-            let still_present = channels.iter().any(|ch| {
-                let center = ch.key.frequency_hz as f64;
-                (center - freq_hz).abs() < f64::EPSILON
-                    && (ch.bandwidth - bw_hz).abs() < f64::EPSILON
-            });
-            if still_present {
-                spectrum_handle.set_scanner_active_channel(freq_hz, bw_hz);
+        // Reapply only if the previously-active channel is still in
+        // the refreshed scanner set. Match by `ChannelKey` (name +
+        // integer frequency) — the stable identity the lockout and
+        // active-channel tracking already use — instead of the old
+        // float `(frequency, bandwidth)` compare: a bookmark save
+        // can legitimately change the bandwidth of the still-active
+        // channel, and the refreshed value should be reapplied, not
+        // treated as a drop. Return `ActiveChannelDropped` only
+        // when the key is absent (user disabled or deleted the
+        // active bookmark). Per CR round 1 on PR #844.
+        let outcome = if let Some(key) = active_key {
+            if let Some(ch) = channels.iter().find(|ch| ch.key == *key) {
+                #[allow(clippy::cast_precision_loss)]
+                spectrum_handle
+                    .set_scanner_active_channel(ch.key.frequency_hz as f64, ch.bandwidth);
                 ScannerAxisRefreshOutcome::Unchanged
             } else {
                 // Leave `active_channel_*` cleared by
@@ -309,6 +302,7 @@ fn wire_scanner_master_switch(
                 &config_for_switch,
                 &spectrum_for_switch,
                 &display_axis_row,
+                None,
             );
         } else {
             spectrum_for_switch.exit_scanner_mode();

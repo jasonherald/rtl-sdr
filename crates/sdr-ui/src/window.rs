@@ -1506,11 +1506,13 @@ fn wire_bookmark_mutation_refresh(
         // — the lock is already disengaged. Per issue #516
         // smoke feedback.
         if scanner_switch_for_mutated.is_active() {
+            let active_key = state_for_mutated.scanner_active_key.borrow().clone();
             let outcome = refresh_scanner_axis_lock(
                 &bookmarks.bookmarks.borrow(),
                 &config_for_mutated,
                 &spectrum_for_mutated,
                 &display_axis_row_for_mutated,
+                active_key.as_ref(),
             );
             // If the helper dropped the previously-active
             // channel (user disabled `scan_enabled` on the
