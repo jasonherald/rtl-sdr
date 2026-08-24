@@ -358,7 +358,6 @@ fn wire_auto_record_persistence(
     }
 }
 
-
 /// Build the shared TLE cache. `None` means the platform refused us a
 /// cache directory (rare; sandboxed minimal environments) — the caller
 /// disables TLE-specific UI but keeps ground-station persistence, ZIP
@@ -383,6 +382,50 @@ fn init_tle_cache(
                 .set_subtitle("Cache directory unavailable");
             None
         }
+    }
+}
+
+/// Build the pass-list recompute closure. Built unconditionally —
+/// when the TLE cache is unavailable it's a no-op so the lat/lon/alt
+/// notify handlers can call it without branching; with a cache it does
+/// the real pass-enumeration + row-rebuild work.
+fn build_recompute(
+    cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
+    panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
+    displayed: &Rc<RefCell<Vec<DisplayedPass>>>,
+    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    watched: &Rc<RefCell<std::collections::HashSet<u32>>>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) -> Rc<dyn Fn()> {
+    // `recompute` is built unconditionally — when the cache is
+    // unavailable it's a no-op so the lat/lon/alt notify handlers
+    // can call it without branching. When the cache is available
+    // it does the real pass-enumeration + row-rebuild work.
+    if let Some(cache) = cache {
+        let cache_recompute = std::sync::Arc::clone(cache);
+        let panel_weak_recompute = panel_weak.clone();
+        let displayed_recompute = Rc::clone(&displayed);
+        let tune_for_recompute = Rc::clone(tune_to_satellite);
+        let watched_for_recompute = Rc::clone(&watched);
+        let config_for_recompute = std::sync::Arc::clone(config);
+        Rc::new(move || {
+            let Some(panel) = panel_weak_recompute.upgrade() else {
+                return;
+            };
+            rebuild_pass_rows(
+                &panel,
+                &cache_recompute,
+                &displayed_recompute,
+                &tune_for_recompute,
+                &watched_for_recompute,
+                &config_for_recompute,
+            );
+        })
+    } else {
+        // No cache → no enumeration. Lat/lon/alt notify handlers
+        // still call this on every change; making it a no-op
+        // keeps the call sites branch-free.
+        Rc::new(|| {})
     }
 }
 
@@ -432,36 +475,14 @@ pub(super) fn connect_satellites_panel(
     let notify_scheduler: Rc<RefCell<NotifyScheduler>> =
         Rc::new(RefCell::new(NotifyScheduler::new()));
 
-    // `recompute` is built unconditionally — when the cache is
-    // unavailable it's a no-op so the lat/lon/alt notify handlers
-    // can call it without branching. When the cache is available
-    // it does the real pass-enumeration + row-rebuild work.
-    let recompute: Rc<dyn Fn()> = if let Some(cache) = cache.as_ref() {
-        let cache_recompute = std::sync::Arc::clone(cache);
-        let panel_weak_recompute = panel_weak.clone();
-        let displayed_recompute = Rc::clone(&displayed);
-        let tune_for_recompute = Rc::clone(tune_to_satellite);
-        let watched_for_recompute = Rc::clone(&watched);
-        let config_for_recompute = std::sync::Arc::clone(config);
-        Rc::new(move || {
-            let Some(panel) = panel_weak_recompute.upgrade() else {
-                return;
-            };
-            rebuild_pass_rows(
-                &panel,
-                &cache_recompute,
-                &displayed_recompute,
-                &tune_for_recompute,
-                &watched_for_recompute,
-                &config_for_recompute,
-            );
-        })
-    } else {
-        // No cache → no enumeration. Lat/lon/alt notify handlers
-        // still call this on every change; making it a no-op
-        // keeps the call sites branch-free.
-        Rc::new(|| {})
-    };
+    let recompute = build_recompute(
+        cache.as_ref(),
+        &panel_weak,
+        &displayed,
+        tune_to_satellite,
+        &watched,
+        config,
+    );
 
     // Initial paint — show passes immediately if we already have
     // cached TLEs from a prior session. (No-op if cache is None.)
