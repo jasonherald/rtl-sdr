@@ -302,18 +302,7 @@ fn begin_session_event_loop(
     deps: &SessionDeps,
     event_rx: std::sync::mpsc::Receiver<sdr_transcription::TranscriptionEvent>,
 ) {
-    if let Some(audio_tx) = deps.engine.borrow().audio_sender() {
-        deps.state
-            .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
-    }
-    // Drop any channel-marker buffered while transcription was off —
-    // the first text event after re-enable should attribute to the
-    // *next* hop, not whichever channel the scanner happened to land
-    // on during the off period. Per CodeRabbit round 1 on PR #558.
-    *deps.state.pending_channel_marker.borrow_mut() = None;
-
-    deps.panel.status_label.set_text("Starting...");
-    deps.panel.status_label.set_visible(true);
+    attach_session_audio_tap(deps);
 
     // Weak refs for the entire timeout source — don't keep widgets
     // alive past their UI lifetime through the glib timeout source.
@@ -360,6 +349,22 @@ fn begin_session_event_loop(
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Hand the backend's audio sender to the DSP tap and reset the
+/// per-session UI state. Drops any channel-marker buffered while
+/// transcription was off — the first text event after re-enable
+/// should attribute to the *next* hop, not whichever channel the
+/// scanner happened to land on during the off period (CR round 1 on
+/// PR #558).
+fn attach_session_audio_tap(deps: &SessionDeps) {
+    if let Some(audio_tx) = deps.engine.borrow().audio_sender() {
+        deps.state
+            .send_dsp(crate::messages::UiToDsp::EnableTranscription(audio_tx));
+    }
+    *deps.state.pending_channel_marker.borrow_mut() = None;
+    deps.panel.status_label.set_text("Starting...");
+    deps.panel.status_label.set_visible(true);
 }
 
 /// Session-stop half of the enable toggle: unlock the rows, detach
