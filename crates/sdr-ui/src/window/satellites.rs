@@ -178,6 +178,19 @@ pub(super) fn save_sstv_batch(
     (saved, errors)
 }
 
+/// One pass row + its source `Pass` so the 1 Hz ticker can refresh
+/// the title without re-running pass enumeration. The optional bell
+/// `ToggleButton` is held so the watch-toggle handler can mirror the
+/// active state across every row whose satellite matches — multiple
+/// NOAA 19 passes in the visible list must all reflect the same
+/// subscription state. `None` for off-catalog passes (no NORAD id →
+/// no notify).
+struct DisplayedPass {
+    row: adw::ActionRow,
+    pass: sdr_sat::Pass,
+    bell_btn: Option<gtk4::ToggleButton>,
+}
+
 /// Wire the Satellites scheduler panel to its config-persistence
 /// layer, the [`sdr_sat::TleCache`], and a 1 Hz countdown timer.
 ///
@@ -222,19 +235,6 @@ pub(super) fn connect_satellites_panel(
     use sidebar::satellites_recorder::{
         Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
     };
-
-    // One pass row + its source `Pass` so the 1 Hz ticker can
-    // refresh the title without re-running pass enumeration. The
-    // optional bell `ToggleButton` is held so the watch-toggle
-    // handler can mirror the active state across every row whose
-    // satellite matches — multiple NOAA 19 passes in the visible
-    // list must all reflect the same subscription state. `None`
-    // for off-catalog passes (no NORAD id → no notify).
-    struct DisplayedPass {
-        row: adw::ActionRow,
-        pass: Pass,
-        bell_btn: Option<gtk4::ToggleButton>,
-    }
 
     // Borrow the panel for synchronous setup, then capture only
     // weak refs in long-lived closures. Cloning the strong panel
