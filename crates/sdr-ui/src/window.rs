@@ -158,6 +158,38 @@ struct TuneCtx {
     status_bar: Rc<StatusBar>,
 }
 
+/// UI-mirror half of the 13-step tune sequence: bandwidth row range +
+/// value (with the redundant-`SetBandwidth` notify suppressed),
+/// mode-specific control visibility, and the status-bar frequency /
+/// demod indicators — done last so a panic anywhere upstream doesn't
+/// leave an optimistic value the DSP never received.
+fn mirror_tune_ui(ctx: &TuneCtx, mode: sdr_types::DemodMode, bw_hz: f64, freq_f64: f64) {
+    let TuneCtx {
+        state,
+        bandwidth_row,
+        radio_panel,
+        status_bar,
+        ..
+    } = ctx;
+    update_bandwidth_row_range_for_mode(radio_panel, state, mode);
+    // Suppress the bandwidth row's notify around `set_value` so
+    // it doesn't redispatch a redundant `SetBandwidth` —
+    // `tune_to_target` already sent the canonical command above.
+    state.suppress_bandwidth_notify.set(true);
+    bandwidth_row.set_value(bw_hz);
+    state.suppress_bandwidth_notify.set(false);
+    // Mode-specific control visibility (e.g. squelch / deemph rows
+    // shown only in NFM/WFM) — must be poked explicitly because
+    // the demod-dropdown notify only covers the dropdown's own
+    // state.
+    radio_panel.apply_demod_visibility(mode);
+    // Status bar mirrors. Done last so a panic anywhere upstream
+    // doesn't leave the indicator showing an optimistic value that
+    // the DSP never received.
+    status_bar.update_frequency(freq_f64);
+    status_bar.update_demod(header::demod_mode_label(mode), bw_hz);
+}
+
 /// Apply the canonical tune-target dispatch — the 13 widget /
 /// state / DSP mirror steps that bookmark recall, the satellite
 /// play button, and auto-record-on-pass all need to perform when
@@ -195,9 +227,7 @@ fn tune_to_target(
         demod_dropdown,
         spectrum_handle,
         scanner_force_disable,
-        bandwidth_row,
-        radio_panel,
-        status_bar,
+        ..
     } = ctx;
     // Verification logging: print the entire tune request as a
     // single structured line so a `grep tune_to_target ~/.cache/sdr-rs/sdr.log`
@@ -247,23 +277,7 @@ fn tune_to_target(
     // overriding the correct `SetBandwidth(bw_hz)` we just sent
     // above. WFM→NFM retunes are the common failure case.
     // Per CR round 2 on PR #574.
-    update_bandwidth_row_range_for_mode(radio_panel, state, mode);
-    // Suppress the bandwidth row's notify around `set_value` so
-    // it doesn't redispatch a redundant `SetBandwidth` —
-    // `tune_to_target` already sent the canonical command above.
-    state.suppress_bandwidth_notify.set(true);
-    bandwidth_row.set_value(bw_hz);
-    state.suppress_bandwidth_notify.set(false);
-    // Mode-specific control visibility (e.g. squelch / deemph rows
-    // shown only in NFM/WFM) — must be poked explicitly because
-    // the demod-dropdown notify only covers the dropdown's own
-    // state.
-    radio_panel.apply_demod_visibility(mode);
-    // Status bar mirrors. Done last so a panic anywhere upstream
-    // doesn't leave the indicator showing an optimistic value that
-    // the DSP never received.
-    status_bar.update_frequency(freq_f64);
-    status_bar.update_demod(header::demod_mode_label(mode), bw_hz);
+    mirror_tune_ui(ctx, mode, bw_hz, freq_f64);
     // Companion to the TUNE_REQUEST log above — confirms the dispatch
     // path completed without panic. The DSP-side will emit its own
     // `SetDemodMode`/`SetBandwidth` info logs when it processes the
@@ -1405,7 +1419,6 @@ fn connect_sidebar_panels(
 ) {
     let state = &tune_ctx.state;
     let spectrum_handle = &tune_ctx.spectrum_handle;
-    let status_bar = &tune_ctx.status_bar;
     let scanner_force_disable = &tune_ctx.scanner_force_disable;
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
@@ -1513,12 +1526,10 @@ fn connect_sidebar_panels(
     connect_satellites_panel(
         panels,
         config,
-        state,
+        tune_ctx,
         toast_overlay,
-        spectrum_handle,
         &tune_to_satellite,
         set_playing,
-        status_bar,
     );
     connect_aviation_panel(&panels.aviation, state, config, toast_overlay);
     // Transcript panel is wired separately (not in SidebarPanels).

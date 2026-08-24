@@ -6,7 +6,7 @@ use libadwaita::prelude::*;
 
 use super::{
     AppState, CtcssMode, Duration, PendingSstvExport, Rc, RefCell, SidebarPanels, StatusBar,
-    UiToDsp, adw, gio, glib, plain_toast, sidebar, spectrum,
+    TuneCtx, TuneFn, UiToDsp, adw, gio, glib, plain_toast, sidebar, spectrum,
 };
 
 /// Cadence of the Satellites panel's countdown ticker — 1 line/sec
@@ -373,7 +373,7 @@ fn build_recompute(
     cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
     panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
     displayed: &Rc<RefCell<Vec<DisplayedPass>>>,
-    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    tune_to_satellite: &Rc<TuneFn>,
     watched: &Rc<RefCell<std::collections::HashSet<u32>>>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) -> Rc<dyn Fn()> {
@@ -512,7 +512,7 @@ fn build_recorder_interpreter(
     state: &Rc<AppState>,
     cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
     toast_overlay: &adw::ToastOverlay,
-    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    tune_to_satellite: &Rc<TuneFn>,
     set_playing: &Rc<dyn Fn(bool)>,
 ) -> Rc<dyn Fn(sidebar::satellites_recorder::Action)> {
     use sidebar::satellites_recorder::Action as RecorderAction;
@@ -803,21 +803,30 @@ fn arm_recorder_tick(deps: TickDeps) {
 /// that drives it. The tick is only armed when a TLE cache exists —
 /// without one `displayed` stays empty forever and the timer would
 /// tick uselessly.
-#[allow(clippy::too_many_arguments)]
+
+/// Shared wiring state built once by [`connect_satellites_panel`]
+/// and threaded into the recorder/tick layer: the weak panel handle,
+/// the displayed-pass list, the pass-list recompute closure, the
+/// watched-satellite set (#510), and the optional TLE cache.
+struct SatWiring {
+    panel_weak: sidebar::satellites_panel::SatellitesPanelWeak,
+    displayed: Rc<RefCell<Vec<DisplayedPass>>>,
+    recompute: Rc<dyn Fn()>,
+    watched: Rc<RefCell<std::collections::HashSet<u32>>>,
+    cache: Option<std::sync::Arc<sdr_sat::TleCache>>,
+}
+
 fn wire_recorder(
     panels: &SidebarPanels,
-    state: &Rc<AppState>,
+    tune_ctx: &TuneCtx,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     toast_overlay: &adw::ToastOverlay,
-    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
-    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    tune_to_satellite: &Rc<TuneFn>,
     set_playing: &Rc<dyn Fn(bool)>,
-    panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
-    displayed: &Rc<RefCell<Vec<DisplayedPass>>>,
-    recompute: &Rc<dyn Fn()>,
-    watched: &Rc<RefCell<std::collections::HashSet<u32>>>,
-    cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
+    wiring: &SatWiring,
 ) {
+    let state = &tune_ctx.state;
+    let cache = wiring.cache.as_ref();
     // 1 Hz countdown ticker. Only scheduled when the cache is
     // available — without it `displayed` stays empty forever and
     // the timer would tick uselessly. Captures the panel weakly
@@ -853,14 +862,14 @@ fn wire_recorder(
 
     if cache.is_some() {
         arm_recorder_tick(TickDeps {
-            panel_weak: panel_weak.clone(),
+            panel_weak: wiring.panel_weak.clone(),
             state: Rc::clone(state),
-            displayed: Rc::clone(displayed),
-            recompute: Rc::clone(recompute),
+            displayed: Rc::clone(&wiring.displayed),
+            recompute: Rc::clone(&wiring.recompute),
             interpret: Rc::clone(&interpret_action),
-            spectrum: Rc::clone(spectrum_handle),
+            spectrum: Rc::clone(&tune_ctx.spectrum_handle),
             config: std::sync::Arc::clone(config),
-            watched: Rc::clone(watched),
+            watched: Rc::clone(&wiring.watched),
             bandwidth_row: panels.radio.bandwidth_row.clone(),
             scanner_switch: panels.scanner.master_switch.clone(),
             squelch_enabled_row: panels.radio.squelch_enabled_row.clone(),
@@ -915,14 +924,15 @@ fn wire_doppler(
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    state: &Rc<AppState>,
+    tune_ctx: &TuneCtx,
     toast_overlay: &adw::ToastOverlay,
-    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
-    tune_to_satellite: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    tune_to_satellite: &Rc<TuneFn>,
     set_playing: &Rc<dyn Fn(bool)>,
-    status_bar: &Rc<StatusBar>,
 ) {
     use sidebar::satellites_panel::{SatellitesPanelWeak, load_watched_satellites};
+
+    let state = &tune_ctx.state;
+    let status_bar = &tune_ctx.status_bar;
 
     // Borrow the panel for synchronous setup, then capture only
     // weak refs in long-lived closures. Cloning the strong panel
@@ -982,19 +992,21 @@ pub(super) fn connect_satellites_panel(
 
     wire_zip_lookup(panel, &panel_weak);
 
+    let wiring = SatWiring {
+        panel_weak,
+        displayed,
+        recompute,
+        watched,
+        cache,
+    };
     wire_recorder(
         panels,
-        state,
+        tune_ctx,
         config,
         toast_overlay,
-        spectrum_handle,
         tune_to_satellite,
         set_playing,
-        &panel_weak,
-        &displayed,
-        &recompute,
-        &watched,
-        cache.as_ref(),
+        &wiring,
     );
 }
 
@@ -1003,7 +1015,7 @@ pub(super) fn connect_satellites_panel(
 /// and this is the wiring layer that gives each action its widgets.
 struct RecorderDeps {
     state: Rc<AppState>,
-    tune: Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    tune: Rc<TuneFn>,
     set_playing: Rc<dyn Fn(bool)>,
     cache: Option<std::sync::Arc<sdr_sat::TleCache>>,
     toast_overlay: glib::WeakRef<adw::ToastOverlay>,
@@ -2765,7 +2777,7 @@ fn rebuild_pass_rows(
     panel: &sidebar::satellites_panel::SatellitesPanel,
     cache: &std::sync::Arc<sdr_sat::TleCache>,
     displayed: &Rc<RefCell<Vec<DisplayedPass>>>,
-    tune: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+    tune: &Rc<TuneFn>,
     watched: &Rc<RefCell<std::collections::HashSet<u32>>>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
@@ -2963,11 +2975,7 @@ fn on_pass_bell_toggled(
 /// nothing). The 4th tuple element (`Option<ImagingProtocol>`) is
 /// ignored — manual tune is user-initiated and works on any catalog
 /// entry; only the auto-record path filters on `Some(protocol)`.
-fn attach_pass_play_button(
-    row: &adw::ActionRow,
-    pass: &sdr_sat::Pass,
-    tune: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
-) {
+fn attach_pass_play_button(row: &adw::ActionRow, pass: &sdr_sat::Pass, tune: &Rc<TuneFn>) {
     use sidebar::satellites_panel::{format_downlink_mhz, tune_target_for_pass};
 
     let Some((freq_hz, mode, bw_hz, _protocol, _norad_id)) = tune_target_for_pass(pass) else {
