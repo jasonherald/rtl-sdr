@@ -598,11 +598,7 @@ pub(super) fn connect_satellites_panel(
         // teardown ordering: every other panel widget the
         // closure captures is a strong clone too. Per #547.
         let auto_record_composites_switch_a = panel.auto_record_composites_switch.clone();
-        let post_toast = move |overlay_weak: &glib::WeakRef<adw::ToastOverlay>, msg: &str| {
-            if let Some(overlay) = overlay_weak.upgrade() {
-                overlay.add_toast(plain_toast(msg));
-            }
-        };
+
         // Compute the rotate-180 flag for the currently-recording APT
         // pass: `true` when the satellite is on the ascending leg of
         // its orbit, which means the assembled image is upside-down +
@@ -621,60 +617,7 @@ pub(super) fn connect_satellites_panel(
         // and the rotation compute — exporting the older pass's
         // image with the newer pass's orientation. Per CR round 6
         // on PR #571.
-        let compute_apt_rotate_180_for_pass = {
-            let cache_a = cache_a.clone();
-            move |norad_id: u32, aos: chrono::DateTime<chrono::Utc>| -> bool {
-                let Some(cache) = cache_a.as_ref() else {
-                    return false;
-                };
-                // Look up by stable NORAD id (not display name) so
-                // a catalog rename doesn't silently break this
-                // path. Per CR round 2 on PR #571.
-                let Some(known) = sdr_sat::KNOWN_SATELLITES
-                    .iter()
-                    .find(|s| s.norad_id == norad_id)
-                else {
-                    tracing::debug!(
-                        norad_id,
-                        "APT rotate-180: satellite not in catalog; defaulting to no rotation",
-                    );
-                    return false;
-                };
-                let (line1, line2) = match cache.cached_tle_for(known.norad_id) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::debug!(
-                            norad_id,
-                            error = %e,
-                            "APT rotate-180: TLE unavailable; defaulting to no rotation",
-                        );
-                        return false;
-                    }
-                };
-                let parsed = match sdr_sat::Satellite::from_tle(known.name, &line1, &line2) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::debug!(
-                            norad_id,
-                            error = %e,
-                            "APT rotate-180: TLE parse failed; defaulting to no rotation",
-                        );
-                        return false;
-                    }
-                };
-                match sdr_sat::is_ascending(&parsed, aos) {
-                    Ok(asc) => asc,
-                    Err(e) => {
-                        tracing::debug!(
-                            norad_id,
-                            error = %e,
-                            "APT rotate-180: SGP4 propagate failed; defaulting to no rotation",
-                        );
-                        false
-                    }
-                }
-            }
-        };
+
         Rc::new(move |action: RecorderAction| match action {
             RecorderAction::StartAutoRecord {
                 satellite,
@@ -851,7 +794,8 @@ pub(super) fn connect_satellites_panel(
                         // of ascending passes come out upside-down
                         // even though the auto-record save rotates
                         // them. Per CR round 1 on PR #571.
-                        let rotate_180 = compute_apt_rotate_180_for_pass(norad_id, aos);
+                        let rotate_180 =
+                            compute_apt_rotate_180_for_pass(cache_a.as_ref(), norad_id, aos);
                         if let Some(view) = state_a.apt_viewer.borrow().as_ref() {
                             view.set_rotate_180(rotate_180);
                         }
@@ -1041,8 +985,9 @@ pub(super) fn connect_satellites_panel(
                 // AOS sample point. Defaults to `false` (no rotation)
                 // if any step fails — descending-pass orientation is
                 // the safer default since it preserves north-at-top.
-                let rotate_180 = exported_pass
-                    .is_some_and(|(norad_id, aos)| compute_apt_rotate_180_for_pass(norad_id, aos));
+                let rotate_180 = exported_pass.is_some_and(|(norad_id, aos)| {
+                    compute_apt_rotate_180_for_pass(cache_a.as_ref(), norad_id, aos)
+                });
                 let mode = sdr_radio::apt_image::BrightnessMode::default();
                 // Async export: snapshot the AptImage on the main
                 // thread NOW, hand the snapshot to a worker via
@@ -2092,6 +2037,83 @@ pub(super) fn connect_satellites_panel(
             }
             glib::ControlFlow::Continue
         });
+    }
+}
+
+/// Toast through a weak overlay handle — no-op when the window is
+/// gone.
+fn post_toast(overlay_weak: &glib::WeakRef<adw::ToastOverlay>, msg: &str) {
+    if let Some(overlay) = overlay_weak.upgrade() {
+        overlay.add_toast(plain_toast(msg));
+    }
+}
+
+/// Compute the rotate-180 flag for the currently-recording APT pass:
+/// `true` when the satellite is on the ascending leg of its orbit,
+/// which means the assembled image is upside-down + mirrored
+/// east/west (per `sdr_radio::apt_image::rotate_180_per_channel`).
+/// Falls back to `false` (no rotation) on any failure — TLE cache
+/// miss, parse failure, propagation error, or recording-pass info
+/// missing. The default is safe: NOAA satellites are sun-synchronous,
+/// so the descending pass is the typical case for daytime captures
+/// and no-rotation preserves north-at-top. Takes the pass tuple
+/// directly (`norad_id`, `aos`) so callers compute rotation against
+/// an explicit snapshot — reading `AppState` here could race a
+/// back-to-back AOS and export the older pass's image with the newer
+/// pass's orientation (CR round 6 on PR #571).
+fn compute_apt_rotate_180_for_pass(
+    cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
+    norad_id: u32,
+    aos: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(cache) = cache else {
+        return false;
+    };
+    // Look up by stable NORAD id (not display name) so a catalog
+    // rename doesn't silently break this path. Per CR round 2 on
+    // PR #571.
+    let Some(known) = sdr_sat::KNOWN_SATELLITES
+        .iter()
+        .find(|s| s.norad_id == norad_id)
+    else {
+        tracing::debug!(
+            norad_id,
+            "APT rotate-180: satellite not in catalog; defaulting to no rotation",
+        );
+        return false;
+    };
+    let (line1, line2) = match cache.cached_tle_for(known.norad_id) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(
+                norad_id,
+                error = %e,
+                "APT rotate-180: TLE unavailable; defaulting to no rotation",
+            );
+            return false;
+        }
+    };
+    let parsed = match sdr_sat::Satellite::from_tle(known.name, &line1, &line2) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(
+                norad_id,
+                error = %e,
+                "APT rotate-180: TLE parse failed; defaulting to no rotation",
+            );
+            return false;
+        }
+    };
+    match sdr_sat::is_ascending(&parsed, aos) {
+        Ok(asc) => asc,
+        Err(e) => {
+            tracing::debug!(
+                norad_id,
+                error = %e,
+                "APT rotate-180: SGP4 propagate failed; defaulting to no rotation",
+            );
+            false
+        }
     }
 }
 
