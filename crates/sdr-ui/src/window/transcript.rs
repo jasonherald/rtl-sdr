@@ -379,53 +379,12 @@ pub(super) fn connect_transcript_panel(
                                     }
                                     TranscriptionEvent::Partial { text } => {
                                         #[cfg(feature = "sherpa")]
-                                        {
-                                            // Belt-and-suspenders: only paint
-                                            // the live line if (a) the current
-                                            // model actually supports partials
-                                            // and (b) display mode is Live.
-                                            //
-                                            // (a) defends against a future bug
-                                            // where an offline model accidentally
-                                            // emits a Partial event — today the
-                                            // offline session loop never does,
-                                            // but the UI shouldn't trust that.
-                                            // Without this check, italics would
-                                            // appear on Moonshine/Parakeet on
-                                            // any spurious Partial.
-                                            //
-                                            // (b) honors the user's display-mode
-                                            // preference for partial-emitting
-                                            // models. Re-read on every event so
-                                            // mid-session toggle takes effect.
-                                            let model_supports_partials = model_row_weak
-                                                .upgrade()
-                                                .is_some_and(|row| {
-                                                    let idx = row.selected() as usize;
-                                                    sdr_transcription::SherpaModel::ALL
-                                                        .get(idx)
-                                                        .copied()
-                                                        .is_some_and(
-                                                            sdr_transcription::SherpaModel::supports_partials,
-                                                        )
-                                                });
-                                            let show_live = model_supports_partials
-                                                && display_mode_row_weak.upgrade().is_some_and(
-                                                    |row| row.selected() != DISPLAY_MODE_FINAL_IDX,
-                                                );
-                                            if show_live
-                                                && let Some(label) = live_line_weak.upgrade()
-                                            {
-                                                label.set_text(&text);
-                                                label.set_visible(true);
-                                            }
-                                            // Privacy: never log the raw text.
-                                            tracing::debug!(
-                                                target: "transcription",
-                                                partial_chars = text.chars().count(),
-                                                "sherpa partial received"
-                                            );
-                                        }
+                                        show_live_partial(
+                                            &text,
+                                            &model_row_weak,
+                                            &display_mode_row_weak,
+                                            &live_line_weak,
+                                        );
                                         #[cfg(not(feature = "sherpa"))]
                                         {
                                             // Whisper never emits Partial, but
@@ -444,11 +403,10 @@ pub(super) fn connect_transcript_panel(
                                         // actual audio to attribute, so
                                         // a quiet channel never produces
                                         // a divider.
-                                        if let Some((switched_at, channel_name)) =
-                                            state_for_marker
-                                                .pending_channel_marker
-                                                .borrow_mut()
-                                                .take()
+                                        if let Some((switched_at, channel_name)) = state_for_marker
+                                            .pending_channel_marker
+                                            .borrow_mut()
+                                            .take()
                                         {
                                             sidebar::transcript_panel::push_channel_marker(
                                                 &tv,
@@ -592,6 +550,41 @@ pub(super) fn connect_transcript_panel(
     });
 
     engine
+}
+
+/// Paint a sherpa partial into the live line — but only when (a) the
+/// current model actually supports partials ((a) defends against a
+/// future bug where an offline model emits a spurious `Partial`; the
+/// UI shouldn't trust that it can't) and (b) the display mode is
+/// Live. Both are re-read per event so a mid-session toggle takes
+/// effect. Privacy: the raw text is never logged.
+#[cfg(feature = "sherpa")]
+fn show_live_partial(
+    text: &str,
+    model_row: &glib::WeakRef<adw::ComboRow>,
+    display_mode_row: &glib::WeakRef<adw::ComboRow>,
+    live_line: &glib::WeakRef<gtk4::Label>,
+) {
+    let model_supports_partials = model_row.upgrade().is_some_and(|row| {
+        let idx = row.selected() as usize;
+        sdr_transcription::SherpaModel::ALL
+            .get(idx)
+            .copied()
+            .is_some_and(sdr_transcription::SherpaModel::supports_partials)
+    });
+    let show_live = model_supports_partials
+        && display_mode_row
+            .upgrade()
+            .is_some_and(|row| row.selected() != DISPLAY_MODE_FINAL_IDX);
+    if show_live && let Some(label) = live_line.upgrade() {
+        label.set_text(text);
+        label.set_visible(true);
+    }
+    tracing::debug!(
+        target: "transcription",
+        partial_chars = text.chars().count(),
+        "sherpa partial received"
+    );
 }
 
 /// Assemble the Whisper `BackendConfig` from the panel controls at
