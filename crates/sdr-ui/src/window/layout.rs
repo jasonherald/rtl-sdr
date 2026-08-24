@@ -126,14 +126,16 @@ pub(super) fn build_layout(
 
     build_split_views(
         config,
-        panels,
-        general_panel,
-        transcript_panel,
-        left_stack,
-        right_stack,
+        SplitViewParts {
+            panels,
+            general_panel,
+            transcript_panel,
+            left_stack,
+            right_stack,
+            spectrum_handle,
+            status_bar,
+        },
         &content_box,
-        spectrum_handle,
-        status_bar,
     )
 }
 
@@ -856,18 +858,33 @@ fn build_panel_stacks(
 
 /// Nested `AdwOverlaySplitViews` + resize handles + activity bars around the content box.
 /// Split out per the 50-NLOC gate (#817).
-#[allow(clippy::too_many_arguments)]
-fn build_split_views(
-    config: &std::sync::Arc<sdr_config::ConfigManager>,
+/// Owned widgets `build_layout` hands to [`build_split_views`] —
+/// the pieces that end up inside [`LayoutHandles`] after the split
+/// views wrap them.
+struct SplitViewParts {
     panels: SidebarPanels,
     general_panel: sidebar::GeneralPanel,
     transcript_panel: sidebar::transcript_panel::TranscriptPanel,
     left_stack: gtk4::Stack,
     right_stack: gtk4::Stack,
-    content_box: &gtk4::Box,
     spectrum_handle: spectrum::SpectrumHandle,
     status_bar: StatusBar,
+}
+
+fn build_split_views(
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    parts: SplitViewParts,
+    content_box: &gtk4::Box,
 ) -> LayoutHandles {
+    let SplitViewParts {
+        panels,
+        general_panel,
+        transcript_panel,
+        left_stack,
+        right_stack,
+        spectrum_handle,
+        status_bar,
+    } = parts;
     // Inner (right) split view — sidebar sits on the trailing edge
     // so the right activity bar is the rightmost element on-screen.
     //

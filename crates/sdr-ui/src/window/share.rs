@@ -1449,10 +1449,6 @@ fn wire_auth_require_toggle(
     toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
     widgets_weak: &ServerSwitchWidgetsWeak,
 ) {
-    let running_for_auth_toggle = Rc::clone(running);
-    let toast_overlay_for_auth_toggle = toast_overlay_weak.clone();
-    let widgets_weak_for_auth_toggle = widgets_weak.clone();
-    let auth_toggle_reentry_guard = Rc::new(std::cell::Cell::new(false));
     // Master "Require key" toggle.
     //
     // Order of operations (per `CodeRabbit` round 1 on PR #406):
@@ -1471,44 +1467,51 @@ fn wire_auth_require_toggle(
     // mutation always proceeds — toggling auth with the switch
     // off is a config-only change and the next Start path
     // honors it via the pending-key plumbing.
-    let key_row_for_toggle = panels.server.auth_key_row.downgrade();
-    let reveal_button_for_toggle = panels.server.auth_key_reveal_button.downgrade();
-    let current_key_for_toggle = Rc::clone(current_auth_key);
-    let revealed_for_toggle = Rc::clone(auth_key_revealed);
-    let auth_toggle_guard_for_handler = Rc::clone(&auth_toggle_reentry_guard);
+    let deps = AuthToggleDeps {
+        reentry_guard: Rc::new(std::cell::Cell::new(false)),
+        key_row: panels.server.auth_key_row.downgrade(),
+        widgets_weak: widgets_weak.clone(),
+        running: Rc::clone(running),
+        toast_overlay: toast_overlay_weak.clone(),
+        current_key: Rc::clone(current_auth_key),
+        revealed: Rc::clone(auth_key_revealed),
+        reveal_button: panels.server.auth_key_reveal_button.downgrade(),
+    };
     panels
         .server
         .auth_require_row
         .connect_active_notify(move |row| {
-            on_auth_require_toggled(
-                row,
-                &auth_toggle_guard_for_handler,
-                &key_row_for_toggle,
-                &widgets_weak_for_auth_toggle,
-                &running_for_auth_toggle,
-                &toast_overlay_for_auth_toggle,
-                &current_key_for_toggle,
-                &revealed_for_toggle,
-                &reveal_button_for_toggle,
-            );
+            on_auth_require_toggled(row, &deps);
         });
 }
 
 /// Body of the require-key toggle handler: reentry guard, widget
 /// upgrades, then the enable / disable halves with switch-revert on
 /// failure. Split out per the 50-NLOC gate (#817).
-#[allow(clippy::too_many_arguments)]
-fn on_auth_require_toggled(
-    row: &adw::SwitchRow,
-    auth_toggle_guard_for_handler: &Rc<std::cell::Cell<bool>>,
-    key_row_for_toggle: &glib::WeakRef<adw::ActionRow>,
-    widgets_weak_for_auth_toggle: &ServerSwitchWidgetsWeak,
-    running_for_auth_toggle: &Rc<RefCell<Option<RunningServer>>>,
-    toast_overlay_for_auth_toggle: &glib::WeakRef<adw::ToastOverlay>,
-    current_key_for_toggle: &Rc<RefCell<Option<Vec<u8>>>>,
-    revealed_for_toggle: &Rc<std::cell::Cell<bool>>,
-    reveal_button_for_toggle: &glib::WeakRef<gtk4::Button>,
-) {
+/// Everything the require-key toggle handler reads or mutates,
+/// captured once by the closure in `wire_auth_require_toggle`.
+struct AuthToggleDeps {
+    reentry_guard: Rc<std::cell::Cell<bool>>,
+    key_row: glib::WeakRef<adw::ActionRow>,
+    widgets_weak: ServerSwitchWidgetsWeak,
+    running: Rc<RefCell<Option<RunningServer>>>,
+    toast_overlay: glib::WeakRef<adw::ToastOverlay>,
+    current_key: Rc<RefCell<Option<Vec<u8>>>>,
+    revealed: Rc<std::cell::Cell<bool>>,
+    reveal_button: glib::WeakRef<gtk4::Button>,
+}
+
+fn on_auth_require_toggled(row: &adw::SwitchRow, deps: &AuthToggleDeps) {
+    let AuthToggleDeps {
+        reentry_guard: auth_toggle_guard_for_handler,
+        key_row: key_row_for_toggle,
+        widgets_weak: widgets_weak_for_auth_toggle,
+        running: running_for_auth_toggle,
+        toast_overlay: toast_overlay_for_auth_toggle,
+        current_key: current_key_for_toggle,
+        revealed: revealed_for_toggle,
+        reveal_button: reveal_button_for_toggle,
+    } = deps;
     if auth_toggle_guard_for_handler.get() {
         // Re-entered from our own `set_active` revert
         // path — let the signal settle without running
