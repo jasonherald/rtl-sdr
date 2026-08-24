@@ -506,155 +506,7 @@ pub(super) fn connect_satellites_panel(
         });
     }
 
-    // ZIP code → lat/lon shortcut. We wire BOTH `apply` (apply
-    // button click / Enter when apply-button is sensitive) and
-    // `entry_activated` (Enter, unconditional), then dedupe by an
-    // "in-flight" flag — `apply` won't fire if AdwEntryRow's
-    // internal "has the text been edited?" tracking is in a state
-    // where the apply button is insensitive, but `entry_activated`
-    // fires on Enter regardless. Belt-and-braces is cheaper than
-    // chasing libadwaita's internal sensitivity rules.
-    //
-    // Result text goes to `zip_status_row` (AdwEntryRow has no
-    // subtitle slot of its own). Wired regardless of TLE cache
-    // availability — the ZIP lookup is independent.
-    {
-        let in_flight: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
-        let run_lookup: Rc<dyn Fn(adw::EntryRow)> = {
-            let panel_weak_zip = panel_weak.clone();
-            let in_flight_run = Rc::clone(&in_flight);
-            Rc::new(move |entry: adw::EntryRow| {
-                if in_flight_run.get() {
-                    tracing::debug!("Satellites: ZIP lookup ignored — already in flight");
-                    return;
-                }
-                let Some(panel) = panel_weak_zip.upgrade() else {
-                    return;
-                };
-                // Trim once, here, so the trimmed value is what
-                // flows through the lookup. `lookup_us_zip` does its
-                // own trim internally too, but a paste of "  24068 "
-                // showing up as `length=8` in the debug log reads
-                // worse than `length=5`.
-                let zip = entry.text().trim().to_string();
-                if zip.is_empty() {
-                    // Empty entry — nothing to do; treat as a no-op so a
-                    // stray Enter doesn't reset the status row.
-                    return;
-                }
-                in_flight_run.set(true);
-                tracing::debug!("Satellites: ZIP lookup triggered (length={})", zip.len());
-                entry.set_sensitive(false);
-                panel.zip_status_row.set_title("Looking up…");
-
-                let panel_weak_done = panel_weak_zip.clone();
-                let in_flight_done = Rc::clone(&in_flight_run);
-                let zip_for_task = zip.clone();
-                glib::spawn_future_local(async move {
-                    // Chain the two lookups on the worker thread so the
-                    // UI side just gets one result. ZIP failure is fatal
-                    // for this run; elevation failure is logged and
-                    // demoted to `Ok(_, None)` — altitude is best-effort
-                    // since it barely matters for pass prediction
-                    // anyway, and we'd rather populate lat/lon than
-                    // leave the user staring at an error toast.
-                    let result = gio::spawn_blocking(move || -> Result<
-                    (sdr_sat::PostalLocation, Result<f64, String>),
-                    sdr_sat::PostalLookupError,
-                > {
-                    let loc = sdr_sat::lookup_us_zip(&zip_for_task)?;
-                    // Elevation lookup is best-effort — a failure here
-                    // shouldn't fail the whole flow, but we DO want
-                    // the provider error to reach the UI so the user
-                    // can see why altitude didn't update. Pass it
-                    // back as `Err(String)` (cheap to send across
-                    // thread, decoupled from `ElevationLookupError`'s
-                    // type, and the log already scrubbed lat/lon).
-                    let elevation = match sdr_sat::lookup_elevation_m(loc.lat_deg, loc.lon_deg)
-                    {
-                        Ok(m) => Ok(m),
-                        Err(e) => {
-                            // Don't include lat/lon in the log — that's user
-                            // location data. The error message itself is
-                            // safe (it's the upstream HTTP error / parse
-                            // error / dataset-coverage error).
-                            tracing::warn!("elevation lookup failed: {e}");
-                            Err(e.to_string())
-                        }
-                    };
-                    Ok((loc, elevation))
-                })
-                .await;
-
-                    in_flight_done.set(false);
-                    let Some(panel) = panel_weak_done.upgrade() else {
-                        return;
-                    };
-                    panel.zip_row.set_sensitive(true);
-
-                    match result {
-                        Ok(Ok((loc, elevation))) => {
-                            // Order matters slightly: setting lat/lon/alt
-                            // fires `value-notify`, which persists the
-                            // value and triggers `recompute`. Three
-                            // recomputes back-to-back is fine —
-                            // sub-millisecond each.
-                            panel.lat_row.set_value(loc.lat_deg);
-                            panel.lon_row.set_value(loc.lon_deg);
-                            let where_text = if loc.region.is_empty() {
-                                loc.place
-                            } else {
-                                format!("{place}, {region}", place = loc.place, region = loc.region)
-                            };
-                            let status = match elevation {
-                                Ok(alt_m) => {
-                                    panel.alt_row.set_value(alt_m);
-                                    format!("Resolved: {where_text} ({alt_m:.0} m)")
-                                }
-                                Err(e) => {
-                                    // Leave altitude alone but
-                                    // surface the provider error
-                                    // so the user knows what to
-                                    // try next (e.g. retry on a
-                                    // bad network).
-                                    format!("Resolved: {where_text} (altitude unchanged: {e})")
-                                }
-                            };
-                            panel.zip_status_row.set_title(&status);
-                        }
-                        Ok(Err(e)) => {
-                            // Don't include the ZIP in the log — user
-                            // location data, already surfaced inline in
-                            // the status row. Provider error alone is
-                            // enough.
-                            tracing::warn!("ZIP lookup failed: {e}");
-                            panel.zip_status_row.set_title(&e.to_string());
-                        }
-                        Err(_) => {
-                            tracing::warn!("ZIP lookup task panicked");
-                            panel
-                                .zip_status_row
-                                .set_title("Lookup failed: background task panicked");
-                        }
-                    }
-                });
-            })
-        };
-        // Wire both signal paths to the same closure: `apply` for
-        // the apply button click (when libadwaita has flagged the
-        // text as edited), `entry-activated` for raw Enter keys
-        // (always fires, regardless of edit state).
-        {
-            let run = Rc::clone(&run_lookup);
-            panel.zip_row.connect_apply(move |entry| run(entry.clone()));
-        }
-        {
-            let run = Rc::clone(&run_lookup);
-            panel
-                .zip_row
-                .connect_entry_activated(move |entry| run(entry.clone()));
-        }
-    }
+    wire_zip_lookup(panel, &panel_weak, &recompute, config);
 
     // 1 Hz countdown ticker. Only scheduled when the cache is
     // available — without it `displayed` stays empty forever and
@@ -2240,6 +2092,165 @@ pub(super) fn connect_satellites_panel(
             }
             glib::ControlFlow::Continue
         });
+    }
+}
+
+/// ZIP code → lat/lon shortcut. Both `apply` (apply-button click /
+/// Enter when the apply button is sensitive) and `entry_activated`
+/// (Enter, unconditional) are wired to the same closure, deduped by
+/// an in-flight flag. Split out per the 50-NLOC gate (#817).
+fn wire_zip_lookup(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
+    recompute: &Rc<dyn Fn()>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    // ZIP code → lat/lon shortcut. We wire BOTH `apply` (apply
+    // button click / Enter when apply-button is sensitive) and
+    // `entry_activated` (Enter, unconditional), then dedupe by an
+    // "in-flight" flag — `apply` won't fire if AdwEntryRow's
+    // internal "has the text been edited?" tracking is in a state
+    // where the apply button is insensitive, but `entry_activated`
+    // fires on Enter regardless. Belt-and-braces is cheaper than
+    // chasing libadwaita's internal sensitivity rules.
+    //
+    // Result text goes to `zip_status_row` (AdwEntryRow has no
+    // subtitle slot of its own). Wired regardless of TLE cache
+    // availability — the ZIP lookup is independent.
+    let in_flight: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+    let run_lookup: Rc<dyn Fn(adw::EntryRow)> = {
+        let panel_weak_zip = panel_weak.clone();
+        let in_flight_run = Rc::clone(&in_flight);
+        Rc::new(move |entry: adw::EntryRow| {
+            if in_flight_run.get() {
+                tracing::debug!("Satellites: ZIP lookup ignored — already in flight");
+                return;
+            }
+            let Some(panel) = panel_weak_zip.upgrade() else {
+                return;
+            };
+            // Trim once, here, so the trimmed value is what
+            // flows through the lookup. `lookup_us_zip` does its
+            // own trim internally too, but a paste of "  24068 "
+            // showing up as `length=8` in the debug log reads
+            // worse than `length=5`.
+            let zip = entry.text().trim().to_string();
+            if zip.is_empty() {
+                // Empty entry — nothing to do; treat as a no-op so a
+                // stray Enter doesn't reset the status row.
+                return;
+            }
+            in_flight_run.set(true);
+            tracing::debug!("Satellites: ZIP lookup triggered (length={})", zip.len());
+            entry.set_sensitive(false);
+            panel.zip_status_row.set_title("Looking up…");
+
+            let panel_weak_done = panel_weak_zip.clone();
+            let in_flight_done = Rc::clone(&in_flight_run);
+            let zip_for_task = zip.clone();
+            glib::spawn_future_local(async move {
+                // Chain the two lookups on the worker thread so the
+                // UI side just gets one result. ZIP failure is fatal
+                // for this run; elevation failure is logged and
+                // demoted to `Ok(_, None)` — altitude is best-effort
+                // since it barely matters for pass prediction
+                // anyway, and we'd rather populate lat/lon than
+                // leave the user staring at an error toast.
+                let result = gio::spawn_blocking(move || -> Result<
+                    (sdr_sat::PostalLocation, Result<f64, String>),
+                    sdr_sat::PostalLookupError,
+                > {
+                    let loc = sdr_sat::lookup_us_zip(&zip_for_task)?;
+                    // Elevation lookup is best-effort — a failure here
+                    // shouldn't fail the whole flow, but we DO want
+                    // the provider error to reach the UI so the user
+                    // can see why altitude didn't update. Pass it
+                    // back as `Err(String)` (cheap to send across
+                    // thread, decoupled from `ElevationLookupError`'s
+                    // type, and the log already scrubbed lat/lon).
+                    let elevation = match sdr_sat::lookup_elevation_m(loc.lat_deg, loc.lon_deg)
+                    {
+                        Ok(m) => Ok(m),
+                        Err(e) => {
+                            // Don't include lat/lon in the log — that's user
+                            // location data. The error message itself is
+                            // safe (it's the upstream HTTP error / parse
+                            // error / dataset-coverage error).
+                            tracing::warn!("elevation lookup failed: {e}");
+                            Err(e.to_string())
+                        }
+                    };
+                    Ok((loc, elevation))
+                })
+                .await;
+
+                in_flight_done.set(false);
+                let Some(panel) = panel_weak_done.upgrade() else {
+                    return;
+                };
+                panel.zip_row.set_sensitive(true);
+
+                match result {
+                    Ok(Ok((loc, elevation))) => {
+                        // Order matters slightly: setting lat/lon/alt
+                        // fires `value-notify`, which persists the
+                        // value and triggers `recompute`. Three
+                        // recomputes back-to-back is fine —
+                        // sub-millisecond each.
+                        panel.lat_row.set_value(loc.lat_deg);
+                        panel.lon_row.set_value(loc.lon_deg);
+                        let where_text = if loc.region.is_empty() {
+                            loc.place
+                        } else {
+                            format!("{place}, {region}", place = loc.place, region = loc.region)
+                        };
+                        let status = match elevation {
+                            Ok(alt_m) => {
+                                panel.alt_row.set_value(alt_m);
+                                format!("Resolved: {where_text} ({alt_m:.0} m)")
+                            }
+                            Err(e) => {
+                                // Leave altitude alone but
+                                // surface the provider error
+                                // so the user knows what to
+                                // try next (e.g. retry on a
+                                // bad network).
+                                format!("Resolved: {where_text} (altitude unchanged: {e})")
+                            }
+                        };
+                        panel.zip_status_row.set_title(&status);
+                    }
+                    Ok(Err(e)) => {
+                        // Don't include the ZIP in the log — user
+                        // location data, already surfaced inline in
+                        // the status row. Provider error alone is
+                        // enough.
+                        tracing::warn!("ZIP lookup failed: {e}");
+                        panel.zip_status_row.set_title(&e.to_string());
+                    }
+                    Err(_) => {
+                        tracing::warn!("ZIP lookup task panicked");
+                        panel
+                            .zip_status_row
+                            .set_title("Lookup failed: background task panicked");
+                    }
+                }
+            });
+        })
+    };
+    // Wire both signal paths to the same closure: `apply` for
+    // the apply button click (when libadwaita has flagged the
+    // text as edited), `entry-activated` for raw Enter keys
+    // (always fires, regardless of edit state).
+    {
+        let run = Rc::clone(&run_lookup);
+        panel.zip_row.connect_apply(move |entry| run(entry.clone()));
+    }
+    {
+        let run = Rc::clone(&run_lookup);
+        panel
+            .zip_row
+            .connect_entry_activated(move |entry| run(entry.clone()));
     }
 }
 
