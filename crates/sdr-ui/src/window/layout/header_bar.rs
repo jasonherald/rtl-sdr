@@ -106,9 +106,8 @@ pub(in crate::window) fn build_header_bar(
     // reliably by screen readers for icon-only controls. Per CR
     // round 2 on PR #844 (same idiom as the volume / favorites
     // buttons below).
-    screenshot_button.update_property(&[gtk4::accessible::Property::Label(
-        "Export waterfall to PNG",
-    )]);
+    screenshot_button
+        .update_property(&[gtk4::accessible::Property::Label("Export waterfall to PNG")]);
 
     // RadioReference frequency browser button
     let rr_button = gtk4::Button::builder()

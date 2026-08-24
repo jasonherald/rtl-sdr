@@ -204,7 +204,6 @@ fn on_gain_list(ctx: &DspEventCtx, gains: &[f64]) {
     }
 }
 
-
 /// Recording ↔ transcription mutex, UI leg: the controller's
 /// `stop_transcription` on both recording-start paths is silent (no
 /// paired `DspToUi` event), so the enable switch would stay on while

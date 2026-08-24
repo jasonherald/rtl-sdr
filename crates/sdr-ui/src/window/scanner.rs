@@ -309,7 +309,6 @@ fn wire_scanner_master_switch(
             update_scanner_axis_status_row(&display_axis_row, None);
         }
     });
-
 }
 
 /// Lockout button -> LockoutScannerChannel(active key).
