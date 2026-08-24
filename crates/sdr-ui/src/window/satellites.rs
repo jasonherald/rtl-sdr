@@ -1823,6 +1823,40 @@ fn save_lrpt_composites(
 /// Split out of [`interpret_recorder_action`] per the 50-NLOC gate
 /// (#817).
 #[allow(clippy::too_many_arguments)]
+
+/// Fallback [`SstvSaveOutcome`] when the `spawn_blocking` PNG worker
+/// panics. Re-constructs the full retain list from the backups: prior
+/// pending batches (preserved as-is) plus the current pass re-keyed to
+/// its dir, so neither is silently dropped by the failure-path drain.
+/// Per CR round 7 #25 on PR #599.
+fn sstv_panic_outcome(
+    e: Box<dyn std::any::Any + Send>,
+    pending_batches_backup: Vec<PendingSstvExport>,
+    current_images_backup: Vec<sdr_radio::sstv_image::CompletedSstvImage>,
+    dir: &std::path::Path,
+) -> SstvSaveOutcome {
+    tracing::warn!("auto-record SaveSstvPass: worker thread panicked: {e:?}",);
+    let mut retained = pending_batches_backup;
+    if !current_images_backup.is_empty() {
+        retained.push(PendingSstvExport {
+            dir: dir.to_path_buf(),
+            // Original attempt would have started at index 0; on panic
+            // retry we reuse that start so filenames remain stable. Per
+            // CR round 8 #27 on PR #599.
+            start_index: 0,
+            images: current_images_backup,
+        });
+    }
+    SstvSaveOutcome {
+        message: format!(
+            "Pass complete but PNG worker panicked (target was {})",
+            dir.display()
+        ),
+        current_ok: false,
+        retained,
+    }
+}
+
 fn on_save_sstv_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
     // Per-pass auto-record save. Each pass's images are
     // written into their own `sstv-iss-{ts}` directory.
@@ -1890,35 +1924,12 @@ fn on_save_sstv_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
             current_ok,
             retained,
         } = join.unwrap_or_else(|e| {
-            tracing::warn!("auto-record SaveSstvPass: worker thread panicked: {e:?}",);
-            // Re-construct the full retain list from
-            // the backups: prior pending batches
-            // (preserved as-is) plus the current pass
-            // re-keyed to its dir, so neither is
-            // silently dropped by the failure-path
-            // drain below. Per CR round 7 #25 on PR
-            // #599.
-            let mut retained = pending_batches_backup;
-            if !current_images_backup.is_empty() {
-                retained.push(PendingSstvExport {
-                    dir: dir_backup.clone(),
-                    // Original attempt would have
-                    // started at index 0; on panic
-                    // retry we reuse that start so
-                    // filenames remain stable. Per
-                    // CR round 8 #27 on PR #599.
-                    start_index: 0,
-                    images: current_images_backup,
-                });
-            }
-            SstvSaveOutcome {
-                message: format!(
-                    "Pass complete but PNG worker panicked (target was {})",
-                    dir_for_msg.display()
-                ),
-                current_ok: false,
-                retained,
-            }
+            sstv_panic_outcome(
+                e,
+                pending_batches_backup,
+                current_images_backup,
+                &dir_backup,
+            )
         });
         post_toast(&toast_overlay_weak_for_save, &message);
         // Restore retained batches (pending that still
