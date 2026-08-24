@@ -411,21 +411,15 @@ pub(super) fn connect_transcript_panel(
                                         // Mirror the synchronous start()
                                         // failure teardown so the UI
                                         // isn't left locked.
-                                        session_rows.unlock();
-                                        if let Some(enable) = enable_row_weak.upgrade() {
-                                            enable.set_active(false);
-                                        }
-                                        status.set_text(&msg);
-                                        status.set_css_classes(&["error"]);
-                                        status.set_visible(true);
-                                        progress.set_visible(false);
-                                        // Clear any stale partial so it
-                                        // doesn't linger into the next session.
-                                        #[cfg(feature = "sherpa")]
-                                        if let Some(label) = live_line_weak.upgrade() {
-                                            label.set_text("");
-                                            label.set_visible(false);
-                                        }
+                                        teardown_failed_session(
+                                            &session_rows,
+                                            &enable_row_weak,
+                                            &status,
+                                            &progress,
+                                            &msg,
+                                            #[cfg(feature = "sherpa")]
+                                            &live_line_weak,
+                                        );
                                         return glib::ControlFlow::Break;
                                     }
                                 },
@@ -469,19 +463,15 @@ pub(super) fn connect_transcript_panel(
                                     tracing::warn!(
                                         "transcription event channel disconnected unexpectedly"
                                     );
-                                    session_rows.unlock();
-                                    if let Some(enable) = enable_row_weak.upgrade() {
-                                        enable.set_active(false);
-                                    }
-                                    status.set_text("Transcription stopped unexpectedly");
-                                    status.set_css_classes(&["error"]);
-                                    status.set_visible(true);
-                                    progress.set_visible(false);
-                                    #[cfg(feature = "sherpa")]
-                                    if let Some(label) = live_line_weak.upgrade() {
-                                        label.set_text("");
-                                        label.set_visible(false);
-                                    }
+                                    teardown_failed_session(
+                                        &session_rows,
+                                        &enable_row_weak,
+                                        &status,
+                                        &progress,
+                                        "Transcription stopped unexpectedly",
+                                        #[cfg(feature = "sherpa")]
+                                        &live_line_weak,
+                                    );
                                     return glib::ControlFlow::Break;
                                 }
                             }
@@ -526,6 +516,30 @@ pub(super) fn connect_transcript_panel(
     });
 
     engine
+}
+
+/// Mid-session failure teardown, shared by the `Error` event arm and
+/// the spontaneous channel-disconnect arm: unlock the settings rows,
+/// snap the toggle off, surface the error on the status label, and
+/// clear any stale live partial.
+fn teardown_failed_session(
+    session_rows: &SessionRowWeaks,
+    enable_row: &glib::WeakRef<adw::SwitchRow>,
+    status: &gtk4::Label,
+    progress: &gtk4::ProgressBar,
+    msg: &str,
+    #[cfg(feature = "sherpa")] live_line: &glib::WeakRef<gtk4::Label>,
+) {
+    session_rows.unlock();
+    if let Some(enable) = enable_row.upgrade() {
+        enable.set_active(false);
+    }
+    status.set_text(msg);
+    status.set_css_classes(&["error"]);
+    status.set_visible(true);
+    progress.set_visible(false);
+    #[cfg(feature = "sherpa")]
+    clear_live_line(live_line);
 }
 
 /// Append a finalized utterance to the transcript log. Drains the
