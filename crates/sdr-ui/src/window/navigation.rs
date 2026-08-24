@@ -4,8 +4,7 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
 use super::{
-    AppState, DeemphasisMode, Rc, ScannerForceDisable, SidebarPanels, StatusBar, UiToDsp, adw,
-    header, sidebar, spectrum, tune_to_target,
+    AppState, DeemphasisMode, Rc, SidebarPanels, TuneCtx, UiToDsp, adw, sidebar, tune_to_target,
 };
 
 /// Restore optional tuning-profile settings from a bookmark to DSP and UI.
@@ -39,24 +38,11 @@ pub(super) fn restore_bookmark_profile(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn connect_navigation_panel(
     panels: &SidebarPanels,
-    state: &Rc<AppState>,
-    freq_selector: &header::frequency_selector::FrequencySelector,
-    demod_dropdown: &gtk4::DropDown,
-    status_bar: &Rc<StatusBar>,
-    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
-    scanner_force_disable: &Rc<ScannerForceDisable>,
+    tune_ctx: &TuneCtx,
     volume_button: &gtk4::ScaleButton,
 ) {
-    wire_bookmark_navigation(
-        panels,
-        state,
-        freq_selector,
-        demod_dropdown,
-        status_bar,
-        spectrum_handle,
-        scanner_force_disable,
-        volume_button,
-    );
+    let state = &tune_ctx.state;
+    wire_bookmark_navigation(panels, tune_ctx, volume_button);
 
     wire_add_bookmark_button(panels, state);
 
@@ -65,50 +51,28 @@ pub(super) fn connect_navigation_panel(
 
 /// Bookmark-selected navigation: restore the full tuning profile.
 /// Split out per the 50-NLOC gate (#817).
-#[allow(clippy::too_many_arguments)]
 fn wire_bookmark_navigation(
     panels: &SidebarPanels,
-    state: &Rc<AppState>,
-    freq_selector: &header::frequency_selector::FrequencySelector,
-    demod_dropdown: &gtk4::DropDown,
-    status_bar: &Rc<StatusBar>,
-    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
-    scanner_force_disable: &Rc<ScannerForceDisable>,
+    tune_ctx: &TuneCtx,
     volume_button: &gtk4::ScaleButton,
 ) {
     // Navigation callback: restore full tuning profile from bookmark.
-    let state_nav = Rc::clone(state);
-    let fs = freq_selector.clone();
-    // Strong clone — single-threaded GTK main loop, the closure
-    // outlives the dropdown only at teardown which drops both at
-    // once. Pre-#509 this was a `WeakRef` upgraded inside the
-    // closure; `tune_to_target` takes `&gtk4::DropDown`, and the
-    // strong clone keeps the call shape uniform with the satellite
-    // closure (which has always held a strong clone).
-    let dd = demod_dropdown.clone();
-    let sb = Rc::clone(status_bar);
-    let spectrum_nav = Rc::clone(spectrum_handle);
-    let radio_nav = panels.radio.clone();
+    // The ctx clone is cheap (`Rc` bumps / `GObject` refcounts) and
+    // strong — single-threaded GTK main loop, the closure outlives
+    // the widgets only at teardown which drops both at once
+    // (pre-#509 rationale, unchanged).
+    let ctx_nav = tune_ctx.clone();
     let source_nav_gain = panels.source.gain_row.clone();
     let source_nav_agc = panels.source.agc_row.clone();
-    let force_disable_nav = Rc::clone(scanner_force_disable);
     let volume_button_nav = volume_button.clone();
-    let bandwidth_row_nav = panels.radio.bandwidth_row.clone();
 
     panels.bookmarks.connect_navigate(move |bookmark| {
         navigate_to_bookmark(
             bookmark,
-            &state_nav,
-            &fs,
-            &dd,
-            &sb,
-            &spectrum_nav,
-            &radio_nav,
+            &ctx_nav,
             &source_nav_gain,
             &source_nav_agc,
-            &force_disable_nav,
             &volume_button_nav,
-            &bandwidth_row_nav,
         );
     });
 }
@@ -116,20 +80,12 @@ fn wire_bookmark_navigation(
 /// Bookmark/preset navigation body: the canonical 13-step mirror
 /// sequence (#509) plus the bookmark-specific profile restore.
 /// Split out per the 50-NLOC gate (#817).
-#[allow(clippy::too_many_arguments)]
 fn navigate_to_bookmark(
     bookmark: &sidebar::navigation_panel::Bookmark,
-    state_nav: &Rc<AppState>,
-    fs: &header::frequency_selector::FrequencySelector,
-    dd: &gtk4::DropDown,
-    sb: &Rc<StatusBar>,
-    spectrum_nav: &Rc<spectrum::SpectrumHandle>,
-    radio_nav: &sidebar::radio_panel::RadioPanel,
+    tune_ctx: &TuneCtx,
     source_nav_gain: &adw::SpinRow,
     source_nav_agc: &adw::ComboRow,
-    force_disable_nav: &Rc<ScannerForceDisable>,
     volume_button_nav: &gtk4::ScaleButton,
-    bandwidth_row_nav: &adw::SpinRow,
 ) {
     // Both bookmark recall AND band-preset selection come in
     // through this callback (the preset handler in
@@ -142,20 +98,7 @@ fn navigate_to_bookmark(
 
     // Canonical 13-step mirror sequence — single source of
     // truth shared with the satellite tune path. Per #509.
-    tune_to_target(
-        state_nav,
-        fs,
-        dd,
-        spectrum_nav,
-        force_disable_nav,
-        bandwidth_row_nav,
-        radio_nav,
-        sb,
-        freq,
-        mode,
-        bw,
-        "preset/bookmark selection",
-    );
+    tune_to_target(tune_ctx, freq, mode, bw, "preset/bookmark selection");
 
     // Restore optional tuning-profile settings (squelch, gain,
     // etc.). Bookmark-specific layer on top of the canonical
@@ -163,8 +106,8 @@ fn navigate_to_bookmark(
     // need this.
     restore_bookmark_profile(
         bookmark,
-        state_nav,
-        radio_nav,
+        &tune_ctx.state,
+        &tune_ctx.radio_panel,
         source_nav_gain,
         source_nav_agc,
         volume_button_nav,

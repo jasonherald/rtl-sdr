@@ -134,6 +134,30 @@ fn apply_manual_tune(
     radio_panel.update_distance_frequency(freq_hz);
 }
 
+/// Signature of the shared "tune the radio" closure handed to the
+/// Satellites panel (per-row play buttons, auto-record AOS, the
+/// `app.tune-satellite` action): `(freq_hz, demod_mode, bandwidth_hz)`.
+type TuneFn = dyn Fn(u64, sdr_types::DemodMode, u32);
+
+/// Everything the canonical 13-step tune mirror sequence (#509)
+/// touches: `AppState` + every UI widget / status indicator that
+/// mirrors the radio's tuning state. Consolidating the duplicated
+/// sequence into `tune_to_target` requires every captured widget the
+/// original call sites held; bundling them here keeps the signatures
+/// flat. All fields are cheap clones (`Rc` bumps / `GObject`
+/// refcounts), so the ctx itself is `Clone` for capture in closures.
+#[derive(Clone)]
+struct TuneCtx {
+    state: Rc<AppState>,
+    freq_selector: header::frequency_selector::FrequencySelector,
+    demod_dropdown: gtk4::DropDown,
+    spectrum_handle: Rc<spectrum::SpectrumHandle>,
+    scanner_force_disable: Rc<ScannerForceDisable>,
+    bandwidth_row: adw::SpinRow,
+    radio_panel: sidebar::radio_panel::RadioPanel,
+    status_bar: Rc<StatusBar>,
+}
+
 /// Apply the canonical tune-target dispatch — the 13 widget /
 /// state / DSP mirror steps that bookmark recall, the satellite
 /// play button, and auto-record-on-pass all need to perform when
@@ -154,30 +178,27 @@ fn apply_manual_tune(
 /// a side effect of `set_selected` below. This mirrors the existing
 /// pattern that both call sites historically used.
 #[allow(
-    clippy::too_many_arguments,
-    reason = "consolidating the duplicated 13-step mirror sequence into a single \
-              source of truth requires every captured widget / handle the two \
-              call sites used to capture; threading them through is the point"
-)]
-#[allow(
     clippy::cast_precision_loss,
     reason = "freq_hz is bounded by the user-tunable RTL-SDR range (≤6 GHz) and \
               well below f64's 2^53 mantissa ceiling"
 )]
 fn tune_to_target(
-    state: &Rc<AppState>,
-    freq_selector: &header::frequency_selector::FrequencySelector,
-    demod_dropdown: &gtk4::DropDown,
-    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
-    scanner_force_disable: &ScannerForceDisable,
-    bandwidth_row: &adw::SpinRow,
-    radio_panel: &sidebar::radio_panel::RadioPanel,
-    status_bar: &Rc<StatusBar>,
+    ctx: &TuneCtx,
     freq_hz: u64,
     mode: sdr_types::DemodMode,
     bw_hz: f64,
     reason: &'static str,
 ) {
+    let TuneCtx {
+        state,
+        freq_selector,
+        demod_dropdown,
+        spectrum_handle,
+        scanner_force_disable,
+        bandwidth_row,
+        radio_panel,
+        status_bar,
+    } = ctx;
     // Verification logging: print the entire tune request as a
     // single structured line so a `grep tune_to_target ~/.cache/sdr-rs/sdr.log`
     // gives a complete picture of every retune (manual or auto-record).
@@ -929,18 +950,23 @@ pub fn build_window(
         })
     };
 
+    let tune_ctx = TuneCtx {
+        state: Rc::clone(&state),
+        freq_selector: freq_selector.clone(),
+        demod_dropdown: demod_dropdown.clone(),
+        spectrum_handle: Rc::clone(&spectrum_handle),
+        scanner_force_disable: Rc::clone(&scanner_force_disable),
+        bandwidth_row: panels.radio.bandwidth_row.clone(),
+        radio_panel: panels.radio.clone(),
+        status_bar: Rc::clone(&status_bar_demod),
+    };
     connect_sidebar_panels(
         app,
         &panels,
-        &state,
-        &spectrum_handle,
-        &freq_selector,
-        &demod_dropdown,
-        &status_bar_demod,
+        &tune_ctx,
         &toast_overlay,
         config,
         &favorites_handle,
-        &scanner_force_disable,
         &volume_button,
         &set_playing,
     );
@@ -1370,18 +1396,17 @@ pub fn build_window(
 fn connect_sidebar_panels(
     app: &adw::Application,
     panels: &SidebarPanels,
-    state: &Rc<AppState>,
-    spectrum_handle: &Rc<spectrum::SpectrumHandle>,
-    freq_selector: &header::frequency_selector::FrequencySelector,
-    demod_dropdown: &gtk4::DropDown,
-    status_bar: &Rc<StatusBar>,
+    tune_ctx: &TuneCtx,
     toast_overlay: &adw::ToastOverlay,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     favorites_header: &FavoritesHeaderHandle,
-    scanner_force_disable: &Rc<ScannerForceDisable>,
     volume_button: &gtk4::ScaleButton,
     set_playing: &Rc<dyn Fn(bool)>,
 ) {
+    let state = &tune_ctx.state;
+    let spectrum_handle = &tune_ctx.spectrum_handle;
+    let status_bar = &tune_ctx.status_bar;
+    let scanner_force_disable = &tune_ctx.scanner_force_disable;
     // Shared "is the rtl_tcp server currently live?" flag. Written by
     // the server panel's start/stop handler, read by the source
     // panel's device-type guard so the two panels can enforce the
@@ -1447,30 +1472,10 @@ fn connect_sidebar_panels(
     // callbacks fire `SetDemodMode` / a redundant `SetBandwidth`
     // themselves — idempotent at the DSP, cheaper than threading
     // a suppress flag through here.
-    let tune_to_satellite: Rc<dyn Fn(u64, sdr_types::DemodMode, u32)> = {
-        let state_t = Rc::clone(state);
-        let freq_selector_t = freq_selector.clone();
-        let demod_dropdown_t = demod_dropdown.clone();
-        let spectrum_t = Rc::clone(spectrum_handle);
-        let force_disable_t = Rc::clone(scanner_force_disable);
-        let bandwidth_row_t = panels.radio.bandwidth_row.clone();
-        let radio_panel_t = panels.radio.clone();
-        let status_bar_t = Rc::clone(status_bar);
+    let tune_to_satellite: Rc<TuneFn> = {
+        let ctx_t = tune_ctx.clone();
         Rc::new(move |freq_hz, mode, bw_hz| {
-            tune_to_target(
-                &state_t,
-                &freq_selector_t,
-                &demod_dropdown_t,
-                &spectrum_t,
-                &force_disable_t,
-                &bandwidth_row_t,
-                &radio_panel_t,
-                &status_bar_t,
-                freq_hz,
-                mode,
-                f64::from(bw_hz),
-                "satellite tune",
-            );
+            tune_to_target(&ctx_t, freq_hz, mode, f64::from(bw_hz), "satellite tune");
         })
     };
     // Register `app.tune-satellite` so the "Tune" button on a #510
@@ -1517,16 +1522,7 @@ fn connect_sidebar_panels(
     );
     connect_aviation_panel(&panels.aviation, state, config, toast_overlay);
     // Transcript panel is wired separately (not in SidebarPanels).
-    connect_navigation_panel(
-        panels,
-        state,
-        freq_selector,
-        demod_dropdown,
-        status_bar,
-        spectrum_handle,
-        scanner_force_disable,
-        volume_button,
-    );
+    connect_navigation_panel(panels, tune_ctx, volume_button);
 
     // Mutation-triggered scanner re-projection. Fires on scan
     // checkbox, priority star, and delete — every per-bookmark
