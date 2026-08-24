@@ -224,13 +224,12 @@ pub(super) fn connect_satellites_panel(
     use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
         AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
-        SatellitesPanelWeak, enumerate_upcoming_passes, format_downlink_mhz, format_last_refresh,
-        format_pass_subtitle, format_pass_title, load_auto_record_apt, load_auto_record_audio,
+        SatellitesPanelWeak, enumerate_upcoming_passes, format_last_refresh, format_pass_subtitle,
+        format_pass_title, load_auto_record_apt, load_auto_record_audio,
         load_auto_record_composites, load_auto_record_quality, load_notify_lead_min,
         load_station_alt_m, load_station_lat_deg, load_station_lon_deg, load_watched_satellites,
         norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
         save_auto_record_composites, save_f64, save_tle_last_refresh, save_watched_satellites,
-        tune_target_for_pass,
     };
     use sidebar::satellites_recorder::{
         Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
@@ -382,31 +381,7 @@ pub(super) fn connect_satellites_panel(
                 // user-initiated action and works on any catalog
                 // entry. Only the auto-record path filters on
                 // `Some(protocol)`.
-                if let Some((freq_hz, mode, bw_hz, _protocol, _norad_id)) =
-                    tune_target_for_pass(&pass)
-                {
-                    let play_btn = gtk4::Button::builder()
-                        .icon_name("media-playback-start-symbolic")
-                        .tooltip_text(format!(
-                            "Tune to {} ({})",
-                            pass.satellite,
-                            format_downlink_mhz(freq_hz),
-                        ))
-                        .valign(gtk4::Align::Center)
-                        .css_classes(["flat"])
-                        .build();
-                    // Tooltips aren't read by screen readers — set
-                    // the accessible label too, matching the
-                    // project rule for icon-only buttons.
-                    let a11y_label = format!("Tune to {} downlink", pass.satellite);
-                    play_btn
-                        .update_property(&[gtk4::accessible::Property::Label(a11y_label.as_str())]);
-                    let tune_for_click = Rc::clone(&tune_for_recompute);
-                    play_btn.connect_clicked(move |_| {
-                        tune_for_click(freq_hz, mode, bw_hz);
-                    });
-                    row.add_suffix(&play_btn);
-                }
+                attach_pass_play_button(&row, &pass, &tune_for_recompute);
                 // 🔔 watch-toggle (#510) — per-satellite, NOT
                 // per-pass. Toggling on row N flips the user's
                 // subscription for THIS satellite. Mirrored across
@@ -2464,6 +2439,44 @@ pub(super) fn connect_satellites_panel(
             glib::ControlFlow::Continue
         });
     }
+}
+
+/// Per-row play button — one-click tune to the satellite's downlink
+/// with the right demod / BW. Skipped when the satellite isn't in the
+/// catalog (impossible in practice but the lookup type is `Option`,
+/// so we fail closed — no button rather than a button that does
+/// nothing). The 4th tuple element (`Option<ImagingProtocol>`) is
+/// ignored — manual tune is user-initiated and works on any catalog
+/// entry; only the auto-record path filters on `Some(protocol)`.
+fn attach_pass_play_button(
+    row: &adw::ActionRow,
+    pass: &sdr_sat::Pass,
+    tune: &Rc<dyn Fn(u64, sdr_types::DemodMode, u32)>,
+) {
+    use sidebar::satellites_panel::{format_downlink_mhz, tune_target_for_pass};
+
+    let Some((freq_hz, mode, bw_hz, _protocol, _norad_id)) = tune_target_for_pass(pass) else {
+        return;
+    };
+    let play_btn = gtk4::Button::builder()
+        .icon_name("media-playback-start-symbolic")
+        .tooltip_text(format!(
+            "Tune to {} ({})",
+            pass.satellite,
+            format_downlink_mhz(freq_hz),
+        ))
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    // Tooltips aren't read by screen readers — set the accessible
+    // label too, matching the project rule for icon-only buttons.
+    let a11y_label = format!("Tune to {} downlink", pass.satellite);
+    play_btn.update_property(&[gtk4::accessible::Property::Label(a11y_label.as_str())]);
+    let tune_for_click = Rc::clone(tune);
+    play_btn.connect_clicked(move |_| {
+        tune_for_click(freq_hz, mode, bw_hz);
+    });
+    row.add_suffix(&play_btn);
 }
 
 /// Cadence of the Doppler tracker's trigger re-evaluation —
