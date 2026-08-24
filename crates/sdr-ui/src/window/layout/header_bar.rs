@@ -16,6 +16,7 @@ pub(in crate::window) fn build_sidebar_toggle(
         .tooltip_text("Toggle sidebar")
         .active(true)
         .build();
+    toggle.update_property(&[gtk4::accessible::Property::Label("Toggle sidebar")]);
 
     toggle.connect_toggled(glib::clone!(
         #[weak]
@@ -51,19 +52,25 @@ pub(in crate::window) struct FavoritesHeaderHandle {
     clippy::too_many_lines,
     reason = "widget-assembly — splitting scatters one-time wire-up across helpers without readability win"
 )]
+/// Named handles out of [`build_header_bar`]. A struct rather than a
+/// positional tuple so an insertion or reorder can't silently swap
+/// two same-typed widgets (`screenshot_button` and `rr_button` are
+/// both `gtk4::Button`). Per CR round 2 on PR #844.
+pub(in crate::window) struct HeaderBarHandles {
+    pub(in crate::window) header: adw::HeaderBar,
+    pub(in crate::window) play_button: gtk4::ToggleButton,
+    pub(in crate::window) demod_dropdown: gtk4::DropDown,
+    pub(in crate::window) freq_selector: header::frequency_selector::FrequencySelector,
+    pub(in crate::window) screenshot_button: gtk4::Button,
+    pub(in crate::window) rr_button: gtk4::Button,
+    pub(in crate::window) volume_button: gtk4::ScaleButton,
+    pub(in crate::window) favorites_handle: FavoritesHeaderHandle,
+}
+
 pub(in crate::window) fn build_header_bar(
     sidebar_toggle: &gtk4::ToggleButton,
     state: &Rc<AppState>,
-) -> (
-    adw::HeaderBar,
-    gtk4::ToggleButton,
-    gtk4::DropDown,
-    header::frequency_selector::FrequencySelector,
-    gtk4::Button,
-    gtk4::Button,
-    gtk4::ScaleButton,
-    FavoritesHeaderHandle,
-) {
+) -> HeaderBarHandles {
     let play_button = build_play_button(state);
 
     // Frequency selector as the title widget.
@@ -95,6 +102,13 @@ pub(in crate::window) fn build_header_bar(
         .icon_name("camera-photo-symbolic")
         .tooltip_text("Export waterfall to PNG")
         .build();
+    // Explicit accessibility label — tooltips alone aren't announced
+    // reliably by screen readers for icon-only controls. Per CR
+    // round 2 on PR #844 (same idiom as the volume / favorites
+    // buttons below).
+    screenshot_button.update_property(&[gtk4::accessible::Property::Label(
+        "Export waterfall to PNG",
+    )]);
 
     // RadioReference frequency browser button
     let rr_button = gtk4::Button::builder()
@@ -102,6 +116,9 @@ pub(in crate::window) fn build_header_bar(
         .tooltip_text("RadioReference Frequency Browser")
         .visible(crate::preferences::accounts_page::has_rr_credentials())
         .build();
+    rr_button.update_property(&[gtk4::accessible::Property::Label(
+        "RadioReference frequency browser",
+    )]);
 
     // Favorites slide-out button — opens a popover listing the
     // user's pinned `rtl_tcp` servers. Entries populated
@@ -115,16 +132,16 @@ pub(in crate::window) fn build_header_bar(
     header.pack_end(&screenshot_button);
     header.pack_end(&favorites_handle.button);
 
-    (
+    HeaderBarHandles {
         header,
         play_button,
-        demod_dropdown.clone(),
+        demod_dropdown: demod_dropdown.clone(),
         freq_selector,
         screenshot_button,
         rr_button,
         volume_button,
         favorites_handle,
-    )
+    }
 }
 
 /// Width of the favorites popover's scrollable list. Wide enough
@@ -229,11 +246,13 @@ pub(in crate::window) fn build_menu_button() -> gtk4::MenuButton {
     menu.append(Some("_About SDR-RS"), Some("app.about"));
     menu.append(Some("_Quit"), Some("app.quit"));
 
-    gtk4::MenuButton::builder()
+    let menu_button = gtk4::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .menu_model(&menu)
         .tooltip_text("Main menu")
-        .build()
+        .build();
+    menu_button.update_property(&[gtk4::accessible::Property::Label("Main menu")]);
+    menu_button
 }
 
 /// Wrap header and content in an `AdwToolbarView`.
@@ -283,6 +302,7 @@ fn build_play_button(state: &Rc<AppState>) -> gtk4::ToggleButton {
         .tooltip_text("Start / Stop")
         .css_classes(["play-button"])
         .build();
+    play_button.update_property(&[gtk4::accessible::Property::Label("Start or stop")]);
 
     // Connect play/stop button to DSP
     let state_play = Rc::clone(state);

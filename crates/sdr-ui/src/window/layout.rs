@@ -6,7 +6,8 @@ use libadwaita::prelude::*;
 
 mod header_bar;
 pub(in crate::window) use header_bar::{
-    FavoritesHeaderHandle, build_header_bar, build_sidebar_toggle, build_toolbar_view,
+    FavoritesHeaderHandle, HeaderBarHandles, build_header_bar, build_sidebar_toggle,
+    build_toolbar_view,
 };
 
 use super::{

@@ -373,7 +373,7 @@ pub fn build_window(
     } = build_layout(&state, config);
     let spectrum_handle = Rc::new(spectrum_handle_raw);
     let sidebar_toggle = build_sidebar_toggle(&left_split_view);
-    let (
+    let layout::HeaderBarHandles {
         header,
         play_button,
         demod_dropdown,
@@ -382,7 +382,7 @@ pub fn build_window(
         rr_button,
         volume_button,
         favorites_handle,
-    ) = build_header_bar(&sidebar_toggle, &state);
+    } = build_header_bar(&sidebar_toggle, &state);
 
     // Header bookmarks shortcut — a plain click-to-navigate button
     // (not a state toggle). Clicking it routes through the right
