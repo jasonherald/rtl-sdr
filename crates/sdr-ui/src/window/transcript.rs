@@ -155,6 +155,7 @@ pub(super) fn connect_transcript_panel(
 
     let state_clone = Rc::clone(state);
     let engine_clone = Rc::clone(&engine);
+    let panel_for_session = transcript.clone();
     let status_label = transcript.status_label.clone();
     let progress_bar = transcript.progress_bar.clone();
     let text_view = transcript.text_view.clone();
@@ -287,96 +288,8 @@ pub(super) fn connect_transcript_panel(
 
             // Read tuning slider values.
             #[cfg(feature = "whisper")]
-            #[allow(clippy::cast_possible_truncation)]
-            let silence_threshold = silence_row.value() as f32;
-            // Sherpa builds: silence_threshold is unused by SherpaBackend
-            // (see build_recognizer_config doc comment). Pass a sentinel.
-            #[cfg(feature = "sherpa")]
-            let silence_threshold: f32 = 0.0;
-            #[allow(clippy::cast_possible_truncation)]
-            let noise_gate_ratio = noise_gate_row.value() as f32;
-
-            // Build BackendConfig — Whisper and Sherpa are mutually exclusive
-            // cargo features, so exactly one variant is compiled in.
-            #[cfg(feature = "whisper")]
-            let model = {
-                let whisper_model = sdr_transcription::WhisperModel::ALL
-                    .get(model_idx)
-                    .copied()
-                    .unwrap_or(sdr_transcription::WhisperModel::TinyEn);
-                sdr_transcription::ModelChoice::Whisper(whisper_model)
-            };
-            #[cfg(feature = "sherpa")]
-            let model = {
-                let sherpa_model = sdr_transcription::SherpaModel::ALL
-                    .get(model_idx)
-                    .copied()
-                    .unwrap_or(sdr_transcription::SherpaModel::StreamingZipformerEn);
-                sdr_transcription::ModelChoice::Sherpa(sherpa_model)
-            };
-
-            #[cfg(feature = "sherpa")]
-            #[allow(clippy::cast_possible_truncation)]
-            let vad_threshold = vad_threshold_row.value() as f32;
-            // Whisper builds compile the field but ignore it (no Silero VAD).
-            #[cfg(feature = "whisper")]
-            let vad_threshold: f32 = sdr_transcription::VAD_THRESHOLD_DEFAULT;
-
-            #[cfg(feature = "sherpa")]
-            let segmentation_mode = if auto_break_enabled {
-                sdr_transcription::SegmentationMode::AutoBreak
-            } else {
-                sdr_transcription::SegmentationMode::Vad
-            };
-            #[cfg(feature = "whisper")]
-            let segmentation_mode = sdr_transcription::SegmentationMode::Vad;
-
-            // Auto Break timing parameters read from the session sliders.
-            // Whisper builds hardcode the defaults (these fields are
-            // never consumed because Whisper uses a different backend).
-            #[cfg(feature = "sherpa")]
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let auto_break_min_open_ms = auto_break_min_open_row.value() as u32;
-            #[cfg(feature = "sherpa")]
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let auto_break_tail_ms = auto_break_tail_row.value() as u32;
-            #[cfg(feature = "sherpa")]
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let auto_break_min_segment_ms = auto_break_min_segment_row.value() as u32;
-            #[cfg(feature = "whisper")]
-            let auto_break_min_open_ms = sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_DEFAULT;
-            #[cfg(feature = "whisper")]
-            let auto_break_tail_ms = sdr_transcription::AUTO_BREAK_TAIL_MS_DEFAULT;
-            #[cfg(feature = "whisper")]
-            let auto_break_min_segment_ms =
-                sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT;
-
-            // Audio enhancement mode from the transcript panel
-            // combo row. The row's persisted index is captured at
-            // session start (not subscribed to — matches the
-            // existing "lock during session" behavior for all
-            // transcription settings).
-            let audio_enhancement = match audio_enhancement_row.selected() {
-                sidebar::transcript_panel::AUDIO_ENHANCEMENT_BROADBAND_IDX => {
-                    sdr_transcription::denoise::AudioEnhancement::Broadband
-                }
-                sidebar::transcript_panel::AUDIO_ENHANCEMENT_OFF_IDX => {
-                    sdr_transcription::denoise::AudioEnhancement::Off
-                }
-                _ => sdr_transcription::denoise::AudioEnhancement::VoiceBand,
-            };
-
-            let config = sdr_transcription::BackendConfig {
-                model,
-                silence_threshold,
-                noise_gate_ratio,
-                vad_threshold,
-                segmentation_mode,
-                auto_break_min_open_ms,
-                auto_break_tail_ms,
-                auto_break_min_segment_ms,
-                audio_enhancement,
-            };
+            let auto_break_enabled = false;
+            let config = build_backend_config(&panel_for_session, model_idx, auto_break_enabled);
 
             // Scope the borrow so it's dropped before any potential re-entry
             // from row.set_active(false) on error.
@@ -750,6 +663,82 @@ pub(super) fn connect_transcript_panel(
     });
 
     engine
+}
+
+/// Assemble the Whisper `BackendConfig` from the panel controls at
+/// session start. Whisper has no Silero VAD or Auto Break sliders —
+/// those fields carry compile-time defaults the backend never reads.
+#[cfg(feature = "whisper")]
+fn build_backend_config(
+    transcript: &sidebar::transcript_panel::TranscriptPanel,
+    model_idx: usize,
+    _auto_break_enabled: bool,
+) -> sdr_transcription::BackendConfig {
+    let whisper_model = sdr_transcription::WhisperModel::ALL
+        .get(model_idx)
+        .copied()
+        .unwrap_or(sdr_transcription::WhisperModel::TinyEn);
+    #[allow(clippy::cast_possible_truncation)]
+    sdr_transcription::BackendConfig {
+        model: sdr_transcription::ModelChoice::Whisper(whisper_model),
+        silence_threshold: transcript.silence_row.value() as f32,
+        noise_gate_ratio: transcript.noise_gate_row.value() as f32,
+        vad_threshold: sdr_transcription::VAD_THRESHOLD_DEFAULT,
+        segmentation_mode: sdr_transcription::SegmentationMode::Vad,
+        auto_break_min_open_ms: sdr_transcription::AUTO_BREAK_MIN_OPEN_MS_DEFAULT,
+        auto_break_tail_ms: sdr_transcription::AUTO_BREAK_TAIL_MS_DEFAULT,
+        auto_break_min_segment_ms: sdr_transcription::AUTO_BREAK_MIN_SEGMENT_MS_DEFAULT,
+        audio_enhancement: read_audio_enhancement(transcript),
+    }
+}
+
+/// Assemble the Sherpa `BackendConfig` from the panel controls at
+/// session start. `silence_threshold` is a sentinel — `SherpaBackend`
+/// never reads it (see `build_recognizer_config`).
+#[cfg(feature = "sherpa")]
+fn build_backend_config(
+    transcript: &sidebar::transcript_panel::TranscriptPanel,
+    model_idx: usize,
+    auto_break_enabled: bool,
+) -> sdr_transcription::BackendConfig {
+    let sherpa_model = sdr_transcription::SherpaModel::ALL
+        .get(model_idx)
+        .copied()
+        .unwrap_or(sdr_transcription::SherpaModel::StreamingZipformerEn);
+    let segmentation_mode = if auto_break_enabled {
+        sdr_transcription::SegmentationMode::AutoBreak
+    } else {
+        sdr_transcription::SegmentationMode::Vad
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    sdr_transcription::BackendConfig {
+        model: sdr_transcription::ModelChoice::Sherpa(sherpa_model),
+        silence_threshold: 0.0,
+        noise_gate_ratio: transcript.noise_gate_row.value() as f32,
+        vad_threshold: transcript.vad_threshold_row.value() as f32,
+        segmentation_mode,
+        auto_break_min_open_ms: transcript.auto_break_min_open_row.value() as u32,
+        auto_break_tail_ms: transcript.auto_break_tail_row.value() as u32,
+        auto_break_min_segment_ms: transcript.auto_break_min_segment_row.value() as u32,
+        audio_enhancement: read_audio_enhancement(transcript),
+    }
+}
+
+/// Audio-enhancement mode from the panel combo row, captured at
+/// session start (not subscribed to — matches the "lock during
+/// session" behavior of every transcription setting).
+fn read_audio_enhancement(
+    transcript: &sidebar::transcript_panel::TranscriptPanel,
+) -> sdr_transcription::denoise::AudioEnhancement {
+    match transcript.audio_enhancement_row.selected() {
+        sidebar::transcript_panel::AUDIO_ENHANCEMENT_BROADBAND_IDX => {
+            sdr_transcription::denoise::AudioEnhancement::Broadband
+        }
+        sidebar::transcript_panel::AUDIO_ENHANCEMENT_OFF_IDX => {
+            sdr_transcription::denoise::AudioEnhancement::Off
+        }
+        _ => sdr_transcription::denoise::AudioEnhancement::VoiceBand,
+    }
 }
 
 /// Widget handles for an in-flight sherpa model reload: the status
