@@ -75,7 +75,7 @@ pub(super) fn build_recorder_interpreter(
 /// Everything the auto-recorder action interpreter needs, captured
 /// once. The recorder itself is pure — `tick()` returns actions —
 /// and this is the wiring layer that gives each action its widgets.
-pub(super) struct RecorderDeps {
+pub(in crate::window) struct RecorderDeps {
     pub(super) state: Rc<AppState>,
     pub(super) tune: Rc<TuneFn>,
     pub(super) set_playing: Rc<dyn Fn(bool)>,
