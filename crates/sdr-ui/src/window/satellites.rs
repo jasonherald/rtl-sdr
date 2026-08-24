@@ -2120,67 +2120,7 @@ fn wire_zip_lookup(
         let panel_weak_zip = panel_weak.clone();
         let in_flight_run = Rc::clone(&in_flight);
         Rc::new(move |entry: adw::EntryRow| {
-            if in_flight_run.get() {
-                tracing::debug!("Satellites: ZIP lookup ignored — already in flight");
-                return;
-            }
-            let Some(panel) = panel_weak_zip.upgrade() else {
-                return;
-            };
-            // Trim once, here, so the trimmed value is what
-            // flows through the lookup. `lookup_us_zip` does its
-            // own trim internally too, but a paste of "  24068 "
-            // showing up as `length=8` in the debug log reads
-            // worse than `length=5`.
-            let zip = entry.text().trim().to_string();
-            if zip.is_empty() {
-                // Empty entry — nothing to do; treat as a no-op so a
-                // stray Enter doesn't reset the status row.
-                return;
-            }
-            in_flight_run.set(true);
-            tracing::debug!("Satellites: ZIP lookup triggered (length={})", zip.len());
-            entry.set_sensitive(false);
-            panel.zip_status_row.set_title("Looking up…");
-
-            let panel_weak_done = panel_weak_zip.clone();
-            let in_flight_done = Rc::clone(&in_flight_run);
-            let zip_for_task = zip.clone();
-            glib::spawn_future_local(async move {
-                // Chain the two lookups on the worker thread so the
-                // UI side just gets one result. ZIP failure is fatal
-                // for this run; elevation failure is logged and
-                // demoted to `Ok(_, None)` — altitude is best-effort
-                // since it barely matters for pass prediction
-                // anyway, and we'd rather populate lat/lon than
-                // leave the user staring at an error toast.
-                let result =
-                    gio::spawn_blocking(move || lookup_zip_and_elevation(&zip_for_task)).await;
-
-                in_flight_done.set(false);
-                let Some(panel) = panel_weak_done.upgrade() else {
-                    return;
-                };
-                panel.zip_row.set_sensitive(true);
-
-                match result {
-                    Ok(Ok((loc, elevation))) => apply_zip_result(&panel, loc, elevation),
-                    Ok(Err(e)) => {
-                        // Don't include the ZIP in the log — user
-                        // location data, already surfaced inline in
-                        // the status row. Provider error alone is
-                        // enough.
-                        tracing::warn!("ZIP lookup failed: {e}");
-                        panel.zip_status_row.set_title(&e.to_string());
-                    }
-                    Err(_) => {
-                        tracing::warn!("ZIP lookup task panicked");
-                        panel
-                            .zip_status_row
-                            .set_title("Lookup failed: background task panicked");
-                    }
-                }
-            });
+            on_zip_lookup_requested(&entry, &panel_weak_zip, &in_flight_run);
         })
     };
     // Wire both signal paths to the same closure: `apply` for
@@ -2197,6 +2137,76 @@ fn wire_zip_lookup(
             .zip_row
             .connect_entry_activated(move |entry| run(entry.clone()));
     }
+}
+
+/// One ZIP-lookup run: in-flight dedupe, trim, kick the async chain,
+/// and re-enable the row + paint the status when the result lands.
+/// Split out per the 50-NLOC gate (#817).
+fn on_zip_lookup_requested(
+    entry: &adw::EntryRow,
+    panel_weak_zip: &sidebar::satellites_panel::SatellitesPanelWeak,
+    in_flight_run: &Rc<std::cell::Cell<bool>>,
+) {
+    if in_flight_run.get() {
+        tracing::debug!("Satellites: ZIP lookup ignored — already in flight");
+        return;
+    }
+    let Some(panel) = panel_weak_zip.upgrade() else {
+        return;
+    };
+    // Trim once, here, so the trimmed value is what
+    // flows through the lookup. `lookup_us_zip` does its
+    // own trim internally too, but a paste of "  24068 "
+    // showing up as `length=8` in the debug log reads
+    // worse than `length=5`.
+    let zip = entry.text().trim().to_string();
+    if zip.is_empty() {
+        // Empty entry — nothing to do; treat as a no-op so a
+        // stray Enter doesn't reset the status row.
+        return;
+    }
+    in_flight_run.set(true);
+    tracing::debug!("Satellites: ZIP lookup triggered (length={})", zip.len());
+    entry.set_sensitive(false);
+    panel.zip_status_row.set_title("Looking up…");
+
+    let panel_weak_done = panel_weak_zip.clone();
+    let in_flight_done = Rc::clone(&in_flight_run);
+    let zip_for_task = zip.clone();
+    glib::spawn_future_local(async move {
+        // Chain the two lookups on the worker thread so the
+        // UI side just gets one result. ZIP failure is fatal
+        // for this run; elevation failure is logged and
+        // demoted to `Ok(_, None)` — altitude is best-effort
+        // since it barely matters for pass prediction
+        // anyway, and we'd rather populate lat/lon than
+        // leave the user staring at an error toast.
+        let result = gio::spawn_blocking(move || lookup_zip_and_elevation(&zip_for_task)).await;
+
+        in_flight_done.set(false);
+        let Some(panel) = panel_weak_done.upgrade() else {
+            return;
+        };
+        panel.zip_row.set_sensitive(true);
+
+        match result {
+            Ok(Ok((loc, elevation))) => apply_zip_result(&panel, loc, elevation),
+            Ok(Err(e)) => {
+                // Don't include the ZIP in the log — user
+                // location data, already surfaced inline in
+                // the status row. Provider error alone is
+                // enough.
+                tracing::warn!("ZIP lookup failed: {e}");
+                panel.zip_status_row.set_title(&e.to_string());
+            }
+            Err(_) => {
+                tracing::warn!("ZIP lookup task panicked");
+                panel
+                    .zip_status_row
+                    .set_title("Lookup failed: background task panicked");
+            }
+        }
+    });
 }
 
 /// Chain the ZIP → lat/lon and elevation lookups on the worker
