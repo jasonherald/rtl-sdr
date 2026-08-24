@@ -469,6 +469,51 @@ fn wire_station_rows(
     }
 }
 
+// Refresh button — re-download every known satellite's TLE on
+// a worker thread, update the timestamp row, and rebuild the
+// pass list. Same `spawn_future_local` + `spawn_blocking`
+// pattern as the RadioReference search button. Wired only
+// when the cache is available; otherwise the button was
+// already disabled above.
+fn wire_tle_refresh_button(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    cache_outer: &std::sync::Arc<sdr_sat::TleCache>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
+    recompute: &Rc<dyn Fn()>,
+) {
+    let cache_refresh = std::sync::Arc::clone(cache_outer);
+    let config_refresh = std::sync::Arc::clone(config);
+    let panel_weak_refresh = panel_weak.clone();
+    let recompute_refresh = Rc::clone(&recompute);
+    panel.refresh_button.connect_clicked(move |_| {
+        let Some(panel) = panel_weak_refresh.upgrade() else {
+            return;
+        };
+        panel.refresh_spinner.set_visible(true);
+        panel.refresh_spinner.start();
+        panel.refresh_button.set_sensitive(false);
+
+        let cache_task = std::sync::Arc::clone(&cache_refresh);
+        let config_done = std::sync::Arc::clone(&config_refresh);
+        let panel_weak_done = panel_weak_refresh.clone();
+        let recompute_done = Rc::clone(&recompute_refresh);
+
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || force_refresh_all_tles(&cache_task)).await;
+
+            let Some(panel) = panel_weak_done.upgrade() else {
+                return;
+            };
+            panel.refresh_spinner.stop();
+            panel.refresh_spinner.set_visible(false);
+            panel.refresh_button.set_sensitive(true);
+
+            finish_tle_refresh(&panel, &config_done, &recompute_done, result);
+        });
+    });
+}
+
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -548,43 +593,8 @@ pub(super) fn connect_satellites_panel(
         connect_doppler_tracker(panels, state, cache_doppler, status_bar);
     }
 
-    // Refresh button — re-download every known satellite's TLE on
-    // a worker thread, update the timestamp row, and rebuild the
-    // pass list. Same `spawn_future_local` + `spawn_blocking`
-    // pattern as the RadioReference search button. Wired only
-    // when the cache is available; otherwise the button was
-    // already disabled above.
     if let Some(cache_outer) = cache.as_ref() {
-        let cache_refresh = std::sync::Arc::clone(cache_outer);
-        let config_refresh = std::sync::Arc::clone(config);
-        let panel_weak_refresh = panel_weak.clone();
-        let recompute_refresh = Rc::clone(&recompute);
-        panel.refresh_button.connect_clicked(move |_| {
-            let Some(panel) = panel_weak_refresh.upgrade() else {
-                return;
-            };
-            panel.refresh_spinner.set_visible(true);
-            panel.refresh_spinner.start();
-            panel.refresh_button.set_sensitive(false);
-
-            let cache_task = std::sync::Arc::clone(&cache_refresh);
-            let config_done = std::sync::Arc::clone(&config_refresh);
-            let panel_weak_done = panel_weak_refresh.clone();
-            let recompute_done = Rc::clone(&recompute_refresh);
-
-            glib::spawn_future_local(async move {
-                let result = gio::spawn_blocking(move || force_refresh_all_tles(&cache_task)).await;
-
-                let Some(panel) = panel_weak_done.upgrade() else {
-                    return;
-                };
-                panel.refresh_spinner.stop();
-                panel.refresh_spinner.set_visible(false);
-                panel.refresh_button.set_sensitive(true);
-
-                finish_tle_refresh(&panel, &config_done, &recompute_done, result);
-            });
-        });
+        wire_tle_refresh_button(panel, cache_outer, config, &panel_weak, &recompute);
     }
 
     wire_zip_lookup(panel, &panel_weak);
