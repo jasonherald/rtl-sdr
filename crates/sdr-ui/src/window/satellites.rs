@@ -89,9 +89,30 @@ pub(super) fn save_sstv_batches(
         });
     }
 
-    let message = if total_saved == 0 && total_failed == 0 {
-        // No prior pending batches and the current pass produced
-        // no images — same warn-and-skip semantics as before.
+    let message = sstv_save_summary(
+        total_saved,
+        total_failed,
+        &error_summary,
+        &current_dir_display,
+    );
+
+    SstvSaveOutcome {
+        message,
+        current_ok,
+        retained,
+    }
+}
+
+/// Toast text for a completed SSTV save sweep. The zero/zero case is
+/// a pass that produced no imagery — same warn-and-skip semantics the
+/// inline version had.
+fn sstv_save_summary(
+    total_saved: usize,
+    total_failed: usize,
+    error_summary: &[String],
+    current_dir_display: &str,
+) -> String {
+    if total_saved == 0 && total_failed == 0 {
         tracing::warn!(
             "auto-record SaveSstvPass but no SSTV images were decoded — pass produced no imagery",
         );
@@ -105,12 +126,6 @@ pub(super) fn save_sstv_batches(
             "Pass complete — {total_saved} image(s) saved, {total_failed} failed: {}",
             error_summary.join("; ")
         )
-    };
-
-    SstvSaveOutcome {
-        message,
-        current_ok,
-        retained,
     }
 }
 
