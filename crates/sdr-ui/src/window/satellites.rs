@@ -2570,32 +2570,7 @@ pub(super) fn connect_doppler_tracker(
     // atomically clears `active`, captures and resets
     // `user_reference_offset_hz`, and returns the captured value
     // for us to flush to DSP.
-    {
-        let tracker = Rc::clone(&tracker);
-        let state = Rc::clone(state);
-        let status_bar = Rc::clone(status_bar);
-        panels
-            .satellites
-            .doppler_switch
-            .connect_active_notify(move |row| {
-                let enabled = row.is_active();
-                let mut t = tracker.borrow_mut();
-                let was_active = t.active().is_some();
-                let final_offset = t.set_master_enabled(enabled);
-                drop(t);
-                // Only dispatch the fallback `SetVfoOffset` when
-                // a satellite was actually being tracked. Without
-                // this guard, toggling Doppler off while no
-                // satellite is engaged would still send
-                // `SetVfoOffset(0.0)` and clobber any non-zero
-                // VFO offset the user had set independently. Per
-                // CR round 3 on PR #554.
-                if was_active && let Some(offset) = final_offset {
-                    state.dispatch_vfo_offset(offset);
-                    status_bar.update_doppler(None);
-                }
-            });
-    }
+    wire_doppler_master_switch(panels, &tracker, state, status_bar);
 
     // 1 Hz trigger re-evaluation tick: rebuild the candidate
     // list from catalog × frequency match × ground station ×
@@ -2638,6 +2613,42 @@ pub(super) fn connect_doppler_tracker(
             doppler_recompute_tick(&panel, &tracker, &cache, &state, &status_bar)
         });
     }
+}
+
+/// Master-switch handler for the Doppler tracker: flips the tracker's
+/// enabled state and, when a satellite was actively tracked, restores
+/// the user's reference offset + clears the status-bar badge. Split
+/// out per the 50-NLOC gate (#817).
+fn wire_doppler_master_switch(
+    panels: &SidebarPanels,
+    tracker: &Rc<RefCell<crate::doppler_tracker::DopplerTracker>>,
+    state: &Rc<AppState>,
+    status_bar: &Rc<StatusBar>,
+) {
+    let tracker = Rc::clone(&tracker);
+    let state = Rc::clone(state);
+    let status_bar = Rc::clone(status_bar);
+    panels
+        .satellites
+        .doppler_switch
+        .connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            let mut t = tracker.borrow_mut();
+            let was_active = t.active().is_some();
+            let final_offset = t.set_master_enabled(enabled);
+            drop(t);
+            // Only dispatch the fallback `SetVfoOffset` when
+            // a satellite was actually being tracked. Without
+            // this guard, toggling Doppler off while no
+            // satellite is engaged would still send
+            // `SetVfoOffset(0.0)` and clobber any non-zero
+            // VFO offset the user had set independently. Per
+            // CR round 3 on PR #554.
+            if was_active && let Some(offset) = final_offset {
+                state.dispatch_vfo_offset(offset);
+                status_bar.update_doppler(None);
+            }
+        });
 }
 
 /// One recompute-tick of the Doppler tracker: re-propagate the active
