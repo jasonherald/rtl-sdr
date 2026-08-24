@@ -806,12 +806,11 @@ fn wire_sherpa_model_reload(
         let model_row_reload_weak = row.downgrade();
         let enable_row_reload_weak = enable_row_reload.downgrade();
 
-        // Show the status area.
-        status_label_reload.set_text(&format!("Reloading {}...", new_model.label()));
-        status_label_reload.set_css_classes(&["dim-label"]);
-        status_label_reload.set_visible(true);
-        progress_bar_reload.set_fraction(0.0);
-        progress_bar_reload.set_visible(true);
+        begin_model_reload_ui(
+            &status_label_reload,
+            &progress_bar_reload,
+            new_model.label(),
+        );
 
         let event_rx = sdr_transcription::reload_sherpa_host(new_model);
 
@@ -849,6 +848,16 @@ fn wire_sherpa_model_reload(
             glib::ControlFlow::Continue
         });
     });
+}
+
+/// Show the reload status area in its initial "Reloading…" state.
+#[cfg(feature = "sherpa")]
+fn begin_model_reload_ui(status: &gtk4::Label, progress: &gtk4::ProgressBar, model_label: &str) {
+    status.set_text(&format!("Reloading {model_label}..."));
+    status.set_css_classes(&["dim-label"]);
+    status.set_visible(true);
+    progress.set_fraction(0.0);
+    progress.set_visible(true);
 }
 
 /// Drain pending `InitEvent`s for an in-flight model reload. Returns
