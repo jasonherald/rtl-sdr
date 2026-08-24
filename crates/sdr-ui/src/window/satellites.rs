@@ -1354,48 +1354,8 @@ fn on_save_lrpt_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
     // CodeRabbit round 8 on PR #543. Established
     // pattern in this file (TLE refresh @ 8678,
     // bookmark import @ 8805).
-    let snapshots: Vec<(u16, sdr_lrpt::image::ChannelBuffer)> = {
-        let mut sorted = deps.state.lrpt_image.channel_apids();
-        sorted.sort_unstable();
-        sorted
-            .into_iter()
-            .filter_map(|apid| {
-                deps.state
-                    .lrpt_image
-                    .snapshot_channel(apid)
-                    .filter(|s| s.lines > 0)
-                    .map(|s| (apid, s))
-            })
-            .collect()
-    };
-    // Composite snapshots — only when the user opted in
-    // via the panel toggle. Each entry is the recipe +
-    // a [`CompositeSnapshot`] (cloned source channel
-    // pixel buffers + truncated height). Built on the
-    // GTK main thread but the assembler lock is held
-    // only long enough to memcpy the source channels
-    // (~5 ms per recipe for full-pass data, vs ~30 ms
-    // for the full RGB interleave that happens in the
-    // worker). The expensive per-pixel interleave +
-    // PNG encode runs inside `gio::spawn_blocking`
-    // below. Per CR round 1 on PR #575.
-    let composites_on = deps.auto_record_composites_switch.is_active();
-    let composite_snapshots: Vec<(
-        crate::lrpt_viewer::CompositeRecipe,
-        sdr_lrpt::image::CompositeSnapshot,
-    )> = if composites_on {
-        deps.state.lrpt_image.with_assembler(|a| {
-            crate::lrpt_viewer::COMPOSITE_CATALOG
-                .iter()
-                .filter_map(|recipe| {
-                    a.clone_channels_for_composite(recipe.r_apid, recipe.g_apid, recipe.b_apid)
-                        .map(|snap| (*recipe, snap))
-                })
-                .collect()
-        })
-    } else {
-        Vec::new()
-    };
+    let snapshots = snapshot_lrpt_channels(deps);
+    let composite_snapshots = snapshot_lrpt_composites(deps);
     let toast_overlay_weak_for_save = deps.toast_overlay.clone();
     // Clone state for the post-save viewer-close
     // — we need to read `state.lrpt_recording_pass`
@@ -1584,6 +1544,48 @@ fn on_save_lrpt_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
             window.close();
         }
     });
+}
+
+/// Snapshot the per-APID channel buffers out of the shared LRPT
+/// assembler (cheap memcpys under the lock; encode happens later on
+/// a worker).
+fn snapshot_lrpt_channels(deps: &RecorderDeps) -> Vec<(u16, sdr_lrpt::image::ChannelBuffer)> {
+    let mut sorted = deps.state.lrpt_image.channel_apids();
+    sorted.sort_unstable();
+    sorted
+        .into_iter()
+        .filter_map(|apid| {
+            deps.state
+                .lrpt_image
+                .snapshot_channel(apid)
+                .filter(|s| s.lines > 0)
+                .map(|s| (apid, s))
+        })
+        .collect()
+}
+
+/// Snapshot the enabled composite recipes' channel triples — empty
+/// when the composites switch is off.
+#[allow(clippy::type_complexity)]
+fn snapshot_lrpt_composites(
+    deps: &RecorderDeps,
+) -> Vec<(
+    crate::lrpt_viewer::CompositeRecipe,
+    sdr_lrpt::image::CompositeSnapshot,
+)> {
+    if deps.auto_record_composites_switch.is_active() {
+        deps.state.lrpt_image.with_assembler(|a| {
+            crate::lrpt_viewer::COMPOSITE_CATALOG
+                .iter()
+                .filter_map(|recipe| {
+                    a.clone_channels_for_composite(recipe.r_apid, recipe.g_apid, recipe.b_apid)
+                        .map(|snap| (*recipe, snap))
+                })
+                .collect()
+        })
+    } else {
+        Vec::new()
+    }
 }
 
 /// Save one LRPT pass to disk: per-pass directory, one greyscale PNG
