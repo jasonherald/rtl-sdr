@@ -813,40 +813,65 @@ fn wire_sherpa_model_reload(
         );
 
         let event_rx = sdr_transcription::reload_sherpa_host(new_model);
+        arm_reload_poll_tick(
+            &status_label_reload,
+            &progress_bar_reload,
+            model_row_reload_weak,
+            enable_row_reload_weak,
+            event_rx,
+            new_model.label().to_owned(),
+            std::sync::Arc::clone(&config_for_reload_persist),
+            idx,
+        );
+    });
+}
 
-        // Drain progress events on the main thread via a periodic timeout.
-        let status_weak = status_label_reload.downgrade();
-        let progress_weak = progress_bar_reload.downgrade();
-        let mut current_component: String = new_model.label().to_owned();
-        // Capture an Arc clone + the new idx for the deferred
-        // persistence path — written to config on Ready, dropped
-        // silently on Failed/Disconnected.
-        let config_for_this_reload = std::sync::Arc::clone(&config_for_reload_persist);
-        let persist_idx = idx;
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            // Widgets gone (window closing) → the model row is gone
-            // too, so no need to re-enable it.
-            let (Some(status), Some(progress)) = (status_weak.upgrade(), progress_weak.upgrade())
-            else {
-                return glib::ControlFlow::Break;
-            };
-            let ui = ReloadUi {
-                status,
-                progress,
-                model_row: model_row_reload_weak.clone(),
-                enable_row: enable_row_reload_weak.clone(),
-            };
-            if let Some(flow) = drain_sherpa_reload_events(
-                &event_rx,
-                &ui,
-                &mut current_component,
-                &config_for_this_reload,
-                persist_idx,
-            ) {
-                return flow;
-            }
-            glib::ControlFlow::Continue
-        });
+/// Arm the 100 ms poll tick that drains a reload's `InitEvent`s.
+/// Self-cancels via `Break` when the status widgets are gone (window
+/// closing) or on any terminal event.
+#[cfg(feature = "sherpa")]
+#[allow(clippy::too_many_arguments)]
+fn arm_reload_poll_tick(
+    status_label: &gtk4::Label,
+    progress_bar: &gtk4::ProgressBar,
+    model_row_reload_weak: glib::WeakRef<adw::ComboRow>,
+    enable_row_reload_weak: glib::WeakRef<adw::SwitchRow>,
+    event_rx: std::sync::mpsc::Receiver<sdr_transcription::InitEvent>,
+    initial_component: String,
+    config_for_this_reload: std::sync::Arc<sdr_config::ConfigManager>,
+    persist_idx: usize,
+) {
+    let status_weak = status_label.downgrade();
+    let progress_weak = progress_bar.downgrade();
+    let mut current_component = initial_component;
+
+    // Drain progress events on the main thread via a periodic
+    // timeout. The Arc + idx captures are the deferred-persistence
+    // path — written to config on Ready, dropped silently on
+    // Failed/Disconnected.
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        // Widgets gone (window closing) → the model row is gone
+        // too, so no need to re-enable it.
+        let (Some(status), Some(progress)) = (status_weak.upgrade(), progress_weak.upgrade())
+        else {
+            return glib::ControlFlow::Break;
+        };
+        let ui = ReloadUi {
+            status,
+            progress,
+            model_row: model_row_reload_weak.clone(),
+            enable_row: enable_row_reload_weak.clone(),
+        };
+        if let Some(flow) = drain_sherpa_reload_events(
+            &event_rx,
+            &ui,
+            &mut current_component,
+            &config_for_this_reload,
+            persist_idx,
+        ) {
+            return flow;
+        }
+        glib::ControlFlow::Continue
     });
 }
 
