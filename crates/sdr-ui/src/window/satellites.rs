@@ -918,219 +918,254 @@ fn on_recorder_aos(
     // doesn't hijack the user's audio chain (mirrors
     // the AOS side-effect-isolation rule from CR
     // round 1 on PR #541).
-    let force_audio_chain_off = || force_audio_chain_off(deps);
 
     match protocol {
         sdr_sat::ImagingProtocol::Apt => {
-            // **Order is load-bearing.** Force the
-            // audio chain off BEFORE start/tune so
-            // the very first samples through the
-            // freshly-tuned demod aren't gated by a
-            // stale squelch / CTCSS / FM-IF-NR
-            // setting. Otherwise low-SNR AOS rows
-            // race against the change-notify chain
-            // dispatching the SetX messages and the
-            // first few scan lines could be silenced
-            // before the demod even sees them. Per
-            // CR round 1 on PR #557.
-            force_audio_chain_off();
-            // Drive Start through the header play
-            // button — its `connect_toggled` handler
-            // is the single place that updates
-            // `state.is_running`, dispatches
-            // `UiToDsp::Start`, and swaps the
-            // play/stop icon. `set_active` is a
-            // no-op when the radio is already
-            // running, so this is safe to call
-            // unconditionally without a duplicate
-            // Start. The pre-AOS `was_running` flag
-            // (captured in `SavedTune` by the 1 Hz
-            // tick before this action fires) drives
-            // the corresponding LOS-side stop.
-            (deps.set_playing)(true);
-            (deps.tune)(freq_hz, mode, bandwidth_hz);
-            // Zero the live VFO offset for the
-            // auto-record pass. The user's pre-AOS
-            // offset (a manual VFO drag away from
-            // centre) is preserved in `SavedTune`
-            // for the LOS restore, but during the
-            // pass the demod must align *exactly*
-            // with the satellite's downlink —
-            // otherwise we'd demod at `freq_hz +
-            // saved_offset` and the APT subcarrier
-            // would land outside the channel
-            // filter. The DSP's
-            // `DspToUi::VfoOffsetChanged` echo
-            // updates the spectrum widget, freq
-            // selector, and status bar; no manual
-            // mirror needed.
-            deps.state.dispatch_vfo_offset(0.0);
-            crate::apt_viewer::open_apt_viewer_if_needed(&deps.parent_provider, &deps.state);
-            // Clear the canvas at AOS so a back-to-back
-            // pass (e.g. NOAA 18 → NOAA 19 with
-            // overlapping viewer sessions) starts on a
-            // clean image. The viewer was either just
-            // opened above (already empty) or carried
-            // over from a previous pass — either way,
-            // an explicit clear keeps the image we're
-            // about to save scoped to *this* pass.
-            if let Some(view) = deps.state.apt_viewer.borrow().as_ref() {
-                view.clear();
-            }
-            // Stash recording-pass info for the LOS-side
-            // SavePng wiring to compute the auto-rotation
-            // flag (B2 of the noaa-apt parity work). The
-            // exact AOS time matters less than "around
-            // when" — `is_ascending` checks the lat
-            // derivative over a 30 s window, which is
-            // valid anywhere mid-pass. NORAD id arrives
-            // pre-resolved on the recorder action — no
-            // name → catalog lookup at this layer means
-            // no silent rotation breakage if the catalog
-            // ever picks up alias drift. Per CR round 3
-            // on PR #571.
-            let aos = chrono::Utc::now();
-            *deps.state.apt_recording_pass.borrow_mut() = Some((norad_id, aos));
-            // Push the rotate-180 flag down to the
-            // renderer so the toolbar's manual `Export
-            // PNG` button matches the auto-record
-            // orientation. Without this, manual exports
-            // of ascending passes come out upside-down
-            // even though the auto-record save rotates
-            // them. Per CR round 1 on PR #571.
-            let rotate_180 = compute_apt_rotate_180_for_pass(deps.cache.as_ref(), norad_id, aos);
-            if let Some(view) = deps.state.apt_viewer.borrow().as_ref() {
-                view.set_rotate_180(rotate_180);
-            }
+            aos_apt(deps, &satellite, norad_id, freq_hz, mode, bandwidth_hz);
         }
         sdr_sat::ImagingProtocol::Lrpt => {
-            // **Order is load-bearing.** Reset the
-            // shared image AND the viewer canvas
-            // BEFORE starting playback / retuning
-            // so the freshly-tuned LRPT decoder
-            // can't push pass-1 leftover rows (or
-            // race the clear and erase the first
-            // few rows of the new pass). Per
-            // CodeRabbit round 8 on PR #543.
-            //
-            // The viewer is opened first so the
-            // `view.clear()` call below can target
-            // it — the open path also sends
-            // `UiToDsp::SetLrptImage(handle)` to
-            // the DSP thread, which lazy-inits the
-            // decoder against the (now-cleared)
-            // shared image. Catalog's
-            // `demod_mode: Lrpt` lines up the
-            // controller's IF rate (144 ksps) with
-            // the QPSK demod's expected sample rate
-            // — without that, `radio_input` would
-            // be at the wrong rate and the demod's
-            // resampler would sit at the wrong
-            // setpoint. Per epic #469 task 7.
-
-            // Tell the DSP thread which Meteor
-            // downlink profile to use for this pass
-            // — METEOR-M N2 was QPSK with
-            // differential precoding; the active
-            // METEOR-M2 3 / M2-4 are plain OQPSK
-            // (#730). Sent
-            // BEFORE `open_lrpt_viewer_if_needed`
-            // (which triggers lazy decoder init)
-            // so the freshly-built decoder uses
-            // the right inner chain. Per #662.
-            //
-            // Always send — even when the catalog
-            // lookup misses or returns
-            // `lrpt_modulation = None`. Otherwise
-            // the previous pass's modulation leaks
-            // into the next decoder init (the
-            // controller stash defaults to OQPSK at
-            // startup but mutates per
-            // `SetLrptDownlink`, so a Qpsk-then-
-            // None sequence would silently keep the
-            // Qpsk chain). Fallback is `Qpsk`
-            // because that's the standards-default
-            // LRPT modulation; a future LRPT
-            // satellite that turns up uncatalogued
-            // is more likely to be standard-spec
-            // than Meteor-style OQPSK. Per CR
-            // round 1 on PR #663.
-            // Profile first, then the canvas wipe on the
-            // DSP thread — the order matters (see
-            // `lrpt_pass_start_commands`).
-            for command in
-                crate::lrpt_viewer::lrpt_pass_start_commands(norad_id, &deps.state.lrpt_image)
-            {
-                deps.state.send_dsp(command);
-            }
-
-            crate::lrpt_viewer::open_lrpt_viewer_if_needed(&deps.parent_provider, &deps.state);
-            if let Some(view) = deps.state.lrpt_viewer.borrow().as_ref() {
-                view.clear();
-            }
-            // Force audio chain off BEFORE start/tune
-            // so the freshly-tuned demod isn't gated
-            // by a stale squelch / CTCSS / FM-IF-NR
-            // setting. Per CR round 1 on PR #557 —
-            // see APT arm above for the full
-            // rationale.
-            force_audio_chain_off();
-            // Now safe to start playback + retune;
-            // any decoded rows from this point
-            // forward land in the cleared image.
-            (deps.set_playing)(true);
-            (deps.tune)(freq_hz, mode, bandwidth_hz);
-            deps.state.dispatch_vfo_offset(0.0);
-            // Mirror into AppState so is_recording() (used by
-            // the close-to-tray Quit confirmation modal)
-            // reflects an in-progress LRPT pass. Per #512.
-            // The `(norad_id, aos)` tuple lets the LOS
-            // completion path snapshot-and-compare so an
-            // overlapping pass-N+1 AOS that starts during
-            // pass-N's encode doesn't have its `is_recording`
-            // flag clobbered when pass-N's completion
-            // fires. Mirrors the APT
-            // `apt_recording_pass` pattern from PR #571
-            // round 4. Per CR round 2 on PR #575.
-            let aos = chrono::Utc::now();
-            *deps.state.lrpt_recording_pass.borrow_mut() = Some((norad_id, aos));
+            aos_lrpt(deps, &satellite, norad_id, freq_hz, mode, bandwidth_hz);
         }
         sdr_sat::ImagingProtocol::Sstv => {
-            // **Order is load-bearing.** Open the viewer
-            // (which sends `UiToDsp::SetSstvImage`) and
-            // clear both the shared handle and the canvas
-            // BEFORE starting playback / retuning so no
-            // leftover rows from a previous pass land in
-            // the fresh image buffer.  Mirrors the LRPT
-            // arm's clear-before-start discipline from
-            // CR round 8 on PR #543.
-            crate::sstv_viewer::open_sstv_viewer_if_needed(&deps.parent_provider, &deps.state);
-            deps.state.sstv_image.clear();
-            // Failed-pass images now live in
-            // `sstv_pending_export` keyed by their
-            // original pass directory (moved there at
-            // `SaveSstvPass` time, not here at AOS).
-            // The current-pass buffer is the round-4
-            // simple clear. Per CR round 6 #21 on
-            // PR #599 (refines round 5 #20).
-            deps.state.sstv_completed_images.borrow_mut().clear();
-            if let Some(view) = deps.state.sstv_viewer.borrow().as_ref() {
-                view.clear();
-            }
-            // ISS SSTV is audible NFM — do NOT force the
-            // audio chain off.  The user's squelch /
-            // CTCSS / FM-IF-NR settings are correct for
-            // the mode; we only suppress them for
-            // silent-passthrough decoders (LRPT) and the
-            // APT path (subcarrier noise). Per CLAUDE.md
-            // and step 8 of epic #472 task spec.
-            (deps.set_playing)(true);
-            (deps.tune)(freq_hz, mode, bandwidth_hz);
-            deps.state.dispatch_vfo_offset(0.0);
-            let aos = chrono::Utc::now();
-            *deps.state.sstv_recording_pass.borrow_mut() = Some((norad_id, aos));
+            aos_sstv(deps, norad_id, freq_hz, mode, bandwidth_hz);
         }
     }
+}
+
+/// APT AOS wiring. Split out of [`on_recorder_aos`] per the 50-NLOC
+/// gate (#817).
+fn aos_apt(
+    deps: &RecorderDeps,
+    satellite: &str,
+    norad_id: u32,
+    freq_hz: u64,
+    mode: sdr_types::DemodMode,
+    bandwidth_hz: u32,
+) {
+    // **Order is load-bearing.** Force the
+    // audio chain off BEFORE start/tune so
+    // the very first samples through the
+    // freshly-tuned demod aren't gated by a
+    // stale squelch / CTCSS / FM-IF-NR
+    // setting. Otherwise low-SNR AOS rows
+    // race against the change-notify chain
+    // dispatching the SetX messages and the
+    // first few scan lines could be silenced
+    // before the demod even sees them. Per
+    // CR round 1 on PR #557.
+    force_audio_chain_off(deps);
+    // Drive Start through the header play
+    // button — its `connect_toggled` handler
+    // is the single place that updates
+    // `state.is_running`, dispatches
+    // `UiToDsp::Start`, and swaps the
+    // play/stop icon. `set_active` is a
+    // no-op when the radio is already
+    // running, so this is safe to call
+    // unconditionally without a duplicate
+    // Start. The pre-AOS `was_running` flag
+    // (captured in `SavedTune` by the 1 Hz
+    // tick before this action fires) drives
+    // the corresponding LOS-side stop.
+    (deps.set_playing)(true);
+    (deps.tune)(freq_hz, mode, bandwidth_hz);
+    // Zero the live VFO offset for the
+    // auto-record pass. The user's pre-AOS
+    // offset (a manual VFO drag away from
+    // centre) is preserved in `SavedTune`
+    // for the LOS restore, but during the
+    // pass the demod must align *exactly*
+    // with the satellite's downlink —
+    // otherwise we'd demod at `freq_hz +
+    // saved_offset` and the APT subcarrier
+    // would land outside the channel
+    // filter. The DSP's
+    // `DspToUi::VfoOffsetChanged` echo
+    // updates the spectrum widget, freq
+    // selector, and status bar; no manual
+    // mirror needed.
+    deps.state.dispatch_vfo_offset(0.0);
+    crate::apt_viewer::open_apt_viewer_if_needed(&deps.parent_provider, &deps.state);
+    // Clear the canvas at AOS so a back-to-back
+    // pass (e.g. NOAA 18 → NOAA 19 with
+    // overlapping viewer sessions) starts on a
+    // clean image. The viewer was either just
+    // opened above (already empty) or carried
+    // over from a previous pass — either way,
+    // an explicit clear keeps the image we're
+    // about to save scoped to *this* pass.
+    if let Some(view) = deps.state.apt_viewer.borrow().as_ref() {
+        view.clear();
+    }
+    // Stash recording-pass info for the LOS-side
+    // SavePng wiring to compute the auto-rotation
+    // flag (B2 of the noaa-apt parity work). The
+    // exact AOS time matters less than "around
+    // when" — `is_ascending` checks the lat
+    // derivative over a 30 s window, which is
+    // valid anywhere mid-pass. NORAD id arrives
+    // pre-resolved on the recorder action — no
+    // name → catalog lookup at this layer means
+    // no silent rotation breakage if the catalog
+    // ever picks up alias drift. Per CR round 3
+    // on PR #571.
+    let aos = chrono::Utc::now();
+    *deps.state.apt_recording_pass.borrow_mut() = Some((norad_id, aos));
+    // Push the rotate-180 flag down to the
+    // renderer so the toolbar's manual `Export
+    // PNG` button matches the auto-record
+    // orientation. Without this, manual exports
+    // of ascending passes come out upside-down
+    // even though the auto-record save rotates
+    // them. Per CR round 1 on PR #571.
+    let rotate_180 = compute_apt_rotate_180_for_pass(deps.cache.as_ref(), norad_id, aos);
+    if let Some(view) = deps.state.apt_viewer.borrow().as_ref() {
+        view.set_rotate_180(rotate_180);
+    }
+}
+
+/// LRPT AOS wiring. Split out of [`on_recorder_aos`] per the 50-NLOC
+/// gate (#817).
+fn aos_lrpt(
+    deps: &RecorderDeps,
+    satellite: &str,
+    norad_id: u32,
+    freq_hz: u64,
+    mode: sdr_types::DemodMode,
+    bandwidth_hz: u32,
+) {
+    // **Order is load-bearing.** Reset the
+    // shared image AND the viewer canvas
+    // BEFORE starting playback / retuning
+    // so the freshly-tuned LRPT decoder
+    // can't push pass-1 leftover rows (or
+    // race the clear and erase the first
+    // few rows of the new pass). Per
+    // CodeRabbit round 8 on PR #543.
+    //
+    // The viewer is opened first so the
+    // `view.clear()` call below can target
+    // it — the open path also sends
+    // `UiToDsp::SetLrptImage(handle)` to
+    // the DSP thread, which lazy-inits the
+    // decoder against the (now-cleared)
+    // shared image. Catalog's
+    // `demod_mode: Lrpt` lines up the
+    // controller's IF rate (144 ksps) with
+    // the QPSK demod's expected sample rate
+    // — without that, `radio_input` would
+    // be at the wrong rate and the demod's
+    // resampler would sit at the wrong
+    // setpoint. Per epic #469 task 7.
+
+    // Tell the DSP thread which Meteor
+    // downlink profile to use for this pass
+    // — METEOR-M N2 was QPSK with
+    // differential precoding; the active
+    // METEOR-M2 3 / M2-4 are plain OQPSK
+    // (#730). Sent
+    // BEFORE `open_lrpt_viewer_if_needed`
+    // (which triggers lazy decoder init)
+    // so the freshly-built decoder uses
+    // the right inner chain. Per #662.
+    //
+    // Always send — even when the catalog
+    // lookup misses or returns
+    // `lrpt_modulation = None`. Otherwise
+    // the previous pass's modulation leaks
+    // into the next decoder init (the
+    // controller stash defaults to OQPSK at
+    // startup but mutates per
+    // `SetLrptDownlink`, so a Qpsk-then-
+    // None sequence would silently keep the
+    // Qpsk chain). Fallback is `Qpsk`
+    // because that's the standards-default
+    // LRPT modulation; a future LRPT
+    // satellite that turns up uncatalogued
+    // is more likely to be standard-spec
+    // than Meteor-style OQPSK. Per CR
+    // round 1 on PR #663.
+    // Profile first, then the canvas wipe on the
+    // DSP thread — the order matters (see
+    // `lrpt_pass_start_commands`).
+    for command in crate::lrpt_viewer::lrpt_pass_start_commands(norad_id, &deps.state.lrpt_image) {
+        deps.state.send_dsp(command);
+    }
+
+    crate::lrpt_viewer::open_lrpt_viewer_if_needed(&deps.parent_provider, &deps.state);
+    if let Some(view) = deps.state.lrpt_viewer.borrow().as_ref() {
+        view.clear();
+    }
+    // Force audio chain off BEFORE start/tune
+    // so the freshly-tuned demod isn't gated
+    // by a stale squelch / CTCSS / FM-IF-NR
+    // setting. Per CR round 1 on PR #557 —
+    // see APT arm above for the full
+    // rationale.
+    force_audio_chain_off(deps);
+    // Now safe to start playback + retune;
+    // any decoded rows from this point
+    // forward land in the cleared image.
+    (deps.set_playing)(true);
+    (deps.tune)(freq_hz, mode, bandwidth_hz);
+    deps.state.dispatch_vfo_offset(0.0);
+    // Mirror into AppState so is_recording() (used by
+    // the close-to-tray Quit confirmation modal)
+    // reflects an in-progress LRPT pass. Per #512.
+    // The `(norad_id, aos)` tuple lets the LOS
+    // completion path snapshot-and-compare so an
+    // overlapping pass-N+1 AOS that starts during
+    // pass-N's encode doesn't have its `is_recording`
+    // flag clobbered when pass-N's completion
+    // fires. Mirrors the APT
+    // `apt_recording_pass` pattern from PR #571
+    // round 4. Per CR round 2 on PR #575.
+    let aos = chrono::Utc::now();
+    *deps.state.lrpt_recording_pass.borrow_mut() = Some((norad_id, aos));
+}
+
+/// SSTV AOS wiring. Split out of [`on_recorder_aos`] per the 50-NLOC
+/// gate (#817).
+fn aos_sstv(
+    deps: &RecorderDeps,
+    norad_id: u32,
+    freq_hz: u64,
+    mode: sdr_types::DemodMode,
+    bandwidth_hz: u32,
+) {
+    // **Order is load-bearing.** Open the viewer
+    // (which sends `UiToDsp::SetSstvImage`) and
+    // clear both the shared handle and the canvas
+    // BEFORE starting playback / retuning so no
+    // leftover rows from a previous pass land in
+    // the fresh image buffer.  Mirrors the LRPT
+    // arm's clear-before-start discipline from
+    // CR round 8 on PR #543.
+    crate::sstv_viewer::open_sstv_viewer_if_needed(&deps.parent_provider, &deps.state);
+    deps.state.sstv_image.clear();
+    // Failed-pass images now live in
+    // `sstv_pending_export` keyed by their
+    // original pass directory (moved there at
+    // `SaveSstvPass` time, not here at AOS).
+    // The current-pass buffer is the round-4
+    // simple clear. Per CR round 6 #21 on
+    // PR #599 (refines round 5 #20).
+    deps.state.sstv_completed_images.borrow_mut().clear();
+    if let Some(view) = deps.state.sstv_viewer.borrow().as_ref() {
+        view.clear();
+    }
+    // ISS SSTV is audible NFM — do NOT force the
+    // audio chain off.  The user's squelch /
+    // CTCSS / FM-IF-NR settings are correct for
+    // the mode; we only suppress them for
+    // silent-passthrough decoders (LRPT) and the
+    // APT path (subcarrier noise). Per CLAUDE.md
+    // and step 8 of epic #472 task spec.
+    (deps.set_playing)(true);
+    (deps.tune)(freq_hz, mode, bandwidth_hz);
+    deps.state.dispatch_vfo_offset(0.0);
+    let aos = chrono::Utc::now();
+    *deps.state.sstv_recording_pass.borrow_mut() = Some((norad_id, aos));
 }
 
 /// Force every audio-chain gate off for an imaging pass: squelch,
