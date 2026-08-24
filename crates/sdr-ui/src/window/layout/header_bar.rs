@@ -42,6 +42,15 @@ pub(in crate::window) struct FavoritesHeaderHandle {
     pub(in crate::window) empty_label: gtk4::Label,
 }
 
+/// Build the `AdwHeaderBar` with play/stop, frequency selector, demod selector,
+/// and volume control.
+///
+/// Returns the header bar, play button, demod dropdown, and frequency selector
+/// (for shortcuts, status bar wiring, and frequency change callbacks).
+#[allow(
+    clippy::too_many_lines,
+    reason = "widget-assembly — splitting scatters one-time wire-up across helpers without readability win"
+)]
 pub(in crate::window) fn build_header_bar(
     sidebar_toggle: &gtk4::ToggleButton,
     state: &Rc<AppState>,

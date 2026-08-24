@@ -241,15 +241,6 @@ fn wire_station_rows(
     }
 }
 
-/// Wire the auto-record machinery: the pure [`AutoRecorder`] state
-/// machine, its action interpreter (stashed weakly on `AppState` so
-/// the `AcarsEnabledChanged(Ok(false))` arm in `handle_dsp_message`
-/// can replay deferred AOS actions — issue #589 / CR round 1 on
-/// PR #591; the strong owner is the tick source), and the 1 Hz tick
-/// that drives it. The tick is only armed when a TLE cache exists —
-/// without one `displayed` stays empty forever and the timer would
-/// tick uselessly.
-
 /// Wire the Satellites scheduler panel to its config-persistence
 /// layer, the [`sdr_sat::TleCache`], and a 1 Hz countdown timer.
 ///

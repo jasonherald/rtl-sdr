@@ -1,4 +1,4 @@
-//! rtl_tcp server auth-key surface: OS-keyring persistence, the
+//! `rtl_tcp` server auth-key surface: OS-keyring persistence, the
 //! require-key toggle (server-first ordering per CR round 1 on
 //! PR #406), reveal/copy/regenerate buttons, and the live
 //! auth-change + advertiser-refresh plumbing. Split out of

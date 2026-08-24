@@ -273,7 +273,7 @@ struct AptExportDone {
     mode: sdr_radio::apt_image::BrightnessMode,
     /// Viewer window snapshotted at export START — the user closing
     /// and reopening the viewer mid-export must not close the wrong
-    /// window; cloning the WeakRef pins the identity while staying
+    /// window; cloning the `WeakRef` pins the identity while staying
     /// weak so a dropped window upgrades to None and we no-op. Per
     /// CR round 3 on PR #571.
     window_weak: Option<glib::WeakRef<adw::Window>>,

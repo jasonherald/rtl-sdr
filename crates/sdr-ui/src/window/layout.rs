@@ -423,16 +423,6 @@ pub(super) fn build_resize_handle(
     handle
 }
 
-/// Build the `AdwHeaderBar` with play/stop, frequency selector, demod selector,
-/// and volume control.
-///
-/// Returns the header bar, play button, demod dropdown, and frequency selector
-/// (for shortcuts, status bar wiring, and frequency change callbacks).
-#[allow(
-    clippy::too_many_lines,
-    reason = "widget-assembly — splitting scatters one-time wire-up across helpers without readability win"
-)]
-
 /// Wire click handlers on every button of a multi-activity bar so:
 ///
 /// - Clicking a *different* button swaps the stack's visible child

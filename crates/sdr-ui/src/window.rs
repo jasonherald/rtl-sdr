@@ -1396,9 +1396,6 @@ pub fn build_window(
     Some(state)
 }
 
-/// Connect all sidebar panel controls to dispatch `UiToDsp` commands.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-
 // "Tune to satellite" closure used by the Satellites panel's
 // per-row play buttons. Mirrors the bookmark-recall dance in
 // `connect_navigation_panel` end-to-end: forces the scanner
@@ -1426,7 +1423,7 @@ fn build_tune_to_satellite(tune_ctx: &TuneCtx) -> Rc<TuneFn> {
 // looks the entry up in `KNOWN_SATELLITES` for downlink /
 // demod / bandwidth.
 fn register_tune_satellite_action(app: &adw::Application, tune_to_satellite: &Rc<TuneFn>) {
-    let tune_for_action = Rc::clone(&tune_to_satellite);
+    let tune_for_action = Rc::clone(tune_to_satellite);
     let action = gio::SimpleAction::new(
         crate::notify::TUNE_SATELLITE_ACTION,
         Some(glib::VariantTy::UINT32),
@@ -1524,7 +1521,7 @@ fn wire_bookmark_mutation_refresh(
 /// Load the shared favorites map (stable `hostname:port` key → rich
 /// `FavoriteEntry`) once, so the source panel's role picker and the
 /// discovery re-announce path mutate the SAME `Rc<RefCell<..>>` and
-/// persistence stays consistent. Per CodeRabbit round 8 on PR #408.
+/// persistence stays consistent. Per `CodeRabbit` round 8 on PR #408.
 #[allow(clippy::type_complexity)]
 fn load_favorites_map(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -1537,6 +1534,12 @@ fn load_favorites_map(
     ))
 }
 
+/// Connect all sidebar panel controls to dispatch `UiToDsp` commands.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "top-level wiring fan-out: each arg is a distinct owned subsystem handle \
+              (app, panels, tune ctx, toasts, config, favorites, volume, play state)"
+)]
 fn connect_sidebar_panels(
     app: &adw::Application,
     panels: &SidebarPanels,

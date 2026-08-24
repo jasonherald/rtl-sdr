@@ -534,16 +534,6 @@ fn start_shared_server(
     }
 }
 
-/// Render bytes/interval as a human-readable data rate. Picks the
-/// right unit automatically: kbps when we're below 1 Mbps (quiet
-/// clients), Mbps otherwise. `rtl_tcp` IQ streams at 2.4 MS/s × 2
-/// bytes per sample = ~4.8 Mbps, so the Mbps case dominates in
-/// practice.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "intermediate f64 conversion for rate math; Mbps precision is cosmetic"
-)]
-
 /// Upstream `rtl_tcp`'s `-D` flag accepts 0 = off, 2 = Q-branch
 /// direct sampling. Only those two values are meaningful for the
 /// UI switch; I-branch (1) is deliberately not exposed because

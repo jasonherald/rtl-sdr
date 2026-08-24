@@ -1,4 +1,4 @@
-//! rtl_tcp server status surface: the 500 ms polling loop and the
+//! `rtl_tcp` server status surface: the 500 ms polling loop and the
 //! renderers for status / uptime / data-rate / activity-log /
 //! client-list rows. Split out of `window/share.rs` per the Codacy
 //! 500-NLOC file gate on PR #844.
@@ -281,6 +281,15 @@ pub(in crate::window) fn format_uptime(elapsed: Duration) -> String {
     }
 }
 
+/// Render bytes/interval as a human-readable data rate. Picks the
+/// right unit automatically: kbps when we're below 1 Mbps (quiet
+/// clients), Mbps otherwise. `rtl_tcp` IQ streams at 2.4 MS/s × 2
+/// bytes per sample = ~4.8 Mbps, so the Mbps case dominates in
+/// practice.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "intermediate f64 conversion for rate math; Mbps precision is cosmetic"
+)]
 pub(in crate::window) fn format_data_rate(bytes: u64, interval: Duration) -> String {
     let secs = interval.as_secs_f64();
     if secs <= 0.0 {

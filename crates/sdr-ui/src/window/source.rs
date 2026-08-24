@@ -54,6 +54,8 @@ pub(super) fn handle_rtl_tcp_state_toast(
     prev_disc: u8,
     ctx: &super::dsp_events::DspEventCtx,
 ) {
+    use sdr_types::RtlTcpConnectionState;
+
     let app_state = &ctx.state;
     let toast_overlay_weak = &ctx.toast_overlay_weak;
     let role_row_weak = &ctx.rtl_tcp_role_row_weak;
@@ -61,7 +63,6 @@ pub(super) fn handle_rtl_tcp_state_toast(
     let hostname_row_weak = &ctx.rtl_tcp_hostname_row_weak;
     let port_row_weak = &ctx.rtl_tcp_port_row_weak;
     let pending_controller_busy_toasts = &ctx.pending_controller_busy_toasts;
-    use sdr_types::RtlTcpConnectionState;
 
     // Sweep any still-live ControllerBusy toasts on any
     // transition that isn't re-entering ControllerBusy. Pre-
@@ -1074,6 +1075,10 @@ pub(super) fn set_favorite_toggle_accessible_name(btn: &gtk4::ToggleButton, is_f
 /// path rewrites. Both callers (favorites Connect button, discovered-
 /// row Connect button) build this shim from the row handles they
 /// already own — strong clones or weak-upgraded strongs alike.
+#[allow(
+    clippy::struct_field_names,
+    reason = "fields deliberately mirror the source-panel row names they borrow"
+)]
 pub(super) struct RtlTcpConnectRows<'a> {
     pub(super) hostname_row: &'a adw::EntryRow,
     pub(super) port_row: &'a adw::SpinRow,
