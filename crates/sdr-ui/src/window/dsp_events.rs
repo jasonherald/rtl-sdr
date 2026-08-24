@@ -972,6 +972,17 @@ fn on_acars_engaged(ctx: &DspEventCtx) {
         volume_button,
         ..
     } = ctx;
+    // Engage-edge guard: the controller re-acknowledges
+    // `SetAcarsEnabled(true)` when ACARS is already engaged. A
+    // repeated `Ok(true)` must not overwrite `acars_saved_tune` /
+    // `acars_saved_volume` with the (already airband-locked)
+    // current values — disengage would then "restore" the ACARS
+    // center frequency and volume 0.0. Per CR round 1 on PR #844.
+    if state.acars_enabled.get() {
+        state.acars_pending.set(false);
+        tracing::debug!("acars engage ack repeated while already engaged; ignoring");
+        return;
+    }
     state.acars_enabled.set(true);
     state.acars_pending.set(false);
     state.acars_total_count.set(0);
@@ -1121,10 +1132,23 @@ fn drain_deferred_aos_actions(ctx: &DspEventCtx) {
     // Defer to next idle so we're outside the
     // dispatch borrow.
     let pending = state.pending_aos_actions.borrow_mut().take();
-    if let Some(actions) = pending
-        && let Some(interp_weak) = state.recorder_action_interpreter.borrow().clone()
-        && let Some(interp) = interp_weak.upgrade()
-    {
+    if let Some(actions) = pending {
+        let interp = state
+            .recorder_action_interpreter
+            .borrow()
+            .clone()
+            .and_then(|weak| weak.upgrade());
+        let Some(interp) = interp else {
+            // Interpreter gone (window tearing down, or wiring not
+            // yet stashed) — the deferred satellite batch cannot
+            // run. Log the drop instead of vanishing silently.
+            // Per CR round 1 on PR #844.
+            tracing::warn!(
+                "AOS replay: dropping {} deferred action(s) — recorder interpreter unavailable",
+                actions.len()
+            );
+            return;
+        };
         tracing::info!(
             "AOS replay: ACARS disengaged, executing {} deferred action(s)",
             actions.len()
