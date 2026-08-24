@@ -9,7 +9,6 @@ use super::{AppState, Rc, adw, glib, sidebar};
 /// Wire the Aviation sidebar panel: toggle switch → DSP, 4 Hz tick
 /// for status/channel-row refresh, the open-viewer button, and the
 /// output-formatter controls (station ID, JSONL log, network feeder).
-#[allow(clippy::too_many_lines)]
 pub(super) fn connect_aviation_panel(
     panel: &sidebar::aviation_panel::AviationPanel,
     state: &Rc<AppState>,
@@ -24,9 +23,6 @@ pub(super) fn connect_aviation_panel(
     wire_acars_output_rows(panel, state, config);
 }
 
-/// Format a `SystemTime` as a relative age string ("5s ago",
-/// "2m ago", "1h ago"). Returns "—" if the timestamp is in the
-/// future or unrepresentable.
 /// Walk the most recent rows of the viewer store backwards from
 /// the end and check for a `(aircraft, mode, label, text)` key
 /// match within `ACARS_COLLAPSE_WINDOW`. Returns the matched
@@ -86,6 +82,9 @@ pub(super) fn try_collapse_into_existing(
     None
 }
 
+/// Format a `SystemTime` as a relative age string ("5s ago",
+/// "2m ago", "1h ago"). Returns "—" if the timestamp is in the
+/// future or unrepresentable.
 pub(super) fn format_relative_age(ts: std::time::SystemTime) -> String {
     let Ok(elapsed) = ts.elapsed() else {
         return "—".to_string();

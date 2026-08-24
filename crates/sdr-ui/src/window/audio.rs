@@ -248,8 +248,8 @@ fn wire_network_sink_config(panels: &SidebarPanels, state: &Rc<AppState>) {
     wire_recording_toggles(panels, state);
 }
 
-/// Audio / IQ recording switch rows.
-/// Split out per the 50-NLOC gate (#817).
+/// Audio recording switch row (the IQ recording toggle is wired in
+/// `window/source.rs` alongside the source panel).
 fn wire_recording_toggles(panels: &SidebarPanels, state: &Rc<AppState>) {
     // Audio recording toggle
     let state_rec = Rc::clone(state);

@@ -12,14 +12,6 @@ use super::{
 /// Sidebar collapse breakpoint width in pixels.
 pub(super) const SIDEBAR_BREAKPOINT_PX: f64 = 800.0;
 
-/// Build the `AdwOverlaySplitView` with sidebar configuration panels, content,
-/// and status bar.
-///
-/// Returns the split view, sidebar panels, spectrum display handle, and status bar.
-#[allow(
-    clippy::type_complexity,
-    reason = "splitting into a struct would trade one named return for one named struct whose fields are used exactly once by the caller — net neutral for readability, net negative for locality of widget construction"
-)]
 /// Minimum left-panel width in pixels — narrower than this makes
 /// `AdwPreferencesGroup` content wrap awkwardly (design doc §4.4).
 pub(super) const LEFT_SIDEBAR_MIN_WIDTH: f64 = 220.0;
@@ -86,7 +78,8 @@ pub(super) struct LayoutHandles {
     pub(super) general_panel: sidebar::GeneralPanel,
 }
 
-#[allow(clippy::too_many_lines)]
+/// Build the `AdwOverlaySplitView` with sidebar configuration panels,
+/// content, and status bar, returning the full [`LayoutHandles`] set.
 pub(super) fn build_layout(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -921,8 +914,6 @@ fn build_split_views(
     }
 }
 
-/// Volume `ScaleButton` with a11y label (value wiring lives in `build_window`).
-/// Split out per the 50-NLOC gate (#817).
 /// Volume `ScaleButton` with a11y label (value wiring lives in
 /// `build_window`). Split out per the 50-NLOC gate (#817).
 fn build_volume_button() -> gtk4::ScaleButton {
@@ -948,12 +939,10 @@ fn build_volume_button() -> gtk4::ScaleButton {
     // servers buttons).
     volume_button.update_property(&[gtk4::accessible::Property::Label("Volume")]);
 
-    // App menu
     volume_button
 }
 
 /// Play/stop toggle + its DSP dispatch. Split out per the 50-NLOC gate (#817).
-/// Split out per the 50-NLOC gate (#817).
 fn build_play_button(state: &Rc<AppState>) -> gtk4::ToggleButton {
     // Play/stop button
     let play_button = gtk4::ToggleButton::builder()

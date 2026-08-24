@@ -11,8 +11,6 @@ use super::{
     update_bandwidth_row_range_for_mode, update_vfo_reset_button_visibility,
 };
 
-/// Handle a single message from the DSP thread.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 /// Widget/state references the `DspToUi` poll loop hands to
 /// [`handle_dsp_message`]. Built once in `build_window` and moved
 /// into the poll closure — same clones, same lifecycles as the
@@ -55,6 +53,8 @@ pub(super) struct DspEventCtx {
     pub(super) model_row: adw::ComboRow,
 }
 
+/// Handle a single message from the DSP thread — a one-line-arm
+/// dispatch into the `on_*` handlers below.
 pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
     match msg {
         DspToUi::FftData(_) => {
@@ -138,17 +138,6 @@ pub(super) fn apply_network_sink_status(
     row.set_subtitle(&subtitle);
 }
 
-/// Render a `RtlTcpConnectionState` into the status row + button
-/// sensitivities. Pulled out of the renderer so the message
-/// handler can call it with individual weak-upgraded widgets
-/// instead of holding a whole `SourcePanel` clone across the
-/// signal-handler boundary.
-/// Fire a toast + manipulate widgets on each **edge transition**
-/// into a terminal role-denial state (`ControllerBusy`,
-/// `AuthRequired`, `AuthFailed`), or on a successful `Connected`
-/// immediately following an auth-required transition (to save
-/// the user-entered key to the per-server keyring).
-///
 /// `adw::Toast::set_timeout(0)` keeps a toast on screen until
 /// the user dismisses it or an explicit `dismiss()` fires. Used
 /// for the two `ControllerBusy` action toasts — the stakes are
@@ -164,6 +153,11 @@ pub(super) const TOAST_TIMEOUT_PERSISTENT: u32 = 0;
 /// enough to clear without user interaction once the user has
 /// moved on to typing. Per `CodeRabbit` round 12 on PR #408.
 pub(super) const TOAST_TIMEOUT_SHORT_SECS: u32 = 5;
+
+/// Pixel tolerance for the ACARS viewer "scrolled to top" test.
+/// `GtkAdjustment` values are fractional, so an exact compare
+/// against `lower()` would miss sub-pixel rests.
+const SCROLL_TOP_TOLERANCE_PX: f64 = 1.0;
 
 /// `DspToUi::SourceStopped` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
@@ -937,7 +931,7 @@ fn on_acars_message(ctx: &DspEventCtx, msg: &sdr_acars::AcarsMessage) {
         // adj.value() AFTER the append would see the shifted
         // value and skip the snap-to-top.
         let adj = handles.scrolled_window.vadjustment();
-        let was_at_top = (adj.value() - adj.lower()).abs() < 1.0;
+        let was_at_top = (adj.value() - adj.lower()).abs() < SCROLL_TOP_TOLERANCE_PX;
 
         append_acars_viewer_row(handles, msg, &adj, was_at_top);
         update_acars_aircraft_index(handles, msg);

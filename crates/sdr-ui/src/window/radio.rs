@@ -184,7 +184,6 @@ pub(super) fn update_vfo_reset_button_visibility(
 }
 
 /// Connect radio panel controls to DSP commands.
-#[allow(clippy::too_many_lines)]
 pub(super) fn connect_radio_panel(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -298,10 +297,20 @@ fn wire_af_rows(panels: &SidebarPanels, state: &Rc<AppState>) {
         .radio
         .deemphasis_row
         .connect_selected_notify(move |row| {
+            use crate::sidebar::radio_panel::{
+                DEEMPHASIS_EU50_IDX, DEEMPHASIS_NONE_IDX, DEEMPHASIS_US75_IDX,
+            };
             let mode = match row.selected() {
-                1 => DeemphasisMode::Eu50,
-                2 => DeemphasisMode::Us75,
-                _ => DeemphasisMode::None,
+                DEEMPHASIS_NONE_IDX => DeemphasisMode::None,
+                DEEMPHASIS_EU50_IDX => DeemphasisMode::Eu50,
+                DEEMPHASIS_US75_IDX => DeemphasisMode::Us75,
+                other => {
+                    // Transient model-churn value (matches the
+                    // audio panel's legal-index contract) — fall
+                    // back to None but leave a trace.
+                    tracing::warn!(other, "deemphasis combo: unexpected index");
+                    DeemphasisMode::None
+                }
             };
             state_de.send_dsp(UiToDsp::SetDeemphasis(mode));
         });
