@@ -170,7 +170,7 @@ pub(super) fn connect_transcript_panel(
     squelch_enabled_row: &adw::SwitchRow,
     #[cfg_attr(not(feature = "sherpa"), allow(unused_variables))] toast_overlay: &adw::ToastOverlay,
 ) -> Rc<RefCell<sdr_transcription::TranscriptionEngine>> {
-    use sdr_transcription::{TranscriptionEngine, TranscriptionEvent};
+    use sdr_transcription::TranscriptionEngine;
 
     let engine: Rc<RefCell<TranscriptionEngine>> =
         Rc::new(RefCell::new(TranscriptionEngine::new()));
