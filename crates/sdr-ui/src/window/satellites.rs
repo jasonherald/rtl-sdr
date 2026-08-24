@@ -229,7 +229,7 @@ pub(super) fn connect_satellites_panel(
         load_auto_record_composites, load_auto_record_quality, load_notify_lead_min,
         load_station_alt_m, load_station_lat_deg, load_station_lon_deg, load_watched_satellites,
         norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
-        save_auto_record_composites, save_f64, save_tle_last_refresh, save_watched_satellites,
+        save_auto_record_composites, save_f64, save_tle_last_refresh,
     };
     use sidebar::satellites_recorder::{
         Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
@@ -390,89 +390,13 @@ pub(super) fn connect_satellites_panel(
                 // passes per day) stay in sync. `None` for
                 // off-catalog passes — no NORAD id, no
                 // notification target, no button.
-                let bell_btn = if let Some(norad_id) = norad_id_for_pass(&pass) {
-                    let initial_active = watched_for_recompute.borrow().contains(&norad_id);
-                    let bell_btn = gtk4::ToggleButton::builder()
-                        .icon_name("alarm-symbolic")
-                        .active(initial_active)
-                        .tooltip_text(format!(
-                            "Notify before {} passes (T-pre-pass alert)",
-                            pass.satellite,
-                        ))
-                        .valign(gtk4::Align::Center)
-                        .css_classes(["flat"])
-                        .build();
-                    let a11y_label = format!("Notify before {} passes", pass.satellite);
-                    bell_btn
-                        .update_property(&[gtk4::accessible::Property::Label(a11y_label.as_str())]);
-                    let watched_for_toggle = Rc::clone(&watched_for_recompute);
-                    let config_for_toggle = std::sync::Arc::clone(&config_for_recompute);
-                    // `Weak` (not strong `Rc`) breaks the cycle:
-                    // bell_btn → handler closure → Rc → Vec
-                    // <DisplayedPass> → bell_btn. With a strong ref
-                    // here, removing rows from `passes_group`
-                    // wouldn't drop the bell_btn, which would keep
-                    // the closure (and the Vec) pinned forever.
-                    let displayed_for_toggle = Rc::downgrade(&displayed_recompute);
-                    bell_btn.connect_toggled(move |b| {
-                        let active = b.is_active();
-                        {
-                            let mut set = watched_for_toggle.borrow_mut();
-                            // `HashSet::insert` / `HashSet::remove`
-                            // return whether membership actually
-                            // changed. Skip the config write when it
-                            // didn't — sibling-mirror re-enters this
-                            // handler for every other row of the
-                            // same satellite, and without the guard
-                            // every mirror would issue an identical
-                            // save_watched_satellites call. Per CR
-                            // round 3 on PR #568.
-                            let changed = if active {
-                                set.insert(norad_id)
-                            } else {
-                                set.remove(&norad_id)
-                            };
-                            if changed {
-                                save_watched_satellites(&config_for_toggle, &set);
-                            }
-                        }
-                        // Mirror across sibling rows. `set_active`
-                        // is a no-op when the state already matches,
-                        // so the recursion terminates after one
-                        // round-trip per sibling. The pointer
-                        // compare keeps us from re-entering THIS
-                        // button's own handler. If the displayed
-                        // Vec has already been dropped (window
-                        // teardown), the upgrade fails and we
-                        // simply skip mirroring — the watched-set
-                        // write above is the only persistent
-                        // effect that matters at that point.
-                        //
-                        // Match siblings by NORAD id, not display
-                        // name: the watched set is keyed by id, and
-                        // any future catalog drift where two entries
-                        // share a label (alternate names, alias
-                        // entries) would otherwise toggle the wrong
-                        // satellite's bells. Per CR round 1 on PR
-                        // #568.
-                        let Some(displayed) = displayed_for_toggle.upgrade() else {
-                            return;
-                        };
-                        for entry in displayed.borrow().iter() {
-                            if norad_id_for_pass(&entry.pass) == Some(norad_id)
-                                && let Some(other) = &entry.bell_btn
-                                && other.as_ptr() != b.as_ptr()
-                                && other.is_active() != active
-                            {
-                                other.set_active(active);
-                            }
-                        }
-                    });
-                    row.add_suffix(&bell_btn);
-                    Some(bell_btn)
-                } else {
-                    None
-                };
+                let bell_btn = build_pass_bell_button(
+                    &row,
+                    &pass,
+                    &watched_for_recompute,
+                    &config_for_recompute,
+                    &displayed_recompute,
+                );
                 panel.passes_group.add(&row);
                 new_rows.push(DisplayedPass {
                     row,
@@ -2439,6 +2363,102 @@ pub(super) fn connect_satellites_panel(
             glib::ControlFlow::Continue
         });
     }
+}
+
+/// 🔔 watch-toggle (#510) — per-satellite, NOT per-pass. Toggling on
+/// row N flips the user's subscription for THIS satellite; the toggle
+/// handler mirrors the active state across sibling rows (NOAA 19
+/// typically has 4-6 passes per day) so they stay in sync. Returns
+/// `None` for off-catalog passes — no NORAD id, no notification
+/// target, no button.
+fn build_pass_bell_button(
+    row: &adw::ActionRow,
+    pass: &sdr_sat::Pass,
+    watched: &Rc<RefCell<std::collections::HashSet<u32>>>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    displayed: &Rc<RefCell<Vec<DisplayedPass>>>,
+) -> Option<gtk4::ToggleButton> {
+    use sidebar::satellites_panel::{norad_id_for_pass, save_watched_satellites};
+
+    let norad_id = norad_id_for_pass(pass)?;
+    let initial_active = watched.borrow().contains(&norad_id);
+    let bell_btn = gtk4::ToggleButton::builder()
+        .icon_name("alarm-symbolic")
+        .active(initial_active)
+        .tooltip_text(format!(
+            "Notify before {} passes (T-pre-pass alert)",
+            pass.satellite,
+        ))
+        .valign(gtk4::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    let a11y_label = format!("Notify before {} passes", pass.satellite);
+    bell_btn.update_property(&[gtk4::accessible::Property::Label(a11y_label.as_str())]);
+    let watched_for_toggle = Rc::clone(watched);
+    let config_for_toggle = std::sync::Arc::clone(config);
+    // `Weak` (not strong `Rc`) breaks the cycle:
+    // bell_btn → handler closure → Rc → Vec
+    // <DisplayedPass> → bell_btn. With a strong ref
+    // here, removing rows from `passes_group`
+    // wouldn't drop the bell_btn, which would keep
+    // the closure (and the Vec) pinned forever.
+    let displayed_for_toggle = Rc::downgrade(displayed);
+    bell_btn.connect_toggled(move |b| {
+        let active = b.is_active();
+        {
+            let mut set = watched_for_toggle.borrow_mut();
+            // `HashSet::insert` / `HashSet::remove`
+            // return whether membership actually
+            // changed. Skip the config write when it
+            // didn't — sibling-mirror re-enters this
+            // handler for every other row of the
+            // same satellite, and without the guard
+            // every mirror would issue an identical
+            // save_watched_satellites call. Per CR
+            // round 3 on PR #568.
+            let changed = if active {
+                set.insert(norad_id)
+            } else {
+                set.remove(&norad_id)
+            };
+            if changed {
+                save_watched_satellites(&config_for_toggle, &set);
+            }
+        }
+        // Mirror across sibling rows. `set_active`
+        // is a no-op when the state already matches,
+        // so the recursion terminates after one
+        // round-trip per sibling. The pointer
+        // compare keeps us from re-entering THIS
+        // button's own handler. If the displayed
+        // Vec has already been dropped (window
+        // teardown), the upgrade fails and we
+        // simply skip mirroring — the watched-set
+        // write above is the only persistent
+        // effect that matters at that point.
+        //
+        // Match siblings by NORAD id, not display
+        // name: the watched set is keyed by id, and
+        // any future catalog drift where two entries
+        // share a label (alternate names, alias
+        // entries) would otherwise toggle the wrong
+        // satellite's bells. Per CR round 1 on PR
+        // #568.
+        let Some(displayed) = displayed_for_toggle.upgrade() else {
+            return;
+        };
+        for entry in displayed.borrow().iter() {
+            if norad_id_for_pass(&entry.pass) == Some(norad_id)
+                && let Some(other) = &entry.bell_btn
+                && other.as_ptr() != b.as_ptr()
+                && other.is_active() != active
+            {
+                other.set_active(active);
+            }
+        }
+    });
+    row.add_suffix(&bell_btn);
+    Some(bell_btn)
 }
 
 /// Per-row play button — one-click tune to the satellite's downlink
