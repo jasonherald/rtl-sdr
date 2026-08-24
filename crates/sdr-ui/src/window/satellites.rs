@@ -220,7 +220,7 @@ pub(super) fn connect_satellites_panel(
     set_playing: &Rc<dyn Fn(bool)>,
     status_bar: &Rc<StatusBar>,
 ) {
-    use sdr_sat::{KNOWN_SATELLITES, Pass, TleCache};
+    use sdr_sat::{Pass, TleCache};
     use sidebar::satellites_notify::{Action as NotifyAction, NotifyScheduler};
     use sidebar::satellites_panel::{
         AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
@@ -228,7 +228,7 @@ pub(super) fn connect_satellites_panel(
         load_auto_record_audio, load_auto_record_composites, load_auto_record_quality,
         load_notify_lead_min, load_station_alt_m, load_station_lat_deg, load_station_lon_deg,
         load_watched_satellites, norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
-        save_auto_record_composites, save_f64, save_tle_last_refresh,
+        save_auto_record_composites, save_f64,
     };
     use sidebar::satellites_recorder::{
         Action as RecorderAction, AutoRecorder, SavedTune, ToastKind,
@@ -492,47 +492,7 @@ pub(super) fn connect_satellites_panel(
             let recompute_done = Rc::clone(&recompute_refresh);
 
             glib::spawn_future_local(async move {
-                let result = gio::spawn_blocking(move || {
-                    // `force_refresh` — NOT `tle_text` — because the
-                    // user clicked Refresh and a fresh-cache fast-path
-                    // would let us mark "Last refreshed: now" without
-                    // any actual network fetch. `force_refresh` always
-                    // hits the network and never falls back to a stale
-                    // cache, so a successful return means a real round
-                    // trip happened. A per-satellite failure is logged
-                    // and skipped so a single decommissioned /
-                    // rate-limited entry can't break the whole
-                    // refresh: the user still gets the rest.
-                    let mut last_err: Option<sdr_sat::TleCacheError> = None;
-                    let mut succeeded = 0usize;
-                    for known in KNOWN_SATELLITES {
-                        match cache_task.force_refresh(known.norad_id) {
-                            Ok(_) => succeeded += 1,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "TLE refresh for {} (NORAD {}) failed: {e}",
-                                    known.name,
-                                    known.norad_id,
-                                );
-                                last_err = Some(e);
-                            }
-                        }
-                    }
-                    if succeeded == 0 {
-                        // Every fetch failed — surface the last error so
-                        // the UI can show it. (If at least one
-                        // succeeded, treat the refresh as "done" so
-                        // the user sees the timestamp tick forward.)
-                        Err(last_err.unwrap_or_else(|| {
-                            sdr_sat::TleCacheError::Fetch(
-                                "refresh produced no successful fetches".to_string(),
-                            )
-                        }))
-                    } else {
-                        Ok(())
-                    }
-                })
-                .await;
+                let result = gio::spawn_blocking(move || force_refresh_all_tles(&cache_task)).await;
 
                 let Some(panel) = panel_weak_done.upgrade() else {
                     return;
@@ -541,28 +501,7 @@ pub(super) fn connect_satellites_panel(
                 panel.refresh_spinner.set_visible(false);
                 panel.refresh_button.set_sensitive(true);
 
-                match result {
-                    Ok(Ok(())) => {
-                        let now = chrono::Utc::now();
-                        save_tle_last_refresh(&config_done, now);
-                        panel
-                            .last_refresh_row
-                            .set_subtitle(&format_last_refresh(&config_done));
-                        recompute_done();
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("TLE refresh failed: {e}");
-                        panel
-                            .last_refresh_row
-                            .set_subtitle(&format!("Refresh failed: {e}"));
-                    }
-                    Err(_) => {
-                        tracing::warn!("TLE refresh task panicked");
-                        panel
-                            .last_refresh_row
-                            .set_subtitle("Refresh failed: background task panicked");
-                    }
-                }
+                finish_tle_refresh(&panel, &config_done, &recompute_done, result);
             });
         });
     }
@@ -2301,6 +2240,77 @@ pub(super) fn connect_satellites_panel(
             }
             glib::ControlFlow::Continue
         });
+    }
+}
+
+/// Force-refresh every catalog satellite's TLE. `force_refresh` — NOT
+/// `tle_text` — because the user clicked Refresh and a fresh-cache
+/// fast-path would let us mark "Last refreshed: now" without any
+/// actual network fetch; a successful return means a real round trip
+/// happened. A per-satellite failure is logged and skipped so a
+/// single decommissioned / rate-limited entry can't break the whole
+/// refresh; only an all-fail sweep surfaces the last error.
+fn force_refresh_all_tles(
+    cache: &std::sync::Arc<sdr_sat::TleCache>,
+) -> Result<(), sdr_sat::TleCacheError> {
+    use sdr_sat::KNOWN_SATELLITES;
+
+    let mut last_err: Option<sdr_sat::TleCacheError> = None;
+    let mut succeeded = 0usize;
+    for known in KNOWN_SATELLITES {
+        match cache.force_refresh(known.norad_id) {
+            Ok(_) => succeeded += 1,
+            Err(e) => {
+                tracing::warn!(
+                    "TLE refresh for {} (NORAD {}) failed: {e}",
+                    known.name,
+                    known.norad_id,
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    if succeeded == 0 {
+        Err(last_err.unwrap_or_else(|| {
+            sdr_sat::TleCacheError::Fetch("refresh produced no successful fetches".to_string())
+        }))
+    } else {
+        Ok(())
+    }
+}
+
+/// Completion side of a TLE refresh: persist + show the new timestamp
+/// and re-enumerate passes on success; surface the failure (or a
+/// panicked background task) on the last-refresh row otherwise.
+fn finish_tle_refresh(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    recompute: &Rc<dyn Fn()>,
+    result: Result<Result<(), sdr_sat::TleCacheError>, Box<dyn std::any::Any + Send>>,
+) {
+    use sidebar::satellites_panel::{format_last_refresh, save_tle_last_refresh};
+
+    match result {
+        Ok(Ok(())) => {
+            let now = chrono::Utc::now();
+            save_tle_last_refresh(config, now);
+            panel
+                .last_refresh_row
+                .set_subtitle(&format_last_refresh(config));
+            recompute();
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("TLE refresh failed: {e}");
+            panel
+                .last_refresh_row
+                .set_subtitle(&format!("Refresh failed: {e}"));
+        }
+        Err(_) => {
+            tracing::warn!("TLE refresh task panicked");
+            panel
+                .last_refresh_row
+                .set_subtitle("Refresh failed: background task panicked");
+        }
     }
 }
 
