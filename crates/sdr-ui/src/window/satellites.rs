@@ -1396,6 +1396,43 @@ fn on_apt_export_complete(
 /// Split out of [`interpret_recorder_action`] per the 50-NLOC gate
 /// (#817).
 #[allow(clippy::too_many_arguments)]
+
+/// Log a warning when a Meteor-M pass delivered fewer AVHRR APIDs than
+/// the satellite's expected set — the Roscosmos transmission schedule
+/// occasionally changes which channels are on (see #645).
+fn warn_missing_lrpt_apids(
+    snapshots: &[(u16, sdr_lrpt::image::ChannelBuffer)],
+    exported_lrpt_pass: Option<(u32, chrono::DateTime<chrono::Utc>)>,
+) {
+    // Diagnostic: warn if the satellite delivered some
+    // APIDs but not the full per-satellite expected set.
+    // Catches schedule changes (e.g. Roscosmos flipping
+    // M2-3 between summer-mode c1/c2/c3 and standard
+    // c1/c2/c4) as a single log line instead of the user
+    // wondering why some composite recipes silently
+    // produced nothing. Silent passes are skipped — they're
+    // a different failure mode handled by
+    // `pass_decoded_nothing` above. Per #645.
+    if let Some((norad_id, _aos)) = exported_lrpt_pass
+        && let Some(sat) = sdr_sat::KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == norad_id)
+    {
+        let received_apids: Vec<u16> = snapshots.iter().map(|(apid, _)| *apid).collect();
+        let missing = sat.missing_lrpt_apids(&received_apids);
+        if !missing.is_empty() {
+            tracing::warn!(
+                "auto-record LOS: {} delivered APIDs {:?} but expected {:?}; \
+             missing {:?} — Roscosmos schedule may have changed (see #645)",
+                sat.name,
+                received_apids,
+                sat.expected_lrpt_apids.unwrap_or(&[]),
+                missing,
+            );
+        }
+    }
+}
+
 fn on_save_lrpt_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
     // Walk every APID present in the SHARED `LrptImage`
     // (the DSP-side decoder's destination — the source
@@ -1464,33 +1501,8 @@ fn on_save_lrpt_pass(deps: &RecorderDeps, dir: std::path::PathBuf) {
     // many passes produce no LRPT). Per silent-pass
     // diagnosis 2026-05-08.
     let pass_decoded_nothing = snapshots.is_empty();
-    // Diagnostic: warn if the satellite delivered some
-    // APIDs but not the full per-satellite expected set.
-    // Catches schedule changes (e.g. Roscosmos flipping
-    // M2-3 between summer-mode c1/c2/c3 and standard
-    // c1/c2/c4) as a single log line instead of the user
-    // wondering why some composite recipes silently
-    // produced nothing. Silent passes are skipped — they're
-    // a different failure mode handled by
-    // `pass_decoded_nothing` above. Per #645.
-    if !pass_decoded_nothing
-        && let Some((norad_id, _aos)) = exported_lrpt_pass
-        && let Some(sat) = sdr_sat::KNOWN_SATELLITES
-            .iter()
-            .find(|s| s.norad_id == norad_id)
-    {
-        let received_apids: Vec<u16> = snapshots.iter().map(|(apid, _)| *apid).collect();
-        let missing = sat.missing_lrpt_apids(&received_apids);
-        if !missing.is_empty() {
-            tracing::warn!(
-                "auto-record LOS: {} delivered APIDs {:?} but expected {:?}; \
-             missing {:?} — Roscosmos schedule may have changed (see #645)",
-                sat.name,
-                received_apids,
-                sat.expected_lrpt_apids.unwrap_or(&[]),
-                missing,
-            );
-        }
+    if !pass_decoded_nothing {
+        warn_missing_lrpt_apids(&snapshots, exported_lrpt_pass);
     }
     glib::spawn_future_local(async move {
         let dir_for_msg = dir.clone();
