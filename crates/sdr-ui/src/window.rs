@@ -1407,150 +1407,82 @@ pub fn build_window(
 
 /// Connect all sidebar panel controls to dispatch `UiToDsp` commands.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn connect_sidebar_panels(
-    app: &adw::Application,
+
+// "Tune to satellite" closure used by the Satellites panel's
+// per-row play buttons. Mirrors the bookmark-recall dance in
+// `connect_navigation_panel` end-to-end: forces the scanner
+// off, updates local `AppState`, sends `Tune` + `SetBandwidth`
+// to the DSP, and pokes every UI widget / status indicator
+// that mirrors the radio's tuning state — spectrum centre
+// line, demod dropdown, bandwidth SpinRow, status bar
+// frequency / demod-mode label, and the radio panel's mode-
+// specific control visibility. The dropdown's
+// `selected-notify` and the spin row's `value-notify`
+// callbacks fire `SetDemodMode` / a redundant `SetBandwidth`
+// themselves — idempotent at the DSP, cheaper than threading
+// a suppress flag through here.
+fn build_tune_to_satellite(tune_ctx: &TuneCtx) -> Rc<TuneFn> {
+    let ctx_t = tune_ctx.clone();
+    Rc::new(move |freq_hz, mode, bw_hz| {
+        tune_to_target(&ctx_t, freq_hz, mode, f64::from(bw_hz), "satellite tune");
+    })
+}
+
+// Register `app.tune-satellite` so the "Tune" button on a #510
+// pre-pass desktop notification can route back to the same
+// tune closure the panel's per-row play buttons use. Action
+// target is the satellite's NORAD id (`u32`); the handler
+// looks the entry up in `KNOWN_SATELLITES` for downlink /
+// demod / bandwidth.
+fn register_tune_satellite_action(app: &adw::Application, tune_to_satellite: &Rc<TuneFn>) {
+    let tune_for_action = Rc::clone(&tune_to_satellite);
+    let action = gio::SimpleAction::new(
+        crate::notify::TUNE_SATELLITE_ACTION,
+        Some(glib::VariantTy::UINT32),
+    );
+    action.connect_activate(move |_, param| {
+        let Some(norad_id) = param.and_then(glib::Variant::get::<u32>) else {
+            tracing::warn!("tune-satellite action fired without a u32 target");
+            return;
+        };
+        let Some(known) = sdr_sat::KNOWN_SATELLITES
+            .iter()
+            .find(|s| s.norad_id == norad_id)
+        else {
+            tracing::warn!(
+                norad_id,
+                "tune-satellite action target not in KNOWN_SATELLITES",
+            );
+            return;
+        };
+        tune_for_action(known.downlink_hz, known.demod_mode, known.bandwidth_hz);
+    });
+    app.add_action(&action);
+}
+
+// Mutation-triggered scanner re-projection. Fires on scan
+// checkbox, priority star, and delete — every per-bookmark
+// change that affects the projected channel list. Install
+// this *after* `connect_sidebar_panels` finishes the other
+// panel wiring so early construction-time rebuilds (which
+// pre-date the callback) don't dispatch a spurious empty
+// `UpdateScannerChannels`.
+//
+// The callback lives inside `BookmarksPanel.on_mutated`, so
+// capturing a strong `Rc<BookmarksPanel>` would close a
+// retain cycle (panel → on_mutated → closure → panel) and
+// leak on teardown. Downgrade to `Weak` and upgrade-or-return
+// inside the closure — reads `.bookmarks` via the upgraded
+// handle so the projection still lands against the live
+// backing store. Same pattern the Save closure uses in
+// `sidebar::build_sidebar`.
+fn wire_bookmark_mutation_refresh(
     panels: &SidebarPanels,
     tune_ctx: &TuneCtx,
-    toast_overlay: &adw::ToastOverlay,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    favorites_header: &FavoritesHeaderHandle,
-    volume_button: &gtk4::ScaleButton,
-    set_playing: &Rc<dyn Fn(bool)>,
 ) {
     let state = &tune_ctx.state;
     let spectrum_handle = &tune_ctx.spectrum_handle;
-    let scanner_force_disable = &tune_ctx.scanner_force_disable;
-    // Shared "is the rtl_tcp server currently live?" flag. Written by
-    // the server panel's start/stop handler, read by the source
-    // panel's device-type guard so the two panels can enforce the
-    // "local RTL-SDR source and server-sharing-the-dongle are
-    // mutually exclusive" rule without either side owning state the
-    // other has to synthesize. `Rc<Cell<bool>>` is ideal: GTK single-
-    // threaded, no interior locking needed, cheap to clone into
-    // closures.
-    let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
-
-    // Shared favorites map — key (stable hostname:port) → rich
-    // `FavoriteEntry` record. Loaded once here and handed to
-    // both `connect_source_panel` (role picker mutates
-    // `requested_role` per-server) and `connect_rtl_tcp_discovery`
-    // (re-announce path refreshes metadata). Pre-`CodeRabbit`
-    // round 8 on PR #408 each function built its own view: the
-    // role picker read + wrote the on-disk JSON via
-    // `load_favorites`/`save_favorites` while discovery held a
-    // separate in-memory HashMap. A subsequent `ServerAnnounced`
-    // would preserve the stale in-memory role from the map and
-    // clobber the user's just-saved selection on next re-
-    // announce. Hoisting the map here makes both paths mutate
-    // the SAME `Rc<RefCell<..>>` so persistence stays
-    // consistent. `Rc<RefCell<HashMap>>` mirrors the
-    // `displayed_rows` pattern — single-threaded GTK main loop,
-    // no lock contention.
-    let favorites: Rc<
-        RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>,
-    > = Rc::new(RefCell::new(
-        crate::sidebar::source_panel::load_favorites(config)
-            .into_iter()
-            .map(|entry| (entry.key.clone(), entry))
-            .collect(),
-    ));
-
-    connect_source_panel(
-        panels,
-        state,
-        toast_overlay,
-        Rc::clone(&server_running),
-        config,
-        &favorites,
-    );
-    connect_source_rtlsdr_probe(panels);
-    connect_rtl_tcp_discovery(panels, state, config, favorites_header, &favorites);
-    connect_server_panel(panels, toast_overlay, server_running);
-    connect_radio_panel(panels, state, scanner_force_disable);
-    connect_display_panel(panels, state, spectrum_handle, config);
-    connect_audio_panel(panels, state);
-    connect_volume_persistence(panels, state, config, volume_button);
-    connect_distance_estimator_persistence(panels, config);
-    connect_scanner_panel(panels, state, config, spectrum_handle);
-    // "Tune to satellite" closure used by the Satellites panel's
-    // per-row play buttons. Mirrors the bookmark-recall dance in
-    // `connect_navigation_panel` end-to-end: forces the scanner
-    // off, updates local `AppState`, sends `Tune` + `SetBandwidth`
-    // to the DSP, and pokes every UI widget / status indicator
-    // that mirrors the radio's tuning state — spectrum centre
-    // line, demod dropdown, bandwidth SpinRow, status bar
-    // frequency / demod-mode label, and the radio panel's mode-
-    // specific control visibility. The dropdown's
-    // `selected-notify` and the spin row's `value-notify`
-    // callbacks fire `SetDemodMode` / a redundant `SetBandwidth`
-    // themselves — idempotent at the DSP, cheaper than threading
-    // a suppress flag through here.
-    let tune_to_satellite: Rc<TuneFn> = {
-        let ctx_t = tune_ctx.clone();
-        Rc::new(move |freq_hz, mode, bw_hz| {
-            tune_to_target(&ctx_t, freq_hz, mode, f64::from(bw_hz), "satellite tune");
-        })
-    };
-    // Register `app.tune-satellite` so the "Tune" button on a #510
-    // pre-pass desktop notification can route back to the same
-    // tune closure the panel's per-row play buttons use. Action
-    // target is the satellite's NORAD id (`u32`); the handler
-    // looks the entry up in `KNOWN_SATELLITES` for downlink /
-    // demod / bandwidth.
-    {
-        let tune_for_action = Rc::clone(&tune_to_satellite);
-        let action = gio::SimpleAction::new(
-            crate::notify::TUNE_SATELLITE_ACTION,
-            Some(glib::VariantTy::UINT32),
-        );
-        action.connect_activate(move |_, param| {
-            let Some(norad_id) = param.and_then(glib::Variant::get::<u32>) else {
-                tracing::warn!("tune-satellite action fired without a u32 target");
-                return;
-            };
-            let Some(known) = sdr_sat::KNOWN_SATELLITES
-                .iter()
-                .find(|s| s.norad_id == norad_id)
-            else {
-                tracing::warn!(
-                    norad_id,
-                    "tune-satellite action target not in KNOWN_SATELLITES",
-                );
-                return;
-            };
-            tune_for_action(known.downlink_hz, known.demod_mode, known.bandwidth_hz);
-        });
-        app.add_action(&action);
-    }
-
-    connect_satellites_panel(
-        panels,
-        config,
-        tune_ctx,
-        toast_overlay,
-        &tune_to_satellite,
-        set_playing,
-    );
-    connect_aviation_panel(&panels.aviation, state, config, toast_overlay);
-    // Transcript panel is wired separately (not in SidebarPanels).
-    connect_navigation_panel(panels, tune_ctx, volume_button);
-
-    // Mutation-triggered scanner re-projection. Fires on scan
-    // checkbox, priority star, and delete — every per-bookmark
-    // change that affects the projected channel list. Install
-    // this *after* `connect_sidebar_panels` finishes the other
-    // panel wiring so early construction-time rebuilds (which
-    // pre-date the callback) don't dispatch a spurious empty
-    // `UpdateScannerChannels`.
-    //
-    // The callback lives inside `BookmarksPanel.on_mutated`, so
-    // capturing a strong `Rc<BookmarksPanel>` would close a
-    // retain cycle (panel → on_mutated → closure → panel) and
-    // leak on teardown. Downgrade to `Weak` and upgrade-or-return
-    // inside the closure — reads `.bookmarks` via the upgraded
-    // handle so the projection still lands against the live
-    // backing store. Same pattern the Save closure uses in
-    // `sidebar::build_sidebar`.
     let bookmarks_weak = Rc::downgrade(&panels.bookmarks);
     let state_for_mutated = Rc::clone(state);
     let config_for_mutated = std::sync::Arc::clone(config);
@@ -1594,6 +1526,98 @@ fn connect_sidebar_panels(
             }
         }
     });
+}
+
+/// Load the shared favorites map (stable `hostname:port` key → rich
+/// `FavoriteEntry`) once, so the source panel's role picker and the
+/// discovery re-announce path mutate the SAME `Rc<RefCell<..>>` and
+/// persistence stays consistent. Per CodeRabbit round 8 on PR #408.
+#[allow(clippy::type_complexity)]
+fn load_favorites_map(
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) -> Rc<RefCell<std::collections::HashMap<String, sidebar::source_panel::FavoriteEntry>>> {
+    Rc::new(RefCell::new(
+        crate::sidebar::source_panel::load_favorites(config)
+            .into_iter()
+            .map(|entry| (entry.key.clone(), entry))
+            .collect(),
+    ))
+}
+
+fn connect_sidebar_panels(
+    app: &adw::Application,
+    panels: &SidebarPanels,
+    tune_ctx: &TuneCtx,
+    toast_overlay: &adw::ToastOverlay,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    favorites_header: &FavoritesHeaderHandle,
+    volume_button: &gtk4::ScaleButton,
+    set_playing: &Rc<dyn Fn(bool)>,
+) {
+    let state = &tune_ctx.state;
+    let spectrum_handle = &tune_ctx.spectrum_handle;
+    let scanner_force_disable = &tune_ctx.scanner_force_disable;
+    // Shared "is the rtl_tcp server currently live?" flag. Written by
+    // the server panel's start/stop handler, read by the source
+    // panel's device-type guard so the two panels can enforce the
+    // "local RTL-SDR source and server-sharing-the-dongle are
+    // mutually exclusive" rule without either side owning state the
+    // other has to synthesize. `Rc<Cell<bool>>` is ideal: GTK single-
+    // threaded, no interior locking needed, cheap to clone into
+    // closures.
+    let server_running: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+
+    // Shared favorites map — key (stable hostname:port) → rich
+    // `FavoriteEntry` record. Loaded once here and handed to
+    // both `connect_source_panel` (role picker mutates
+    // `requested_role` per-server) and `connect_rtl_tcp_discovery`
+    // (re-announce path refreshes metadata). Pre-`CodeRabbit`
+    // round 8 on PR #408 each function built its own view: the
+    // role picker read + wrote the on-disk JSON via
+    // `load_favorites`/`save_favorites` while discovery held a
+    // separate in-memory HashMap. A subsequent `ServerAnnounced`
+    // would preserve the stale in-memory role from the map and
+    // clobber the user's just-saved selection on next re-
+    // announce. Hoisting the map here makes both paths mutate
+    // the SAME `Rc<RefCell<..>>` so persistence stays
+    // consistent. `Rc<RefCell<HashMap>>` mirrors the
+    // `displayed_rows` pattern — single-threaded GTK main loop,
+    // no lock contention.
+    let favorites = load_favorites_map(config);
+
+    connect_source_panel(
+        panels,
+        state,
+        toast_overlay,
+        Rc::clone(&server_running),
+        config,
+        &favorites,
+    );
+    connect_source_rtlsdr_probe(panels);
+    connect_rtl_tcp_discovery(panels, state, config, favorites_header, &favorites);
+    connect_server_panel(panels, toast_overlay, server_running);
+    connect_radio_panel(panels, state, scanner_force_disable);
+    connect_display_panel(panels, state, spectrum_handle, config);
+    connect_audio_panel(panels, state);
+    connect_volume_persistence(panels, state, config, volume_button);
+    connect_distance_estimator_persistence(panels, config);
+    connect_scanner_panel(panels, state, config, spectrum_handle);
+    let tune_to_satellite = build_tune_to_satellite(tune_ctx);
+    register_tune_satellite_action(app, &tune_to_satellite);
+
+    connect_satellites_panel(
+        panels,
+        config,
+        tune_ctx,
+        toast_overlay,
+        &tune_to_satellite,
+        set_playing,
+    );
+    connect_aviation_panel(&panels.aviation, state, config, toast_overlay);
+    // Transcript panel is wired separately (not in SidebarPanels).
+    connect_navigation_panel(panels, tune_ctx, volume_button);
+
+    wire_bookmark_mutation_refresh(panels, tune_ctx, config);
 }
 
 /// Register application-level actions (Preferences, About, Quit).
