@@ -2540,10 +2540,7 @@ pub(super) fn connect_doppler_tracker(
     cache: &std::sync::Arc<sdr_sat::TleCache>,
     status_bar: &Rc<StatusBar>,
 ) {
-    use crate::doppler_tracker::{
-        DopplerTracker, FREQ_MATCH_TOLERANCE_HZ, compute_doppler_offset_hz, should_tick,
-    };
-    use sdr_sat::{GroundStation, Satellite};
+    use crate::doppler_tracker::DopplerTracker;
 
     // Read the widget's current state — it was already restored
     // (and a persistence handler wired) by `restore_doppler_switch`,
@@ -2638,89 +2635,106 @@ pub(super) fn connect_doppler_tracker(
             let Some(panel) = panel_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            // Lifecycle gate: master + running. The status-bar
-            // badge clears on the first not-running tick so the
-            // user gets immediate "Doppler is idle" feedback when
-            // they press Stop — `update_doppler(None)` is
-            // idempotent (set_visible(false) on an already-hidden
-            // label is a no-op). Per #567.
-            if !should_tick(tracker.borrow().master_enabled(), state.is_running.get()) {
-                status_bar.update_doppler(None);
-                return glib::ControlFlow::Continue;
-            }
-            let active_sat = tracker.borrow().active();
-            let Some(sat) = active_sat else {
-                return glib::ControlFlow::Continue;
-            };
-            // Has the user retuned away from the active satellite?
-            // If so, disengage NOW rather than wait up to 1 s for
-            // the trigger tick — otherwise stale Doppler keeps
-            // dispatching against the new center frequency for up
-            // to a full second. Per CR round 5 on PR #554.
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "catalog downlinks sit in the 100s of MHz, well \
-                          below f64's 2^53 mantissa ceiling"
-            )]
-            let downlink = sat.downlink_hz as f64;
-            let current_freq = state.center_frequency.get();
-            if (downlink - current_freq).abs() > FREQ_MATCH_TOLERANCE_HZ {
-                let mut t = tracker.borrow_mut();
-                let prior_user_ref = t.user_reference_offset_hz();
-                let _ = t.set_active(None);
-                drop(t);
-                state.dispatch_vfo_offset(prior_user_ref);
-                status_bar.update_doppler(None);
-                return glib::ControlFlow::Continue;
-            }
-            let station = GroundStation::new(
-                panel.lat_row.value(),
-                panel.lon_row.value(),
-                panel.alt_row.value(),
-            );
-            let Ok((line1, line2)) = cache.cached_tle_for(sat.norad_id) else {
-                // TLE evicted between trigger evaluation and
-                // recompute — dormant for this tick; the next
-                // 1 Hz trigger tick will drop the active sat
-                // since `cached_tle_for` will fail there too.
-                return glib::ControlFlow::Continue;
-            };
-            let Ok(parsed) = Satellite::from_tle(sat.name, &line1, &line2) else {
-                return glib::ControlFlow::Continue;
-            };
-            let now = chrono::Utc::now();
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "catalog downlinks sit in the 100s of MHz, well \
-                          below f64's 2^53 mantissa ceiling"
-            )]
-            let carrier = sat.downlink_hz as f64;
-            let Ok(doppler) = compute_doppler_offset_hz(&parsed, &station, now, carrier) else {
-                tracing::debug!(
-                    satellite = sat.name,
-                    "Doppler recompute: SGP4 propagate failed; skipping tick"
-                );
-                return glib::ControlFlow::Continue;
-            };
-            let live = tracker.borrow().live_offset_hz(doppler);
-            // Status bar updates every tick — the kHz/0.1
-            // format hides sub-100-Hz jitter naturally.
-            status_bar.update_doppler(Some(doppler));
-            // SetVfoOffset is rate-limited to material changes.
-            // Baseline lives on `AppState` and is kept in sync by
-            // the `connect_vfo_offset_changed` callback (fires on
-            // both DSP echo and direct user-drag dispatches). Per
-            // CR round 7 on PR #554. We also write it eagerly at
-            // dispatch so a fast back-to-back tick before the
-            // echo round-trip doesn't over-dispatch — the echo
-            // arrives later with the same value, harmless.
-            let baseline = state.last_dispatched_vfo_offset_hz.get();
-            if (live - baseline).abs() > DOPPLER_DISPATCH_THRESHOLD_HZ {
-                state.dispatch_vfo_offset(live);
-            }
-            glib::ControlFlow::Continue
+            doppler_recompute_tick(&panel, &tracker, &cache, &state, &status_bar)
         });
     }
+}
+
+/// One recompute-tick of the Doppler tracker: re-propagate the active
+/// satellite's position and retune the VFO offset when the predicted
+/// Doppler shift moved past the dispatch threshold. Split out per the
+/// 50-NLOC gate (#817).
+fn doppler_recompute_tick(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    tracker: &Rc<RefCell<crate::doppler_tracker::DopplerTracker>>,
+    cache: &std::sync::Arc<sdr_sat::TleCache>,
+    state: &Rc<AppState>,
+    status_bar: &Rc<StatusBar>,
+) -> glib::ControlFlow {
+    use crate::doppler_tracker::{FREQ_MATCH_TOLERANCE_HZ, compute_doppler_offset_hz, should_tick};
+    use sdr_sat::{GroundStation, Satellite};
+
+    // Lifecycle gate: master + running. The status-bar
+    // badge clears on the first not-running tick so the
+    // user gets immediate "Doppler is idle" feedback when
+    // they press Stop — `update_doppler(None)` is
+    // idempotent (set_visible(false) on an already-hidden
+    // label is a no-op). Per #567.
+    if !should_tick(tracker.borrow().master_enabled(), state.is_running.get()) {
+        status_bar.update_doppler(None);
+        return glib::ControlFlow::Continue;
+    }
+    let active_sat = tracker.borrow().active();
+    let Some(sat) = active_sat else {
+        return glib::ControlFlow::Continue;
+    };
+    // Has the user retuned away from the active satellite?
+    // If so, disengage NOW rather than wait up to 1 s for
+    // the trigger tick — otherwise stale Doppler keeps
+    // dispatching against the new center frequency for up
+    // to a full second. Per CR round 5 on PR #554.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "catalog downlinks sit in the 100s of MHz, well \
+                  below f64's 2^53 mantissa ceiling"
+    )]
+    let downlink = sat.downlink_hz as f64;
+    let current_freq = state.center_frequency.get();
+    if (downlink - current_freq).abs() > FREQ_MATCH_TOLERANCE_HZ {
+        let mut t = tracker.borrow_mut();
+        let prior_user_ref = t.user_reference_offset_hz();
+        let _ = t.set_active(None);
+        drop(t);
+        state.dispatch_vfo_offset(prior_user_ref);
+        status_bar.update_doppler(None);
+        return glib::ControlFlow::Continue;
+    }
+    let station = GroundStation::new(
+        panel.lat_row.value(),
+        panel.lon_row.value(),
+        panel.alt_row.value(),
+    );
+    let Ok((line1, line2)) = cache.cached_tle_for(sat.norad_id) else {
+        // TLE evicted between trigger evaluation and
+        // recompute — dormant for this tick; the next
+        // 1 Hz trigger tick will drop the active sat
+        // since `cached_tle_for` will fail there too.
+        return glib::ControlFlow::Continue;
+    };
+    let Ok(parsed) = Satellite::from_tle(sat.name, &line1, &line2) else {
+        return glib::ControlFlow::Continue;
+    };
+    let now = chrono::Utc::now();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "catalog downlinks sit in the 100s of MHz, well \
+                  below f64's 2^53 mantissa ceiling"
+    )]
+    let carrier = sat.downlink_hz as f64;
+    let Ok(doppler) = compute_doppler_offset_hz(&parsed, &station, now, carrier) else {
+        tracing::debug!(
+            satellite = sat.name,
+            "Doppler recompute: SGP4 propagate failed; skipping tick"
+        );
+        return glib::ControlFlow::Continue;
+    };
+    let live = tracker.borrow().live_offset_hz(doppler);
+    // Status bar updates every tick — the kHz/0.1
+    // format hides sub-100-Hz jitter naturally.
+    status_bar.update_doppler(Some(doppler));
+    // SetVfoOffset is rate-limited to material changes.
+    // Baseline lives on `AppState` and is kept in sync by
+    // the `connect_vfo_offset_changed` callback (fires on
+    // both DSP echo and direct user-drag dispatches). Per
+    // CR round 7 on PR #554. We also write it eagerly at
+    // dispatch so a fast back-to-back tick before the
+    // echo round-trip doesn't over-dispatch — the echo
+    // arrives later with the same value, harmless.
+    let baseline = state.last_dispatched_vfo_offset_hz.get();
+    if (live - baseline).abs() > DOPPLER_DISPATCH_THRESHOLD_HZ {
+        state.dispatch_vfo_offset(live);
+    }
+    glib::ControlFlow::Continue
 }
 
 /// One 1 Hz trigger-tick of the Doppler tracker: rebuild the
