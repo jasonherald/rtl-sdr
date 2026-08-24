@@ -2404,61 +2404,83 @@ fn build_pass_bell_button(
     // the closure (and the Vec) pinned forever.
     let displayed_for_toggle = Rc::downgrade(displayed);
     bell_btn.connect_toggled(move |b| {
-        let active = b.is_active();
-        {
-            let mut set = watched_for_toggle.borrow_mut();
-            // `HashSet::insert` / `HashSet::remove`
-            // return whether membership actually
-            // changed. Skip the config write when it
-            // didn't — sibling-mirror re-enters this
-            // handler for every other row of the
-            // same satellite, and without the guard
-            // every mirror would issue an identical
-            // save_watched_satellites call. Per CR
-            // round 3 on PR #568.
-            let changed = if active {
-                set.insert(norad_id)
-            } else {
-                set.remove(&norad_id)
-            };
-            if changed {
-                save_watched_satellites(&config_for_toggle, &set);
-            }
-        }
-        // Mirror across sibling rows. `set_active`
-        // is a no-op when the state already matches,
-        // so the recursion terminates after one
-        // round-trip per sibling. The pointer
-        // compare keeps us from re-entering THIS
-        // button's own handler. If the displayed
-        // Vec has already been dropped (window
-        // teardown), the upgrade fails and we
-        // simply skip mirroring — the watched-set
-        // write above is the only persistent
-        // effect that matters at that point.
-        //
-        // Match siblings by NORAD id, not display
-        // name: the watched set is keyed by id, and
-        // any future catalog drift where two entries
-        // share a label (alternate names, alias
-        // entries) would otherwise toggle the wrong
-        // satellite's bells. Per CR round 1 on PR
-        // #568.
-        let Some(displayed) = displayed_for_toggle.upgrade() else {
-            return;
-        };
-        for entry in displayed.borrow().iter() {
-            if norad_id_for_pass(&entry.pass) == Some(norad_id)
-                && let Some(other) = &entry.bell_btn
-                && other.as_ptr() != b.as_ptr()
-                && other.is_active() != active
-            {
-                other.set_active(active);
-            }
-        }
+        on_pass_bell_toggled(
+            b,
+            norad_id,
+            &watched_for_toggle,
+            &config_for_toggle,
+            &displayed_for_toggle,
+        );
     });
     row.add_suffix(&bell_btn);
     Some(bell_btn)
+}
+
+/// Toggle body of a pass bell: flip the per-satellite subscription
+/// (persisting only on real membership change — sibling mirroring
+/// re-enters this handler; CR round 3 on PR #568), then mirror the
+/// state across sibling rows by NORAD id (CR round 1 on PR #568).
+fn on_pass_bell_toggled(
+    b: &gtk4::ToggleButton,
+    norad_id: u32,
+    watched: &Rc<RefCell<std::collections::HashSet<u32>>>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    displayed: &std::rc::Weak<RefCell<Vec<DisplayedPass>>>,
+) {
+    use sidebar::satellites_panel::{norad_id_for_pass, save_watched_satellites};
+
+    let active = b.is_active();
+    {
+        let mut set = watched.borrow_mut();
+        // `HashSet::insert` / `HashSet::remove`
+        // return whether membership actually
+        // changed. Skip the config write when it
+        // didn't — sibling-mirror re-enters this
+        // handler for every other row of the
+        // same satellite, and without the guard
+        // every mirror would issue an identical
+        // save_watched_satellites call. Per CR
+        // round 3 on PR #568.
+        let changed = if active {
+            set.insert(norad_id)
+        } else {
+            set.remove(&norad_id)
+        };
+        if changed {
+            save_watched_satellites(&config, &set);
+        }
+    }
+    // Mirror across sibling rows. `set_active`
+    // is a no-op when the state already matches,
+    // so the recursion terminates after one
+    // round-trip per sibling. The pointer
+    // compare keeps us from re-entering THIS
+    // button's own handler. If the displayed
+    // Vec has already been dropped (window
+    // teardown), the upgrade fails and we
+    // simply skip mirroring — the watched-set
+    // write above is the only persistent
+    // effect that matters at that point.
+    //
+    // Match siblings by NORAD id, not display
+    // name: the watched set is keyed by id, and
+    // any future catalog drift where two entries
+    // share a label (alternate names, alias
+    // entries) would otherwise toggle the wrong
+    // satellite's bells. Per CR round 1 on PR
+    // #568.
+    let Some(displayed) = displayed.upgrade() else {
+        return;
+    };
+    for entry in displayed.borrow().iter() {
+        if norad_id_for_pass(&entry.pass) == Some(norad_id)
+            && let Some(other) = &entry.bell_btn
+            && other.as_ptr() != b.as_ptr()
+            && other.is_active() != active
+        {
+            other.set_active(active);
+        }
+    }
 }
 
 /// Per-row play button — one-click tune to the satellite's downlink
