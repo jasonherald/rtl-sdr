@@ -846,18 +846,10 @@ fn interpret_recorder_action(deps: &RecorderDeps, action: sidebar::satellites_re
             tracing::info!("auto-record LOS: resetting imaging decoders");
             deps.state.send_dsp(UiToDsp::ResetImagingDecoders);
         }
-        RecorderAction::SavePng(path) => {
-            on_save_apt_png(deps, path);
-        }
-        RecorderAction::SaveLrptPass(dir) => {
-            on_save_lrpt_pass(deps, dir);
-        }
-        RecorderAction::SaveSstvPass(dir) => {
-            on_save_sstv_pass(deps, dir);
-        }
-        RecorderAction::RestoreTune(saved) => {
-            on_restore_tune(deps, saved);
-        }
+        RecorderAction::SavePng(path) => on_save_apt_png(deps, path),
+        RecorderAction::SaveLrptPass(dir) => on_save_lrpt_pass(deps, dir),
+        RecorderAction::SaveSstvPass(dir) => on_save_sstv_pass(deps, dir),
+        RecorderAction::RestoreTune(saved) => on_restore_tune(deps, saved),
         RecorderAction::Toast { message, kind } => {
             if matches!(kind, ToastKind::Warn) {
                 // No dedicated warn styling on AdwToast; the
