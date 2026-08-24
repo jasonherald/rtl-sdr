@@ -204,6 +204,26 @@ fn on_gain_list(ctx: &DspEventCtx, gains: &[f64]) {
     }
 }
 
+
+/// Recording ↔ transcription mutex, UI leg: the controller's
+/// `stop_transcription` on both recording-start paths is silent (no
+/// paired `DspToUi` event), so the enable switch would stay on while
+/// the tap is already dead. Flip it off here — `set_active(false)`
+/// runs the normal stop path (row unlock, status clear; the
+/// `DisableTranscription` re-dispatch is idempotent). Per CR round 2
+/// on PR #844.
+fn resync_transcription_switch_for_recording(ctx: &DspEventCtx) {
+    if ctx.transcription_enable_row.is_active() {
+        tracing::info!("recording started — stopping active transcription session");
+        ctx.transcription_enable_row.set_active(false);
+        if let Some(overlay) = ctx.toast_overlay_weak.upgrade() {
+            overlay.add_toast(plain_toast(
+                "Transcription stopped — recording and transcription are mutually exclusive",
+            ));
+        }
+    }
+}
+
 /// `DspToUi::AudioRecordingStarted` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
 fn on_audio_recording_started(ctx: &DspEventCtx, path: &std::path::Path) {
@@ -217,6 +237,7 @@ fn on_audio_recording_started(ctx: &DspEventCtx, path: &std::path::Path) {
     // close-to-tray Quit confirmation modal) reflects reality.
     // Per #512.
     state.audio_recording_active.set(true);
+    resync_transcription_switch_for_recording(ctx);
     if let Some(overlay) = toast_overlay_weak.upgrade() {
         let name = path
             .file_name()
@@ -254,6 +275,7 @@ fn on_iq_recording_started(ctx: &DspEventCtx, path: &std::path::Path) {
         ..
     } = ctx;
     tracing::info!(?path, "IQ recording started");
+    resync_transcription_switch_for_recording(ctx);
     // Mirror into AppState so is_recording() (used by the
     // close-to-tray Quit confirmation modal) reflects reality.
     // Per #512.

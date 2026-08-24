@@ -246,18 +246,16 @@ pub fn build_aviation_panel(channel_count: usize) -> AviationPanel {
         .build();
 
     let station_id_row = adw::EntryRow::builder().title("Station ID").build();
-    // 8-char cap matches acarsdec's `idstation` field width
+    // `ACARS_STATION_ID_MAX_CHARS` cap matches acarsdec's `idstation` width
     // (output.c uses an 8-byte char array for the station_id
     // embedded in JSON output). `AdwEntryRow` doesn't expose
     // `set_max_length` directly, so we truncate on `changed`.
     // CR round 2 on PR #595.
     station_id_row.connect_changed(|row| {
+        use crate::acars_config::ACARS_STATION_ID_MAX_CHARS;
         let text = row.text();
-        if text.chars().count() > 8 {
-            let truncated: String = text
-                .chars()
-                .take(crate::acars_config::ACARS_STATION_ID_MAX_CHARS)
-                .collect();
+        if text.chars().count() > ACARS_STATION_ID_MAX_CHARS {
+            let truncated: String = text.chars().take(ACARS_STATION_ID_MAX_CHARS).collect();
             row.set_text(&truncated);
         }
     });

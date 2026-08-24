@@ -143,7 +143,6 @@ fn begin_model_reload_ui(status: &gtk4::Label, progress: &gtk4::ProgressBar, mod
 /// `Some(Break)` on a terminal event (Ready / Failed / worker
 /// disconnect) and `None` when the queue is drained and polling
 /// should continue. Split out per the 50-NLOC gate (#817).
-#[allow(clippy::too_many_arguments)]
 fn drain_sherpa_reload_events(
     event_rx: &std::sync::mpsc::Receiver<sdr_transcription::InitEvent>,
     ui: &ReloadUi,

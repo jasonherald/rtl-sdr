@@ -15,9 +15,10 @@ use super::super::adw;
 /// match within `ACARS_COLLAPSE_WINDOW`. Returns the matched
 /// row's index after bumping its count + `last_seen` in place,
 /// or `None` if no in-window match — in which case the caller
-/// appends a fresh row. Stops walking as soon as it sees a row
-/// older than the recency window (rows are insertion-ordered
-/// in the underlying store, oldest at index 0). Issue #586.
+/// appends a fresh row. Scans every row: `record_duplicate`
+/// updates `last_seen` in place without reordering the store,
+/// so index order does not imply age order and an early exit
+/// would miss valid matches. Issue #586.
 pub(in crate::window) fn try_collapse_into_existing(
     store: &gtk4::gio::ListStore,
     msg: &sdr_acars::AcarsMessage,

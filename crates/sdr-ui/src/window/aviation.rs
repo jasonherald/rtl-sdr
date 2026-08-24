@@ -165,6 +165,12 @@ fn on_acars_region_selected(
         custom_row_for_dispatch.set_visible(true);
         let saved = crate::acars_config::read_acars_custom_channels(config);
         if saved.is_empty() {
+            // Persist the Custom selection itself even though no
+            // channel list exists yet — the apply handler saves
+            // only the list, so skipping this would restore the
+            // previous region on next launch. Per CR round 2 on
+            // PR #844.
+            crate::acars_config::save_acars_channel_set(config, region.config_id());
             tracing::info!(
                 "acars region: Custom selected with no saved channels — awaiting EntryRow apply"
             );

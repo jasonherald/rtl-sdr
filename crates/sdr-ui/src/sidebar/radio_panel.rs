@@ -165,13 +165,13 @@ const SQUELCH_PAGE_DB: f64 = 10.0;
 /// Combo indices of the De-emphasis `StringList` model
 /// (`["None", "50 µs (EU)", "75 µs (US)"]`). Keep in lock-step with
 /// the model built in `build_radio_panel`.
-pub const DEEMPHASIS_NONE_IDX: u32 = 0;
+pub(crate) const DEEMPHASIS_NONE_IDX: u32 = 0;
 /// 50 µs (EU) entry of the De-emphasis combo model.
-pub const DEEMPHASIS_EU50_IDX: u32 = 1;
+pub(crate) const DEEMPHASIS_EU50_IDX: u32 = 1;
 /// 75 µs (US) entry of the De-emphasis combo model.
-pub const DEEMPHASIS_US75_IDX: u32 = 2;
+pub(crate) const DEEMPHASIS_US75_IDX: u32 = 2;
 /// Number of entries in the De-emphasis combo model.
-pub const DEEMPHASIS_MODEL_LEN: u32 = 3;
+pub(crate) const DEEMPHASIS_MODEL_LEN: u32 = 3;
 
 /// Radio / demodulator configuration panel with references to interactive rows.
 #[derive(Clone)]

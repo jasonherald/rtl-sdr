@@ -310,14 +310,6 @@ fn wire_scanner_master_switch(
         }
     });
 
-    // Restore persisted slider values BEFORE wiring the notify
-    // handlers below. `set_value` on a SpinRow fires
-    // `value-changed`, so if we wired first and restored after
-    // we'd trigger a spurious `save_default_*_ms` +
-    // `project_and_push_scanner_channels` during window
-    // construction — plus `build_window` re-seeds the scanner
-    // right after `connect_sidebar_panels` returns, which would
-    // pile on a second redundant dispatch per slider.
 }
 
 /// Lockout button -> LockoutScannerChannel(active key).
@@ -343,6 +335,14 @@ fn wire_scanner_lockout_button(
     });
 }
 
+// Restore persisted slider values BEFORE wiring the notify
+// handlers (`wire_scanner_timing_rows` body order). `set_value` on a
+// SpinRow fires `value-changed`, so if we wired first and restored
+// after we'd trigger a spurious `save_default_*_ms` +
+// `project_and_push_scanner_channels` during window construction —
+// plus `build_window` re-seeds the scanner right after
+// `connect_sidebar_panels` returns, which would pile on a second
+// redundant dispatch per slider.
 /// Dwell / hang rows with persisted seeds.
 /// Split out per the 50-NLOC gate (#817).
 fn wire_scanner_timing_rows(
