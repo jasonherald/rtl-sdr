@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use sdr_server_rtltcp::{ClientInfo, InitialDeviceState, codec::Codec};
 
-use super::{
+use super::status::{
     SERVER_STATUS_POLL_INTERVAL, format_commanded_state, format_data_rate, format_hz, format_uptime,
 };
 
@@ -224,7 +224,7 @@ fn format_commanded_state_renders_manual_gain_in_db() {
 
 #[test]
 fn format_log_age_buckets() {
-    use super::format_log_age;
+    use super::status::format_log_age;
     // < 2 s → "just now" debounces the 500 ms poll from showing
     // "0s ago" / "1s ago" noise on the most-recent entry.
     assert_eq!(format_log_age(Duration::from_millis(0)), "just now");

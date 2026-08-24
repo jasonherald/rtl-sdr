@@ -246,15 +246,16 @@ pub fn build_aviation_panel(channel_count: usize) -> AviationPanel {
         .build();
 
     let station_id_row = adw::EntryRow::builder().title("Station ID").build();
-    // 8-char cap matches acarsdec's `idstation` field width
+    // `ACARS_STATION_ID_MAX_CHARS` cap matches acarsdec's `idstation` width
     // (output.c uses an 8-byte char array for the station_id
     // embedded in JSON output). `AdwEntryRow` doesn't expose
     // `set_max_length` directly, so we truncate on `changed`.
     // CR round 2 on PR #595.
     station_id_row.connect_changed(|row| {
+        use crate::acars_config::ACARS_STATION_ID_MAX_CHARS;
         let text = row.text();
-        if text.chars().count() > 8 {
-            let truncated: String = text.chars().take(8).collect();
+        if text.chars().count() > ACARS_STATION_ID_MAX_CHARS {
+            let truncated: String = text.chars().take(ACARS_STATION_ID_MAX_CHARS).collect();
             row.set_text(&truncated);
         }
     });
@@ -315,14 +316,25 @@ pub fn build_aviation_panel(channel_count: usize) -> AviationPanel {
 /// is variable, including 0 when the user hasn't entered a CSV
 /// yet). Issue #592.
 pub fn rebuild_channel_rows(panel: &AviationPanel, channel_count: usize) {
-    let mut rows = panel.channel_rows.borrow_mut();
+    rebuild_channel_rows_parts(&panel.channels_group, &panel.channel_rows, channel_count);
+}
+
+/// Field-level form of [`rebuild_channel_rows`] for signal-handler
+/// closures that can't capture the whole (non-`Clone`) panel struct —
+/// they clone the group + rows cell instead.
+pub fn rebuild_channel_rows_parts(
+    channels_group: &adw::PreferencesGroup,
+    channel_rows: &std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>>,
+    channel_count: usize,
+) {
+    let mut rows = channel_rows.borrow_mut();
     for row in rows.iter() {
-        panel.channels_group.remove(row);
+        channels_group.remove(row);
     }
     rows.clear();
     for _ in 0..channel_count {
         let row = adw::ActionRow::builder().title("—").subtitle("—").build();
-        panel.channels_group.add(&row);
+        channels_group.add(&row);
         rows.push(row);
     }
 }

@@ -42,6 +42,17 @@ pub const KEY_ACARS_STATION_ID: &str = "acars_station_id";
 /// yet (or the active region isn't Custom). Issue #592.
 pub const KEY_ACARS_CUSTOM_CHANNELS: &str = "acars_custom_channels";
 
+/// UI-side mirror of the DSP's station-ID cap
+/// (`sdr_core::acars_output::STATION_ID_MAX_CHARS` is crate-private).
+/// Applied at every entry point so the sidebar truncation, wiring
+/// normalization, and DSP handling cannot drift. Per CR round 1 on
+/// PR #844.
+pub const ACARS_STATION_ID_MAX_CHARS: usize = 8;
+
+/// Placeholder shown for the JSONL log target when the path row is
+/// empty — the DSP falls back to this well-known location.
+pub const ACARS_JSONL_DEFAULT_PATH: &str = "~/sdr-recordings/acars.jsonl";
+
 /// Default value used when a key is missing from the config.
 const DEFAULT_ACARS_ENABLED: bool = false;
 const DEFAULT_ACARS_CHANNEL_SET: &str = "us-6";

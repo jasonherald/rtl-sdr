@@ -163,6 +163,11 @@ const NOISE_GATE_PAGE: f64 = 1.0;
 
 /// Transcript panel with toggle switch, model picker, tuning sliders,
 /// status label, progress bar, scrolling transcript log, and clear button.
+///
+/// `Clone` is a cheap per-widget `GObject` refcount bump — same idiom as
+/// `RadioPanel` — so session closures can capture one panel handle
+/// instead of a dozen row clones.
+#[derive(Clone)]
 pub struct TranscriptPanel {
     /// The `AdwPreferencesGroup` widget to pack into the sidebar.
     pub widget: adw::PreferencesGroup,
