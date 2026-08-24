@@ -182,11 +182,6 @@ pub(super) fn connect_transcript_panel(
     let status_label = transcript.status_label.clone();
     let progress_bar = transcript.progress_bar.clone();
     let text_view = transcript.text_view.clone();
-    let model_row = transcript.model_row.clone();
-    #[cfg(feature = "whisper")]
-    let silence_row = transcript.silence_row.clone();
-    let noise_gate_row = transcript.noise_gate_row.clone();
-    let audio_enhancement_row = transcript.audio_enhancement_row.clone();
     // Weak refs used by the async event-loop closure to drive the same
     // teardown the synchronous error path does (see below) when the
     // backend fires TranscriptionEvent::Error mid-session. Weak so the
@@ -197,19 +192,7 @@ pub(super) fn connect_transcript_panel(
     // needs individually; the lock/unlock set lives in
     // `SessionRowWeaks`.
     #[cfg(feature = "sherpa")]
-    let model_row_weak = model_row.downgrade();
-    #[cfg(feature = "sherpa")]
-    let display_mode_row = transcript.display_mode_row.clone();
-    #[cfg(feature = "sherpa")]
-    let vad_threshold_row = transcript.vad_threshold_row.clone();
-    #[cfg(feature = "sherpa")]
-    let auto_break_row = transcript.auto_break_row.clone();
-    #[cfg(feature = "sherpa")]
-    let auto_break_min_open_row = transcript.auto_break_min_open_row.clone();
-    #[cfg(feature = "sherpa")]
-    let auto_break_tail_row = transcript.auto_break_tail_row.clone();
-    #[cfg(feature = "sherpa")]
-    let auto_break_min_segment_row = transcript.auto_break_min_segment_row.clone();
+    let model_row_weak = transcript.model_row.downgrade();
     #[cfg(feature = "sherpa")]
     let squelch_enabled_row_for_session = squelch_enabled_row.clone();
     #[cfg(feature = "sherpa")]
@@ -217,7 +200,7 @@ pub(super) fn connect_transcript_panel(
     #[cfg(feature = "sherpa")]
     let live_line_label = transcript.live_line_label.clone();
     #[cfg(feature = "sherpa")]
-    let display_mode_row_weak = display_mode_row.downgrade();
+    let display_mode_row_weak = transcript.display_mode_row.downgrade();
     #[cfg(feature = "sherpa")]
     let live_line_weak = live_line_label.downgrade();
 
@@ -230,7 +213,7 @@ pub(super) fn connect_transcript_panel(
             // session-start branch; the Auto Break eligibility check
             // below needs it, and the BackendConfig construction
             // below reuses it.
-            let model_idx = model_row.selected() as usize;
+            let model_idx = panel_for_session.model_row.selected() as usize;
 
             // Auto Break is eligible ONLY when all three conditions
             // hold: (1) the toggle itself is on, (2) the current demod
@@ -251,7 +234,7 @@ pub(super) fn connect_transcript_panel(
                     .get(model_idx)
                     .copied()
                     .is_some_and(|m| !m.supports_partials());
-                auto_break_row.is_active()
+                panel_for_session.auto_break_row.is_active()
                     && state_clone.demod_mode.get() == sdr_types::DemodMode::Nfm
                     && selected_is_offline
             };
@@ -279,26 +262,10 @@ pub(super) fn connect_transcript_panel(
             }
 
             // Lock model and tuning controls while transcription is active.
-            model_row.set_sensitive(false);
-            #[cfg(feature = "whisper")]
-            silence_row.set_sensitive(false);
-            noise_gate_row.set_sensitive(false);
-            audio_enhancement_row.set_sensitive(false);
             // All settings lock during a session for mid-session fault
             // tolerance — walks back PR 4's earlier display_mode_row
             // exception. User stops, changes, starts.
-            #[cfg(feature = "sherpa")]
-            display_mode_row.set_sensitive(false);
-            #[cfg(feature = "sherpa")]
-            vad_threshold_row.set_sensitive(false);
-            #[cfg(feature = "sherpa")]
-            auto_break_row.set_sensitive(false);
-            #[cfg(feature = "sherpa")]
-            auto_break_min_open_row.set_sensitive(false);
-            #[cfg(feature = "sherpa")]
-            auto_break_tail_row.set_sensitive(false);
-            #[cfg(feature = "sherpa")]
-            auto_break_min_segment_row.set_sensitive(false);
+            lock_session_rows(&panel_for_session);
 
             // Read tuning slider values.
             #[cfg(feature = "whisper")]
@@ -516,6 +483,25 @@ pub(super) fn connect_transcript_panel(
     });
 
     engine
+}
+
+/// Disable every transcription settings row for the duration of a
+/// session. Counterpart of [`SessionRowWeaks::unlock`].
+fn lock_session_rows(t: &sidebar::transcript_panel::TranscriptPanel) {
+    t.model_row.set_sensitive(false);
+    #[cfg(feature = "whisper")]
+    t.silence_row.set_sensitive(false);
+    t.noise_gate_row.set_sensitive(false);
+    t.audio_enhancement_row.set_sensitive(false);
+    #[cfg(feature = "sherpa")]
+    {
+        t.display_mode_row.set_sensitive(false);
+        t.vad_threshold_row.set_sensitive(false);
+        t.auto_break_row.set_sensitive(false);
+        t.auto_break_min_open_row.set_sensitive(false);
+        t.auto_break_tail_row.set_sensitive(false);
+        t.auto_break_min_segment_row.set_sensitive(false);
+    }
 }
 
 /// Mid-session failure teardown, shared by the `Error` event arm and
