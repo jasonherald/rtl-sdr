@@ -586,12 +586,10 @@ struct TickDeps {
     state: Rc<AppState>,
     displayed: Rc<RefCell<Vec<DisplayedPass>>>,
     recompute: Rc<dyn Fn()>,
-    recorder: Rc<RefCell<sidebar::satellites_recorder::AutoRecorder>>,
     interpret: Rc<dyn Fn(sidebar::satellites_recorder::Action)>,
     spectrum: Rc<spectrum::SpectrumHandle>,
     config: std::sync::Arc<sdr_config::ConfigManager>,
     watched: Rc<RefCell<std::collections::HashSet<u32>>>,
-    notify_scheduler: Rc<RefCell<sidebar::satellites_notify::NotifyScheduler>>,
     bandwidth_row: adw::SpinRow,
     scanner_switch: gtk4::Switch,
     squelch_enabled_row: adw::SwitchRow,
@@ -611,6 +609,8 @@ struct TickDeps {
 /// the panel weakly so the source returns `ControlFlow::Break` once
 /// the panel is dropped.
 fn arm_recorder_tick(deps: TickDeps) {
+    let recorder = RefCell::new(sidebar::satellites_recorder::AutoRecorder::new());
+    let notify_scheduler = RefCell::new(sidebar::satellites_notify::NotifyScheduler::new());
     use sdr_sat::Pass;
     use sidebar::satellites_notify::Action as NotifyAction;
     use sidebar::satellites_panel::{
@@ -692,7 +692,7 @@ fn arm_recorder_tick(deps: TickDeps) {
         // next eligible pass without a restart. Per #511.
         let min_elev_deg =
             AutoRecordQuality::from_index(panel.auto_record_quality_row.selected()).min_elev_deg();
-        let actions = deps.recorder.borrow_mut().tick(
+        let actions = recorder.borrow_mut().tick(
             now,
             &passes_snapshot,
             auto_record_on,
@@ -748,7 +748,7 @@ fn arm_recorder_tick(deps: TickDeps) {
                 .iter()
                 .filter_map(|e| norad_id_for_pass(&e.pass).map(|id| (id, &e.pass)))
                 .collect();
-            deps.notify_scheduler
+            notify_scheduler
                 .borrow_mut()
                 .tick(now, lead, lead_min, pairs, |id| {
                     watched_snapshot.contains(&id)
@@ -796,9 +796,6 @@ fn wire_recorder(
     watched: &Rc<RefCell<std::collections::HashSet<u32>>>,
     cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
 ) {
-    let notify_scheduler = Rc::new(RefCell::new(
-        sidebar::satellites_notify::NotifyScheduler::new(),
-    ));
     // 1 Hz countdown ticker. Only scheduled when the cache is
     // available — without it `displayed` stays empty forever and
     // the timer would tick uselessly. Captures the panel weakly
@@ -811,9 +808,6 @@ fn wire_recorder(
     // GLib source. The recorder itself is pure (returns
     // `Vec<RecorderAction>`); the closure below interprets each
     // action against the live UI / DSP / filesystem.
-    let recorder: Rc<RefCell<sidebar::satellites_recorder::AutoRecorder>> = Rc::new(RefCell::new(
-        sidebar::satellites_recorder::AutoRecorder::new(),
-    ));
 
     let interpret_action = build_recorder_interpreter(
         panels,
@@ -841,12 +835,10 @@ fn wire_recorder(
             state: Rc::clone(state),
             displayed: Rc::clone(&displayed),
             recompute: Rc::clone(&recompute),
-            recorder: Rc::clone(&recorder),
             interpret: Rc::clone(&interpret_action),
             spectrum: Rc::clone(spectrum_handle),
             config: std::sync::Arc::clone(config),
             watched: Rc::clone(&watched),
-            notify_scheduler: Rc::clone(&notify_scheduler),
             bandwidth_row: panels.radio.bandwidth_row.clone(),
             scanner_switch: panels.scanner.master_switch.clone(),
             squelch_enabled_row: panels.radio.squelch_enabled_row.clone(),
