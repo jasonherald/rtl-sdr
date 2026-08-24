@@ -260,6 +260,104 @@ fn seed_persisted_panel_values(
         .set_subtitle(&format_last_refresh(config));
 }
 
+/// Persist the notify-lead SpinRow on change.
+fn wire_notify_lead_persistence(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    let config_lead = std::sync::Arc::clone(config);
+    panel.notify_lead_row.connect_value_notify(move |row| {
+        #[allow(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "SpinRow is bounded NOTIFY_LEAD_MIN_LOWER..=UPPER \
+                      (positive, < u32::MAX)"
+        )]
+        let value = row.value().round() as u32;
+        sidebar::satellites_panel::save_notify_lead_min(&config_lead, value);
+    });
+}
+
+/// Wire the persist-only auto-record handlers: APT master toggle,
+/// "also save audio" (#533), false-colour composites (#547), and the
+/// quality threshold combo (validated through
+/// `AutoRecordQuality::from_index` per CR round 1 on PR #574). The
+/// recorder samples these widgets at AOS/LOS; flipping mid-pass does
+/// not retroactively start or stop anything.
+fn wire_auto_record_persistence(
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    use sidebar::satellites_panel::{
+        save_auto_record_apt, save_auto_record_audio, save_auto_record_composites,
+    };
+    // Auto-record toggle — persist only. The actual "tune the
+    // radio + start APT decoding when a NOAA pass starts" wiring
+    // lands in #482 and reads from the same config key.
+    {
+        let config_auto = std::sync::Arc::clone(config);
+        panel.auto_record_switch.connect_active_notify(move |sw| {
+            save_auto_record_apt(&config_auto, sw.is_active());
+        });
+    }
+
+    // "Also save audio" toggle — persist only. The recorder's
+    // 1 Hz tick samples this switch's `is_active()` at AOS.
+    // Per #533.
+    {
+        let config_audio = std::sync::Arc::clone(config);
+        panel
+            .auto_record_audio_switch
+            .connect_active_notify(move |sw| {
+                save_auto_record_audio(&config_audio, sw.is_active());
+            });
+    }
+
+    // "Save false-colour composites" toggle — persist only. The
+    // `RecorderAction::SaveLrptPass` handler reads
+    // `panel.auto_record_composites_switch.is_active()` at LOS
+    // (mirrors the audio-save sampling pattern — flipping
+    // mid-pass doesn't retroactively start or stop anything).
+    // Per #547.
+    {
+        let config_comp = std::sync::Arc::clone(config);
+        panel
+            .auto_record_composites_switch
+            .connect_active_notify(move |sw| {
+                save_auto_record_composites(&config_comp, sw.is_active());
+                tracing::info!(on = sw.is_active(), "auto_record_composites persisted");
+            });
+    }
+
+    // Persist the quality threshold on change via the symmetric
+    // writer. Validating through `AutoRecordQuality::from_index`
+    // before the write protects the config against transient
+    // out-of-range indices that GTK can emit during model churn —
+    // an unrecognized value would round-trip back to the default
+    // tier on the next read otherwise. Per CR round 1 on PR #574.
+    {
+        let config_quality = std::sync::Arc::clone(config);
+        panel
+            .auto_record_quality_row
+            .connect_selected_notify(move |row| {
+                let raw = row.selected();
+                let quality = crate::sidebar::satellites_panel::AutoRecordQuality::from_index(raw);
+                if quality.to_index() != raw {
+                    // Transient model-churn value (e.g. mid-rebuild
+                    // selection-cleared). Skip the write so we don't
+                    // overwrite a valid persisted index with garbage.
+                    tracing::debug!(raw, "auto_record_quality: ignoring transient combo index");
+                    return;
+                }
+                crate::sidebar::satellites_panel::save_auto_record_quality(
+                    &config_quality,
+                    quality,
+                );
+                tracing::info!(idx = quality.to_index(), "auto_record_quality persisted");
+            });
+    }
+}
+
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
@@ -275,8 +373,7 @@ pub(super) fn connect_satellites_panel(
     use sidebar::satellites_panel::{
         AutoRecordQuality, KEY_STATION_ALT_M, KEY_STATION_LAT_DEG, KEY_STATION_LON_DEG,
         SatellitesPanelWeak, format_pass_title, load_notify_lead_min, load_watched_satellites,
-        norad_id_for_pass, save_auto_record_apt, save_auto_record_audio,
-        save_auto_record_composites, save_f64,
+        norad_id_for_pass, save_f64,
     };
     use sidebar::satellites_recorder::{Action as RecorderAction, AutoRecorder, SavedTune};
 
@@ -291,19 +388,7 @@ pub(super) fn connect_satellites_panel(
 
     seed_persisted_panel_values(panel, config);
 
-    {
-        let config_lead = std::sync::Arc::clone(config);
-        panel.notify_lead_row.connect_value_notify(move |row| {
-            #[allow(
-                clippy::cast_sign_loss,
-                clippy::cast_possible_truncation,
-                reason = "SpinRow is bounded NOTIFY_LEAD_MIN_LOWER..=UPPER \
-                          (positive, < u32::MAX)"
-            )]
-            let value = row.value().round() as u32;
-            sidebar::satellites_panel::save_notify_lead_min(&config_lead, value);
-        });
-    }
+    wire_notify_lead_persistence(panel, config);
 
     // `Option<Arc<TleCache>>`. `None` means the platform refused us
     // a cache directory (rare; sandboxed minimal environments).
@@ -398,71 +483,7 @@ pub(super) fn connect_satellites_panel(
         });
     }
 
-    // Auto-record toggle — persist only. The actual "tune the
-    // radio + start APT decoding when a NOAA pass starts" wiring
-    // lands in #482 and reads from the same config key.
-    {
-        let config_auto = std::sync::Arc::clone(config);
-        panel.auto_record_switch.connect_active_notify(move |sw| {
-            save_auto_record_apt(&config_auto, sw.is_active());
-        });
-    }
-
-    // "Also save audio" toggle — persist only. The recorder's
-    // 1 Hz tick samples this switch's `is_active()` at AOS.
-    // Per #533.
-    {
-        let config_audio = std::sync::Arc::clone(config);
-        panel
-            .auto_record_audio_switch
-            .connect_active_notify(move |sw| {
-                save_auto_record_audio(&config_audio, sw.is_active());
-            });
-    }
-
-    // "Save false-colour composites" toggle — persist only. The
-    // `RecorderAction::SaveLrptPass` handler reads
-    // `panel.auto_record_composites_switch.is_active()` at LOS
-    // (mirrors the audio-save sampling pattern — flipping
-    // mid-pass doesn't retroactively start or stop anything).
-    // Per #547.
-    {
-        let config_comp = std::sync::Arc::clone(config);
-        panel
-            .auto_record_composites_switch
-            .connect_active_notify(move |sw| {
-                save_auto_record_composites(&config_comp, sw.is_active());
-                tracing::info!(on = sw.is_active(), "auto_record_composites persisted");
-            });
-    }
-
-    // Persist the quality threshold on change via the symmetric
-    // writer. Validating through `AutoRecordQuality::from_index`
-    // before the write protects the config against transient
-    // out-of-range indices that GTK can emit during model churn —
-    // an unrecognized value would round-trip back to the default
-    // tier on the next read otherwise. Per CR round 1 on PR #574.
-    {
-        let config_quality = std::sync::Arc::clone(config);
-        panel
-            .auto_record_quality_row
-            .connect_selected_notify(move |row| {
-                let raw = row.selected();
-                let quality = crate::sidebar::satellites_panel::AutoRecordQuality::from_index(raw);
-                if quality.to_index() != raw {
-                    // Transient model-churn value (e.g. mid-rebuild
-                    // selection-cleared). Skip the write so we don't
-                    // overwrite a valid persisted index with garbage.
-                    tracing::debug!(raw, "auto_record_quality: ignoring transient combo index");
-                    return;
-                }
-                crate::sidebar::satellites_panel::save_auto_record_quality(
-                    &config_quality,
-                    quality,
-                );
-                tracing::info!(idx = quality.to_index(), "auto_record_quality persisted");
-            });
-    }
+    wire_auto_record_persistence(panel, config);
 
     // Doppler-correction tracker (#521).
     //
