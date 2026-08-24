@@ -1527,19 +1527,39 @@ fn on_save_apt_png(deps: &RecorderDeps, path: std::path::PathBuf) {
     // identity of the window we'll attempt to close, while
     // staying weak so a closed/dropped window upgrades to
     // None and we no-op. Per CR round 3 on PR #571.
-    let exported_window_weak = deps.state.apt_viewer_window.borrow().as_ref().cloned();
+    let done = AptExportDone {
+        path: path_for_msg,
+        rotate_180,
+        mode,
+        window_weak: deps.state.apt_viewer_window.borrow().as_ref().cloned(),
+        pass: exported_pass,
+    };
     view.export_png_full_async(path_for_export, mode, rotate_180, move |result| {
         on_apt_export_complete(
             result,
-            &path_for_msg,
-            rotate_180,
-            mode,
+            &done,
             &toast_overlay_for_complete,
             &state_for_complete,
-            exported_window_weak.as_ref(),
-            exported_pass,
         );
     });
+}
+
+/// Snapshot taken at APT-export start, consumed by the async
+/// completion callback.
+struct AptExportDone {
+    /// Destination path, kept for the toast / log messages.
+    path: std::path::PathBuf,
+    rotate_180: bool,
+    mode: sdr_radio::apt_image::BrightnessMode,
+    /// Viewer window snapshotted at export START — the user closing
+    /// and reopening the viewer mid-export must not close the wrong
+    /// window; cloning the WeakRef pins the identity while staying
+    /// weak so a dropped window upgrades to None and we no-op. Per
+    /// CR round 3 on PR #571.
+    window_weak: Option<glib::WeakRef<adw::Window>>,
+    /// Recording-pass tuple for the compare-and-clear on
+    /// completion. Per CR round 4 on PR #571.
+    pass: Option<(u32, chrono::DateTime<chrono::Utc>)>,
 }
 
 /// Completion side of the async APT PNG export: toast the outcome,
@@ -1548,17 +1568,21 @@ fn on_save_apt_png(deps: &RecorderDeps, path: std::path::PathBuf) {
 /// on PR #571), and clear the recording-pass slot only when it still
 /// holds the exported pass (a new AOS may own it — CR round 4 on
 /// PR #571).
-#[allow(clippy::too_many_arguments)]
 fn on_apt_export_complete(
     result: Result<(), crate::viewer::ViewerError>,
-    path_for_msg: &std::path::Path,
-    rotate_180: bool,
-    mode: sdr_radio::apt_image::BrightnessMode,
+    done: &AptExportDone,
     toast_overlay: &glib::WeakRef<adw::ToastOverlay>,
     state: &Rc<AppState>,
-    exported_window_weak: Option<&glib::WeakRef<adw::Window>>,
-    exported_pass: Option<(u32, chrono::DateTime<chrono::Utc>)>,
 ) {
+    let AptExportDone {
+        path: path_for_msg,
+        rotate_180,
+        mode,
+        window_weak,
+        pass: exported_pass,
+    } = done;
+    let exported_pass = *exported_pass;
+    let exported_window_weak = window_weak.as_ref();
     let (export_ok, msg) = match result {
         Ok(()) => {
             tracing::info!(
