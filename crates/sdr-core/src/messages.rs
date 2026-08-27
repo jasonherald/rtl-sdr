@@ -244,6 +244,10 @@ pub enum SourceType {
     /// the 5-byte command channel. Distinct from `Network` because
     /// the wire protocol and feature set diverge.
     RtlTcp,
+    /// Airspy R2 / Mini USB receiver (`libairspy-rs`). 12-bit ADC,
+    /// firmware-reported rate table, composite linearity gain. Per
+    /// issue #848.
+    Airspy,
 }
 
 /// Messages sent from the UI thread to the DSP pipeline thread.

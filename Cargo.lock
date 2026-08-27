@@ -1952,6 +1952,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libairspy-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "602a2cfd23e361ede8a0d139dcadae47b8bd3326b6bd83a3523de9684018b3c4"
+dependencies = [
+ "rusb",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "libbz2-rs-sys"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3156,6 +3167,7 @@ dependencies = [
  "sdr-server-rtltcp",
  "sdr-sink-audio",
  "sdr-sink-network",
+ "sdr-source-airspy",
  "sdr-source-file",
  "sdr-source-network",
  "sdr-source-rtlsdr",
@@ -3319,6 +3331,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdr-source-airspy"
+version = "0.1.0"
+dependencies = [
+ "libairspy-rs",
+ "sdr-pipeline",
+ "sdr-types",
+ "tracing",
+]
+
+[[package]]
 name = "sdr-source-file"
 version = "0.1.0"
 dependencies = [
@@ -3432,6 +3454,7 @@ dependencies = [
  "sdr-scanner",
  "sdr-server-rtltcp",
  "sdr-sink-audio",
+ "sdr-source-airspy",
  "sdr-source-rtlsdr",
  "sdr-transcription",
  "sdr-tray",

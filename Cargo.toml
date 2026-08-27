@@ -101,6 +101,7 @@ members = [
     "crates/sdr-dsp",
     "crates/sdr-pipeline",
     "crates/sdr-source-rtlsdr",
+    "crates/sdr-source-airspy",
     "crates/sdr-source-network",
     "crates/sdr-server-rtltcp",
     "crates/sdr-scanner",
@@ -139,7 +140,11 @@ sdr-pipeline = { path = "crates/sdr-pipeline" }
 # per-runtime cargo features (currently unused by this app — the source
 # thread uses the sync iterator).
 librtlsdr-rs = "0.3"
+# libairspy-rs is the same story for the Airspy R2 / Mini — our pure-Rust
+# port of libairspy (airspyone_host), consumed from crates.io. Per #848.
+libairspy-rs = "0.1"
 sdr-source-rtlsdr = { path = "crates/sdr-source-rtlsdr" }
+sdr-source-airspy = { path = "crates/sdr-source-airspy" }
 sdr-source-network = { path = "crates/sdr-source-network" }
 sdr-server-rtltcp = { path = "crates/sdr-server-rtltcp" }
 # sdr-rtltcp-discovery was spun out into its own repo + published to

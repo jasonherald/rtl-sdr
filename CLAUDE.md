@@ -4,7 +4,7 @@ Rust port of SDR++ — software-defined radio application with GTK4 UI.
 
 ## Architecture
 
-22-member workspace (root binary + 21 library crates) with clear dependency boundaries.
+23-member workspace (root binary + 22 library crates) with clear dependency boundaries.
 The driver layer (`sdr-rtlsdr`) was spun out as a standalone published crate
 [`librtlsdr-rs`](https://crates.io/crates/librtlsdr-rs) and is consumed from
 crates.io rather than as a path dependency.
@@ -18,6 +18,8 @@ librtlsdr-rs          → External: pure-Rust port of librtlsdr over rusb — 5 
 sdr-rtltcp-discovery  → External: mDNS browser/responder for `_rtl_tcp._tcp.local.` (crates.io)
 sdr-server-rtltcp     → `rtl_tcp` server — share a local dongle over TCP
 sdr-source-rtlsdr     → RTL-SDR source module (depends on: types, pipeline, librtlsdr-rs, config)
+libairspy-rs          → External: pure-Rust port of libairspy over rusb — Airspy R2/Mini (crates.io)
+sdr-source-airspy     → Airspy source module (depends on: types, pipeline, libairspy-rs)
 sdr-source-network    → TCP/UDP IQ source (depends on: types, pipeline, config)
 sdr-source-file       → WAV file playback source (depends on: types, pipeline, config)
 sdr-sink-audio        → PipeWire output (depends on: types, pipeline, config)
