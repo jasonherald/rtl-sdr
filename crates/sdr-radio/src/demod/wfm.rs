@@ -33,7 +33,6 @@ const WFM_MAX_BANDWIDTH: f64 = 250_000.0;
 /// Default frequency snap interval for WFM (Hz) — broadcast FM spacing.
 const WFM_SNAP_INTERVAL: f64 = 100_000.0;
 
-
 /// Wideband FM demodulator using `BroadcastFmDemod` from sdr-dsp.
 ///
 /// Supports both mono and stereo output:
