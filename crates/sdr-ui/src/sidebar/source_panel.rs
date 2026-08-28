@@ -200,15 +200,26 @@ pub fn sample_rate_labels_for_device(device: u32) -> &'static [&'static str] {
 /// the source clamps to step 21. The live `GainList` event still
 /// refines the bounds after Play; this keeps the row honest at
 /// selection time. Per CR round 1 on PR #850.
+/// Bottom of the Airspy composite linearity ladder.
+const AIRSPY_GAIN_MIN_STEP: f64 = 0.0;
+/// Top of the ladder, derived from the source crate's step count so
+/// the UI bound cannot drift from the gain contract.
+const AIRSPY_GAIN_MAX_STEP: f64 = (sdr_source_airspy::LINEARITY_GAIN_STEPS - 1) as f64;
+/// The ladder moves in whole steps.
+const AIRSPY_GAIN_STEP: f64 = 1.0;
+/// Page increment — a few steps per click, mirroring the RTL row's
+/// step/page ratio.
+const AIRSPY_GAIN_PAGE: f64 = 3.0;
+
 pub fn apply_device_gain_row(gain_row: &adw::SpinRow, device: u32) {
     let adj = gain_row.adjustment();
     if device == DEVICE_AIRSPY {
         gain_row.set_subtitle("Linearity step");
         gain_row.set_digits(0);
-        adj.set_lower(0.0);
-        adj.set_upper(21.0);
-        adj.set_step_increment(1.0);
-        adj.set_page_increment(3.0);
+        adj.set_lower(AIRSPY_GAIN_MIN_STEP);
+        adj.set_upper(AIRSPY_GAIN_MAX_STEP);
+        adj.set_step_increment(AIRSPY_GAIN_STEP);
+        adj.set_page_increment(AIRSPY_GAIN_PAGE);
     } else {
         gain_row.set_subtitle("dB");
         gain_row.set_digits(1);
