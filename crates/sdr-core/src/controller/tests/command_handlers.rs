@@ -402,13 +402,19 @@ fn handle_set_converter_offset_rolls_back_state_on_live_rejection() {
     // CR round 4 on PR #851: a live rejection must not leave DspState
     // at the new offset — the pre-start handlers replay it, so later
     // starts would retry the rejected configuration.
+    /// The offset already committed before the test dispatch — a
+    /// `SpyVerter`'s +120 MHz.
+    const ESTABLISHED_OFFSET_HZ: f64 = 120_000_000.0;
+    /// The offset the fake source refuses; the value itself is
+    /// irrelevant (the source rejects unconditionally).
+    const REJECTED_OFFSET_HZ: f64 = -300_000_000.0;
     let (dsp_tx, rx) = mpsc::channel();
     let mut state = DspState::new(dsp_tx.clone()).unwrap();
-    state.converter_offset_hz = 120_000_000.0;
+    state.converter_offset_hz = ESTABLISHED_OFFSET_HZ;
     state.source = Some(Box::new(OffsetRejectingSource));
-    super::super::source::handle_set_converter_offset(&mut state, &dsp_tx, -300_000_000.0);
+    super::super::source::handle_set_converter_offset(&mut state, &dsp_tx, REJECTED_OFFSET_HZ);
     assert!(
-        (state.converter_offset_hz - 120_000_000.0).abs() < f64::EPSILON,
+        (state.converter_offset_hz - ESTABLISHED_OFFSET_HZ).abs() < f64::EPSILON,
         "state keeps the previous offset after a live rejection"
     );
     // And the user hears about it.
