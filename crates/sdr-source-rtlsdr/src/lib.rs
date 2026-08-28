@@ -261,6 +261,10 @@ pub struct RtlSdrSource {
     /// on every open; previously silently dropped by the trait default
     /// (#739).
     rtl_agc_enabled: bool,
+    /// Upconverter offset in Hz: hardware tunes to
+    /// `display frequency + offset`; `self.frequency` stays in
+    /// display terms (e.g. Ham-It-Up = +125 MHz). Per #848 phase 4.
+    converter_offset_hz: f64,
     /// Most-recent direct-sampling mode the controller dispatched
     /// (0 = off, 1 = I branch, 2 = Q branch). Remembered across
     /// stop/start so `start()` can program it *before* the first
@@ -528,6 +532,7 @@ impl RtlSdrSource {
             last_tuner_gain_tenths_db: None,
             last_gain_manual: None,
             rtl_agc_enabled: false,
+            converter_offset_hz: 0.0,
             direct_sampling_mode: DIRECT_SAMPLING_OFF,
         }
     }
@@ -660,12 +665,16 @@ impl Source for RtlSdrSource {
 
         let tuner = device.tuner_type();
         let direct_sampling_mode = self.direct_sampling_mode;
-        let frequency_hz = self.frequency;
-        device.set_center_freq(self.frequency as u32).map_err(|e| {
+        // The tuner floor check and the hardware tune both work in
+        // hardware terms (display + upconverter offset) — an HF
+        // display frequency is fine when the offset lifts it above
+        // the R82xx floor. Per #848 phase 4.
+        let hardware_hz = self.frequency + self.converter_offset_hz;
+        device.set_center_freq(hardware_hz as u32).map_err(|e| {
             SourceError::TuneFailed(Self::tune_failure_message(
                 tuner,
                 direct_sampling_mode,
-                frequency_hz,
+                hardware_hz,
                 &e.to_string(),
             ))
         })?;
@@ -783,14 +792,15 @@ impl Source for RtlSdrSource {
         // Commit only once the driver accepted it (the driver resets its
         // own frequency to 0 on error); with no device open, remember it
         // for `start()` (#742).
+        let hardware_hz = frequency_hz + self.converter_offset_hz;
         if let Some(device) = &mut self.device {
             let tuner = device.tuner_type();
             let direct_sampling_mode = self.direct_sampling_mode;
-            device.set_center_freq(frequency_hz as u32).map_err(|e| {
+            device.set_center_freq(hardware_hz as u32).map_err(|e| {
                 SourceError::TuneFailed(Self::tune_failure_message(
                     tuner,
                     direct_sampling_mode,
-                    frequency_hz,
+                    hardware_hz,
                     &e.to_string(),
                 ))
             })?;
@@ -975,6 +985,23 @@ impl Source for RtlSdrSource {
             device
                 .set_freq_correction(ppm)
                 .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn set_converter_offset(&mut self, offset_hz: f64) -> Result<(), SourceError> {
+        let device_open = self.device.is_some();
+        tracing::info!(
+            offset_hz,
+            device_open,
+            "RtlSdrSource::set_converter_offset dispatch"
+        );
+        self.converter_offset_hz = offset_hz;
+        // Live retune at the unchanged display frequency so the
+        // offset takes effect immediately.
+        if self.device.is_some() {
+            let display = self.frequency;
+            self.tune(display)?;
         }
         Ok(())
     }

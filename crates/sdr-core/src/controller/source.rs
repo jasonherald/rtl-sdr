@@ -216,6 +216,13 @@ fn reapply_rtl_tcp_rate_and_tune(
 /// Order: direct sampling → RTL AGC → gain mode → gain, matching the
 /// driver's own open-time programming order.
 pub(super) fn rtl_sdr_pre_start_settings(state: &DspState, source: &mut dyn Source) {
+    if let Err(e) = source.set_converter_offset(state.converter_offset_hz) {
+        tracing::warn!(
+            error = %e,
+            offset_hz = state.converter_offset_hz,
+            "pre-start converter-offset dispatch failed"
+        );
+    }
     if let Err(e) = source.set_direct_sampling(state.direct_sampling_mode) {
         tracing::warn!(
             error = %e,
@@ -260,6 +267,13 @@ pub(super) fn rtl_sdr_pre_start_settings(state: &DspState, source: &mut dyn Sour
 /// user touches the gain slider on the new device. Per issue #848;
 /// per-device gain persistence is follow-up scope there.
 pub(super) fn airspy_pre_start_settings(state: &DspState, source: &mut dyn Source) {
+    if let Err(e) = source.set_converter_offset(state.converter_offset_hz) {
+        tracing::warn!(
+            error = %e,
+            offset_hz = state.converter_offset_hz,
+            "pre-start converter-offset dispatch failed"
+        );
+    }
     if let Err(e) = source.set_gain_mode(!state.tuner_agc_auto) {
         tracing::warn!(
             error = %e,
@@ -1472,6 +1486,25 @@ pub(super) fn handle_set_file_looping(
     {
         tracing::warn!("set file looping failed: {e}");
         let _ = dsp_tx.send(DspToUi::Error(format!("File looping failed: {e}")));
+    }
+}
+
+/// Handler for `UiToDsp::SetConverterOffset` (#848 phase 4). Persist
+/// to state first (so a dispatch with no live source is replayed on
+/// the next open via the pre-start settings), then forward to the
+/// live source, which retunes at the unchanged display frequency.
+pub(super) fn handle_set_converter_offset(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    offset_hz: f64,
+) {
+    tracing::info!(offset_hz, "set converter offset");
+    state.converter_offset_hz = offset_hz;
+    if let Some(source) = &mut state.source
+        && let Err(e) = source.set_converter_offset(offset_hz)
+    {
+        tracing::warn!("set converter offset failed: {e}");
+        let _ = dsp_tx.send(DspToUi::Error(format!("Converter offset failed: {e}")));
     }
 }
 

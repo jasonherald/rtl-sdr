@@ -54,6 +54,18 @@ pub trait Source: Send {
         Ok(())
     }
 
+    /// Set the upconverter offset in Hz (no-op default for sources
+    /// without a hardware tuner). When non-zero, the source tunes the
+    /// hardware to `display_frequency + offset` while every other
+    /// layer — state, spectrum labels, bookmarks, scanner — keeps
+    /// working in display frequencies. Models a SpyVerter-style
+    /// upconverter (HF shifted up by 120 MHz, so hearing 10 MHz means
+    /// tuning the tuner to 130 MHz) or a Ham-It-Up (+125 MHz).
+    /// Per issue #848 phase 4.
+    fn set_converter_offset(&mut self, _offset_hz: f64) -> Result<(), SourceError> {
+        Ok(())
+    }
+
     /// UI-facing connection state for `rtl_tcp` clients. Only the
     /// network `RtlTcpSource` implements this meaningfully — every
     /// other source returns `None`. Lets the UI poll the active

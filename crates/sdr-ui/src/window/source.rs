@@ -3199,9 +3199,41 @@ fn wire_rtl_frontend_toggles(
             state_bias_tee.send_dsp(UiToDsp::SetBiasTee(enabled));
         });
 
+    wire_converter_offset_row(panels, state, config);
+
     wire_sampling_mode_rows(panels, state, toast_overlay, config);
 
     wire_iq_inversion_and_decimation(panels, state, config);
+}
+
+/// Upconverter offset row (#848 phase 4). Same restore-then-wire +
+/// startup-dispatch idiom as bias-T: the `SetConverterOffset`
+/// handler stores the value in `DspState` up-front and the
+/// pre-start settings replay it onto every freshly opened USB
+/// source. The row edits in MHz; the wire value is Hz.
+fn wire_converter_offset_row(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    {
+        let persisted_hz = sidebar::source_panel::load_source_converter_offset_hz(config);
+        panels
+            .source
+            .converter_offset_row
+            .set_value(persisted_hz / 1_000_000.0);
+        state.send_dsp(UiToDsp::SetConverterOffset(persisted_hz));
+    }
+    let state_offset = Rc::clone(state);
+    let config_offset = std::sync::Arc::clone(config);
+    panels
+        .source
+        .converter_offset_row
+        .connect_value_notify(move |row| {
+            let offset_hz = row.value() * 1_000_000.0;
+            sidebar::source_panel::save_source_converter_offset_hz(&config_offset, offset_hz);
+            state_offset.send_dsp(UiToDsp::SetConverterOffset(offset_hz));
+        });
 }
 
 /// Gain row + AGC type selector with mutex + restore ordering (#551).

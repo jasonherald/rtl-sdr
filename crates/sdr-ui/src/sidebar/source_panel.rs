@@ -63,6 +63,23 @@ pub const KEY_LEGACY_AGC_ENABLED: &str = "rtl_sdr_agc_enabled";
 /// LNA. Per issue #537.
 pub const KEY_SOURCE_RTL_BIAS_TEE: &str = "src_rtl_bias_tee";
 
+/// Config key for the persisted upconverter offset in Hz. Shared
+/// across USB sources — the offset models the antenna chain (one
+/// upconverter box), not the dongle behind it. 0.0 = no converter.
+/// Per issue #848 phase 4.
+pub const KEY_SOURCE_CONVERTER_OFFSET_HZ: &str = "src_converter_offset_hz";
+
+/// Upconverter-offset `SpinRow` defaults (MHz).
+const CONVERTER_OFFSET_DEFAULT_MHZ: f64 = 0.0;
+/// Lower bound — negative covers block *down*-converters.
+const CONVERTER_OFFSET_MIN_MHZ: f64 = -6000.0;
+/// Upper bound — comfortably above any HF upconverter product.
+const CONVERTER_OFFSET_MAX_MHZ: f64 = 6000.0;
+/// Fine step: 1 kHz, enough to trim a converter's LO error.
+const CONVERTER_OFFSET_STEP_MHZ: f64 = 0.001;
+/// Page step: 1 MHz.
+const CONVERTER_OFFSET_PAGE_MHZ: f64 = 1.0;
+
 /// Config key for persisted manual tuner gain in dB. Only
 /// applied when AGC is `Off` (hardware/software AGC overrides
 /// manual gain). Default `0.0` matches the spin row's initial
@@ -455,6 +472,9 @@ pub struct SourcePanel {
     /// share-server panel rather than reusing this row. Per
     /// issue #537.
     pub bias_tee_row: adw::SwitchRow,
+    /// Upconverter offset `SpinRow` in MHz (hardware = display +
+    /// offset). Visible for the USB tuner sources. Per #848 phase 4.
+    pub converter_offset_row: adw::SpinRow,
     /// RTL-SDR direct-sampling combo (Disabled / I branch /
     /// Q branch). Q branch is how RTL-SDR Blog v3+ dongles tune
     /// below 28 MHz — the R820T tuner cuts off there, but the
@@ -598,24 +618,79 @@ pub fn format_rtl_tcp_state(state: &RtlTcpConnectionState) -> String {
 /// fallback matches the widget's initial selection.
 pub(crate) const DEFAULT_SAMPLE_RATE_INDEX: u32 = 7;
 
-/// Build RTL-SDR-specific rows: sample rate, gain, AGC, PPM
-/// correction, bias tee, direct sampling, offset tuning.
-fn build_rtlsdr_rows() -> (
-    adw::ComboRow,
-    adw::SpinRow,
-    adw::ComboRow,
-    adw::SpinRow,
-    adw::SwitchRow,
-    adw::ComboRow,
-    adw::SwitchRow,
-) {
-    let sample_rate_model = gtk4::StringList::new(RTL_SAMPLE_RATE_LABELS);
-    let sample_rate_row = adw::ComboRow::builder()
-        .title("Sample Rate")
-        .model(&sample_rate_model)
-        .selected(DEFAULT_SAMPLE_RATE_INDEX)
+/// RF-frontend rows shared by the USB tuner sources: bias-T,
+/// upconverter offset, direct sampling, offset tuning. Split out of
+/// `build_rtlsdr_rows` per the 50-NLOC gate.
+fn build_rtl_frontend_rows() -> (adw::SwitchRow, adw::SpinRow, adw::ComboRow, adw::SwitchRow) {
+    // Bias tee — powers an inline LNA over the coax. Off by
+    // default so users without powered antennas don't drive
+    // unexpected current into a passive antenna's centre
+    // conductor. Per issue #537.
+    let bias_tee_row = adw::SwitchRow::builder()
+        .title("Bias-T")
+        .subtitle("Power an inline LNA over the antenna coax")
+        .active(false)
         .build();
 
+    // Upconverter offset — hardware tunes display + offset. 120 MHz
+    // for a SpyVerter, 125 MHz for a Ham-It-Up, 0 for none. Range
+    // covers down-converters too (negative offsets). Per #848
+    // phase 4.
+    let converter_offset_adj = gtk4::Adjustment::new(
+        CONVERTER_OFFSET_DEFAULT_MHZ,
+        CONVERTER_OFFSET_MIN_MHZ,
+        CONVERTER_OFFSET_MAX_MHZ,
+        CONVERTER_OFFSET_STEP_MHZ,
+        CONVERTER_OFFSET_PAGE_MHZ,
+        0.0,
+    );
+    let converter_offset_row = adw::SpinRow::builder()
+        .title("Upconverter Offset")
+        .subtitle("MHz added to the displayed frequency at the tuner (SpyVerter: 120)")
+        .adjustment(&converter_offset_adj)
+        .digits(3)
+        .build();
+
+    // Direct sampling — Disabled / I branch / Q branch. Order is
+    // load-bearing: the combo's selected index is cast straight
+    // to the `rtlsdr_set_direct_sampling` `mode` argument
+    // (0/1/2). Disabled is the default — only RTL-SDR Blog v3+
+    // dongles benefit, and only when the user is tuning HF.
+    // Per issue #538.
+    let direct_sampling_model = gtk4::StringList::new(&["Disabled", "I branch", "Q branch"]);
+    let direct_sampling_row = adw::ComboRow::builder()
+        .title("Direct Sampling")
+        .subtitle("Bypass the tuner for HF reception (RTL-SDR Blog v3+)")
+        .model(&direct_sampling_model)
+        .selected(DIRECT_SAMPLING_DISABLED_IDX)
+        .build();
+
+    // Offset tuning — pushes the LO away from the requested
+    // centre frequency to dodge the DC spike that lives at the
+    // LO position. Most relevant on E4000 tuners; support
+    // varies by tuner and driver. R820T/R828D reject the
+    // request with `InvalidParameter` (surfaced as a
+    // `TuneFailed` toast by the wiring in `window.rs`). Off by
+    // default to keep behavior predictable across hardware. Per
+    // issue #539.
+    let offset_tuning_row = adw::SwitchRow::builder()
+        .title("Offset Tuning")
+        .subtitle("Shift LO off the tuned freq to avoid the DC spike")
+        .active(false)
+        .build();
+
+    (
+        bias_tee_row,
+        converter_offset_row,
+        direct_sampling_row,
+        offset_tuning_row,
+    )
+}
+
+/// Tuner gain-chain rows shared by the USB tuner sources: manual
+/// gain, AGC selector, PPM correction. Split out of
+/// `build_rtlsdr_rows` per the 50-NLOC gate.
+fn build_tuner_gain_rows() -> (adw::SpinRow, adw::ComboRow, adw::SpinRow) {
     let gain_adj = gtk4::Adjustment::new(
         DEFAULT_GAIN_DB,
         MIN_GAIN_DB,
@@ -652,43 +727,33 @@ fn build_rtlsdr_rows() -> (
         .digits(0)
         .build();
 
-    // Bias tee — powers an inline LNA over the coax. Off by
-    // default so users without powered antennas don't drive
-    // unexpected current into a passive antenna's centre
-    // conductor. Per issue #537.
-    let bias_tee_row = adw::SwitchRow::builder()
-        .title("Bias-T")
-        .subtitle("Power an inline LNA over the antenna coax")
-        .active(false)
+    (gain_row, agc_row, ppm_row)
+}
+
+/// Build RTL-SDR-specific rows: sample rate, gain, AGC, PPM
+/// correction, bias tee, upconverter offset, direct sampling,
+/// offset tuning.
+fn build_rtlsdr_rows() -> (
+    adw::ComboRow,
+    adw::SpinRow,
+    adw::ComboRow,
+    adw::SpinRow,
+    adw::SwitchRow,
+    adw::SpinRow,
+    adw::ComboRow,
+    adw::SwitchRow,
+) {
+    let sample_rate_model = gtk4::StringList::new(RTL_SAMPLE_RATE_LABELS);
+    let sample_rate_row = adw::ComboRow::builder()
+        .title("Sample Rate")
+        .model(&sample_rate_model)
+        .selected(DEFAULT_SAMPLE_RATE_INDEX)
         .build();
 
-    // Direct sampling — Disabled / I branch / Q branch. Order is
-    // load-bearing: the combo's selected index is cast straight
-    // to the `rtlsdr_set_direct_sampling` `mode` argument
-    // (0/1/2). Disabled is the default — only RTL-SDR Blog v3+
-    // dongles benefit, and only when the user is tuning HF.
-    // Per issue #538.
-    let direct_sampling_model = gtk4::StringList::new(&["Disabled", "I branch", "Q branch"]);
-    let direct_sampling_row = adw::ComboRow::builder()
-        .title("Direct Sampling")
-        .subtitle("Bypass the tuner for HF reception (RTL-SDR Blog v3+)")
-        .model(&direct_sampling_model)
-        .selected(DIRECT_SAMPLING_DISABLED_IDX)
-        .build();
+    let (gain_row, agc_row, ppm_row) = build_tuner_gain_rows();
 
-    // Offset tuning — pushes the LO away from the requested
-    // centre frequency to dodge the DC spike that lives at the
-    // LO position. Most relevant on E4000 tuners; support
-    // varies by tuner and driver. R820T/R828D reject the
-    // request with `InvalidParameter` (surfaced as a
-    // `TuneFailed` toast by the wiring in `window.rs`). Off by
-    // default to keep behavior predictable across hardware. Per
-    // issue #539.
-    let offset_tuning_row = adw::SwitchRow::builder()
-        .title("Offset Tuning")
-        .subtitle("Shift LO off the tuned freq to avoid the DC spike")
-        .active(false)
-        .build();
+    let (bias_tee_row, converter_offset_row, direct_sampling_row, offset_tuning_row) =
+        build_rtl_frontend_rows();
 
     (
         sample_rate_row,
@@ -696,6 +761,7 @@ fn build_rtlsdr_rows() -> (
         agc_row,
         ppm_row,
         bias_tee_row,
+        converter_offset_row,
         direct_sampling_row,
         offset_tuning_row,
     )
@@ -757,6 +823,25 @@ fn build_common_rows() -> (
     )
 }
 
+/// Borrowed row handles for the per-device visibility pass. One
+/// bundle instead of a dozen positional widget params — both callers
+/// (initial render and the change-notify handler) build it from the
+/// rows they already hold.
+struct SourceVisibilityRows<'a> {
+    sample_rate: &'a adw::ComboRow,
+    gain: &'a adw::SpinRow,
+    agc: &'a adw::ComboRow,
+    ppm: &'a adw::SpinRow,
+    bias_tee: &'a adw::SwitchRow,
+    converter_offset: &'a adw::SpinRow,
+    direct_sampling: &'a adw::ComboRow,
+    offset_tuning: &'a adw::SwitchRow,
+    hostname: &'a adw::EntryRow,
+    port: &'a adw::SpinRow,
+    protocol: &'a adw::ComboRow,
+    file_path: &'a adw::EntryRow,
+}
+
 /// Apply the per-device visibility policy to every row whose
 /// visibility depends on the selected source type. Single source
 /// of truth for the policy — both [`build_source_panel`]'s
@@ -781,21 +866,21 @@ fn build_common_rows() -> (
 ///   only applies to raw Network — `rtl_tcp` always rides on
 ///   TCP.
 /// - **File path**: visible only for File source.
-#[allow(clippy::too_many_arguments)]
-fn apply_source_row_visibility(
-    selected: u32,
-    sample_rate_row: &adw::ComboRow,
-    gain_row: &adw::SpinRow,
-    agc_row: &adw::ComboRow,
-    ppm_row: &adw::SpinRow,
-    bias_tee_row: &adw::SwitchRow,
-    direct_sampling_row: &adw::ComboRow,
-    offset_tuning_row: &adw::SwitchRow,
-    hostname_row: &adw::EntryRow,
-    port_row: &adw::SpinRow,
-    protocol_row: &adw::ComboRow,
-    file_path_row: &adw::EntryRow,
-) {
+fn apply_source_row_visibility(selected: u32, rows: &SourceVisibilityRows<'_>) {
+    let SourceVisibilityRows {
+        sample_rate: sample_rate_row,
+        gain: gain_row,
+        agc: agc_row,
+        ppm: ppm_row,
+        bias_tee: bias_tee_row,
+        converter_offset: converter_offset_row,
+        direct_sampling: direct_sampling_row,
+        offset_tuning: offset_tuning_row,
+        hostname: hostname_row,
+        port: port_row,
+        protocol: protocol_row,
+        file_path: file_path_row,
+    } = rows;
     let is_rtlsdr = selected == DEVICE_RTLSDR;
     let is_network = selected == DEVICE_NETWORK;
     let is_file = selected == DEVICE_FILE;
@@ -812,6 +897,7 @@ fn apply_source_row_visibility(
 
     // Bias-T powers a SpyVerter / mast-head LNA on both USB radios.
     bias_tee_row.set_visible(is_rtlsdr || is_airspy);
+    converter_offset_row.set_visible(is_rtlsdr || is_airspy);
     direct_sampling_row.set_visible(is_rtlsdr);
     offset_tuning_row.set_visible(is_rtlsdr);
 
@@ -822,64 +908,74 @@ fn apply_source_row_visibility(
     file_path_row.set_visible(is_file);
 }
 
-/// Wire the device selector to show/hide source-specific rows.
-#[allow(clippy::too_many_arguments)]
-fn connect_device_visibility(
-    device_row: &adw::ComboRow,
-    sample_rate_row: &adw::ComboRow,
-    gain_row: &adw::SpinRow,
-    agc_row: &adw::ComboRow,
-    ppm_row: &adw::SpinRow,
-    bias_tee_row: &adw::SwitchRow,
-    direct_sampling_row: &adw::ComboRow,
-    offset_tuning_row: &adw::SwitchRow,
-    hostname_row: &adw::EntryRow,
-    port_row: &adw::SpinRow,
-    protocol_row: &adw::ComboRow,
-    file_path_row: &adw::EntryRow,
-) {
-    device_row.connect_selected_notify(glib::clone!(
-        #[weak]
-        sample_rate_row,
-        #[weak]
-        gain_row,
-        #[weak]
-        agc_row,
-        #[weak]
-        ppm_row,
-        #[weak]
-        bias_tee_row,
-        #[weak]
-        direct_sampling_row,
-        #[weak]
-        offset_tuning_row,
-        #[weak]
-        hostname_row,
-        #[weak]
-        port_row,
-        #[weak]
-        protocol_row,
-        #[weak]
-        file_path_row,
-        move |row| {
-            let selected = row.selected();
-            apply_source_row_visibility(
-                selected,
-                &sample_rate_row,
-                &gain_row,
-                &agc_row,
-                &ppm_row,
-                &bias_tee_row,
-                &direct_sampling_row,
-                &offset_tuning_row,
-                &hostname_row,
-                &port_row,
-                &protocol_row,
-                &file_path_row,
-            );
-            tracing::debug!(device = selected, "source device changed");
+/// Weak counterparts of [`SourceVisibilityRows`] captured by the
+/// device-change closure — weak so the handler can't keep the panel
+/// widgets alive past window teardown.
+struct SourceVisibilityWeak {
+    sample_rate: glib::WeakRef<adw::ComboRow>,
+    gain: glib::WeakRef<adw::SpinRow>,
+    agc: glib::WeakRef<adw::ComboRow>,
+    ppm: glib::WeakRef<adw::SpinRow>,
+    bias_tee: glib::WeakRef<adw::SwitchRow>,
+    converter_offset: glib::WeakRef<adw::SpinRow>,
+    direct_sampling: glib::WeakRef<adw::ComboRow>,
+    offset_tuning: glib::WeakRef<adw::SwitchRow>,
+    hostname: glib::WeakRef<adw::EntryRow>,
+    port: glib::WeakRef<adw::SpinRow>,
+    protocol: glib::WeakRef<adw::ComboRow>,
+    file_path: glib::WeakRef<adw::EntryRow>,
+}
+
+impl SourceVisibilityWeak {
+    fn from_rows(rows: &SourceVisibilityRows<'_>) -> Self {
+        Self {
+            sample_rate: rows.sample_rate.downgrade(),
+            gain: rows.gain.downgrade(),
+            agc: rows.agc.downgrade(),
+            ppm: rows.ppm.downgrade(),
+            bias_tee: rows.bias_tee.downgrade(),
+            converter_offset: rows.converter_offset.downgrade(),
+            direct_sampling: rows.direct_sampling.downgrade(),
+            offset_tuning: rows.offset_tuning.downgrade(),
+            hostname: rows.hostname.downgrade(),
+            port: rows.port.downgrade(),
+            protocol: rows.protocol.downgrade(),
+            file_path: rows.file_path.downgrade(),
         }
-    ));
+    }
+
+    /// Upgrade the whole set atomically; `None` when any widget is
+    /// gone (window teardown) so the caller drops the event.
+    fn apply(&self, selected: u32) -> Option<()> {
+        apply_source_row_visibility(
+            selected,
+            &SourceVisibilityRows {
+                sample_rate: &self.sample_rate.upgrade()?,
+                gain: &self.gain.upgrade()?,
+                agc: &self.agc.upgrade()?,
+                ppm: &self.ppm.upgrade()?,
+                bias_tee: &self.bias_tee.upgrade()?,
+                converter_offset: &self.converter_offset.upgrade()?,
+                direct_sampling: &self.direct_sampling.upgrade()?,
+                offset_tuning: &self.offset_tuning.upgrade()?,
+                hostname: &self.hostname.upgrade()?,
+                port: &self.port.upgrade()?,
+                protocol: &self.protocol.upgrade()?,
+                file_path: &self.file_path.upgrade()?,
+            },
+        );
+        Some(())
+    }
+}
+
+/// Wire the device selector to show/hide source-specific rows.
+fn connect_device_visibility(device_row: &adw::ComboRow, rows: &SourceVisibilityRows<'_>) {
+    let weak = SourceVisibilityWeak::from_rows(rows);
+    device_row.connect_selected_notify(move |row| {
+        let selected = row.selected();
+        let _ = weak.apply(selected);
+        tracing::debug!(device = selected, "source device changed");
+    });
 }
 
 /// Build the source device configuration panel.
@@ -919,6 +1015,7 @@ pub fn build_source_panel() -> SourcePanel {
         agc_row,
         ppm_row,
         bias_tee_row,
+        converter_offset_row,
         direct_sampling_row,
         offset_tuning_row,
     ) = build_rtlsdr_rows();
@@ -1019,6 +1116,7 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&agc_row);
     group.add(&ppm_row);
     group.add(&bias_tee_row);
+    group.add(&converter_offset_row);
     group.add(&direct_sampling_row);
     group.add(&offset_tuning_row);
     group.add(&hostname_row);
@@ -1043,17 +1141,20 @@ pub fn build_source_panel() -> SourcePanel {
     let selected = device_row.selected();
     apply_source_row_visibility(
         selected,
-        &sample_rate_row,
-        &gain_row,
-        &agc_row,
-        &ppm_row,
-        &bias_tee_row,
-        &direct_sampling_row,
-        &offset_tuning_row,
-        &hostname_row,
-        &port_row,
-        &protocol_row,
-        &file_path_row,
+        &SourceVisibilityRows {
+            sample_rate: &sample_rate_row,
+            gain: &gain_row,
+            agc: &agc_row,
+            ppm: &ppm_row,
+            bias_tee: &bias_tee_row,
+            converter_offset: &converter_offset_row,
+            direct_sampling: &direct_sampling_row,
+            offset_tuning: &offset_tuning_row,
+            hostname: &hostname_row,
+            port: &port_row,
+            protocol: &protocol_row,
+            file_path: &file_path_row,
+        },
     );
     // RTL-TCP-specific rows aren't part of `apply_source_row_
     // visibility` — they're handled by `connect_rtl_tcp_visibility`
@@ -1074,17 +1175,20 @@ pub fn build_source_panel() -> SourcePanel {
 
     connect_device_visibility(
         &device_row,
-        &sample_rate_row,
-        &gain_row,
-        &agc_row,
-        &ppm_row,
-        &bias_tee_row,
-        &direct_sampling_row,
-        &offset_tuning_row,
-        &hostname_row,
-        &port_row,
-        &protocol_row,
-        &file_path_row,
+        &SourceVisibilityRows {
+            sample_rate: &sample_rate_row,
+            gain: &gain_row,
+            agc: &agc_row,
+            ppm: &ppm_row,
+            bias_tee: &bias_tee_row,
+            converter_offset: &converter_offset_row,
+            direct_sampling: &direct_sampling_row,
+            offset_tuning: &offset_tuning_row,
+            hostname: &hostname_row,
+            port: &port_row,
+            protocol: &protocol_row,
+            file_path: &file_path_row,
+        },
     );
     connect_rtl_tcp_visibility(
         &device_row,
@@ -1105,6 +1209,7 @@ pub fn build_source_panel() -> SourcePanel {
         agc_row,
         ppm_row,
         bias_tee_row,
+        converter_offset_row,
         direct_sampling_row,
         offset_tuning_row,
         hostname_row,
@@ -1448,6 +1553,23 @@ pub fn load_source_rtl_bias_tee(config: &Arc<ConfigManager>) -> bool {
 pub fn save_source_rtl_bias_tee(config: &Arc<ConfigManager>, enabled: bool) {
     config.write(|v| {
         v[KEY_SOURCE_RTL_BIAS_TEE] = serde_json::json!(enabled);
+    });
+}
+
+/// Read the persisted upconverter offset in Hz (0.0 when unset).
+#[must_use]
+pub fn load_source_converter_offset_hz(config: &Arc<ConfigManager>) -> f64 {
+    config.read(|v| {
+        v.get(KEY_SOURCE_CONVERTER_OFFSET_HZ)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    })
+}
+
+/// Persist the upconverter offset in Hz.
+pub fn save_source_converter_offset_hz(config: &Arc<ConfigManager>, offset_hz: f64) {
+    config.write(|v| {
+        v[KEY_SOURCE_CONVERTER_OFFSET_HZ] = serde_json::json!(offset_hz);
     });
 }
 

@@ -215,3 +215,43 @@ fn bridge_driver_drop_report_does_not_stop_stream() {
     assert_eq!(rx.recv().expect("delivered"), vec![5.0, 6.0]);
     assert_eq!(dropped.load(Ordering::Relaxed), 0);
 }
+
+// ── Upconverter offset (#848 phase 4) ─────────────────────────────
+
+#[test]
+fn converter_offset_shifts_hardware_tune_only() {
+    let mut source = AirspySource::new();
+    source
+        .set_converter_offset(120_000_000.0)
+        .expect("offset stores when closed");
+    source.tune(10_000_000.0).expect("display tune");
+    // Display state stays in display terms…
+    assert!((source.frequency - 10_000_000.0).abs() < f64::EPSILON);
+    // …while the hardware target carries the offset.
+    assert_eq!(
+        source.hardware_freq_hz(10_000_000.0).expect("in range"),
+        130_000_000
+    );
+}
+
+#[test]
+fn converter_offset_zero_is_identity() {
+    let source = AirspySource::new();
+    assert_eq!(
+        source.hardware_freq_hz(100_000_000.0).expect("in range"),
+        100_000_000
+    );
+}
+
+#[test]
+fn converter_offset_out_of_range_is_rejected() {
+    let mut source = AirspySource::new();
+    source
+        .set_converter_offset(-200_000_000.0)
+        .expect("offset stores");
+    // Display 10 MHz with a −200 MHz offset would tune negative Hz.
+    assert!(matches!(
+        source.hardware_freq_hz(10_000_000.0),
+        Err(SourceError::TuneFailed(_))
+    ));
+}

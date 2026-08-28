@@ -222,6 +222,7 @@ struct RecordingSource {
     gain_modes: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     gains: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
     bias: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    offsets: std::sync::Arc<std::sync::Mutex<Vec<f64>>>,
 }
 
 impl Source for RecordingSource {
@@ -259,6 +260,10 @@ impl Source for RecordingSource {
     }
     fn set_bias_tee(&mut self, enabled: bool) -> Result<(), sdr_types::SourceError> {
         self.bias.lock().unwrap().push(enabled);
+        Ok(())
+    }
+    fn set_converter_offset(&mut self, offset_hz: f64) -> Result<(), sdr_types::SourceError> {
+        self.offsets.lock().unwrap().push(offset_hz);
         Ok(())
     }
 }
@@ -311,4 +316,30 @@ fn airspy_replay_applies_persisted_bias_tee() {
         !matches!(rx.try_recv(), Ok(DspToUi::Error(_))),
         "no error toast on successful bias replay"
     );
+}
+
+#[test]
+fn pre_start_settings_replay_converter_offset_on_both_sources() {
+    // #848 phase 4: the persisted upconverter offset must reach the
+    // source before start() on both USB source flavors.
+    let (dsp_tx, _rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx).unwrap();
+    state.converter_offset_hz = 120_000_000.0;
+    let mut source = RecordingSource::default();
+    let offsets = std::sync::Arc::clone(&source.offsets);
+    super::super::source::airspy_pre_start_settings(&state, &mut source);
+    super::super::source::rtl_sdr_pre_start_settings(&state, &mut source);
+    assert_eq!(*offsets.lock().unwrap(), vec![120_000_000.0, 120_000_000.0]);
+}
+
+#[test]
+fn handle_set_converter_offset_persists_and_forwards_live() {
+    let (dsp_tx, _rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let source = RecordingSource::default();
+    let offsets = std::sync::Arc::clone(&source.offsets);
+    state.source = Some(Box::new(source));
+    super::super::source::handle_set_converter_offset(&mut state, &dsp_tx, 125_000_000.0);
+    assert!((state.converter_offset_hz - 125_000_000.0).abs() < f64::EPSILON);
+    assert_eq!(*offsets.lock().unwrap(), vec![125_000_000.0]);
 }
