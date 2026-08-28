@@ -293,13 +293,22 @@ fn on_airspy_device_list(ctx: &DspEventCtx, serials: &[u64]) {
     state.suppress_airspy_unit_notify.set(true);
     model.splice(0, model.n_items(), &label_refs);
     let persisted = sidebar::source_panel::load_airspy_serial(config);
+    // Runtime selection = the persisted unit only while it is
+    // actually connected. The guard keeps the CONFIG untouched, but
+    // the DSP state must match what the combo shows — otherwise the
+    // factory would try to open the missing serial while the UI says
+    // "First available". Dispatch explicitly (None = first
+    // available); the persisted value re-selects and re-dispatches
+    // when the unit reappears. Per CR round 3 on PR #852.
+    let connected_serial = persisted.filter(|sn| serials.contains(sn));
     #[allow(clippy::cast_possible_truncation, reason = "device lists are tiny")]
-    let selected = persisted
+    let selected = connected_serial
         .and_then(|sn| serials.iter().position(|&s| s == sn))
         .map_or(sidebar::source_panel::AIRSPY_FIRST_AVAILABLE_INDEX, |pos| {
             pos as u32 + sidebar::source_panel::AIRSPY_FIRST_SERIAL_INDEX
         });
     airspy_device_row.set_selected(selected);
+    state.send_dsp(super::UiToDsp::SetAirspyDeviceSerial(connected_serial));
     state.suppress_airspy_unit_notify.set(false);
 }
 
