@@ -71,13 +71,26 @@ const BLOCK_CHANNEL_BOUND: usize = 16;
 /// Hz → MHz divisor for user-facing frequency text.
 const HERTZ_PER_MHZ: f64 = 1_000_000.0;
 
+/// Airspy `Float32Iq` fullscale reciprocal. The driver's float
+/// output is `int12 / 4096` (C `SAMPLE_SCALE = 1/(1 << (15 -
+/// SAMPLE_SHIFT))`), so a rail-to-rail ADC swing spans ±0.5 —
+/// measured empirically against `airspy_rx -t 0` captures during the
+/// #848 bring-up. The pipeline's fullscale convention is ±1.0 (RTL's
+/// `(u8 − 127.4)/128`), so scale by 2 at conversion; without this the
+/// input sits 6 dB low and every display/squelch expectation shifts.
+pub const FLOAT32_FULLSCALE_SCALE: f32 = 2.0;
+
 /// Convert one interleaved `Float32Iq` block into [`Complex`]
-/// samples. Returns the number of complex samples written (bounded
-/// by both the block and `output`).
+/// samples, rescaled to the pipeline's ±1.0 fullscale convention
+/// (see [`FLOAT32_FULLSCALE_SCALE`]). Returns the number of complex
+/// samples written (bounded by both the block and `output`).
 pub fn convert_samples(raw: &[f32], output: &mut [Complex]) -> usize {
     let count = (raw.len() / 2).min(output.len());
     for (i, out) in output.iter_mut().take(count).enumerate() {
-        *out = Complex::new(raw[i * 2], raw[i * 2 + 1]);
+        *out = Complex::new(
+            raw[i * 2] * FLOAT32_FULLSCALE_SCALE,
+            raw[i * 2 + 1] * FLOAT32_FULLSCALE_SCALE,
+        );
     }
     count
 }

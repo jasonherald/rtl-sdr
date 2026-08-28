@@ -12,13 +12,14 @@ use super::*;
 const R2_RATES: &[f64] = &[2_500_000.0, 10_000_000.0];
 
 #[test]
-fn convert_samples_pairs_interleaved_iq() {
+fn convert_samples_pairs_interleaved_iq_at_pipeline_fullscale() {
+    // Driver fullscale ±0.5 maps to pipeline fullscale ±1.0.
     let raw = [0.5_f32, -0.5, 0.25, -0.25];
     let mut out = [Complex::new(0.0, 0.0); 4];
     let n = convert_samples(&raw, &mut out);
     assert_eq!(n, 2);
-    assert_eq!(out[0], Complex::new(0.5, -0.5));
-    assert_eq!(out[1], Complex::new(0.25, -0.25));
+    assert_eq!(out[0], Complex::new(1.0, -1.0));
+    assert_eq!(out[1], Complex::new(0.5, -0.5));
 }
 
 #[test]
