@@ -61,9 +61,11 @@ Noise is the diffuse glow.
 The RTL-SDR sends 8-bit IQ pairs (one byte each for I and Q).
 Cheap hardware, ~48 dB dynamic range. Higher-end SDRs (AirSpy,
 SDRplay) send 12 or 16 bits per axis, which gets you 70-90 dB —
-they hear weaker signals next to stronger ones. SDR-RS handles
-the RTL-SDR's 8-bit stream natively; the spectrum view's dB
-scale reflects what 8 bits can show.
+they hear weaker signals next to stronger ones. SDR-RS supports
+both tiers natively: the RTL-SDR's 8-bit stream and the Airspy
+R2 / Mini's 12-bit stream (delivered as floats). The spectrum
+view's dB scale reflects what the connected device can show —
+you'll notice the deeper noise floor immediately on an Airspy.
 
 ---
 
@@ -91,7 +93,12 @@ flaky and dropping samples (which shows up as gaps in the
 waterfall).
 
 The **General panel** (`Ctrl+1`) is where you'd change the
-sample rate.
+sample rate. The rate list adapts to the connected device: an
+RTL-SDR offers up to 3.2 Msps (2.4 is the reliable ceiling); an
+Airspy R2 reports 2.5 / 10 Msps, and other Airspy models report
+their own tables — the app reads the list from the device
+firmware, so whatever your hardware actually supports is what
+the combo shows.
 
 ---
 

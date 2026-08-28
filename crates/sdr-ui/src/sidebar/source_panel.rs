@@ -69,6 +69,24 @@ pub const KEY_SOURCE_RTL_BIAS_TEE: &str = "src_rtl_bias_tee";
 /// Per issue #848 phase 4.
 pub const KEY_SOURCE_CONVERTER_OFFSET_HZ: &str = "src_converter_offset_hz";
 
+/// Index 0 of the Airspy unit combo — open the first enumerated
+/// device rather than a specific serial.
+pub const AIRSPY_FIRST_AVAILABLE_LABEL: &str = "First available";
+
+/// Combo index of the "first available" entry in the Airspy unit
+/// selector.
+pub const AIRSPY_FIRST_AVAILABLE_INDEX: u32 = 0;
+
+/// Combo index of the FIRST enumerated serial — entries above the
+/// "first available" slot map serial N to index N + this offset.
+pub const AIRSPY_FIRST_SERIAL_INDEX: u32 = 1;
+
+/// Airspy device serial to open, persisted as the 16-digit upper-hex
+/// string [`sdr_source_airspy::format_device_serial`] produces (JSON
+/// numbers cannot carry a full u64 without precision loss). Empty /
+/// absent = first available device. Per #848 phase 5.
+pub const KEY_AIRSPY_SERIAL: &str = "src_airspy_serial";
+
 /// Upconverter-offset `SpinRow` defaults (MHz).
 const CONVERTER_OFFSET_DEFAULT_MHZ: f64 = 0.0;
 /// Lower bound — negative covers block *down*-converters.
@@ -475,6 +493,11 @@ pub struct SourcePanel {
     /// Upconverter offset `SpinRow` in MHz (hardware = display +
     /// offset). Visible for the USB tuner sources. Per #848 phase 4.
     pub converter_offset_row: adw::SpinRow,
+    /// Airspy unit selector: "First available" plus one entry per
+    /// enumerated serial (populated by the `AirspyDeviceList`
+    /// event). Visibility-gated to the Airspy device. Per #848
+    /// phase 5.
+    pub airspy_device_row: adw::ComboRow,
     /// RTL-SDR direct-sampling combo (Disabled / I branch /
     /// Q branch). Q branch is how RTL-SDR Blog v3+ dongles tune
     /// below 28 MHz — the R820T tuner cuts off there, but the
@@ -834,6 +857,7 @@ struct SourceVisibilityRows<'a> {
     ppm: &'a adw::SpinRow,
     bias_tee: &'a adw::SwitchRow,
     converter_offset: &'a adw::SpinRow,
+    airspy_device: &'a adw::ComboRow,
     direct_sampling: &'a adw::ComboRow,
     offset_tuning: &'a adw::SwitchRow,
     hostname: &'a adw::EntryRow,
@@ -874,6 +898,7 @@ fn apply_source_row_visibility(selected: u32, rows: &SourceVisibilityRows<'_>) {
         ppm: ppm_row,
         bias_tee: bias_tee_row,
         converter_offset: converter_offset_row,
+        airspy_device: airspy_device_row,
         direct_sampling: direct_sampling_row,
         offset_tuning: offset_tuning_row,
         hostname: hostname_row,
@@ -898,6 +923,7 @@ fn apply_source_row_visibility(selected: u32, rows: &SourceVisibilityRows<'_>) {
     // Bias-T powers a SpyVerter / mast-head LNA on both USB radios.
     bias_tee_row.set_visible(is_rtlsdr || is_airspy);
     converter_offset_row.set_visible(is_rtlsdr || is_airspy);
+    airspy_device_row.set_visible(is_airspy);
     direct_sampling_row.set_visible(is_rtlsdr);
     offset_tuning_row.set_visible(is_rtlsdr);
 
@@ -918,6 +944,7 @@ struct SourceVisibilityWeak {
     ppm: glib::WeakRef<adw::SpinRow>,
     bias_tee: glib::WeakRef<adw::SwitchRow>,
     converter_offset: glib::WeakRef<adw::SpinRow>,
+    airspy_device: glib::WeakRef<adw::ComboRow>,
     direct_sampling: glib::WeakRef<adw::ComboRow>,
     offset_tuning: glib::WeakRef<adw::SwitchRow>,
     hostname: glib::WeakRef<adw::EntryRow>,
@@ -935,6 +962,7 @@ impl SourceVisibilityWeak {
             ppm: rows.ppm.downgrade(),
             bias_tee: rows.bias_tee.downgrade(),
             converter_offset: rows.converter_offset.downgrade(),
+            airspy_device: rows.airspy_device.downgrade(),
             direct_sampling: rows.direct_sampling.downgrade(),
             offset_tuning: rows.offset_tuning.downgrade(),
             hostname: rows.hostname.downgrade(),
@@ -956,6 +984,7 @@ impl SourceVisibilityWeak {
                 ppm: &self.ppm.upgrade()?,
                 bias_tee: &self.bias_tee.upgrade()?,
                 converter_offset: &self.converter_offset.upgrade()?,
+                airspy_device: &self.airspy_device.upgrade()?,
                 direct_sampling: &self.direct_sampling.upgrade()?,
                 offset_tuning: &self.offset_tuning.upgrade()?,
                 hostname: &self.hostname.upgrade()?,
@@ -1019,6 +1048,16 @@ pub fn build_source_panel() -> SourcePanel {
         direct_sampling_row,
         offset_tuning_row,
     ) = build_rtlsdr_rows();
+    // Airspy unit selector. Starts with only the "first available"
+    // entry; the wiring swaps in enumerated serials when the
+    // controller answers `RefreshAirspyDevices`. Per #848 phase 5.
+    let airspy_device_model = gtk4::StringList::new(&[AIRSPY_FIRST_AVAILABLE_LABEL]);
+    let airspy_device_row = adw::ComboRow::builder()
+        .title("Airspy Unit")
+        .subtitle("Which device to open when multiple are connected")
+        .model(&airspy_device_model)
+        .build();
+
     let (hostname_row, port_row, protocol_row) = build_network_rows();
     let file_path_row = adw::EntryRow::builder()
         .title("File Path")
@@ -1117,6 +1156,7 @@ pub fn build_source_panel() -> SourcePanel {
     group.add(&ppm_row);
     group.add(&bias_tee_row);
     group.add(&converter_offset_row);
+    group.add(&airspy_device_row);
     group.add(&direct_sampling_row);
     group.add(&offset_tuning_row);
     group.add(&hostname_row);
@@ -1139,23 +1179,26 @@ pub fn build_source_panel() -> SourcePanel {
     // the policy lives in exactly one place. Per `CodeRabbit`
     // round 1 on PR #559.
     let selected = device_row.selected();
-    apply_source_row_visibility(
-        selected,
-        &SourceVisibilityRows {
-            sample_rate: &sample_rate_row,
-            gain: &gain_row,
-            agc: &agc_row,
-            ppm: &ppm_row,
-            bias_tee: &bias_tee_row,
-            converter_offset: &converter_offset_row,
-            direct_sampling: &direct_sampling_row,
-            offset_tuning: &offset_tuning_row,
-            hostname: &hostname_row,
-            port: &port_row,
-            protocol: &protocol_row,
-            file_path: &file_path_row,
-        },
-    );
+    // One bundle serves both the initial render and the
+    // change-notify wiring below — a single construction site keeps
+    // the field list in step when rows are added. Per Codacy round 1
+    // on PR #852.
+    let visibility_rows = SourceVisibilityRows {
+        sample_rate: &sample_rate_row,
+        gain: &gain_row,
+        agc: &agc_row,
+        ppm: &ppm_row,
+        bias_tee: &bias_tee_row,
+        converter_offset: &converter_offset_row,
+        airspy_device: &airspy_device_row,
+        direct_sampling: &direct_sampling_row,
+        offset_tuning: &offset_tuning_row,
+        hostname: &hostname_row,
+        port: &port_row,
+        protocol: &protocol_row,
+        file_path: &file_path_row,
+    };
+    apply_source_row_visibility(selected, &visibility_rows);
     // RTL-TCP-specific rows aren't part of `apply_source_row_
     // visibility` — they're handled by `connect_rtl_tcp_visibility`
     // below for change-notify, but the initial render still
@@ -1173,23 +1216,7 @@ pub fn build_source_panel() -> SourcePanel {
     // window.rs flips visibility via the discovery / last-
     // connected load paths.
 
-    connect_device_visibility(
-        &device_row,
-        &SourceVisibilityRows {
-            sample_rate: &sample_rate_row,
-            gain: &gain_row,
-            agc: &agc_row,
-            ppm: &ppm_row,
-            bias_tee: &bias_tee_row,
-            converter_offset: &converter_offset_row,
-            direct_sampling: &direct_sampling_row,
-            offset_tuning: &offset_tuning_row,
-            hostname: &hostname_row,
-            port: &port_row,
-            protocol: &protocol_row,
-            file_path: &file_path_row,
-        },
-    );
+    connect_device_visibility(&device_row, &visibility_rows);
     connect_rtl_tcp_visibility(
         &device_row,
         &rtl_tcp_discovered_row,
@@ -1210,6 +1237,7 @@ pub fn build_source_panel() -> SourcePanel {
         ppm_row,
         bias_tee_row,
         converter_offset_row,
+        airspy_device_row,
         direct_sampling_row,
         offset_tuning_row,
         hostname_row,
@@ -1573,6 +1601,68 @@ pub fn save_source_converter_offset_hz(config: &Arc<ConfigManager>, offset_hz: f
     });
 }
 
+/// Load the persisted Airspy serial; `None` = first available.
+pub fn load_airspy_serial(config: &Arc<ConfigManager>) -> Option<u64> {
+    config.read(|v| {
+        v.get(KEY_AIRSPY_SERIAL)
+            .and_then(serde_json::Value::as_str)
+            .and_then(sdr_source_airspy::parse_device_serial)
+    })
+}
+
+/// Persist the Airspy serial selection (`None` clears to "first
+/// available").
+pub fn save_airspy_serial(config: &Arc<ConfigManager>, serial: Option<u64>) {
+    config.write(|v| {
+        v[KEY_AIRSPY_SERIAL] = serde_json::json!(
+            serial
+                .map(sdr_source_airspy::format_device_serial)
+                .unwrap_or_default()
+        );
+    });
+}
+
+/// Format a sample rate in Hz as the combo label the static tables
+/// use ("2.5 MHz", "10 MHz"). Trailing `.0` is trimmed so integer
+/// megahertz read clean. Per #848 phase 5.
+#[must_use]
+pub fn format_rate_label(rate_hz: f64) -> String {
+    const HZ_PER_MHZ: f64 = 1_000_000.0;
+    let mhz = rate_hz / HZ_PER_MHZ;
+    let text = format!("{mhz:.3}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    format!("{trimmed} MHz")
+}
+
+/// Index of the entry nearest `current_hz` in a device-reported
+/// rate list; `None` on an empty list. The source clamps requests to
+/// its table, so an exact match is the norm — nearest keeps the UI
+/// honest if rounding ever drifts. Per #848 phase 5.
+#[must_use]
+pub fn nearest_rate_index(rates: &[f64], current_hz: f64) -> Option<usize> {
+    rates
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (*a - current_hz).abs().total_cmp(&(*b - current_hz).abs()))
+        .map(|(i, _)| i)
+}
+
+/// Swap the rate combo's labels to a device-reported rate list (the
+/// dynamic counterpart of [`repopulate_sample_rate_model`]). The
+/// caller re-seeds the selection afterwards.
+pub fn repopulate_sample_rate_model_from_rates(sample_rate_row: &adw::ComboRow, rates: &[f64]) {
+    let Some(model) = sample_rate_row
+        .model()
+        .and_then(|m| m.downcast::<gtk4::StringList>().ok())
+    else {
+        tracing::warn!("sample-rate combo model is not a StringList; skipping repopulate");
+        return;
+    };
+    let labels: Vec<String> = rates.iter().map(|&r| format_rate_label(r)).collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    model.splice(0, model.n_items(), &label_refs);
+}
+
 /// Load the persisted RTL2832 direct-sampling combo index.
 /// Defaults to [`DIRECT_SAMPLING_DISABLED_IDX`] when the key is
 /// missing, the value isn't numeric, or the parsed value falls
@@ -1670,16 +1760,19 @@ pub fn save_source_rtl_ppm(config: &Arc<ConfigManager>, ppm: i32) {
 
 /// Load the persisted source-type combo index. Defaults to
 /// [`DEVICE_RTLSDR`] when the key is missing, the value isn't a
-/// `u64`, or the parsed index falls outside `0..=DEVICE_RTLTCP`
+/// `u64`, or the parsed index falls outside `0..=DEVICE_AIRSPY`
 /// (e.g. a future build added more source types and the user
-/// rolled back). Per `CodeRabbit` round 1 on PR #558.
+/// rolled back). Per `CodeRabbit` round 1 on PR #558; bound raised
+/// with the Airspy slot on PR #852 after the stale `DEVICE_RTLTCP`
+/// clamp silently reverted a persisted Airspy selection to RTL-SDR
+/// at startup.
 #[must_use]
 pub fn load_source_device_index(config: &Arc<ConfigManager>) -> u32 {
     config.read(|v| {
         v.get(KEY_SOURCE_DEVICE_INDEX)
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
-            .filter(|&idx| idx <= DEVICE_RTLTCP)
+            .filter(|&idx| idx <= DEVICE_AIRSPY)
             .unwrap_or(DEVICE_RTLSDR)
     })
 }

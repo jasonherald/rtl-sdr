@@ -284,3 +284,45 @@ fn rejected_converter_offset_is_not_retained() {
         130_000_000
     );
 }
+
+// ── Serial-number device selection (#848 phase 5) ─────────────────
+
+#[test]
+fn device_serial_defaults_to_first_available() {
+    let source = AirspySource::new();
+    assert_eq!(source.device_serial(), None);
+}
+
+#[test]
+fn device_serial_dispatch_is_remembered_when_closed() {
+    // Selection takes effect at the next start(); with no device open
+    // the choice must be stored, not dropped.
+    let mut source = AirspySource::new();
+    source.set_device_serial(Some(0x1A2B_3C4D_5E6F_7788));
+    assert_eq!(source.device_serial(), Some(0x1A2B_3C4D_5E6F_7788));
+    source.set_device_serial(None);
+    assert_eq!(source.device_serial(), None);
+}
+
+#[test]
+fn serial_formats_as_upper_hex() {
+    // The UI shows serials the way airspy_info does: 16 upper-hex
+    // digits, zero-padded.
+    assert_eq!(
+        format_device_serial(0x1A2B_3C4D_5E6F_7788),
+        "1A2B3C4D5E6F7788"
+    );
+    assert_eq!(format_device_serial(0x2A), "000000000000002A");
+}
+
+#[test]
+fn serial_parse_round_trips_format() {
+    assert_eq!(
+        parse_device_serial("1A2B3C4D5E6F7788"),
+        Some(0x1A2B_3C4D_5E6F_7788)
+    );
+    // Lowercase input is accepted (hand-edited configs).
+    assert_eq!(parse_device_serial("2a"), Some(0x2A));
+    assert_eq!(parse_device_serial(""), None);
+    assert_eq!(parse_device_serial("not-hex"), None);
+}

@@ -335,6 +335,9 @@ struct DspState {
     /// Upconverter offset in Hz — replayed to the source on every
     /// open so the setting survives stop/start (#848 phase 4).
     converter_offset_hz: f64,
+    /// Airspy device serial to open (`None` = first available) —
+    /// applied by the source factory at the next open (#848 phase 5).
+    airspy_serial: Option<u64>,
     /// RTL-SDR direct-sampling mode (0 = disabled, 1 = I, 2 = Q).
     /// Persist-and-replay companion to `bias_tee_enabled` —
     /// see [issue `#551`].
@@ -641,6 +644,10 @@ struct DspState {
 }
 
 impl DspState {
+    // One flat struct literal initializing every controller field —
+    // splitting it would need Default impls the DSP members can't
+    // provide. Same allowance as handle_command / process_iq_block.
+    #[allow(clippy::too_many_lines)]
     fn new(dsp_tx: mpsc::Sender<DspToUi>) -> Result<Self, String> {
         let frontend = IqFrontend::new(
             DEFAULT_SAMPLE_RATE,
@@ -698,6 +705,7 @@ impl DspState {
             file_looping: false,
             bias_tee_enabled: false,
             converter_offset_hz: 0.0,
+            airspy_serial: None,
             direct_sampling_mode: 0,
             offset_tuning_enabled: false,
             rtl_agc_enabled: false,
@@ -1019,6 +1027,12 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
 
         UiToDsp::SetConverterOffset(offset_hz) => {
             source::handle_set_converter_offset(state, dsp_tx, offset_hz);
+        }
+        UiToDsp::SetAirspyDeviceSerial(serial) => {
+            source::handle_set_airspy_device_serial(state, serial);
+        }
+        UiToDsp::RefreshAirspyDevices => {
+            source::handle_refresh_airspy_devices(dsp_tx);
         }
         UiToDsp::SetBiasTee(enabled) => {
             source::handle_set_bias_tee(state, dsp_tx, enabled);

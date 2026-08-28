@@ -723,3 +723,76 @@ fn converter_offset_round_trips_and_defaults_to_zero() {
     save_source_converter_offset_hz(&config, -125_000_000.0);
     assert!((load_source_converter_offset_hz(&config) - -125_000_000.0).abs() < f64::EPSILON);
 }
+
+// ---- Airspy phase 5: rate labels + serial persistence ----
+
+#[test]
+fn rate_labels_trim_trailing_zeros() {
+    // R2 table
+    assert_eq!(format_rate_label(2_500_000.0), "2.5 MHz");
+    assert_eq!(format_rate_label(10_000_000.0), "10 MHz");
+    // Mini table
+    assert_eq!(format_rate_label(3_000_000.0), "3 MHz");
+    assert_eq!(format_rate_label(6_000_000.0), "6 MHz");
+    assert_eq!(format_rate_label(12_000_000.0), "12 MHz");
+    // Sub-kHz precision survives (matches the RTL static labels).
+    assert_eq!(format_rate_label(1_024_000.0), "1.024 MHz");
+}
+
+#[test]
+fn dynamic_rate_labels_match_static_airspy_table() {
+    // The R2's device-reported table must render EXACTLY the same
+    // labels as the static fallback — otherwise the combo visibly
+    // flickers on first Play.
+    let static_labels = sample_rate_labels_for_device(DEVICE_AIRSPY);
+    let dynamic: Vec<String> = sdr_source_airspy::DEFAULT_SAMPLE_RATES
+        .iter()
+        .map(|&r| format_rate_label(r))
+        .collect();
+    assert_eq!(dynamic, static_labels);
+}
+
+#[test]
+fn airspy_serial_round_trips_and_defaults_to_first_available() {
+    let config = make_config();
+    assert_eq!(load_airspy_serial(&config), None);
+    save_airspy_serial(&config, Some(0x1A2B_3C4D_5E6F_7788));
+    assert_eq!(load_airspy_serial(&config), Some(0x1A2B_3C4D_5E6F_7788));
+    // Clearing back to "first available" persists as empty.
+    save_airspy_serial(&config, None);
+    assert_eq!(load_airspy_serial(&config), None);
+}
+
+#[test]
+fn nearest_rate_index_selects_running_rate() {
+    // Mini table, running at 6 Msps → exact match.
+    let mini = [3_000_000.0, 6_000_000.0, 12_000_000.0];
+    assert_eq!(nearest_rate_index(&mini, 6_000_000.0), Some(1));
+    // A drifted value snaps to the closest entry.
+    assert_eq!(nearest_rate_index(&mini, 5_400_000.0), Some(1));
+    assert_eq!(nearest_rate_index(&mini, 3_100_000.0), Some(0));
+    // Empty list (defensive — the epilogue skips empty tables).
+    assert_eq!(nearest_rate_index(&[], 1.0), None);
+}
+
+#[test]
+fn device_index_round_trips_airspy() {
+    // CR round 1 on PR #852 escalation: the loader's stale
+    // `DEVICE_RTLTCP` bound silently reverted a persisted Airspy
+    // selection to RTL-SDR at startup (user-reported on the phase-5
+    // smoke). Every legal device index must round-trip.
+    let config = make_config();
+    for idx in [
+        DEVICE_RTLSDR,
+        DEVICE_NETWORK,
+        DEVICE_FILE,
+        DEVICE_RTLTCP,
+        DEVICE_AIRSPY,
+    ] {
+        save_source_device_index(&config, idx);
+        assert_eq!(load_source_device_index(&config), idx, "index {idx}");
+    }
+    // Out-of-range still fails closed to RTL-SDR.
+    save_source_device_index(&config, DEVICE_AIRSPY + 1);
+    assert_eq!(load_source_device_index(&config), DEVICE_RTLSDR);
+}

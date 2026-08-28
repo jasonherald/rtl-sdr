@@ -164,6 +164,9 @@ pub struct AirspySource {
     /// Bias-T state to replay on open (powers a `SpyVerter` / external
     /// LNA). Dispatches are remembered even with the device closed.
     bias_tee: bool,
+    /// Serial number of the device to open at `start()`; `None`
+    /// opens the first enumerated device. Per #848 phase 5.
+    device_serial: Option<u64>,
     /// Upconverter offset in Hz: the hardware tunes to
     /// `display frequency + offset` while `self.frequency` (and every
     /// caller) stays in display terms. 0.0 = no converter. Per issue
@@ -179,11 +182,13 @@ impl Default for AirspySource {
 
 impl AirspySource {
     /// Create a new Airspy source. Opens the first enumerated device
-    /// at `start()` (serial selection is issue #848 follow-up scope).
+    /// at `start()` unless [`Self::set_device_serial`] selected a
+    /// specific unit.
     #[must_use]
     pub fn new() -> Self {
         Self {
             device: None,
+            device_serial: None,
             sample_rate: DEFAULT_SAMPLE_RATES[0],
             frequency: 100_000_000.0,
             sample_rates: DEFAULT_SAMPLE_RATES.to_vec(),
@@ -198,14 +203,34 @@ impl AirspySource {
         }
     }
 
-    /// Open the first enumerated device and program the pre-stream
+    /// The serial selected for the next `start()`; `None` = first
+    /// available device.
+    #[must_use]
+    pub fn device_serial(&self) -> Option<u64> {
+        self.device_serial
+    }
+
+    /// Select which physical device the next `start()` opens. Takes
+    /// effect on the next open — an already-running stream is not
+    /// re-opened. Per #848 phase 5.
+    pub fn set_device_serial(&mut self, serial: Option<u64>) {
+        tracing::info!(?serial, "AirspySource::set_device_serial dispatch");
+        self.device_serial = serial;
+    }
+
+    /// Open the selected (or first enumerated) device and program the pre-stream
     /// state: latch `Float32Iq` (before the rate snapshot —
     /// `samplerates()` reports per-sample-type values), snapshot the
     /// firmware rate table, clamp + apply the requested rate, tune,
     /// replay gain state, and apply bias-T (non-fatal). Split out of
     /// `start()` per the 50-NLOC gate on PR #850.
     fn open_and_configure(&mut self) -> Result<Device, SourceError> {
-        let mut device = Device::open().map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+        let mut device = match self.device_serial {
+            Some(serial) => Device::open_serial(serial).map_err(|e| {
+                SourceError::OpenFailed(format!("serial {}: {e}", format_device_serial(serial)))
+            })?,
+            None => Device::open().map_err(|e| SourceError::OpenFailed(e.to_string()))?,
+        };
 
         // Latch Float32Iq BEFORE the rate snapshot: `samplerates()`
         // reports per-sample-type values (doubled for real types).
@@ -333,6 +358,31 @@ fn bridge_transfer(
         }
         Err(TrySendError::Disconnected(_)) => false,
     }
+}
+
+/// Enumerate the serial numbers of every connected Airspy device.
+/// Thin wrapper over the driver so callers (the controller) don't
+/// need a direct `libairspy_rs` dependency. Per #848 phase 5.
+pub fn list_device_serials() -> Result<Vec<u64>, SourceError> {
+    libairspy_rs::list_devices().map_err(|e| SourceError::OpenFailed(e.to_string()))
+}
+
+/// Format a device serial the way `airspy_info` prints it: 16
+/// upper-hex digits, zero-padded.
+#[must_use]
+pub fn format_device_serial(serial: u64) -> String {
+    format!("{serial:016X}")
+}
+
+/// Parse a serial persisted by [`format_device_serial`]. Accepts
+/// lowercase for hand-edited configs; `None` on empty or non-hex
+/// input.
+#[must_use]
+pub fn parse_device_serial(text: &str) -> Option<u64> {
+    if text.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(text, 16).ok()
 }
 
 impl Source for AirspySource {

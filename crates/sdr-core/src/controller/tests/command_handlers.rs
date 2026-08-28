@@ -424,3 +424,65 @@ fn handle_set_converter_offset_rolls_back_state_on_live_rejection() {
         .expect("error toast dispatched");
     assert!(matches!(toast, DspToUi::Error(msg) if msg.contains("offset")));
 }
+
+// ── Airspy serial selection + device-reported rates (#848 phase 5) ──
+
+#[test]
+fn handle_command_routes_set_airspy_device_serial() {
+    const SERIAL: u64 = 0x1A2B_3C4D_5E6F_7788;
+    let (dsp_tx, _rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    handle_command(
+        &mut state,
+        &dsp_tx,
+        UiToDsp::SetAirspyDeviceSerial(Some(SERIAL)),
+    );
+    assert_eq!(state.airspy_serial, Some(SERIAL));
+    handle_command(&mut state, &dsp_tx, UiToDsp::SetAirspyDeviceSerial(None));
+    assert_eq!(state.airspy_serial, None);
+}
+
+#[test]
+fn start_epilogue_reports_device_sample_rates() {
+    // The post-start epilogue must surface the opened device's
+    // firmware rate table so the UI can swap its static model for
+    // the real one (R2 vs Mini report different lists).
+    let (dsp_tx, rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    state.source = Some(Box::new(RecordingSource::default()));
+    super::super::source::send_started_device_info(&state, &dsp_tx);
+    let (rates, current_hz) = rx
+        .try_iter()
+        .find_map(|m| match m {
+            DspToUi::SampleRateList { rates, current_hz } => Some((rates, current_hz)),
+            _ => None,
+        })
+        .expect("SampleRateList emitted");
+    // RecordingSource reports a single 2.5 Msps rate.
+    assert_eq!(rates, vec![2_500_000.0]);
+    // The current rate is the frontend's actual running rate.
+    assert!(current_hz > 0.0);
+}
+
+#[test]
+fn refresh_airspy_devices_always_answers_with_a_list() {
+    // Codacy round 1 on PR #852: the enumeration handler must answer
+    // even when it finds nothing (no hardware in CI) or errors — the
+    // UI is waiting to rebuild its combo either way.
+    let (dsp_tx, rx) = mpsc::channel();
+    handle_command(
+        &mut DspState::new(dsp_tx.clone()).unwrap(),
+        &dsp_tx,
+        UiToDsp::RefreshAirspyDevices,
+    );
+    // The arrival IS the contract under test: CI runners have no
+    // Airspy hardware, so the expected answer here is an empty list
+    // — never silence. (With hardware attached the list carries the
+    // real serials; both are valid.)
+    rx.try_iter()
+        .find_map(|m| match m {
+            DspToUi::AirspyDeviceList(serials) => Some(serials),
+            _ => None,
+        })
+        .expect("AirspyDeviceList answered");
+}

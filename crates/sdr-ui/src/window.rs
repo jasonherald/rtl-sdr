@@ -1332,6 +1332,8 @@ pub fn build_window(
         freq_selector: freq_selector_for_dsp.clone(),
         demod_dropdown: demod_dropdown_for_dsp.clone(),
         sample_rate_row: sample_rate_row_for_dsp.clone(),
+        airspy_device_row: panels.source.airspy_device_row.clone(),
+        config: std::sync::Arc::clone(config),
         decimation_row: decimation_row_for_dsp.clone(),
         volume_button: volume_button_for_dsp.clone(),
         rtl_tcp_status_row_weak: rtl_tcp_status_row_weak.clone(),
