@@ -212,3 +212,103 @@ fn sink_swap_while_running_failure_latches_offline_and_emits_error() {
     );
     drop(blocker);
 }
+
+// ── Airspy pre-start / post-start settings mapping (#848 / PR #850) ──
+
+/// Records every gain / mode / bias dispatch so the Airspy settings
+/// helpers can be verified without hardware.
+#[derive(Default)]
+struct RecordingSource {
+    gain_modes: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    gains: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
+    bias: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl Source for RecordingSource {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+    fn start(&mut self) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn tune(&mut self, _frequency_hz: f64) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn sample_rates(&self) -> &[f64] {
+        &[2_500_000.0]
+    }
+    fn sample_rate(&self) -> f64 {
+        2_500_000.0
+    }
+    fn set_sample_rate(&mut self, _rate: f64) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn read_samples(&mut self, _output: &mut [Complex]) -> Result<usize, sdr_types::SourceError> {
+        Ok(0)
+    }
+    fn set_gain(&mut self, gain_tenths: i32) -> Result<(), sdr_types::SourceError> {
+        self.gains.lock().unwrap().push(gain_tenths);
+        Ok(())
+    }
+    fn set_gain_mode(&mut self, manual: bool) -> Result<(), sdr_types::SourceError> {
+        self.gain_modes.lock().unwrap().push(manual);
+        Ok(())
+    }
+    fn set_bias_tee(&mut self, enabled: bool) -> Result<(), sdr_types::SourceError> {
+        self.bias.lock().unwrap().push(enabled);
+        Ok(())
+    }
+}
+
+#[test]
+fn airspy_pre_start_dispatches_mode_before_gain() {
+    let (dsp_tx, _rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx).unwrap();
+    state.tuner_agc_auto = false;
+    state.tuner_gain_tenths_db = 140;
+    let mut source = RecordingSource::default();
+    let (modes, gains) = (
+        std::sync::Arc::clone(&source.gain_modes),
+        std::sync::Arc::clone(&source.gains),
+    );
+    super::super::source::airspy_pre_start_settings(&state, &mut source);
+    // Manual mode (AGC off) then the persisted gain — order matters:
+    // the composite gain write assumes AGCs are being disabled, and
+    // the value maps to the 0-21 linearity ladder inside the source.
+    assert_eq!(*modes.lock().unwrap(), vec![true]);
+    assert_eq!(*gains.lock().unwrap(), vec![140]);
+}
+
+#[test]
+fn airspy_pre_start_respects_agc_auto() {
+    let (dsp_tx, _rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx).unwrap();
+    state.tuner_agc_auto = true;
+    let mut source = RecordingSource::default();
+    let modes = std::sync::Arc::clone(&source.gain_modes);
+    super::super::source::airspy_pre_start_settings(&state, &mut source);
+    assert_eq!(
+        *modes.lock().unwrap(),
+        vec![false],
+        "agc_auto → manual=false"
+    );
+}
+
+#[test]
+fn airspy_replay_applies_persisted_bias_tee() {
+    let (dsp_tx, rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    state.bias_tee_enabled = true;
+    let mut source = RecordingSource::default();
+    let bias = std::sync::Arc::clone(&source.bias);
+    super::super::source::airspy_replay_persisted_settings(&state, &mut source, &dsp_tx);
+    assert_eq!(*bias.lock().unwrap(), vec![true]);
+    // Success path emits no error event.
+    assert!(
+        !matches!(rx.try_recv(), Ok(DspToUi::Error(_))),
+        "no error toast on successful bias replay"
+    );
+}

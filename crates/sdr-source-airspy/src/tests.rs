@@ -6,6 +6,10 @@
 //! Hardware-free unit tests: sample conversion, gain-ladder mapping,
 //! rate clamping, and the bridge / drain bookkeeping.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use libairspy_rs::conversion::Samples;
+
 use super::*;
 
 /// Fixture rates mirroring the R2 firmware table (IQ, Hz).
@@ -124,4 +128,86 @@ fn set_sample_rate_accepts_any_value_when_closed() {
         .set_sample_rate(2_400_000.0)
         .expect("closed-source rate set is deferred validation");
     assert_eq!(source.sample_rate(), 2_400_000.0);
+}
+
+// ── bridge_transfer: block delivery + drop accounting ──────────────
+
+#[test]
+fn bridge_delivers_float32_blocks_in_order() {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+    let dropped = AtomicU64::new(0);
+    let block = [0.1_f32, 0.2, 0.3, 0.4];
+    assert!(bridge_transfer(&tx, &Samples::Float32(&block), 0, &dropped));
+    assert_eq!(rx.recv().expect("block delivered"), block.to_vec());
+    assert_eq!(dropped.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn bridge_drops_block_and_counts_when_channel_full() {
+    // Bound of 1, prefilled: the DSP is "behind". The bridge must
+    // drop (keep streaming = true) and count, never block the
+    // driver's consumer thread.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+    let dropped = AtomicU64::new(0);
+    assert!(bridge_transfer(
+        &tx,
+        &Samples::Float32(&[1.0, 2.0]),
+        0,
+        &dropped
+    ));
+    assert!(bridge_transfer(
+        &tx,
+        &Samples::Float32(&[3.0, 4.0]),
+        0,
+        &dropped
+    ));
+    assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    // The first block survived; the second was dropped.
+    assert_eq!(rx.recv().expect("first block"), vec![1.0, 2.0]);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn bridge_stops_stream_when_receiver_gone() {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+    drop(rx);
+    let dropped = AtomicU64::new(0);
+    assert!(!bridge_transfer(
+        &tx,
+        &Samples::Float32(&[1.0, 2.0]),
+        0,
+        &dropped
+    ));
+}
+
+#[test]
+fn bridge_rejects_non_float32_blocks() {
+    // The sample type is latched to Float32Iq before start_rx; any
+    // other variant is a driver contract violation and must stop the
+    // stream rather than feed garbage samples to the DSP.
+    let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+    let dropped = AtomicU64::new(0);
+    let int_block = [1_i16, 2, 3, 4];
+    assert!(!bridge_transfer(
+        &tx,
+        &Samples::Int16(&int_block),
+        0,
+        &dropped
+    ));
+}
+
+#[test]
+fn bridge_driver_drop_report_does_not_stop_stream() {
+    // Driver-side ring drops are informational (logged); the stream
+    // must continue and the block still delivers.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+    let dropped = AtomicU64::new(0);
+    assert!(bridge_transfer(
+        &tx,
+        &Samples::Float32(&[5.0, 6.0]),
+        123,
+        &dropped
+    ));
+    assert_eq!(rx.recv().expect("delivered"), vec![5.0, 6.0]);
+    assert_eq!(dropped.load(Ordering::Relaxed), 0);
 }
