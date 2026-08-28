@@ -3486,6 +3486,12 @@ fn wire_airspy_device_row(
         .source
         .airspy_device_row
         .connect_selected_notify(move |row| {
+            // Programmatic rebuilds from the device-list event must
+            // not round-trip into config writes — see
+            // `AppState::suppress_airspy_unit_notify`.
+            if state_serial.suppress_airspy_unit_notify.get() {
+                return;
+            }
             let idx = row.selected();
             // Index 0 = "first available"; N>0 = the (N-1)th
             // enumerated serial, parsed back from its label. A
@@ -3998,10 +4004,12 @@ fn wire_device_selector(
         .connect_selected_notify(move |row| {
             let idx = row.selected();
             // Validate before persisting (same rationale as the
-            // sample-rate row above). `DEVICE_RTLTCP` is the
+            // sample-rate row above). `DEVICE_AIRSPY` is the
             // highest valid index. Per CodeRabbit round 1 on
-            // PR #558.
-            if idx > sidebar::source_panel::DEVICE_RTLTCP {
+            // PR #558; bound raised for Airspy per CR round 1 on
+            // PR #852 (the stale RTLTCP bound silently dropped
+            // the Airspy selection from config).
+            if idx > sidebar::source_panel::DEVICE_AIRSPY {
                 return;
             }
             sidebar::source_panel::save_source_device_index(&config_device, idx);

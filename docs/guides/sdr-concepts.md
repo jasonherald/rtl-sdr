@@ -94,10 +94,11 @@ waterfall).
 
 The **General panel** (`Ctrl+1`) is where you'd change the
 sample rate. The rate list adapts to the connected device: an
-RTL-SDR offers up to 3.2 Msps (2.4 is the reliable ceiling), an
-Airspy R2 reports 2.5 / 10 Msps and a Mini 3 / 6 / 12 Msps — the
-app reads the list from the device firmware, so whatever your
-hardware actually supports is what the combo shows.
+RTL-SDR offers up to 3.2 Msps (2.4 is the reliable ceiling); an
+Airspy R2 reports 2.5 / 10 Msps, and other Airspy models report
+their own tables — the app reads the list from the device
+firmware, so whatever your hardware actually supports is what
+the combo shows.
 
 ---
 

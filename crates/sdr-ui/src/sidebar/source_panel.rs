@@ -1171,24 +1171,26 @@ pub fn build_source_panel() -> SourcePanel {
     // the policy lives in exactly one place. Per `CodeRabbit`
     // round 1 on PR #559.
     let selected = device_row.selected();
-    apply_source_row_visibility(
-        selected,
-        &SourceVisibilityRows {
-            sample_rate: &sample_rate_row,
-            gain: &gain_row,
-            agc: &agc_row,
-            ppm: &ppm_row,
-            bias_tee: &bias_tee_row,
-            converter_offset: &converter_offset_row,
-            airspy_device: &airspy_device_row,
-            direct_sampling: &direct_sampling_row,
-            offset_tuning: &offset_tuning_row,
-            hostname: &hostname_row,
-            port: &port_row,
-            protocol: &protocol_row,
-            file_path: &file_path_row,
-        },
-    );
+    // One bundle serves both the initial render and the
+    // change-notify wiring below — a single construction site keeps
+    // the field list in step when rows are added. Per Codacy round 1
+    // on PR #852.
+    let visibility_rows = SourceVisibilityRows {
+        sample_rate: &sample_rate_row,
+        gain: &gain_row,
+        agc: &agc_row,
+        ppm: &ppm_row,
+        bias_tee: &bias_tee_row,
+        converter_offset: &converter_offset_row,
+        airspy_device: &airspy_device_row,
+        direct_sampling: &direct_sampling_row,
+        offset_tuning: &offset_tuning_row,
+        hostname: &hostname_row,
+        port: &port_row,
+        protocol: &protocol_row,
+        file_path: &file_path_row,
+    };
+    apply_source_row_visibility(selected, &visibility_rows);
     // RTL-TCP-specific rows aren't part of `apply_source_row_
     // visibility` — they're handled by `connect_rtl_tcp_visibility`
     // below for change-notify, but the initial render still
@@ -1206,24 +1208,7 @@ pub fn build_source_panel() -> SourcePanel {
     // window.rs flips visibility via the discovery / last-
     // connected load paths.
 
-    connect_device_visibility(
-        &device_row,
-        &SourceVisibilityRows {
-            sample_rate: &sample_rate_row,
-            gain: &gain_row,
-            agc: &agc_row,
-            ppm: &ppm_row,
-            bias_tee: &bias_tee_row,
-            converter_offset: &converter_offset_row,
-            airspy_device: &airspy_device_row,
-            direct_sampling: &direct_sampling_row,
-            offset_tuning: &offset_tuning_row,
-            hostname: &hostname_row,
-            port: &port_row,
-            protocol: &protocol_row,
-            file_path: &file_path_row,
-        },
-    );
+    connect_device_visibility(&device_row, &visibility_rows);
     connect_rtl_tcp_visibility(
         &device_row,
         &rtl_tcp_discovered_row,
@@ -1634,10 +1619,24 @@ pub fn save_airspy_serial(config: &Arc<ConfigManager>, serial: Option<u64>) {
 /// megahertz read clean. Per #848 phase 5.
 #[must_use]
 pub fn format_rate_label(rate_hz: f64) -> String {
-    let mhz = rate_hz / 1_000_000.0;
+    const HZ_PER_MHZ: f64 = 1_000_000.0;
+    let mhz = rate_hz / HZ_PER_MHZ;
     let text = format!("{mhz:.3}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
     format!("{trimmed} MHz")
+}
+
+/// Index of the entry nearest `current_hz` in a device-reported
+/// rate list; `None` on an empty list. The source clamps requests to
+/// its table, so an exact match is the norm — nearest keeps the UI
+/// honest if rounding ever drifts. Per #848 phase 5.
+#[must_use]
+pub fn nearest_rate_index(rates: &[f64], current_hz: f64) -> Option<usize> {
+    rates
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (*a - current_hz).abs().total_cmp(&(*b - current_hz).abs()))
+        .map(|(i, _)| i)
 }
 
 /// Swap the rate combo's labels to a device-reported rate list (the

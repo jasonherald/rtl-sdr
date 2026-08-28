@@ -111,6 +111,14 @@ pub struct AppState {
     /// which would in turn re-emit `BandwidthChanged` and waste a
     /// round trip per UI reflection.
     pub suppress_bandwidth_notify: Cell<bool>,
+    /// Re-entrancy guard for programmatic Airspy-unit combo updates
+    /// from the `DspToUi::AirspyDeviceList` handler. Without it, the
+    /// fallback re-select of "First available" when the persisted
+    /// unit is temporarily disconnected would fire the notify
+    /// handler and WIPE the saved serial from config. Same pattern
+    /// as [`Self::suppress_bandwidth_notify`]. Per Codacy round 1 on
+    /// PR #852.
+    pub suppress_airspy_unit_notify: Cell<bool>,
     /// Mirror of `suppress_bandwidth_notify` for the demod dropdown.
     /// Set true when we're programmatically changing the selected
     /// demod mode (e.g. the scanner `ScannerActiveChannelChanged`
@@ -464,6 +472,7 @@ impl AppState {
         Rc::new(Self {
             is_running: Cell::new(false),
             live_source_rates: RefCell::new(None),
+            suppress_airspy_unit_notify: Cell::new(false),
             center_frequency: Cell::new(DEFAULT_CENTER_FREQUENCY_HZ),
             last_dispatched_vfo_offset_hz: Cell::new(0.0),
             demod_mode: Cell::new(DemodMode::Wfm),

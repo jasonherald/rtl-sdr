@@ -463,3 +463,26 @@ fn start_epilogue_reports_device_sample_rates() {
     // The current rate is the frontend's actual running rate.
     assert!(current_hz > 0.0);
 }
+
+#[test]
+fn refresh_airspy_devices_always_answers_with_a_list() {
+    // Codacy round 1 on PR #852: the enumeration handler must answer
+    // even when it finds nothing (no hardware in CI) or errors — the
+    // UI is waiting to rebuild its combo either way.
+    let (dsp_tx, rx) = mpsc::channel();
+    handle_command(
+        &mut DspState::new(dsp_tx.clone()).unwrap(),
+        &dsp_tx,
+        UiToDsp::RefreshAirspyDevices,
+    );
+    // The arrival IS the contract under test: CI runners have no
+    // Airspy hardware, so the expected answer here is an empty list
+    // — never silence. (With hardware attached the list carries the
+    // real serials; both are valid.)
+    rx.try_iter()
+        .find_map(|m| match m {
+            DspToUi::AirspyDeviceList(serials) => Some(serials),
+            _ => None,
+        })
+        .expect("AirspyDeviceList answered");
+}

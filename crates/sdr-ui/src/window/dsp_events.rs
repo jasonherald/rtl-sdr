@@ -79,12 +79,10 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
         DspToUi::SourceStopped => on_source_stopped(ctx),
         DspToUi::SampleRateChanged(rate) => on_sample_rate_changed(ctx, rate),
         DspToUi::DisplayBandwidth(raw_rate) => on_display_bandwidth(ctx, raw_rate),
-        DspToUi::DeviceInfo(info) => on_device_info(ctx, &info),
-        DspToUi::GainList(gains) => on_gain_list(ctx, &gains),
-        DspToUi::SampleRateList { rates, current_hz } => {
-            on_sample_rate_list(ctx, &rates, current_hz)
-        }
-        DspToUi::AirspyDeviceList(serials) => on_airspy_device_list(ctx, &serials),
+        msg @ (DspToUi::DeviceInfo(_)
+        | DspToUi::GainList(_)
+        | DspToUi::SampleRateList { .. }
+        | DspToUi::AirspyDeviceList(_)) => on_device_capability_event(ctx, msg),
         DspToUi::AudioRecordingStarted(path) => on_audio_recording_started(ctx, &path),
         DspToUi::AudioRecordingStopped => on_audio_recording_stopped(ctx),
         DspToUi::IqRecordingStarted(path) => on_iq_recording_started(ctx, &path),
@@ -193,6 +191,29 @@ fn on_source_stopped(ctx: &DspEventCtx) {
     transcription_enable_row.set_active(false);
 }
 
+/// Device-capability sub-dispatcher of [`handle_dsp_message`]: the
+/// post-start events describing what the opened hardware can do
+/// (name, gain table, rate table, unit list). Grouped so the central
+/// dispatcher stays a one-line-per-topic match as source surfaces
+/// grow. Per Codacy round 1 on PR #852.
+fn on_device_capability_event(ctx: &DspEventCtx, msg: DspToUi) {
+    match msg {
+        DspToUi::DeviceInfo(info) => on_device_info(ctx, &info),
+        DspToUi::GainList(gains) => on_gain_list(ctx, &gains),
+        DspToUi::SampleRateList { rates, current_hz } => {
+            on_sample_rate_list(ctx, &rates, current_hz);
+        }
+        DspToUi::AirspyDeviceList(serials) => on_airspy_device_list(ctx, &serials),
+        // The outer dispatch only routes the four variants above; a
+        // stray event is a wiring bug worth logging, not a panic
+        // (no-panic rule for library crates).
+        other => tracing::warn!(
+            ?other,
+            "non-capability event routed to on_device_capability_event"
+        ),
+    }
+}
+
 /// `DspToUi::GainList` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
 fn on_gain_list(ctx: &DspEventCtx, gains: &[f64]) {
@@ -230,14 +251,7 @@ fn on_sample_rate_list(ctx: &DspEventCtx, rates: &[f64], current_hz: f64) {
     );
     *state.live_source_rates.borrow_mut() = Some(rates.to_vec());
     sidebar::source_panel::repopulate_sample_rate_model_from_rates(sample_rate_row, rates);
-    // Select the running rate (nearest entry — the source clamps
-    // requests to its table, so an exact match is the norm).
-    let nearest = rates
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| (*a - current_hz).abs().total_cmp(&(*b - current_hz).abs()))
-        .map(|(i, _)| i);
-    if let Some(idx) = nearest {
+    if let Some(idx) = sidebar::source_panel::nearest_rate_index(rates, current_hz) {
         #[allow(clippy::cast_possible_truncation, reason = "rate tables are tiny")]
         sample_rate_row.set_selected(idx as u32);
     }
@@ -251,6 +265,7 @@ fn on_sample_rate_list(ctx: &DspEventCtx, rates: &[f64], current_hz: f64) {
 /// wiring's bounds guard discards).
 fn on_airspy_device_list(ctx: &DspEventCtx, serials: &[u64]) {
     let DspEventCtx {
+        state,
         airspy_device_row,
         config,
         ..
@@ -270,6 +285,12 @@ fn on_airspy_device_list(ctx: &DspEventCtx, serials: &[u64]) {
             .map(|&sn| sdr_source_airspy::format_device_serial(sn)),
     );
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    // Guard the whole programmatic update: the splice and the
+    // re-select both fire `selected` notifies, and the fallback to
+    // "First available" for a temporarily disconnected unit must NOT
+    // overwrite the persisted serial — it stays saved so the unit is
+    // re-selected when it reappears. Per Codacy round 1 on PR #852.
+    state.suppress_airspy_unit_notify.set(true);
     model.splice(0, model.n_items(), &label_refs);
     let persisted = sidebar::source_panel::load_airspy_serial(config);
     let selected = persisted
@@ -277,6 +298,7 @@ fn on_airspy_device_list(ctx: &DspEventCtx, serials: &[u64]) {
         .map_or(0, |pos| pos + 1);
     #[allow(clippy::cast_possible_truncation, reason = "device lists are tiny")]
     airspy_device_row.set_selected(selected as u32);
+    state.suppress_airspy_unit_notify.set(false);
 }
 
 /// Recording ↔ transcription mutex, UI leg: the controller's

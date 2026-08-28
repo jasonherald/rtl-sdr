@@ -762,3 +762,15 @@ fn airspy_serial_round_trips_and_defaults_to_first_available() {
     save_airspy_serial(&config, None);
     assert_eq!(load_airspy_serial(&config), None);
 }
+
+#[test]
+fn nearest_rate_index_selects_running_rate() {
+    // Mini table, running at 6 Msps → exact match.
+    let mini = [3_000_000.0, 6_000_000.0, 12_000_000.0];
+    assert_eq!(nearest_rate_index(&mini, 6_000_000.0), Some(1));
+    // A drifted value snaps to the closest entry.
+    assert_eq!(nearest_rate_index(&mini, 5_400_000.0), Some(1));
+    assert_eq!(nearest_rate_index(&mini, 3_100_000.0), Some(0));
+    // Empty list (defensive — the epilogue skips empty tables).
+    assert_eq!(nearest_rate_index(&[], 1.0), None);
+}
