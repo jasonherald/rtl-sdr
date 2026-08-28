@@ -39,6 +39,8 @@ pub(super) struct DspEventCtx {
     pub(super) freq_selector: header::frequency_selector::FrequencySelector,
     pub(super) demod_dropdown: gtk4::DropDown,
     pub(super) sample_rate_row: adw::ComboRow,
+    pub(super) airspy_device_row: adw::ComboRow,
+    pub(super) config: std::sync::Arc<sdr_config::ConfigManager>,
     pub(super) decimation_row: adw::ComboRow,
     pub(super) volume_button: gtk4::ScaleButton,
     pub(super) rtl_tcp_status_row_weak: glib::WeakRef<adw::ActionRow>,
@@ -79,6 +81,10 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
         DspToUi::DisplayBandwidth(raw_rate) => on_display_bandwidth(ctx, raw_rate),
         DspToUi::DeviceInfo(info) => on_device_info(ctx, &info),
         DspToUi::GainList(gains) => on_gain_list(ctx, &gains),
+        DspToUi::SampleRateList { rates, current_hz } => {
+            on_sample_rate_list(ctx, &rates, current_hz)
+        }
+        DspToUi::AirspyDeviceList(serials) => on_airspy_device_list(ctx, &serials),
         DspToUi::AudioRecordingStarted(path) => on_audio_recording_started(ctx, &path),
         DspToUi::AudioRecordingStopped => on_audio_recording_stopped(ctx),
         DspToUi::IqRecordingStarted(path) => on_iq_recording_started(ctx, &path),
@@ -202,6 +208,75 @@ fn on_gain_list(ctx: &DspEventCtx, gains: &[f64]) {
         gain_row.adjustment().set_lower(min);
         gain_row.adjustment().set_upper(max);
     }
+}
+
+/// `DspToUi::SampleRateList` arm of [`handle_dsp_message`] (#848
+/// phase 5): swap the rate combo to the opened device's firmware
+/// table and select the entry the pipeline is actually running.
+/// The list also becomes the live index→Hz mapping for the rate
+/// selector's notify handler (via `AppState::live_source_rates`), so
+/// a Mini's 3/6/12 Msps table dispatches the right values even
+/// though the static per-device table only knows the R2.
+fn on_sample_rate_list(ctx: &DspEventCtx, rates: &[f64], current_hz: f64) {
+    let DspEventCtx {
+        state,
+        sample_rate_row,
+        ..
+    } = ctx;
+    tracing::info!(
+        count = rates.len(),
+        current_hz,
+        "device sample-rate list received"
+    );
+    *state.live_source_rates.borrow_mut() = Some(rates.to_vec());
+    sidebar::source_panel::repopulate_sample_rate_model_from_rates(sample_rate_row, rates);
+    // Select the running rate (nearest entry — the source clamps
+    // requests to its table, so an exact match is the norm).
+    let nearest = rates
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (*a - current_hz).abs().total_cmp(&(*b - current_hz).abs()))
+        .map(|(i, _)| i);
+    if let Some(idx) = nearest {
+        #[allow(clippy::cast_possible_truncation, reason = "rate tables are tiny")]
+        sample_rate_row.set_selected(idx as u32);
+    }
+}
+
+/// `DspToUi::AirspyDeviceList` arm of [`handle_dsp_message`] (#848
+/// phase 5): rebuild the Airspy unit combo as "First available" plus
+/// one entry per enumerated serial, then re-select the persisted
+/// serial when it is still connected (falling back to "first
+/// available" otherwise — the splice fires transient notifies the
+/// wiring's bounds guard discards).
+fn on_airspy_device_list(ctx: &DspEventCtx, serials: &[u64]) {
+    let DspEventCtx {
+        airspy_device_row,
+        config,
+        ..
+    } = ctx;
+    tracing::info!(count = serials.len(), "airspy device list received");
+    let Some(model) = airspy_device_row
+        .model()
+        .and_then(|m| m.downcast::<gtk4::StringList>().ok())
+    else {
+        tracing::warn!("airspy unit combo model is not a StringList; skipping repopulate");
+        return;
+    };
+    let mut labels = vec![sidebar::source_panel::AIRSPY_FIRST_AVAILABLE_LABEL.to_string()];
+    labels.extend(
+        serials
+            .iter()
+            .map(|&sn| sdr_source_airspy::format_device_serial(sn)),
+    );
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    model.splice(0, model.n_items(), &label_refs);
+    let persisted = sidebar::source_panel::load_airspy_serial(config);
+    let selected = persisted
+        .and_then(|sn| serials.iter().position(|&s| s == sn))
+        .map_or(0, |pos| pos + 1);
+    #[allow(clippy::cast_possible_truncation, reason = "device lists are tiny")]
+    airspy_device_row.set_selected(selected as u32);
 }
 
 /// Recording ↔ transcription mutex, UI leg: the controller's

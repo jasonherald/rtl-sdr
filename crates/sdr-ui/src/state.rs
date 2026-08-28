@@ -94,6 +94,12 @@ pub struct AppState {
     pub last_dispatched_vfo_offset_hz: Cell<f64>,
     /// Current demodulation mode.
     pub demod_mode: Cell<DemodMode>,
+    /// The running source's device-reported sample rates (Hz), from
+    /// the `SampleRateList` event. `None` = no device-reported list
+    /// yet; the rate combo's static per-device table applies. Cleared
+    /// on device switch. Read by the rate-selector wiring so combo
+    /// indices map to the labels actually shown. Per #848 phase 5.
+    pub live_source_rates: RefCell<Option<Vec<f64>>>,
     /// Sender for dispatching commands to the DSP thread.
     pub ui_tx: mpsc::Sender<UiToDsp>,
     /// Re-entrancy guard for programmatic `bandwidth_row.set_value`
@@ -457,6 +463,7 @@ impl AppState {
     pub fn new_shared(ui_tx: mpsc::Sender<UiToDsp>) -> Rc<Self> {
         Rc::new(Self {
             is_running: Cell::new(false),
+            live_source_rates: RefCell::new(None),
             center_frequency: Cell::new(DEFAULT_CENTER_FREQUENCY_HZ),
             last_dispatched_vfo_offset_hz: Cell::new(0.0),
             demod_mode: Cell::new(DemodMode::Wfm),

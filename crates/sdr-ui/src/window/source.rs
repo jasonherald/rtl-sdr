@@ -1690,6 +1690,7 @@ pub(super) fn connect_source_panel(
 
     wire_source_type_guard(panels, state, toast_overlay, server_running, config);
 
+    wire_airspy_device_row(panels, state, config);
     wire_network_source_rows(panels, state, config);
 
     wire_role_and_server_key_rows(panels, state, config, favorites, &last_good_auth_key);
@@ -3427,6 +3428,7 @@ fn wire_source_type_guard(
             };
             last_legal_selection.set(selected);
             state_source.send_dsp(UiToDsp::SetSourceType(source_type));
+            reset_device_scoped_state(selected, &state_source);
             // Swap the rate combo to the device's table and re-seed
             // a legal selection: the persisted index when it fits,
             // else the table's first entry. The dispatch keeps the
@@ -3451,6 +3453,61 @@ fn wire_source_type_guard(
                     state_source.send_dsp(UiToDsp::SetSampleRate(rate));
                 }
             }
+        });
+}
+
+/// Airspy unit selector (#848 phase 5): restore-then-wire. The
+/// persisted serial is dispatched at startup so the next Play opens
+/// the chosen unit even before the combo has real entries; the
+/// enumeration answer (`AirspyDeviceList`) later rebuilds the combo
+/// and re-selects it. Selection changes persist the serial and
+/// dispatch it — taking effect at the next Play, matching how the
+/// RTL/Airspy device switch itself behaves.
+fn wire_airspy_device_row(
+    panels: &SidebarPanels,
+    state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+) {
+    {
+        let persisted = sidebar::source_panel::load_airspy_serial(config);
+        if persisted.is_some() {
+            state.send_dsp(UiToDsp::SetAirspyDeviceSerial(persisted));
+        }
+        // Enumerate at startup when the panel restores to Airspy so
+        // the combo has real entries without a device-switch nudge.
+        let device = sidebar::source_panel::load_source_device_index(config);
+        if device == sidebar::source_panel::DEVICE_AIRSPY {
+            state.send_dsp(UiToDsp::RefreshAirspyDevices);
+        }
+    }
+    let state_serial = Rc::clone(state);
+    let config_serial = std::sync::Arc::clone(config);
+    panels
+        .source
+        .airspy_device_row
+        .connect_selected_notify(move |row| {
+            let idx = row.selected();
+            // Index 0 = "first available"; N>0 = the (N-1)th
+            // enumerated serial, parsed back from its label. A
+            // transient out-of-range index during model churn
+            // parses to None and is discarded.
+            let serial = if idx == 0 {
+                None
+            } else {
+                let Some(label) = row
+                    .model()
+                    .and_then(|m| m.downcast::<gtk4::StringList>().ok())
+                    .and_then(|m| m.string(idx))
+                else {
+                    return;
+                };
+                let Some(serial) = sdr_source_airspy::parse_device_serial(&label) else {
+                    return;
+                };
+                Some(serial)
+            };
+            sidebar::source_panel::save_airspy_serial(&config_serial, serial);
+            state_serial.send_dsp(UiToDsp::SetAirspyDeviceSerial(serial));
         });
 }
 
@@ -4092,6 +4149,29 @@ fn wire_agc_notify_handler(
 
 /// Sample-rate selector, restore-then-wire (#552), advisory re-render on change.
 /// Split out per the 50-NLOC gate (#817).
+/// The rate combo's live index→Hz mapping: the device-reported list
+/// (`SampleRateList` event) when one is active, else the static
+/// per-device table. Per #848 phase 5.
+fn current_rate_table(state: &Rc<AppState>, device: u32) -> Vec<f64> {
+    state
+        .live_source_rates
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| sidebar::source_panel::sample_rates_for_device(device).to_vec())
+}
+
+/// Per-device state reset on a source-type switch: the
+/// device-reported rate list belonged to the previous source (back
+/// to the static table until the next start reports the new
+/// device's), and a switch to Airspy kicks off unit enumeration so
+/// the serial combo fills without a manual nudge. Per #848 phase 5.
+fn reset_device_scoped_state(selected: u32, state: &Rc<AppState>) {
+    *state.live_source_rates.borrow_mut() = None;
+    if selected == sidebar::source_panel::DEVICE_AIRSPY {
+        state.send_dsp(UiToDsp::RefreshAirspyDevices);
+    }
+}
+
 fn wire_sample_rate_selector(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -4144,7 +4224,7 @@ fn wire_sample_rate_selector(
             let device = device_row_for_rates
                 .upgrade()
                 .map_or(DEVICE_RTLSDR, |d| d.selected());
-            let rates = sidebar::source_panel::sample_rates_for_device(device);
+            let rates = current_rate_table(&state_sr, device);
             let Some(&rate) = rates.get(idx as usize) else {
                 return;
             };

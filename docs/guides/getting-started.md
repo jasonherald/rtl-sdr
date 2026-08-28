@@ -29,6 +29,15 @@ with one common gap, which is enough to pick up:
 - Plus the noise floor between all of those, which is its own
   kind of fun.
 
+SDR-RS also supports the **Airspy R2 / Mini** — a step-up receiver
+(12-bit samples instead of 8, up to 10 MHz of visible spectrum
+instead of ~2.4, and a cleaner front end). Everything in this guide
+applies to it too: pick "Airspy R2 / Mini" in the Source panel's
+Device row and the sample-rate and gain controls adapt to it
+automatically. If you have more than one Airspy plugged in, an
+"Airspy Unit" row appears so you can pick which serial number to
+open.
+
 > **Legal note:** Monitoring rules vary by country and (in the US)
 > by state. Broadcast and amateur radio are universally legal to
 > listen to; intercepting, recording, retransmitting, or acting on
@@ -55,7 +64,7 @@ get a first signal working.
 
 ## What you'll need
 
-- The RTL-SDR dongle, plugged in.
+- The RTL-SDR dongle (or an Airspy R2 / Mini), plugged in.
 - An antenna. The little rubber-duck antenna that ships with the
   dongle works for FM broadcast and not much else. For weather
   satellites you'll want a horizontal V-dipole; for air-band a

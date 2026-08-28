@@ -45,6 +45,21 @@ pub enum DspToUi {
     DeviceInfo(String),
     /// Available tuner gain values in dB (queried from device on open).
     GainList(Vec<f64>),
+    /// The opened device's supported sample rates in Hz, sent after
+    /// start. Lets the UI swap its static rate model for the
+    /// device-reported one (Airspy R2 and Mini differ). Per #848
+    /// phase 5.
+    SampleRateList {
+        /// The device's supported rates in Hz, ascending.
+        rates: Vec<f64>,
+        /// The rate the pipeline is actually running (the source may
+        /// clamp a persisted request to the nearest supported value)
+        /// so the UI can select the matching entry.
+        current_hz: f64,
+    },
+    /// Serial numbers of the connected Airspy devices, answering
+    /// [`UiToDsp::RefreshAirspyDevices`]. Per #848 phase 5.
+    AirspyDeviceList(Vec<u64>),
     /// Raw (pre-decimation) sample rate for spectrum display bandwidth.
     DisplayBandwidth(f64),
     /// Audio recording started (contains the file path for display).
@@ -416,6 +431,13 @@ pub enum UiToDsp {
     /// Enable or disable the tuner's bias tee (powers an LNA
     /// over coax).
     SetBiasTee(bool),
+    /// Select which Airspy unit the next start opens by serial
+    /// number; `None` = first available. Takes effect on the next
+    /// open. Per #848 phase 5.
+    SetAirspyDeviceSerial(Option<u64>),
+    /// Enumerate connected Airspy devices; the controller answers
+    /// with [`DspToUi::AirspyDeviceList`]. Per #848 phase 5.
+    RefreshAirspyDevices,
     /// Set the upconverter offset in Hz (0 = none). Hardware tunes to
     /// `display frequency + offset`; every other layer stays in
     /// display frequencies. Per issue #848 phase 4 (`SpyVerter`

@@ -446,7 +446,11 @@ fn create_source_instance(state: &DspState) -> Box<dyn Source> {
         // follow-up scope. The source snapshots the firmware rate
         // table at start() and clamps a persisted RTL-era rate to
         // the nearest supported value instead of failing Play.
-        SourceType::Airspy => Box::new(sdr_source_airspy::AirspySource::new()),
+        SourceType::Airspy => {
+            let mut source = sdr_source_airspy::AirspySource::new();
+            source.set_device_serial(state.airspy_serial);
+            Box::new(source)
+        }
         SourceType::Network => Box::new(sdr_source_network::NetworkSource::new(
             &state.network_host,
             state.network_port,
@@ -984,11 +988,24 @@ fn send_start_epilogue(state: &DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     // `effective_sample_rate()`.
     let _ = dsp_tx.send(DspToUi::DisplayBandwidth(state.frontend.sample_rate()));
 
-    // Send the source's display name + supported gain
-    // values to the UI.
+    send_started_device_info(state, dsp_tx);
+}
+
+/// Send the started source's display name, gain table, and
+/// device-reported sample rates to the UI. The rate list lets the UI
+/// swap its static per-device model for the firmware's actual table
+/// (Airspy R2 and Mini report different lists). Per #848 phase 5.
+pub(super) fn send_started_device_info(state: &DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     if let Some(source) = &state.source {
         let _ = dsp_tx.send(DspToUi::DeviceInfo(source.name().to_string()));
         send_gain_list(source.as_ref(), dsp_tx);
+        let rates = source.sample_rates().to_vec();
+        if !rates.is_empty() {
+            let _ = dsp_tx.send(DspToUi::SampleRateList {
+                rates,
+                current_hz: state.frontend.sample_rate(),
+            });
+        }
     }
 }
 
@@ -1511,6 +1528,31 @@ pub(super) fn handle_set_converter_offset(
         state.converter_offset_hz = previous_offset_hz;
         tracing::warn!("set converter offset failed: {e}");
         let _ = dsp_tx.send(DspToUi::Error(format!("Converter offset failed: {e}")));
+    }
+}
+
+/// Handler for `UiToDsp::SetAirspyDeviceSerial` (#848 phase 5).
+/// Stored only — the source factory applies it at the next open; an
+/// already-running stream is not re-opened.
+pub(super) fn handle_set_airspy_device_serial(state: &mut DspState, serial: Option<u64>) {
+    tracing::info!(?serial, "set airspy device serial");
+    state.airspy_serial = serial;
+}
+
+/// Handler for `UiToDsp::RefreshAirspyDevices` (#848 phase 5):
+/// enumerate connected devices and answer with the serial list.
+/// Enumeration only reads USB descriptors, so it is safe while a
+/// stream is running.
+pub(super) fn handle_refresh_airspy_devices(dsp_tx: &mpsc::Sender<DspToUi>) {
+    match sdr_source_airspy::list_device_serials() {
+        Ok(serials) => {
+            tracing::info!(count = serials.len(), "airspy device enumeration");
+            let _ = dsp_tx.send(DspToUi::AirspyDeviceList(serials));
+        }
+        Err(e) => {
+            tracing::warn!("airspy device enumeration failed: {e}");
+            let _ = dsp_tx.send(DspToUi::AirspyDeviceList(Vec::new()));
+        }
     }
 }
 
