@@ -537,6 +537,24 @@ impl RtlSdrSource {
         }
     }
 
+    /// Translate a display frequency to the hardware tune target by
+    /// adding the upconverter offset. Errors (rather than saturating
+    /// the `u32` cast) when the sum leaves the u32 Hz domain — a
+    /// misconfigured offset must not silently tune the hardware to
+    /// DC. Mirrors `AirspySource::hardware_freq_hz`. Per CR round 1
+    /// on PR #851.
+    fn hardware_freq_hz(&self, display_hz: f64) -> Result<u32, SourceError> {
+        let hw = display_hz + self.converter_offset_hz;
+        if !(0.0..=f64::from(u32::MAX)).contains(&hw) {
+            return Err(SourceError::TuneFailed(format!(
+                "{:.3} MHz with converter offset {:.3} MHz is outside the tunable range",
+                display_hz / 1_000_000.0,
+                self.converter_offset_hz / 1_000_000.0
+            )));
+        }
+        Ok(hw as u32)
+    }
+
     /// Build the user-facing `TuneFailed` message for a failed
     /// `set_center_freq`.
     ///
@@ -669,12 +687,12 @@ impl Source for RtlSdrSource {
         // hardware terms (display + upconverter offset) — an HF
         // display frequency is fine when the offset lifts it above
         // the R82xx floor. Per #848 phase 4.
-        let hardware_hz = self.frequency + self.converter_offset_hz;
-        device.set_center_freq(hardware_hz as u32).map_err(|e| {
+        let hardware_hz = self.hardware_freq_hz(self.frequency)?;
+        device.set_center_freq(hardware_hz).map_err(|e| {
             SourceError::TuneFailed(Self::tune_failure_message(
                 tuner,
                 direct_sampling_mode,
-                hardware_hz,
+                f64::from(hardware_hz),
                 &e.to_string(),
             ))
         })?;
@@ -792,15 +810,15 @@ impl Source for RtlSdrSource {
         // Commit only once the driver accepted it (the driver resets its
         // own frequency to 0 on error); with no device open, remember it
         // for `start()` (#742).
-        let hardware_hz = frequency_hz + self.converter_offset_hz;
+        let hardware_hz = self.hardware_freq_hz(frequency_hz)?;
         if let Some(device) = &mut self.device {
             let tuner = device.tuner_type();
             let direct_sampling_mode = self.direct_sampling_mode;
-            device.set_center_freq(hardware_hz as u32).map_err(|e| {
+            device.set_center_freq(hardware_hz).map_err(|e| {
                 SourceError::TuneFailed(Self::tune_failure_message(
                     tuner,
                     direct_sampling_mode,
-                    hardware_hz,
+                    f64::from(hardware_hz),
                     &e.to_string(),
                 ))
             })?;

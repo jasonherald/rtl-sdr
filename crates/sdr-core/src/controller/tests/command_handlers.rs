@@ -343,3 +343,22 @@ fn handle_set_converter_offset_persists_and_forwards_live() {
     assert!((state.converter_offset_hz - 125_000_000.0).abs() < f64::EPSILON);
     assert_eq!(*offsets.lock().unwrap(), vec![125_000_000.0]);
 }
+
+#[test]
+fn handle_command_routes_set_converter_offset() {
+    // Codacy round 1 on PR #851: exercise the actual dispatch arm,
+    // not just the extracted handler, so a broken match arm can't
+    // hide behind direct-call tests.
+    let (dsp_tx, _rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let source = RecordingSource::default();
+    let offsets = std::sync::Arc::clone(&source.offsets);
+    state.source = Some(Box::new(source));
+    handle_command(
+        &mut state,
+        &dsp_tx,
+        UiToDsp::SetConverterOffset(120_000_000.0),
+    );
+    assert!((state.converter_offset_hz - 120_000_000.0).abs() < f64::EPSILON);
+    assert_eq!(*offsets.lock().unwrap(), vec![120_000_000.0]);
+}

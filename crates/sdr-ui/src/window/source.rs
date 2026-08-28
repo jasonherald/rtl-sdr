@@ -3216,12 +3216,14 @@ fn wire_converter_offset_row(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
+    /// The row edits MHz; config + wire carry Hz.
+    const HZ_PER_MHZ: f64 = 1_000_000.0;
     {
         let persisted_hz = sidebar::source_panel::load_source_converter_offset_hz(config);
         panels
             .source
             .converter_offset_row
-            .set_value(persisted_hz / 1_000_000.0);
+            .set_value(persisted_hz / HZ_PER_MHZ);
         state.send_dsp(UiToDsp::SetConverterOffset(persisted_hz));
     }
     let state_offset = Rc::clone(state);
@@ -3230,7 +3232,7 @@ fn wire_converter_offset_row(
         .source
         .converter_offset_row
         .connect_value_notify(move |row| {
-            let offset_hz = row.value() * 1_000_000.0;
+            let offset_hz = row.value() * HZ_PER_MHZ;
             sidebar::source_panel::save_source_converter_offset_hz(&config_offset, offset_hz);
             state_offset.send_dsp(UiToDsp::SetConverterOffset(offset_hz));
         });

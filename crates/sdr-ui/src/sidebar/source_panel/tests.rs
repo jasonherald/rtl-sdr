@@ -708,3 +708,18 @@ fn non_airspy_devices_keep_the_rtl_rate_table() {
         );
     }
 }
+
+// ---- Upconverter offset persistence (#848 phase 4, PR #851) ----
+
+#[test]
+fn converter_offset_round_trips_and_defaults_to_zero() {
+    let config = make_config();
+    // Fresh config → no converter in the chain.
+    assert!((load_source_converter_offset_hz(&config) - 0.0).abs() < f64::EPSILON);
+    // SpyVerter value survives the round trip in Hz, including the
+    // negative (downconverter) side of the range.
+    save_source_converter_offset_hz(&config, 120_000_000.0);
+    assert!((load_source_converter_offset_hz(&config) - 120_000_000.0).abs() < f64::EPSILON);
+    save_source_converter_offset_hz(&config, -125_000_000.0);
+    assert!((load_source_converter_offset_hz(&config) - -125_000_000.0).abs() < f64::EPSILON);
+}
