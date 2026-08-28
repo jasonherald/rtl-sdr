@@ -19,8 +19,10 @@
 //! own ring drops per transfer via `dropped_samples`.
 //!
 //! The device streams `Float32Iq`, so a delivered block is already
-//! interleaved `[i0, q0, i1, q1, ..]` f32 — [`convert_samples`] is a
-//! straight pairing into [`Complex`] with no offset/scale step.
+//! interleaved `[i0, q0, i1, q1, ..]` f32 — [`convert_samples`] pairs
+//! the values into [`Complex`] and rescales the driver's ±0.5
+//! fullscale to the pipeline's ±1.0 convention (see
+//! [`FLOAT32_FULLSCALE_SCALE`]); no DC offset step is needed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -67,6 +69,12 @@ pub const DEFAULT_SAMPLE_RATES: &[f64] = &[2_500_000.0, 10_000_000.0];
 /// (65536-sample transfers), so 16 blocks ≈ 1 s of buffered audio —
 /// the same headroom the RTL ring provides.
 const BLOCK_CHANNEL_BOUND: usize = 16;
+
+/// Tolerance for "the requested rate already matches a firmware
+/// rate" — hardware rates are whole hertz, so 0.5 Hz absorbs any
+/// float jitter from config/UI round-trips without ever bridging
+/// two distinct table entries. Per CR round 1 on PR #850.
+const RATE_MATCH_TOLERANCE_HZ: f64 = 0.5;
 
 /// Hz → MHz divisor for user-facing frequency text.
 const HERTZ_PER_MHZ: f64 = 1_000_000.0;
@@ -212,7 +220,7 @@ impl AirspySource {
         // RTL-era rate must not fail Play — see `nearest_supported_rate`).
         let rate = nearest_supported_rate(&self.sample_rates, self.sample_rate)
             .ok_or_else(|| SourceError::OpenFailed("empty firmware rate table".into()))?;
-        if (rate - self.sample_rate).abs() > f64::EPSILON {
+        if (rate - self.sample_rate).abs() > RATE_MATCH_TOLERANCE_HZ {
             tracing::warn!(
                 requested = self.sample_rate,
                 clamped = rate,
@@ -320,8 +328,12 @@ impl Source for AirspySource {
         let mut device = self.open_and_configure()?;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(BLOCK_CHANNEL_BOUND);
-        self.stream_dead.store(false, Ordering::Release);
-        self.bridge_dropped_blocks.store(0, Ordering::Relaxed);
+        // Fresh per-session state: if a previous `stop_rx` failed,
+        // its callback may still hold clones of the old Arcs — it
+        // must not be able to flag the NEW stream dead or pollute
+        // its drop counter. Per CR round 1 on PR #850.
+        self.stream_dead = Arc::new(AtomicBool::new(false));
+        self.bridge_dropped_blocks = Arc::new(AtomicU64::new(0));
         let stream_dead = Arc::clone(&self.stream_dead);
         let bridge_dropped = Arc::clone(&self.bridge_dropped_blocks);
         device

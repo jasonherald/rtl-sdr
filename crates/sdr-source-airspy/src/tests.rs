@@ -107,6 +107,10 @@ fn dispatches_are_remembered_without_a_device() {
         .set_bias_tee(true)
         .expect("set_bias_tee stores when closed");
     source.tune(137_900_000.0).expect("tune stores when closed");
+    assert_eq!(source.last_linearity_step, Some(7));
+    assert_eq!(source.last_gain_manual, Some(false));
+    assert!(source.bias_tee);
+    assert!((source.frequency - 137_900_000.0).abs() < f64::EPSILON);
     assert_eq!(source.sample_rate(), DEFAULT_SAMPLE_RATES[0]);
 }
 

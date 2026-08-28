@@ -3359,6 +3359,7 @@ fn wire_source_type_guard(
     // previous illegal value as "new", and endlessly toggle.
     let reverting: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
     let sample_rate_row_for_device = panels.source.sample_rate_row.downgrade();
+    let gain_row_for_device = panels.source.gain_row.downgrade();
     let config_for_device_rates = std::sync::Arc::clone(config);
     panels
         .source
@@ -3398,6 +3399,9 @@ fn wire_source_type_guard(
             // DSP's configured rate in the new device's range so the
             // next Play doesn't need the start()-side clamp. Per
             // #848.
+            if let Some(gain_row) = gain_row_for_device.upgrade() {
+                sidebar::source_panel::apply_device_gain_row(&gain_row, selected);
+            }
             if let Some(rate_row) = sample_rate_row_for_device.upgrade() {
                 sidebar::source_panel::repopulate_sample_rate_model(&rate_row, selected);
                 let rates = sidebar::source_panel::sample_rates_for_device(selected);
@@ -4063,9 +4067,20 @@ fn wire_sample_rate_selector(
     // Sample rate selector. Restore-then-wire (#552).
     {
         // The rate table (and the combo's label model) depend on the
-        // restored device selection — the device row is restored
-        // before this runs. Per #848.
-        let device = panels.source.device_row.selected();
+        // persisted DEVICE selection. Read it from config rather than
+        // the widget: this block runs before `wire_device_selector`
+        // restores the row, so `device_row.selected()` would still be
+        // the construction default and a persisted Airspy selection
+        // would start with the RTL rate model + an RTL rate dispatch.
+        // Same fail-closed bound rule as the device restore itself.
+        // Per CR round 1 on PR #850.
+        let persisted_device = sidebar::source_panel::load_source_device_index(config);
+        let device = if persisted_device <= sidebar::source_panel::DEVICE_AIRSPY {
+            persisted_device
+        } else {
+            sidebar::source_panel::DEVICE_RTLSDR
+        };
+        sidebar::source_panel::apply_device_gain_row(&panels.source.gain_row, device);
         sidebar::source_panel::repopulate_sample_rate_model(&panels.source.sample_rate_row, device);
         let rates = sidebar::source_panel::sample_rates_for_device(device);
         let persisted_idx = sidebar::source_panel::load_source_sample_rate_index(config);

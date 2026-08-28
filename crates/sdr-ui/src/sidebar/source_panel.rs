@@ -193,6 +193,32 @@ pub fn sample_rate_labels_for_device(device: u32) -> &'static [&'static str] {
     }
 }
 
+/// Reconfigure the gain row for the selected device. Airspy's gain
+/// is the unitless 0-21 composite linearity ladder in whole steps
+/// (encoded x10 through the tenths-based dispatch), not a dB value —
+/// leaving the RTL adjustment in place would display "30.0 dB" while
+/// the source clamps to step 21. The live `GainList` event still
+/// refines the bounds after Play; this keeps the row honest at
+/// selection time. Per CR round 1 on PR #850.
+pub fn apply_device_gain_row(gain_row: &adw::SpinRow, device: u32) {
+    let adj = gain_row.adjustment();
+    if device == DEVICE_AIRSPY {
+        gain_row.set_subtitle("Linearity step");
+        gain_row.set_digits(0);
+        adj.set_lower(0.0);
+        adj.set_upper(21.0);
+        adj.set_step_increment(1.0);
+        adj.set_page_increment(3.0);
+    } else {
+        gain_row.set_subtitle("dB");
+        gain_row.set_digits(1);
+        adj.set_lower(MIN_GAIN_DB);
+        adj.set_upper(MAX_GAIN_DB);
+        adj.set_step_increment(GAIN_STEP_DB);
+        adj.set_page_increment(GAIN_PAGE_DB);
+    }
+}
+
 /// Swap the rate combo's `StringList` contents to the device's label
 /// set. Splice keeps the model object (the `ComboRow` holds it), so
 /// only the rows change; the caller re-seeds the selection afterwards
