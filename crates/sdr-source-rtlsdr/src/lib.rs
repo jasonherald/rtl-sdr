@@ -261,6 +261,10 @@ pub struct RtlSdrSource {
     /// on every open; previously silently dropped by the trait default
     /// (#739).
     rtl_agc_enabled: bool,
+    /// Upconverter offset in Hz: hardware tunes to
+    /// `display frequency + offset`; `self.frequency` stays in
+    /// display terms (e.g. Ham-It-Up = +125 MHz). Per #848 phase 4.
+    converter_offset_hz: f64,
     /// Most-recent direct-sampling mode the controller dispatched
     /// (0 = off, 1 = I branch, 2 = Q branch). Remembered across
     /// stop/start so `start()` can program it *before* the first
@@ -528,8 +532,27 @@ impl RtlSdrSource {
             last_tuner_gain_tenths_db: None,
             last_gain_manual: None,
             rtl_agc_enabled: false,
+            converter_offset_hz: 0.0,
             direct_sampling_mode: DIRECT_SAMPLING_OFF,
         }
+    }
+
+    /// Translate a display frequency to the hardware tune target by
+    /// adding the upconverter offset. Errors (rather than saturating
+    /// the `u32` cast) when the sum leaves the u32 Hz domain — a
+    /// misconfigured offset must not silently tune the hardware to
+    /// DC. Mirrors `AirspySource::hardware_freq_hz`. Per CR round 1
+    /// on PR #851.
+    fn hardware_freq_hz(&self, display_hz: f64) -> Result<u32, SourceError> {
+        let hw = display_hz + self.converter_offset_hz;
+        if !(0.0..=f64::from(u32::MAX)).contains(&hw) {
+            return Err(SourceError::TuneFailed(format!(
+                "{:.3} MHz with converter offset {:.3} MHz is outside the tunable range",
+                display_hz / HERTZ_PER_MHZ,
+                self.converter_offset_hz / HERTZ_PER_MHZ
+            )));
+        }
+        Ok(hw as u32)
     }
 
     /// Build the user-facing `TuneFailed` message for a failed
@@ -660,12 +683,16 @@ impl Source for RtlSdrSource {
 
         let tuner = device.tuner_type();
         let direct_sampling_mode = self.direct_sampling_mode;
-        let frequency_hz = self.frequency;
-        device.set_center_freq(self.frequency as u32).map_err(|e| {
+        // The tuner floor check and the hardware tune both work in
+        // hardware terms (display + upconverter offset) — an HF
+        // display frequency is fine when the offset lifts it above
+        // the R82xx floor. Per #848 phase 4.
+        let hardware_hz = self.hardware_freq_hz(self.frequency)?;
+        device.set_center_freq(hardware_hz).map_err(|e| {
             SourceError::TuneFailed(Self::tune_failure_message(
                 tuner,
                 direct_sampling_mode,
-                frequency_hz,
+                f64::from(hardware_hz),
                 &e.to_string(),
             ))
         })?;
@@ -783,14 +810,15 @@ impl Source for RtlSdrSource {
         // Commit only once the driver accepted it (the driver resets its
         // own frequency to 0 on error); with no device open, remember it
         // for `start()` (#742).
+        let hardware_hz = self.hardware_freq_hz(frequency_hz)?;
         if let Some(device) = &mut self.device {
             let tuner = device.tuner_type();
             let direct_sampling_mode = self.direct_sampling_mode;
-            device.set_center_freq(frequency_hz as u32).map_err(|e| {
+            device.set_center_freq(hardware_hz).map_err(|e| {
                 SourceError::TuneFailed(Self::tune_failure_message(
                     tuner,
                     direct_sampling_mode,
-                    frequency_hz,
+                    f64::from(hardware_hz),
                     &e.to_string(),
                 ))
             })?;
@@ -975,6 +1003,49 @@ impl Source for RtlSdrSource {
             device
                 .set_freq_correction(ppm)
                 .map_err(|e| SourceError::TuneFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn set_converter_offset(&mut self, offset_hz: f64) -> Result<(), SourceError> {
+        let device_open = self.device.is_some();
+        tracing::info!(
+            offset_hz,
+            device_open,
+            "RtlSdrSource::set_converter_offset dispatch"
+        );
+        // Commit-or-rollback: a rejected offset must not be retained,
+        // or every later tune and restart fails until another offset
+        // is set. With a device open the live retune validates (and
+        // driver errors also roll back); closed, validate against the
+        // current display frequency the same way `tune` would. Per CR
+        // round 2 on PR #851.
+        let previous_offset_hz = self.converter_offset_hz;
+        self.converter_offset_hz = offset_hz;
+        let result = if self.device.is_some() {
+            let display = self.frequency;
+            self.tune(display)
+        } else {
+            self.hardware_freq_hz(self.frequency).map(|_| ())
+        };
+        if let Err(e) = result {
+            self.converter_offset_hz = previous_offset_hz;
+            // A failed driver tune can leave the hardware reset to
+            // DC while the source still reports the old state.
+            // Best-effort restore the previous hardware target (the
+            // rolled-back offset recomputes it exactly); validation
+            // failures never reached the driver, where this retune
+            // is a harmless no-op re-program. Keep the original
+            // error. Per CR round 3 on PR #851.
+            if self.device.is_some()
+                && let Err(restore) = self.tune(self.frequency)
+            {
+                tracing::warn!(
+                    error = %restore,
+                    "failed to restore hardware tune after rejected converter offset"
+                );
+            }
+            return Err(e);
         }
         Ok(())
     }

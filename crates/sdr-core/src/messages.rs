@@ -416,6 +416,11 @@ pub enum UiToDsp {
     /// Enable or disable the tuner's bias tee (powers an LNA
     /// over coax).
     SetBiasTee(bool),
+    /// Set the upconverter offset in Hz (0 = none). Hardware tunes to
+    /// `display frequency + offset`; every other layer stays in
+    /// display frequencies. Per issue #848 phase 4 (`SpyVerter`
+    /// +120 MHz, Ham-It-Up +125 MHz).
+    SetConverterOffset(f64),
     /// Set direct-sampling mode (0 = off, 1 = I branch, 2 = Q
     /// branch). Engine rejects values outside that range.
     SetDirectSampling(i32),

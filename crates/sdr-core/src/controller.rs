@@ -332,6 +332,9 @@ struct DspState {
     /// bias-T off regardless of the persisted UI switch.
     /// Per CR round 1 on PR #550.
     bias_tee_enabled: bool,
+    /// Upconverter offset in Hz — replayed to the source on every
+    /// open so the setting survives stop/start (#848 phase 4).
+    converter_offset_hz: f64,
     /// RTL-SDR direct-sampling mode (0 = disabled, 1 = I, 2 = Q).
     /// Persist-and-replay companion to `bias_tee_enabled` —
     /// see [issue `#551`].
@@ -694,6 +697,7 @@ impl DspState {
             file_path: std::path::PathBuf::new(),
             file_looping: false,
             bias_tee_enabled: false,
+            converter_offset_hz: 0.0,
             direct_sampling_mode: 0,
             offset_tuning_enabled: false,
             rtl_agc_enabled: false,
@@ -1013,6 +1017,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             source::handle_set_file_looping(state, dsp_tx, looping);
         }
 
+        UiToDsp::SetConverterOffset(offset_hz) => {
+            source::handle_set_converter_offset(state, dsp_tx, offset_hz);
+        }
         UiToDsp::SetBiasTee(enabled) => {
             source::handle_set_bias_tee(state, dsp_tx, enabled);
         }

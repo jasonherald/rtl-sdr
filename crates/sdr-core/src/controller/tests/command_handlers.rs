@@ -222,6 +222,7 @@ struct RecordingSource {
     gain_modes: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     gains: std::sync::Arc<std::sync::Mutex<Vec<i32>>>,
     bias: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    offsets: std::sync::Arc<std::sync::Mutex<Vec<f64>>>,
 }
 
 impl Source for RecordingSource {
@@ -259,6 +260,10 @@ impl Source for RecordingSource {
     }
     fn set_bias_tee(&mut self, enabled: bool) -> Result<(), sdr_types::SourceError> {
         self.bias.lock().unwrap().push(enabled);
+        Ok(())
+    }
+    fn set_converter_offset(&mut self, offset_hz: f64) -> Result<(), sdr_types::SourceError> {
+        self.offsets.lock().unwrap().push(offset_hz);
         Ok(())
     }
 }
@@ -311,4 +316,111 @@ fn airspy_replay_applies_persisted_bias_tee() {
         !matches!(rx.try_recv(), Ok(DspToUi::Error(_))),
         "no error toast on successful bias replay"
     );
+}
+
+#[test]
+fn pre_start_settings_replay_converter_offset_on_both_sources() {
+    // #848 phase 4: the persisted upconverter offset must reach the
+    // source before start() on both USB source flavors.
+    let (dsp_tx, _rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx).unwrap();
+    state.converter_offset_hz = 120_000_000.0;
+    let mut source = RecordingSource::default();
+    let offsets = std::sync::Arc::clone(&source.offsets);
+    super::super::source::airspy_pre_start_settings(&state, &mut source);
+    super::super::source::rtl_sdr_pre_start_settings(&state, &mut source);
+    assert_eq!(*offsets.lock().unwrap(), vec![120_000_000.0, 120_000_000.0]);
+}
+
+#[test]
+fn handle_set_converter_offset_persists_and_forwards_live() {
+    let (dsp_tx, _rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let source = RecordingSource::default();
+    let offsets = std::sync::Arc::clone(&source.offsets);
+    state.source = Some(Box::new(source));
+    super::super::source::handle_set_converter_offset(&mut state, &dsp_tx, 125_000_000.0);
+    assert!((state.converter_offset_hz - 125_000_000.0).abs() < f64::EPSILON);
+    assert_eq!(*offsets.lock().unwrap(), vec![125_000_000.0]);
+}
+
+#[test]
+fn handle_command_routes_set_converter_offset() {
+    // Codacy round 1 on PR #851: exercise the actual dispatch arm,
+    // not just the extracted handler, so a broken match arm can't
+    // hide behind direct-call tests.
+    let (dsp_tx, _rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let source = RecordingSource::default();
+    let offsets = std::sync::Arc::clone(&source.offsets);
+    state.source = Some(Box::new(source));
+    handle_command(
+        &mut state,
+        &dsp_tx,
+        UiToDsp::SetConverterOffset(120_000_000.0),
+    );
+    assert!((state.converter_offset_hz - 120_000_000.0).abs() < f64::EPSILON);
+    assert_eq!(*offsets.lock().unwrap(), vec![120_000_000.0]);
+}
+
+/// Source whose `set_converter_offset` always rejects — positive
+/// proof the handler's state rollback runs on a live refusal.
+struct OffsetRejectingSource;
+
+impl Source for OffsetRejectingSource {
+    fn name(&self) -> &'static str {
+        "offset-rejecting"
+    }
+    fn sample_rates(&self) -> &[f64] {
+        &[]
+    }
+    fn start(&mut self) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn read_samples(&mut self, _buf: &mut [Complex]) -> Result<usize, sdr_types::SourceError> {
+        Ok(0)
+    }
+    fn sample_rate(&self) -> f64 {
+        0.0
+    }
+    fn set_sample_rate(&mut self, _rate: f64) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn tune(&mut self, _frequency_hz: f64) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn set_converter_offset(&mut self, _offset_hz: f64) -> Result<(), sdr_types::SourceError> {
+        Err(sdr_types::SourceError::TuneFailed("rejected".into()))
+    }
+}
+
+#[test]
+fn handle_set_converter_offset_rolls_back_state_on_live_rejection() {
+    // CR round 4 on PR #851: a live rejection must not leave DspState
+    // at the new offset — the pre-start handlers replay it, so later
+    // starts would retry the rejected configuration.
+    /// The offset already committed before the test dispatch — a
+    /// `SpyVerter`'s +120 MHz.
+    const ESTABLISHED_OFFSET_HZ: f64 = 120_000_000.0;
+    /// The offset the fake source refuses; the value itself is
+    /// irrelevant (the source rejects unconditionally).
+    const REJECTED_OFFSET_HZ: f64 = -300_000_000.0;
+    let (dsp_tx, rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    state.converter_offset_hz = ESTABLISHED_OFFSET_HZ;
+    state.source = Some(Box::new(OffsetRejectingSource));
+    super::super::source::handle_set_converter_offset(&mut state, &dsp_tx, REJECTED_OFFSET_HZ);
+    assert!(
+        (state.converter_offset_hz - ESTABLISHED_OFFSET_HZ).abs() < f64::EPSILON,
+        "state keeps the previous offset after a live rejection"
+    );
+    // And the user hears about it.
+    let toast = rx
+        .try_iter()
+        .find(|m| matches!(m, DspToUi::Error(_)))
+        .expect("error toast dispatched");
+    assert!(matches!(toast, DspToUi::Error(msg) if msg.contains("offset")));
 }

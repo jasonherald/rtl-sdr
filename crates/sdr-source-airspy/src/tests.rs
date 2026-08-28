@@ -215,3 +215,72 @@ fn bridge_driver_drop_report_does_not_stop_stream() {
     assert_eq!(rx.recv().expect("delivered"), vec![5.0, 6.0]);
     assert_eq!(dropped.load(Ordering::Relaxed), 0);
 }
+
+// ── Upconverter offset (#848 phase 4) ─────────────────────────────
+
+#[test]
+fn converter_offset_shifts_hardware_tune_only() {
+    let mut source = AirspySource::new();
+    source
+        .set_converter_offset(120_000_000.0)
+        .expect("offset stores when closed");
+    source.tune(10_000_000.0).expect("display tune");
+    // Display state stays in display terms…
+    assert!((source.frequency - 10_000_000.0).abs() < f64::EPSILON);
+    // …while the hardware target carries the offset.
+    assert_eq!(
+        source.hardware_freq_hz(10_000_000.0).expect("in range"),
+        130_000_000
+    );
+}
+
+#[test]
+fn converter_offset_zero_is_identity() {
+    let source = AirspySource::new();
+    assert_eq!(
+        source.hardware_freq_hz(100_000_000.0).expect("in range"),
+        100_000_000
+    );
+}
+
+#[test]
+fn converter_offset_out_of_range_is_rejected() {
+    let mut source = AirspySource::new();
+    // A -90 MHz offset is valid at the 100 MHz default display
+    // frequency (hardware 10 MHz)…
+    source
+        .set_converter_offset(-90_000_000.0)
+        .expect("offset valid at current display frequency");
+    // …but tuning the display to 10 MHz would put the hardware at
+    // -80 MHz — rejected, not wrapped.
+    assert!(matches!(
+        source.hardware_freq_hz(10_000_000.0),
+        Err(SourceError::TuneFailed(_))
+    ));
+}
+
+#[test]
+fn rejected_converter_offset_is_not_retained() {
+    // CR round 2 on PR #851 (same contract as the RTL-SDR source): an
+    // offset that fails validation for the current display frequency
+    // must not be committed.
+    let mut source = AirspySource::new();
+    source.tune(10_000_000.0).expect("display tune");
+    assert!(matches!(
+        source.set_converter_offset(-200_000_000.0),
+        Err(SourceError::TuneFailed(_))
+    ));
+    assert_eq!(
+        source
+            .hardware_freq_hz(10_000_000.0)
+            .expect("offset rolled back"),
+        10_000_000
+    );
+    source
+        .set_converter_offset(120_000_000.0)
+        .expect("valid offset accepted");
+    assert_eq!(
+        source.hardware_freq_hz(10_000_000.0).expect("in range"),
+        130_000_000
+    );
+}

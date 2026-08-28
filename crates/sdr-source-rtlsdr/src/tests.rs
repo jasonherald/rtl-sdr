@@ -219,3 +219,102 @@ fn tune_failure_passthrough_when_hint_does_not_apply() {
         raw
     );
 }
+
+// ── Upconverter offset (#848 phase 4, CR round 1 on PR #851) ──────
+
+#[test]
+fn converter_offset_shifts_hardware_tune_only() {
+    let mut source = RtlSdrSource::new(0);
+    source
+        .set_converter_offset(125_000_000.0)
+        .expect("offset stores when closed");
+    source.tune(10_000_000.0).expect("display tune");
+    // Display state stays in display terms…
+    assert!((source.frequency - 10_000_000.0).abs() < f64::EPSILON);
+    // …while the hardware target carries the offset.
+    assert_eq!(
+        source.hardware_freq_hz(10_000_000.0).expect("in range"),
+        135_000_000
+    );
+}
+
+#[test]
+fn converter_offset_zero_is_identity() {
+    let source = RtlSdrSource::new(0);
+    assert_eq!(
+        source.hardware_freq_hz(100_000_000.0).expect("in range"),
+        100_000_000
+    );
+}
+
+#[test]
+fn converter_offset_out_of_range_is_rejected() {
+    let mut source = RtlSdrSource::new(0);
+    // A -90 MHz offset is valid at the 100 MHz default display
+    // frequency (hardware 10 MHz)…
+    source
+        .set_converter_offset(-90_000_000.0)
+        .expect("offset valid at current display frequency");
+    // …but tuning the display to 10 MHz would put the hardware at
+    // -80 MHz — rejected, not wrapped.
+    assert!(matches!(
+        source.hardware_freq_hz(10_000_000.0),
+        Err(SourceError::TuneFailed(_))
+    ));
+}
+
+#[test]
+fn converter_offset_lifts_hf_display_above_tuner_floor() {
+    // Codacy round 1 on PR #851: with an upconverter in the chain, an
+    // HF display frequency is legitimate — the floor logic works in
+    // hardware terms, so the sum clears the R82xx floor and the
+    // direct-sampling hint must NOT fire.
+    let mut source = RtlSdrSource::new(0);
+    source
+        .set_converter_offset(125_000_000.0)
+        .expect("offset stores");
+    let hardware_hz = source.hardware_freq_hz(10_000_000.0).expect("in range");
+    assert_eq!(hardware_hz, 135_000_000);
+    assert!(f64::from(hardware_hz) >= R82XX_MIN_TUNER_FREQ_HZ);
+    // The failure message for a hardware-terms frequency above the
+    // floor passes the driver text through instead of misleading the
+    // user toward direct sampling.
+    let raw = "some driver error";
+    assert_eq!(
+        RtlSdrSource::tune_failure_message(
+            TunerType::R820T,
+            DIRECT_SAMPLING_OFF,
+            f64::from(hardware_hz),
+            raw
+        ),
+        raw
+    );
+}
+
+#[test]
+fn rejected_converter_offset_is_not_retained() {
+    // CR round 2 on PR #851: an offset that fails validation for the
+    // current display frequency must not be committed — otherwise
+    // every later tune and restart fails until another offset is set.
+    let mut source = RtlSdrSource::new(0);
+    source.tune(10_000_000.0).expect("display tune");
+    assert!(matches!(
+        source.set_converter_offset(-200_000_000.0),
+        Err(SourceError::TuneFailed(_))
+    ));
+    // The previous (zero) offset survives: tuning still works.
+    assert_eq!(
+        source
+            .hardware_freq_hz(10_000_000.0)
+            .expect("offset rolled back"),
+        10_000_000
+    );
+    // And a valid offset still commits afterwards.
+    source
+        .set_converter_offset(125_000_000.0)
+        .expect("valid offset accepted");
+    assert_eq!(
+        source.hardware_freq_hz(10_000_000.0).expect("in range"),
+        135_000_000
+    );
+}

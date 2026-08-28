@@ -164,6 +164,11 @@ pub struct AirspySource {
     /// Bias-T state to replay on open (powers a `SpyVerter` / external
     /// LNA). Dispatches are remembered even with the device closed.
     bias_tee: bool,
+    /// Upconverter offset in Hz: the hardware tunes to
+    /// `display frequency + offset` while `self.frequency` (and every
+    /// caller) stays in display terms. 0.0 = no converter. Per issue
+    /// #848 phase 4 (`SpyVerter` = +120 MHz).
+    converter_offset_hz: f64,
 }
 
 impl Default for AirspySource {
@@ -189,6 +194,7 @@ impl AirspySource {
             last_linearity_step: None,
             last_gain_manual: None,
             bias_tee: false,
+            converter_offset_hz: 0.0,
         }
     }
 
@@ -232,7 +238,8 @@ impl AirspySource {
             .set_samplerate(rate as u32)
             .map_err(|e| SourceError::OpenFailed(format!("set_samplerate: {e}")))?;
 
-        device.set_freq(self.frequency as u32).map_err(|e| {
+        let hardware_hz = self.hardware_freq_hz(self.frequency)?;
+        device.set_freq(hardware_hz).map_err(|e| {
             SourceError::TuneFailed(format!("{:.3} MHz: {e}", self.frequency / HERTZ_PER_MHZ))
         })?;
 
@@ -250,6 +257,22 @@ impl AirspySource {
             tracing::warn!(enabled = self.bias_tee, error = %e, "set_rf_bias failed");
         }
         Ok(device)
+    }
+
+    /// Translate a display frequency to the hardware tune target by
+    /// adding the upconverter offset. Errors (rather than wrapping)
+    /// when the sum leaves the u32 Hz domain — a misconfigured offset
+    /// must not silently tune 4 GHz away. Per issue #848 phase 4.
+    fn hardware_freq_hz(&self, display_hz: f64) -> Result<u32, SourceError> {
+        let hw = display_hz + self.converter_offset_hz;
+        if !(0.0..=f64::from(u32::MAX)).contains(&hw) {
+            return Err(SourceError::TuneFailed(format!(
+                "{:.3} MHz with converter offset {:.3} MHz is outside the tunable range",
+                display_hz / HERTZ_PER_MHZ,
+                self.converter_offset_hz / HERTZ_PER_MHZ
+            )));
+        }
+        Ok(hw as u32)
     }
 
     /// Apply the remembered gain state to an open device: manual mode
@@ -374,8 +397,9 @@ impl Source for AirspySource {
         // vendor traffic, independent of the bulk endpoint). Commit
         // only after the driver accepted; with no device open,
         // remember for `start()` (same contract as RTL, #742).
+        let hardware_hz = self.hardware_freq_hz(frequency_hz)?;
         if let Some(device) = &self.device {
-            device.set_freq(frequency_hz as u32).map_err(|e| {
+            device.set_freq(hardware_hz).map_err(|e| {
                 SourceError::TuneFailed(format!("{:.3} MHz: {e}", frequency_hz / HERTZ_PER_MHZ))
             })?;
         }
@@ -512,6 +536,49 @@ impl Source for AirspySource {
             device
                 .set_rf_bias(enabled)
                 .map_err(|e| SourceError::InvalidParameter(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn set_converter_offset(&mut self, offset_hz: f64) -> Result<(), SourceError> {
+        let device_open = self.device.is_some();
+        tracing::info!(
+            offset_hz,
+            device_open,
+            "AirspySource::set_converter_offset dispatch"
+        );
+        // Commit-or-rollback: a rejected offset must not be retained,
+        // or every later tune and restart fails until another offset
+        // is set. With a device open the live retune validates (and
+        // driver errors also roll back); closed, validate against the
+        // current display frequency the same way `tune` would. Per CR
+        // round 2 on PR #851.
+        let previous_offset_hz = self.converter_offset_hz;
+        self.converter_offset_hz = offset_hz;
+        let result = if self.device.is_some() {
+            let display = self.frequency;
+            self.tune(display)
+        } else {
+            self.hardware_freq_hz(self.frequency).map(|_| ())
+        };
+        if let Err(e) = result {
+            self.converter_offset_hz = previous_offset_hz;
+            // A failed driver tune can leave the hardware reset to
+            // DC while the source still reports the old state.
+            // Best-effort restore the previous hardware target (the
+            // rolled-back offset recomputes it exactly); validation
+            // failures never reached the driver, where this retune
+            // is a harmless no-op re-program. Keep the original
+            // error. Per CR round 3 on PR #851.
+            if self.device.is_some()
+                && let Err(restore) = self.tune(self.frequency)
+            {
+                tracing::warn!(
+                    error = %restore,
+                    "failed to restore hardware tune after rejected converter offset"
+                );
+            }
+            return Err(e);
         }
         Ok(())
     }
