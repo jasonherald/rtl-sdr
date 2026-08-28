@@ -271,7 +271,9 @@ fn rejected_converter_offset_is_not_retained() {
         Err(SourceError::TuneFailed(_))
     ));
     assert_eq!(
-        source.hardware_freq_hz(10_000_000.0).expect("offset rolled back"),
+        source
+            .hardware_freq_hz(10_000_000.0)
+            .expect("offset rolled back"),
         10_000_000
     );
     source

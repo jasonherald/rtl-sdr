@@ -304,7 +304,9 @@ fn rejected_converter_offset_is_not_retained() {
     ));
     // The previous (zero) offset survives: tuning still works.
     assert_eq!(
-        source.hardware_freq_hz(10_000_000.0).expect("offset rolled back"),
+        source
+            .hardware_freq_hz(10_000_000.0)
+            .expect("offset rolled back"),
         10_000_000
     );
     // And a valid offset still commits afterwards.
