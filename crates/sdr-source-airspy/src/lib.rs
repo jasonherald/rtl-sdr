@@ -184,6 +184,66 @@ impl AirspySource {
         }
     }
 
+    /// Open the first enumerated device and program the pre-stream
+    /// state: latch `Float32Iq` (before the rate snapshot —
+    /// `samplerates()` reports per-sample-type values), snapshot the
+    /// firmware rate table, clamp + apply the requested rate, tune,
+    /// replay gain state, and apply bias-T (non-fatal). Split out of
+    /// `start()` per the 50-NLOC gate on PR #850.
+    fn open_and_configure(&mut self) -> Result<Device, SourceError> {
+        let mut device = Device::open().map_err(|e| SourceError::OpenFailed(e.to_string()))?;
+
+        // Latch Float32Iq BEFORE the rate snapshot: `samplerates()`
+        // reports per-sample-type values (doubled for real types).
+        device
+            .set_sample_type(SampleType::Float32Iq)
+            .map_err(|e| SourceError::OpenFailed(format!("set_sample_type: {e}")))?;
+        self.sample_rates = device
+            .samplerates()
+            .into_iter()
+            .map(f64::from)
+            .collect::<Vec<_>>();
+        tracing::info!(
+            rates = ?self.sample_rates,
+            "AirspySource::start: device opened, firmware rate table snapshotted"
+        );
+
+        // Clamp the requested rate to the firmware table (a persisted
+        // RTL-era rate must not fail Play — see `nearest_supported_rate`).
+        let rate = nearest_supported_rate(&self.sample_rates, self.sample_rate)
+            .ok_or_else(|| SourceError::OpenFailed("empty firmware rate table".into()))?;
+        if (rate - self.sample_rate).abs() > f64::EPSILON {
+            tracing::warn!(
+                requested = self.sample_rate,
+                clamped = rate,
+                "AirspySource::start: unsupported rate clamped to nearest firmware rate"
+            );
+            self.sample_rate = rate;
+        }
+        device
+            .set_samplerate(rate as u32)
+            .map_err(|e| SourceError::OpenFailed(format!("set_samplerate: {e}")))?;
+
+        device.set_freq(self.frequency as u32).map_err(|e| {
+            SourceError::TuneFailed(format!("{:.3} MHz: {e}", self.frequency / HERTZ_PER_MHZ))
+        })?;
+
+        self.apply_gain_state(&device)?;
+        // Remember the effective state so later mode flips replay the
+        // same values (mirrors the RTL source's start() contract).
+        self.last_gain_manual = Some(self.last_gain_manual.unwrap_or(true));
+        if self.last_linearity_step.is_none() {
+            self.last_linearity_step = Some(FIRST_TIME_LINEARITY_STEP);
+        }
+
+        if let Err(e) = device.set_rf_bias(self.bias_tee) {
+            // Non-fatal: bias-T only matters for externally powered
+            // frontends; surface it in the log and stream anyway.
+            tracing::warn!(enabled = self.bias_tee, error = %e, "set_rf_bias failed");
+        }
+        Ok(device)
+    }
+
     /// Apply the remembered gain state to an open device: manual mode
     /// programs the composite linearity gain (which itself disables
     /// both per-stage AGCs); auto mode enables LNA + mixer AGC.
@@ -257,56 +317,7 @@ impl Source for AirspySource {
             bias_tee = self.bias_tee,
             "AirspySource::start: opening device"
         );
-        let mut device = Device::open().map_err(|e| SourceError::OpenFailed(e.to_string()))?;
-
-        // Latch Float32Iq BEFORE the rate snapshot: `samplerates()`
-        // reports per-sample-type values (doubled for real types).
-        device
-            .set_sample_type(SampleType::Float32Iq)
-            .map_err(|e| SourceError::OpenFailed(format!("set_sample_type: {e}")))?;
-        self.sample_rates = device
-            .samplerates()
-            .into_iter()
-            .map(f64::from)
-            .collect::<Vec<_>>();
-        tracing::info!(
-            rates = ?self.sample_rates,
-            "AirspySource::start: device opened, firmware rate table snapshotted"
-        );
-
-        // Clamp the requested rate to the firmware table (a persisted
-        // RTL-era rate must not fail Play — see `nearest_supported_rate`).
-        let rate = nearest_supported_rate(&self.sample_rates, self.sample_rate)
-            .ok_or_else(|| SourceError::OpenFailed("empty firmware rate table".into()))?;
-        if (rate - self.sample_rate).abs() > f64::EPSILON {
-            tracing::warn!(
-                requested = self.sample_rate,
-                clamped = rate,
-                "AirspySource::start: unsupported rate clamped to nearest firmware rate"
-            );
-            self.sample_rate = rate;
-        }
-        device
-            .set_samplerate(rate as u32)
-            .map_err(|e| SourceError::OpenFailed(format!("set_samplerate: {e}")))?;
-
-        device.set_freq(self.frequency as u32).map_err(|e| {
-            SourceError::TuneFailed(format!("{:.3} MHz: {e}", self.frequency / HERTZ_PER_MHZ))
-        })?;
-
-        self.apply_gain_state(&device)?;
-        // Remember the effective state so later mode flips replay the
-        // same values (mirrors the RTL source's start() contract).
-        self.last_gain_manual = Some(self.last_gain_manual.unwrap_or(true));
-        if self.last_linearity_step.is_none() {
-            self.last_linearity_step = Some(FIRST_TIME_LINEARITY_STEP);
-        }
-
-        if let Err(e) = device.set_rf_bias(self.bias_tee) {
-            // Non-fatal: bias-T only matters for externally powered
-            // frontends; surface it in the log and stream anyway.
-            tracing::warn!(enabled = self.bias_tee, error = %e, "set_rf_bias failed");
-        }
+        let mut device = self.open_and_configure()?;
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(BLOCK_CHANNEL_BOUND);
         self.stream_dead.store(false, Ordering::Release);
