@@ -73,6 +73,14 @@ pub const KEY_SOURCE_CONVERTER_OFFSET_HZ: &str = "src_converter_offset_hz";
 /// device rather than a specific serial.
 pub const AIRSPY_FIRST_AVAILABLE_LABEL: &str = "First available";
 
+/// Combo index of the "first available" entry in the Airspy unit
+/// selector.
+pub const AIRSPY_FIRST_AVAILABLE_INDEX: u32 = 0;
+
+/// Combo index of the FIRST enumerated serial — entries above the
+/// "first available" slot map serial N to index N + this offset.
+pub const AIRSPY_FIRST_SERIAL_INDEX: u32 = 1;
+
 /// Airspy device serial to open, persisted as the 16-digit upper-hex
 /// string [`sdr_source_airspy::format_device_serial`] produces (JSON
 /// numbers cannot carry a full u64 without precision loss). Empty /

@@ -293,11 +293,13 @@ fn on_airspy_device_list(ctx: &DspEventCtx, serials: &[u64]) {
     state.suppress_airspy_unit_notify.set(true);
     model.splice(0, model.n_items(), &label_refs);
     let persisted = sidebar::source_panel::load_airspy_serial(config);
+    #[allow(clippy::cast_possible_truncation, reason = "device lists are tiny")]
     let selected = persisted
         .and_then(|sn| serials.iter().position(|&s| s == sn))
-        .map_or(0, |pos| pos + 1);
-    #[allow(clippy::cast_possible_truncation, reason = "device lists are tiny")]
-    airspy_device_row.set_selected(selected as u32);
+        .map_or(sidebar::source_panel::AIRSPY_FIRST_AVAILABLE_INDEX, |pos| {
+            pos as u32 + sidebar::source_panel::AIRSPY_FIRST_SERIAL_INDEX
+        });
+    airspy_device_row.set_selected(selected);
     state.suppress_airspy_unit_notify.set(false);
 }
 

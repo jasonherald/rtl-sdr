@@ -3493,11 +3493,10 @@ fn wire_airspy_device_row(
                 return;
             }
             let idx = row.selected();
-            // Index 0 = "first available"; N>0 = the (N-1)th
-            // enumerated serial, parsed back from its label. A
-            // transient out-of-range index during model churn
-            // parses to None and is discarded.
-            let serial = if idx == 0 {
+            // "First available" vs an enumerated serial parsed back
+            // from its label. A transient out-of-range index during
+            // model churn parses to None and is discarded.
+            let serial = if idx == sidebar::source_panel::AIRSPY_FIRST_AVAILABLE_INDEX {
                 None
             } else {
                 let Some(label) = row
