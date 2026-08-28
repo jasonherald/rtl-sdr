@@ -249,12 +249,14 @@ fn converter_offset_zero_is_identity() {
 
 #[test]
 fn converter_offset_out_of_range_is_rejected() {
-    // A large negative offset must error, not saturate the u32 cast
-    // to 0 and tune the hardware to DC.
     let mut source = RtlSdrSource::new(0);
+    // A -90 MHz offset is valid at the 100 MHz default display
+    // frequency (hardware 10 MHz)…
     source
-        .set_converter_offset(-200_000_000.0)
-        .expect("offset stores");
+        .set_converter_offset(-90_000_000.0)
+        .expect("offset valid at current display frequency");
+    // …but tuning the display to 10 MHz would put the hardware at
+    // -80 MHz — rejected, not wrapped.
     assert!(matches!(
         source.hardware_freq_hz(10_000_000.0),
         Err(SourceError::TuneFailed(_))
@@ -286,5 +288,31 @@ fn converter_offset_lifts_hf_display_above_tuner_floor() {
             raw
         ),
         raw
+    );
+}
+
+#[test]
+fn rejected_converter_offset_is_not_retained() {
+    // CR round 2 on PR #851: an offset that fails validation for the
+    // current display frequency must not be committed — otherwise
+    // every later tune and restart fails until another offset is set.
+    let mut source = RtlSdrSource::new(0);
+    source.tune(10_000_000.0).expect("display tune");
+    assert!(matches!(
+        source.set_converter_offset(-200_000_000.0),
+        Err(SourceError::TuneFailed(_))
+    ));
+    // The previous (zero) offset survives: tuning still works.
+    assert_eq!(
+        source.hardware_freq_hz(10_000_000.0).expect("offset rolled back"),
+        10_000_000
+    );
+    // And a valid offset still commits afterwards.
+    source
+        .set_converter_offset(125_000_000.0)
+        .expect("valid offset accepted");
+    assert_eq!(
+        source.hardware_freq_hz(10_000_000.0).expect("in range"),
+        135_000_000
     );
 }

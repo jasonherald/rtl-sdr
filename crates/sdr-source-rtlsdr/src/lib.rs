@@ -548,8 +548,8 @@ impl RtlSdrSource {
         if !(0.0..=f64::from(u32::MAX)).contains(&hw) {
             return Err(SourceError::TuneFailed(format!(
                 "{:.3} MHz with converter offset {:.3} MHz is outside the tunable range",
-                display_hz / 1_000_000.0,
-                self.converter_offset_hz / 1_000_000.0
+                display_hz / HERTZ_PER_MHZ,
+                self.converter_offset_hz / HERTZ_PER_MHZ
             )));
         }
         Ok(hw as u32)
@@ -1014,12 +1014,23 @@ impl Source for RtlSdrSource {
             device_open,
             "RtlSdrSource::set_converter_offset dispatch"
         );
+        // Commit-or-rollback: a rejected offset must not be retained,
+        // or every later tune and restart fails until another offset
+        // is set. With a device open the live retune validates (and
+        // driver errors also roll back); closed, validate against the
+        // current display frequency the same way `tune` would. Per CR
+        // round 2 on PR #851.
+        let previous_offset_hz = self.converter_offset_hz;
         self.converter_offset_hz = offset_hz;
-        // Live retune at the unchanged display frequency so the
-        // offset takes effect immediately.
-        if self.device.is_some() {
+        let result = if self.device.is_some() {
             let display = self.frequency;
-            self.tune(display)?;
+            self.tune(display)
+        } else {
+            self.hardware_freq_hz(self.frequency).map(|_| ())
+        };
+        if let Err(e) = result {
+            self.converter_offset_hz = previous_offset_hz;
+            return Err(e);
         }
         Ok(())
     }

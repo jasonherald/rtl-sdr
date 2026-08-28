@@ -547,12 +547,23 @@ impl Source for AirspySource {
             device_open,
             "AirspySource::set_converter_offset dispatch"
         );
+        // Commit-or-rollback: a rejected offset must not be retained,
+        // or every later tune and restart fails until another offset
+        // is set. With a device open the live retune validates (and
+        // driver errors also roll back); closed, validate against the
+        // current display frequency the same way `tune` would. Per CR
+        // round 2 on PR #851.
+        let previous_offset_hz = self.converter_offset_hz;
         self.converter_offset_hz = offset_hz;
-        // Live retune so the change takes effect immediately at the
-        // current display frequency.
-        if self.device.is_some() {
+        let result = if self.device.is_some() {
             let display = self.frequency;
-            self.tune(display)?;
+            self.tune(display)
+        } else {
+            self.hardware_freq_hz(self.frequency).map(|_| ())
+        };
+        if let Err(e) = result {
+            self.converter_offset_hz = previous_offset_hz;
+            return Err(e);
         }
         Ok(())
     }
