@@ -1030,6 +1030,21 @@ impl Source for RtlSdrSource {
         };
         if let Err(e) = result {
             self.converter_offset_hz = previous_offset_hz;
+            // A failed driver tune can leave the hardware reset to
+            // DC while the source still reports the old state.
+            // Best-effort restore the previous hardware target (the
+            // rolled-back offset recomputes it exactly); validation
+            // failures never reached the driver, where this retune
+            // is a harmless no-op re-program. Keep the original
+            // error. Per CR round 3 on PR #851.
+            if self.device.is_some()
+                && let Err(restore) = self.tune(self.frequency)
+            {
+                tracing::warn!(
+                    error = %restore,
+                    "failed to restore hardware tune after rejected converter offset"
+                );
+            }
             return Err(e);
         }
         Ok(())
