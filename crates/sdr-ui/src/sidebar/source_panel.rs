@@ -1752,16 +1752,19 @@ pub fn save_source_rtl_ppm(config: &Arc<ConfigManager>, ppm: i32) {
 
 /// Load the persisted source-type combo index. Defaults to
 /// [`DEVICE_RTLSDR`] when the key is missing, the value isn't a
-/// `u64`, or the parsed index falls outside `0..=DEVICE_RTLTCP`
+/// `u64`, or the parsed index falls outside `0..=DEVICE_AIRSPY`
 /// (e.g. a future build added more source types and the user
-/// rolled back). Per `CodeRabbit` round 1 on PR #558.
+/// rolled back). Per `CodeRabbit` round 1 on PR #558; bound raised
+/// with the Airspy slot on PR #852 after the stale `DEVICE_RTLTCP`
+/// clamp silently reverted a persisted Airspy selection to RTL-SDR
+/// at startup.
 #[must_use]
 pub fn load_source_device_index(config: &Arc<ConfigManager>) -> u32 {
     config.read(|v| {
         v.get(KEY_SOURCE_DEVICE_INDEX)
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u32::try_from(n).ok())
-            .filter(|&idx| idx <= DEVICE_RTLTCP)
+            .filter(|&idx| idx <= DEVICE_AIRSPY)
             .unwrap_or(DEVICE_RTLSDR)
     })
 }

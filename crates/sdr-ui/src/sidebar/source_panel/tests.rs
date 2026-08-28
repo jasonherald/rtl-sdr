@@ -774,3 +774,25 @@ fn nearest_rate_index_selects_running_rate() {
     // Empty list (defensive — the epilogue skips empty tables).
     assert_eq!(nearest_rate_index(&[], 1.0), None);
 }
+
+#[test]
+fn device_index_round_trips_airspy() {
+    // CR round 1 on PR #852 escalation: the loader's stale
+    // `DEVICE_RTLTCP` bound silently reverted a persisted Airspy
+    // selection to RTL-SDR at startup (user-reported on the phase-5
+    // smoke). Every legal device index must round-trip.
+    let config = make_config();
+    for idx in [
+        DEVICE_RTLSDR,
+        DEVICE_NETWORK,
+        DEVICE_FILE,
+        DEVICE_RTLTCP,
+        DEVICE_AIRSPY,
+    ] {
+        save_source_device_index(&config, idx);
+        assert_eq!(load_source_device_index(&config), idx, "index {idx}");
+    }
+    // Out-of-range still fails closed to RTL-SDR.
+    save_source_device_index(&config, DEVICE_AIRSPY + 1);
+    assert_eq!(load_source_device_index(&config), DEVICE_RTLSDR);
+}
