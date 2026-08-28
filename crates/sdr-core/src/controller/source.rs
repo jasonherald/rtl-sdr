@@ -251,6 +251,51 @@ pub(super) fn rtl_sdr_pre_start_settings(state: &DspState, source: &mut dyn Sour
     }
 }
 
+/// Airspy counterpart of [`rtl_sdr_pre_start_settings`]: gain mode +
+/// gain value must reach the source before `start()` so the open
+/// applies the user's persisted choice instead of the first-time
+/// default. The dB-scaled `tuner_gain_tenths_db` maps onto the
+/// 0–21 linearity ladder inside the source (clamped) — a persisted
+/// RTL-era value lands at the nearest ladder end once, until the
+/// user touches the gain slider on the new device. Per issue #848;
+/// per-device gain persistence is follow-up scope there.
+pub(super) fn airspy_pre_start_settings(state: &DspState, source: &mut dyn Source) {
+    if let Err(e) = source.set_gain_mode(!state.tuner_agc_auto) {
+        tracing::warn!(
+            error = %e,
+            agc_auto = state.tuner_agc_auto,
+            "pre-start Airspy gain-mode dispatch failed"
+        );
+    }
+    if let Err(e) = source.set_gain(state.tuner_gain_tenths_db) {
+        tracing::warn!(
+            error = %e,
+            gain_tenths = state.tuner_gain_tenths_db,
+            "pre-start Airspy gain dispatch failed"
+        );
+    }
+}
+
+/// Airspy counterpart of [`rtl_sdr_replay_persisted_settings`].
+/// Only bias-T applies post-start (no PPM — 0.5 ppm TCXO; no direct
+/// sampling / offset tuning / RTL AGC — RTL2832 concepts). Warn +
+/// toast on failure so the UI switch can't silently lie about
+/// hardware state (same contract as the RTL replay, #551).
+pub(super) fn airspy_replay_persisted_settings(
+    state: &DspState,
+    source: &mut dyn Source,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+) {
+    if let Err(e) = source.set_bias_tee(state.bias_tee_enabled) {
+        tracing::warn!(
+            error = %e,
+            enabled = state.bias_tee_enabled,
+            "re-applying persisted bias-T on Airspy open failed"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!("Bias tee failed: {e}")));
+    }
+}
+
 /// Re-apply the persisted RTL-SDR settings tracked on
 /// [`DspState`] to a freshly-opened source. Each setting is
 /// best-effort — we warn-log and toast on failure but never
@@ -383,6 +428,11 @@ fn replay_tuner_gain_index(
 fn create_source_instance(state: &DspState) -> Box<dyn Source> {
     match state.source_type {
         SourceType::RtlSdr => Box::new(RtlSdrSource::new(DEVICE_INDEX)),
+        // First enumerated Airspy; serial-number selection is #848
+        // follow-up scope. The source snapshots the firmware rate
+        // table at start() and clamps a persisted RTL-era rate to
+        // the nearest supported value instead of failing Play.
+        SourceType::Airspy => Box::new(sdr_source_airspy::AirspySource::new()),
         SourceType::Network => Box::new(sdr_source_network::NetworkSource::new(
             &state.network_host,
             state.network_port,
@@ -464,7 +514,10 @@ pub(super) fn open_source(
     // Tune is a meaningful operation for both the local RTL-SDR and
     // any remote (RtlTcp) — both need the initial center frequency.
     // Network raw-IQ and File sources ignore it.
-    if matches!(state.source_type, SourceType::RtlSdr | SourceType::RtlTcp) {
+    if matches!(
+        state.source_type,
+        SourceType::RtlSdr | SourceType::RtlTcp | SourceType::Airspy
+    ) {
         source.tune(state.center_freq).map_err(|e| e.to_string())?;
     }
 
@@ -473,6 +526,9 @@ pub(super) fn open_source(
     // `rtl_sdr_pre_start_settings` for why each one is there.
     if state.source_type == SourceType::RtlSdr {
         rtl_sdr_pre_start_settings(state, source.as_mut());
+    }
+    if state.source_type == SourceType::Airspy {
+        airspy_pre_start_settings(state, source.as_mut());
     }
 
     source.start().map_err(|e| e.to_string())?;
@@ -504,6 +560,9 @@ pub(super) fn open_source(
     // template).
     if state.source_type == SourceType::RtlSdr {
         rtl_sdr_replay_persisted_settings(state, source.as_mut(), dsp_tx);
+    }
+    if state.source_type == SourceType::Airspy {
+        airspy_replay_persisted_settings(state, source.as_mut(), dsp_tx);
     }
 
     // Sync sample rate from the source (file sources have fixed rates).

@@ -147,6 +147,105 @@ pub const DEVICE_NETWORK: u32 = 1;
 pub const DEVICE_FILE: u32 = 2;
 /// Device selector index for RTL-TCP (rtl_tcp-protocol network client).
 pub const DEVICE_RTLTCP: u32 = 3;
+/// Airspy R2 / Mini USB receiver (`libairspy-rs`). Appended per the
+/// stable-index rule — existing entries are config keys. Per #848.
+pub const DEVICE_AIRSPY: u32 = 4;
+
+/// Display labels for the RTL-SDR sample-rate table — index-aligned
+/// with [`SAMPLE_RATES`].
+pub const RTL_SAMPLE_RATE_LABELS: &[&str] = &[
+    "250 kHz",
+    "1.024 MHz",
+    "1.536 MHz",
+    "1.792 MHz",
+    "1.920 MHz",
+    "2.048 MHz",
+    "2.160 MHz",
+    "2.4 MHz",
+    "2.560 MHz",
+    "2.880 MHz",
+    "3.2 MHz",
+];
+
+/// Display labels for the Airspy IQ sample-rate table — index-aligned
+/// with [`sdr_source_airspy::DEFAULT_SAMPLE_RATES`] (the R2 firmware
+/// table; a Mini's extra rates arrive with the rate-list event in
+/// #848 follow-up scope).
+pub const AIRSPY_SAMPLE_RATE_LABELS: &[&str] = &["2.5 MHz", "10 MHz"];
+
+/// The sample-rate table backing the rate combo for a device-combo
+/// index. Sources without a tunable rate row fall back to the RTL
+/// table (their row is hidden anyway).
+#[must_use]
+pub fn sample_rates_for_device(device: u32) -> &'static [f64] {
+    match device {
+        DEVICE_AIRSPY => sdr_source_airspy::DEFAULT_SAMPLE_RATES,
+        _ => SAMPLE_RATES,
+    }
+}
+
+/// Index-aligned labels for [`sample_rates_for_device`].
+#[must_use]
+pub fn sample_rate_labels_for_device(device: u32) -> &'static [&'static str] {
+    match device {
+        DEVICE_AIRSPY => AIRSPY_SAMPLE_RATE_LABELS,
+        _ => RTL_SAMPLE_RATE_LABELS,
+    }
+}
+
+/// Reconfigure the gain row for the selected device. Airspy's gain
+/// is the unitless 0-21 composite linearity ladder in whole steps
+/// (encoded x10 through the tenths-based dispatch), not a dB value —
+/// leaving the RTL adjustment in place would display "30.0 dB" while
+/// the source clamps to step 21. The live `GainList` event still
+/// refines the bounds after Play; this keeps the row honest at
+/// selection time. Per CR round 1 on PR #850.
+/// Bottom of the Airspy composite linearity ladder.
+const AIRSPY_GAIN_MIN_STEP: f64 = 0.0;
+/// Top of the ladder, derived from the source crate's step count so
+/// the UI bound cannot drift from the gain contract.
+const AIRSPY_GAIN_MAX_STEP: f64 = (sdr_source_airspy::LINEARITY_GAIN_STEPS - 1) as f64;
+/// The ladder moves in whole steps.
+const AIRSPY_GAIN_STEP: f64 = 1.0;
+/// Page increment — a few steps per click, mirroring the RTL row's
+/// step/page ratio.
+const AIRSPY_GAIN_PAGE: f64 = 3.0;
+
+pub fn apply_device_gain_row(gain_row: &adw::SpinRow, device: u32) {
+    let adj = gain_row.adjustment();
+    if device == DEVICE_AIRSPY {
+        gain_row.set_subtitle("Linearity step");
+        gain_row.set_digits(0);
+        adj.set_lower(AIRSPY_GAIN_MIN_STEP);
+        adj.set_upper(AIRSPY_GAIN_MAX_STEP);
+        adj.set_step_increment(AIRSPY_GAIN_STEP);
+        adj.set_page_increment(AIRSPY_GAIN_PAGE);
+    } else {
+        gain_row.set_subtitle("dB");
+        gain_row.set_digits(1);
+        adj.set_lower(MIN_GAIN_DB);
+        adj.set_upper(MAX_GAIN_DB);
+        adj.set_step_increment(GAIN_STEP_DB);
+        adj.set_page_increment(GAIN_PAGE_DB);
+    }
+}
+
+/// Swap the rate combo's `StringList` contents to the device's label
+/// set. Splice keeps the model object (the `ComboRow` holds it), so
+/// only the rows change; the caller re-seeds the selection afterwards
+/// (the splice itself fires transient `selected` notifies that the
+/// out-of-range guards in the notify handler discard).
+pub fn repopulate_sample_rate_model(sample_rate_row: &adw::ComboRow, device: u32) {
+    let Some(model) = sample_rate_row
+        .model()
+        .and_then(|m| m.downcast::<gtk4::StringList>().ok())
+    else {
+        tracing::warn!("sample-rate combo model is not a StringList; skipping repopulate");
+        return;
+    };
+    let labels = sample_rate_labels_for_device(device);
+    model.splice(0, model.n_items(), labels);
+}
 
 /// AGC type for the source panel's three-way selector. Users pick
 /// between the tuner's hardware AGC (overshoots on strong signals,
@@ -510,19 +609,7 @@ fn build_rtlsdr_rows() -> (
     adw::ComboRow,
     adw::SwitchRow,
 ) {
-    let sample_rate_model = gtk4::StringList::new(&[
-        "250 kHz",
-        "1.024 MHz",
-        "1.536 MHz",
-        "1.792 MHz",
-        "1.920 MHz",
-        "2.048 MHz",
-        "2.160 MHz",
-        "2.4 MHz",
-        "2.560 MHz",
-        "2.880 MHz",
-        "3.2 MHz",
-    ]);
+    let sample_rate_model = gtk4::StringList::new(RTL_SAMPLE_RATE_LABELS);
     let sample_rate_row = adw::ComboRow::builder()
         .title("Sample Rate")
         .model(&sample_rate_model)
@@ -713,14 +800,18 @@ fn apply_source_row_visibility(
     let is_network = selected == DEVICE_NETWORK;
     let is_file = selected == DEVICE_FILE;
     let is_rtltcp = selected == DEVICE_RTLTCP;
+    let is_airspy = selected == DEVICE_AIRSPY;
 
-    let tune_controls_visible = is_rtlsdr || is_rtltcp;
+    let tune_controls_visible = is_rtlsdr || is_rtltcp || is_airspy;
     sample_rate_row.set_visible(tune_controls_visible);
     gain_row.set_visible(tune_controls_visible);
     agc_row.set_visible(tune_controls_visible);
-    ppm_row.set_visible(tune_controls_visible);
+    // No PPM row for Airspy — 0.5 ppm TCXO, and the source's
+    // `set_ppm_correction` is the trait no-op.
+    ppm_row.set_visible(is_rtlsdr || is_rtltcp);
 
-    bias_tee_row.set_visible(is_rtlsdr);
+    // Bias-T powers a SpyVerter / mast-head LNA on both USB radios.
+    bias_tee_row.set_visible(is_rtlsdr || is_airspy);
     direct_sampling_row.set_visible(is_rtlsdr);
     offset_tuning_row.set_visible(is_rtlsdr);
 
@@ -815,6 +906,7 @@ pub fn build_source_panel() -> SourcePanel {
         "Network",
         "File",
         "RTL-TCP (network)",
+        "Airspy R2 / Mini",
     ]);
     let device_row = adw::ComboRow::builder()
         .title("Device")

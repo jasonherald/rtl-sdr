@@ -663,3 +663,48 @@ fn source_file_path_round_trip_and_default() {
     config.write(|v| v[KEY_SOURCE_FILE_PATH] = serde_json::json!(42));
     assert_eq!(load_source_file_path(&config), "");
 }
+
+// ── Per-device sample-rate tables (#848 / PR #850) ────────────────
+
+#[test]
+fn device_rate_tables_and_labels_stay_index_aligned() {
+    // The rate combo dispatches by index into the device's table
+    // while the model shows the label at the same index — a length
+    // mismatch would silently desynchronize display from dispatch.
+    for device in [
+        DEVICE_RTLSDR,
+        DEVICE_NETWORK,
+        DEVICE_FILE,
+        DEVICE_RTLTCP,
+        DEVICE_AIRSPY,
+    ] {
+        assert_eq!(
+            sample_rates_for_device(device).len(),
+            sample_rate_labels_for_device(device).len(),
+            "rates/labels drifted for device index {device}"
+        );
+    }
+}
+
+#[test]
+fn airspy_device_maps_to_airspy_rate_table() {
+    assert_eq!(
+        sample_rates_for_device(DEVICE_AIRSPY),
+        sdr_source_airspy::DEFAULT_SAMPLE_RATES
+    );
+    assert_eq!(
+        sample_rate_labels_for_device(DEVICE_AIRSPY),
+        AIRSPY_SAMPLE_RATE_LABELS
+    );
+}
+
+#[test]
+fn non_airspy_devices_keep_the_rtl_rate_table() {
+    for device in [DEVICE_RTLSDR, DEVICE_NETWORK, DEVICE_FILE, DEVICE_RTLTCP] {
+        assert_eq!(sample_rates_for_device(device), SAMPLE_RATES);
+        assert_eq!(
+            sample_rate_labels_for_device(device),
+            RTL_SAMPLE_RATE_LABELS
+        );
+    }
+}

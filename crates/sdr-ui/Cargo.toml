@@ -54,6 +54,7 @@ sdr-sat.workspace = true
 # `Local` for user-facing display.
 chrono.workspace = true
 sdr-source-rtlsdr.workspace = true
+sdr-source-airspy.workspace = true
 # Scanner state machine — UI references `ScannerState` to map
 # phase enum variants to human-readable labels and builds
 # `ChannelKey`/`ScannerChannel` values for `UpdateScannerChannels`.

@@ -26,6 +26,7 @@ sdr-radio.workspace = true
 sdr-scanner.workspace = true
 librtlsdr-rs.workspace = true
 sdr-source-rtlsdr.workspace = true
+sdr-source-airspy.workspace = true
 sdr-source-network.workspace = true
 # `sdr-server-rtltcp` is pulled in for its
 # `extension::Role` enum, used by the `UiToDsp::SetRtlTcpClientConfig`

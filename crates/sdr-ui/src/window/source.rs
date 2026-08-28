@@ -1688,7 +1688,7 @@ pub(super) fn connect_source_panel(
 
     wire_iq_ppm_and_restart_rows(panels, state, config);
 
-    wire_source_type_guard(panels, state, toast_overlay, server_running);
+    wire_source_type_guard(panels, state, toast_overlay, server_running, config);
 
     wire_network_source_rows(panels, state, config);
 
@@ -3339,6 +3339,7 @@ fn wire_source_type_guard(
     state: &Rc<AppState>,
     toast_overlay: &adw::ToastOverlay,
     server_running: Rc<std::cell::Cell<bool>>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
 ) {
     // Source type selector — guard against transient out-of-range
     // indices AND enforce mutual exclusivity with the rtl_tcp server
@@ -3357,6 +3358,9 @@ fn wire_source_type_guard(
     // Without it the revert would re-enter this handler, see the
     // previous illegal value as "new", and endlessly toggle.
     let reverting: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+    let sample_rate_row_for_device = panels.source.sample_rate_row.downgrade();
+    let gain_row_for_device = panels.source.gain_row.downgrade();
+    let config_for_device_rates = std::sync::Arc::clone(config);
     panels
         .source
         .device_row
@@ -3384,10 +3388,35 @@ fn wire_source_type_guard(
                 DEVICE_NETWORK => SourceType::Network,
                 DEVICE_FILE => SourceType::File,
                 DEVICE_RTLTCP => SourceType::RtlTcp,
+                sidebar::source_panel::DEVICE_AIRSPY => SourceType::Airspy,
                 _ => return, // ignore transient indices
             };
             last_legal_selection.set(selected);
             state_source.send_dsp(UiToDsp::SetSourceType(source_type));
+            // Swap the rate combo to the device's table and re-seed
+            // a legal selection: the persisted index when it fits,
+            // else the table's first entry. The dispatch keeps the
+            // DSP's configured rate in the new device's range so the
+            // next Play doesn't need the start()-side clamp. Per
+            // #848.
+            if let Some(gain_row) = gain_row_for_device.upgrade() {
+                sidebar::source_panel::apply_device_gain_row(&gain_row, selected);
+            }
+            if let Some(rate_row) = sample_rate_row_for_device.upgrade() {
+                sidebar::source_panel::repopulate_sample_rate_model(&rate_row, selected);
+                let rates = sidebar::source_panel::sample_rates_for_device(selected);
+                let persisted =
+                    sidebar::source_panel::load_source_sample_rate_index(&config_for_device_rates);
+                let idx = if (persisted as usize) < rates.len() {
+                    persisted
+                } else {
+                    0
+                };
+                rate_row.set_selected(idx);
+                if let Some(&rate) = rates.get(idx as usize) {
+                    state_source.send_dsp(UiToDsp::SetSampleRate(rate));
+                }
+            }
         });
 }
 
@@ -3842,11 +3871,11 @@ fn wire_device_selector(
     // dispatch lives at the end of `connect_source_panel`.
     {
         let persisted_idx = sidebar::source_panel::load_source_device_index(config);
-        // Bound check via `DEVICE_RTLTCP` (the highest valid
+        // Bound check via `DEVICE_AIRSPY` (the highest valid
         // index) — fails closed if a stale config carries an
         // out-of-range value (e.g. a future build added more
         // source types and the user rolled back).
-        if persisted_idx <= sidebar::source_panel::DEVICE_RTLTCP {
+        if persisted_idx <= sidebar::source_panel::DEVICE_AIRSPY {
             panels.source.device_row.set_selected(persisted_idx);
             // Dispatch the restored source type to the DSP so a
             // saved Network / File / RTL-TCP selection takes
@@ -3862,6 +3891,7 @@ fn wire_device_selector(
                 sidebar::source_panel::DEVICE_NETWORK => Some(SourceType::Network),
                 sidebar::source_panel::DEVICE_FILE => Some(SourceType::File),
                 sidebar::source_panel::DEVICE_RTLTCP => Some(SourceType::RtlTcp),
+                sidebar::source_panel::DEVICE_AIRSPY => Some(SourceType::Airspy),
                 _ => None,
             };
             if let Some(source_type) = source_type {
@@ -4036,16 +4066,34 @@ fn wire_sample_rate_selector(
 ) {
     // Sample rate selector. Restore-then-wire (#552).
     {
+        // The rate table (and the combo's label model) depend on the
+        // persisted DEVICE selection. Read it from config rather than
+        // the widget: this block runs before `wire_device_selector`
+        // restores the row, so `device_row.selected()` would still be
+        // the construction default and a persisted Airspy selection
+        // would start with the RTL rate model + an RTL rate dispatch.
+        // Same fail-closed bound rule as the device restore itself.
+        // Per CR round 1 on PR #850.
+        let persisted_device = sidebar::source_panel::load_source_device_index(config);
+        let device = if persisted_device <= sidebar::source_panel::DEVICE_AIRSPY {
+            persisted_device
+        } else {
+            sidebar::source_panel::DEVICE_RTLSDR
+        };
+        sidebar::source_panel::apply_device_gain_row(&panels.source.gain_row, device);
+        sidebar::source_panel::repopulate_sample_rate_model(&panels.source.sample_rate_row, device);
+        let rates = sidebar::source_panel::sample_rates_for_device(device);
         let persisted_idx = sidebar::source_panel::load_source_sample_rate_index(config);
-        if (persisted_idx as usize) < SAMPLE_RATES.len() {
+        if (persisted_idx as usize) < rates.len() {
             panels.source.sample_rate_row.set_selected(persisted_idx);
-            if let Some(&rate) = SAMPLE_RATES.get(persisted_idx as usize) {
+            if let Some(&rate) = rates.get(persisted_idx as usize) {
                 state.send_dsp(UiToDsp::SetSampleRate(rate));
             }
         }
     }
     let state_sr = Rc::clone(state);
     let config_sr = std::sync::Arc::clone(config);
+    let device_row_for_rates = panels.source.device_row.downgrade();
     let apply_on_sr = apply_source_bandwidth_advisory.clone();
     panels
         .source
@@ -4059,7 +4107,11 @@ fn wire_sample_rate_selector(
             // Mirror the protocol_row pattern further down: bail
             // when the index doesn't map to a real sample rate.
             // Per CodeRabbit round 1 on PR #558.
-            let Some(&rate) = SAMPLE_RATES.get(idx as usize) else {
+            let device = device_row_for_rates
+                .upgrade()
+                .map_or(DEVICE_RTLSDR, |d| d.selected());
+            let rates = sidebar::source_panel::sample_rates_for_device(device);
+            let Some(&rate) = rates.get(idx as usize) else {
                 return;
             };
             sidebar::source_panel::save_source_sample_rate_index(&config_sr, idx);
