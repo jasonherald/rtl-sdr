@@ -362,3 +362,59 @@ fn handle_command_routes_set_converter_offset() {
     assert!((state.converter_offset_hz - 120_000_000.0).abs() < f64::EPSILON);
     assert_eq!(*offsets.lock().unwrap(), vec![120_000_000.0]);
 }
+
+/// Source whose `set_converter_offset` always rejects — positive
+/// proof the handler's state rollback runs on a live refusal.
+struct OffsetRejectingSource;
+
+impl Source for OffsetRejectingSource {
+    fn name(&self) -> &'static str {
+        "offset-rejecting"
+    }
+    fn sample_rates(&self) -> &[f64] {
+        &[]
+    }
+    fn start(&mut self) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn read_samples(&mut self, _buf: &mut [Complex]) -> Result<usize, sdr_types::SourceError> {
+        Ok(0)
+    }
+    fn sample_rate(&self) -> f64 {
+        0.0
+    }
+    fn set_sample_rate(&mut self, _rate: f64) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn tune(&mut self, _frequency_hz: f64) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn set_converter_offset(&mut self, _offset_hz: f64) -> Result<(), sdr_types::SourceError> {
+        Err(sdr_types::SourceError::TuneFailed("rejected".into()))
+    }
+}
+
+#[test]
+fn handle_set_converter_offset_rolls_back_state_on_live_rejection() {
+    // CR round 4 on PR #851: a live rejection must not leave DspState
+    // at the new offset — the pre-start handlers replay it, so later
+    // starts would retry the rejected configuration.
+    let (dsp_tx, rx) = mpsc::channel();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    state.converter_offset_hz = 120_000_000.0;
+    state.source = Some(Box::new(OffsetRejectingSource));
+    super::super::source::handle_set_converter_offset(&mut state, &dsp_tx, -300_000_000.0);
+    assert!(
+        (state.converter_offset_hz - 120_000_000.0).abs() < f64::EPSILON,
+        "state keeps the previous offset after a live rejection"
+    );
+    // And the user hears about it.
+    let toast = rx
+        .try_iter()
+        .find(|m| matches!(m, DspToUi::Error(_)))
+        .expect("error toast dispatched");
+    assert!(matches!(toast, DspToUi::Error(msg) if msg.contains("offset")));
+}

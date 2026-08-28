@@ -1499,10 +1499,16 @@ pub(super) fn handle_set_converter_offset(
     offset_hz: f64,
 ) {
     tracing::info!(offset_hz, "set converter offset");
+    let previous_offset_hz = state.converter_offset_hz;
     state.converter_offset_hz = offset_hz;
     if let Some(source) = &mut state.source
         && let Err(e) = source.set_converter_offset(offset_hz)
     {
+        // The source rolled back to its previous offset — mirror
+        // that here, or the pre-start replay would retry the
+        // rejected configuration on every later open. Per CR
+        // round 4 on PR #851.
+        state.converter_offset_hz = previous_offset_hz;
         tracing::warn!("set converter offset failed: {e}");
         let _ = dsp_tx.send(DspToUi::Error(format!("Converter offset failed: {e}")));
     }
