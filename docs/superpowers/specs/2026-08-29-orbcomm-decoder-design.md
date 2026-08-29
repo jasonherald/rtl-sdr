@@ -95,7 +95,7 @@ wideband IQ (pre-VFO, processed_buf)
                │     → RRC matched filter (α=0.4)
                │     → symbol timing recovery
                │     → delay-conjugate-multiply demod (±90° → bit)
-               │     → bit conventions (NRZ-M / LSB-first, per reference)
+               │     → bit conventions (LSB-first; NRZ-M confirmed OFF, Task 9)
                │     → synchronous per-byte packet state machine
                │     → Fletcher-16 verify (+ 1-bit repair)
                └── typed OrbcommEvent stream
