@@ -10,7 +10,7 @@ CARGO       ?= cargo
 CARGO_FLAGS ?= --release
 
 .PHONY: all build install install-bin install-sherpa-runtime-libs \
-        check-cuda-system-libs install-icon install-desktop uninstall \
+        check-cuda-system-libs stop-running-app install-icon install-desktop uninstall \
         test clippy fmt fmt-check \
         lint deny audit scan clean help
 
@@ -93,6 +93,37 @@ build:
 install-bin: build
 install-sherpa-runtime-libs: build
 
+# Never install over a RUNNING sdr-rs: replacing the executable (and
+# its adjacent sdr-rs-libs) under a live process leaves the dynamic
+# loader holding stale state, and the next dlopen — e.g. PipeWire
+# lazily loading an SPA plugin on an audio-route change — SIGSEGVs
+# inside ld-linux (observed 2026-08-29: bias-T toggle after a
+# mid-run install; the core's executable line read "(deleted)").
+# Graceful SIGTERM so GTK runs its shutdown path (recordings
+# finalized, config flushed), bounded wait, hard error if it will
+# not exit. A sentinel records the stop so `install` relaunches the
+# app when done. Ordered after `build` (via install-bin's prereq
+# chain) so the app keeps running through the long compile and is
+# only down for the copy.
+RESTART_SENTINEL := /tmp/.sdr-rs-restart-$(shell id -u)
+stop-running-app:
+	@if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+		echo "  sdr-rs is running — stopping it for the install (will relaunch)"; \
+		touch $(RESTART_SENTINEL); \
+		pkill -u $$(id -u) -x -TERM sdr-rs; \
+		for i in $$(seq 1 50); do \
+			pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1 || break; \
+			sleep 0.2; \
+		done; \
+		if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+			echo "error: sdr-rs did not exit within 10 s — close it and re-run make install"; \
+			rm -f $(RESTART_SENTINEL); \
+			exit 1; \
+		fi; \
+	fi
+
+install-bin: stop-running-app
+
 install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-desktop
 	@echo ""
 	@echo "SDR-RS installed successfully!"
@@ -104,6 +135,11 @@ install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-d
 	@echo "  Desktop:  $(DESKTOPDIR)/com.sdr.rs.desktop"
 	@echo ""
 	@echo "Launch from your app menu or run: sdr-rs"
+	@if [ -f $(RESTART_SENTINEL) ]; then \
+		rm -f $(RESTART_SENTINEL); \
+		echo "  relaunching sdr-rs"; \
+		setsid -f $(BINDIR)/sdr-rs >/dev/null 2>&1 || true; \
+	fi
 	@echo ""
 
 install-bin:
