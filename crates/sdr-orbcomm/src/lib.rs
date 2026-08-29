@@ -3,6 +3,7 @@
 //! reference in docs/superpowers/specs/2026-08-29-orbcomm-decoder-design.md.
 
 pub mod deframe;
+pub mod demod;
 pub mod packet;
 pub mod reassembly;
 pub mod sat_names;
