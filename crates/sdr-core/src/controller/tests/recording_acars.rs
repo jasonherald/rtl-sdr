@@ -413,14 +413,19 @@ fn source_switch_while_engaged_tears_down_on_type_change() {
     );
 }
 
-/// #849 (CR round 1 on PR #860) — the Airspy Mini clamps a 2.5 Msps
-/// request to its nearest table entry (3 Msps). The engage path
-/// builds the `ChannelBank` from the POST-APPLY read-back rate, so the
-/// clamped rate must produce a valid bank: every Airspy rate is an
-/// integer multiple of the 12.5 kHz channel IF rate.
+/// Airspy Mini firmware rate table (IQ, Hz) — the Mini has no
+/// 2.5 Msps entry, so the lock's requested rate clamps to 3 Msps.
+const AIRSPY_MINI_RATES_HZ: [f64; 2] = [3_000_000.0, 6_000_000.0];
+
+/// #849 (CR round 1 on PR #860) — geometry-only half of the Mini
+/// coverage: every Airspy Mini rate is an integer multiple of the
+/// 12.5 kHz channel IF rate, so a bank built at a clamped rate is
+/// valid. The engagement-level half (the clamp actually flowing
+/// through the read-back into the bank) is
+/// [`acars_engage_builds_bank_at_the_clamped_rate`].
 #[test]
 fn channel_bank_builds_at_airspy_mini_clamped_rates() {
-    for rate in [3_000_000.0, 6_000_000.0] {
+    for rate in AIRSPY_MINI_RATES_HZ {
         let bank = sdr_acars::ChannelBank::new(
             rate,
             crate::acars_airband_lock::AcarsRegion::default().center_hz(),
@@ -432,4 +437,70 @@ fn channel_bank_builds_at_airspy_mini_clamped_rates() {
             bank.err()
         );
     }
+}
+
+/// Fake source mimicking an Airspy Mini's rate behavior: any
+/// requested rate clamps to the nearest entry of
+/// [`AIRSPY_MINI_RATES_HZ`], like `AirspySource::set_sample_rate`
+/// does against its firmware snapshot.
+struct MiniLikeSource {
+    rate: f64,
+}
+
+impl Source for MiniLikeSource {
+    fn name(&self) -> &'static str {
+        "mini-like"
+    }
+    fn sample_rates(&self) -> &[f64] {
+        &AIRSPY_MINI_RATES_HZ
+    }
+    fn start(&mut self) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+    fn read_samples(&mut self, _buf: &mut [Complex]) -> Result<usize, sdr_types::SourceError> {
+        Ok(0)
+    }
+    fn sample_rate(&self) -> f64 {
+        self.rate
+    }
+    fn set_sample_rate(&mut self, rate: f64) -> Result<(), sdr_types::SourceError> {
+        self.rate = AIRSPY_MINI_RATES_HZ
+            .iter()
+            .copied()
+            .min_by(|a, b| (a - rate).abs().total_cmp(&(b - rate).abs()))
+            .expect("non-empty table");
+        Ok(())
+    }
+    fn tune(&mut self, _frequency_hz: f64) -> Result<(), sdr_types::SourceError> {
+        Ok(())
+    }
+}
+
+/// #849 (CR round 2 on PR #860) — engagement-level half of the Mini
+/// coverage: engaging on a source that CLAMPS the 2.5 Msps request
+/// must read back the actual hardware rate and build the bank at it,
+/// not at the pre-clamp request.
+#[test]
+fn acars_engage_builds_bank_at_the_clamped_rate() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    state.source_type = SourceType::Airspy;
+    state.source = Some(Box::new(MiniLikeSource { rate: 6_000_000.0 }));
+    let _ = drain(&dsp_rx);
+
+    let _ = handle_set_acars_enabled(&mut state, true, &dsp_tx);
+
+    assert!(
+        state.acars_pre_lock.is_some(),
+        "engaged on the Mini-like source"
+    );
+    assert!(state.acars_bank.is_some(), "bank pre-built at engage");
+    // The 2.5 Msps request clamped to 3 Msps — and the read-back
+    // value is what the DSP graph AND the bank were built from. The
+    // clamp copies a table entry verbatim, so exact comparison is
+    // the correct check.
+    assert!((state.sample_rate - 3_000_000.0).abs() < f64::EPSILON);
 }
