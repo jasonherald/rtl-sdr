@@ -32,6 +32,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SHERPA_CUDA");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SHERPA_ROCM");
 
     // Read build *target* state from cargo env vars rather than
     // `#[cfg(target_os = ...)]` / `#[cfg(feature = ...)]`. The `cfg`
@@ -42,8 +43,12 @@ fn main() {
     // the build-target state.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let sherpa_cuda = std::env::var_os("CARGO_FEATURE_SHERPA_CUDA").is_some();
+    // sherpa-rocm shares the shared-link layout (sherpa libs in
+    // sdr-rs-libs; the ROCm/onnxruntime layer resolves from the
+    // system loader) and needs the same rpath. Per issue #858.
+    let sherpa_rocm = std::env::var_os("CARGO_FEATURE_SHERPA_ROCM").is_some();
 
-    if sherpa_cuda && target_os == "linux" {
+    if (sherpa_cuda || sherpa_rocm) && target_os == "linux" {
         // `$ORIGIN` must reach `ld` as a literal dollar sign; cargo
         // passes `rustc-link-arg` values straight through without
         // shell expansion, so we escape nothing here.

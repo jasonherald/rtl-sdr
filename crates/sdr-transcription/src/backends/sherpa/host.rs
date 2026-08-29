@@ -88,7 +88,24 @@ pub fn init_sherpa_host(model: SherpaModel) -> mpsc::Receiver<InitEvent> {
         return event_rx;
     }
 
-    SherpaHost::spawn(model)
+    // Coerce a backend-unsupported selection (e.g. a persisted
+    // non-Cohere model on a fresh ROCm build, #858) to a model that
+    // can actually start. Without this the worker stores the
+    // unsupported-model error in the `OnceLock` and the host is
+    // stranded — `reload_sherpa_host` refuses a host in the failed
+    // state, so not even a supported model could be loaded later.
+    // Reloads don't need the coercion: a reload rejection keeps the
+    // previous recognizer and surfaces the error to the UI.
+    let supported = model.backend_supported_or_fallback();
+    if supported != model {
+        tracing::warn!(
+            requested = ?model,
+            starting = ?supported,
+            "requested model is unsupported on this backend; starting fallback"
+        );
+    }
+
+    SherpaHost::spawn(supported)
 }
 
 /// Reload the sherpa-onnx host with a different model.
@@ -444,6 +461,7 @@ fn init_online(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
 ) -> Result<RecognizerState, ()> {
+    reject_if_backend_unsupported(model, event_tx)?;
     if !sherpa_model::model_exists(model)
         && !download_and_extract_bundle(model, event_tx, model.label())
     {
@@ -530,6 +548,7 @@ fn init_offline(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
 ) -> Result<RecognizerState, ()> {
+    reject_if_backend_unsupported(model, event_tx)?;
     // --- Silero VAD ---
     if !sherpa_model::silero_vad_exists() {
         tracing::info!("silero VAD not found locally, downloading");
@@ -575,6 +594,30 @@ fn init_offline(
     // first session doesn't pay the download cost.
 
     Ok(RecognizerState::Offline { recognizer })
+}
+
+/// Shared guard for both init paths: reject a model the compiled
+/// backend can't run (the `ROCm` allowlist, #858). On rejection the
+/// error has been stored in `SHERPA_HOST` and emitted as
+/// `InitEvent::Failed` — storing is a no-op in the reload context,
+/// where the `OnceLock` already holds the running host and the
+/// worker keeps the previous recognizer.
+fn reject_if_backend_unsupported(
+    model: SherpaModel,
+    event_tx: &mpsc::Sender<InitEvent>,
+) -> Result<(), ()> {
+    if model.supported_on_backend() {
+        return Ok(());
+    }
+    let msg = format!(
+        "{} is unavailable on the ROCm backend (#858) — use Cohere \
+         Transcribe.",
+        model.label()
+    );
+    tracing::warn!(%msg);
+    store_init_failure(BackendError::Init(msg.clone()));
+    let _ = event_tx.send(InitEvent::Failed { message: msg });
+    Err(())
 }
 
 /// Helper to store an initialization failure in the global `OnceLock`.

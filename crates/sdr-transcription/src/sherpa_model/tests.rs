@@ -394,3 +394,49 @@ fn nemotron_variants_share_the_streaming_contract() {
     .collect();
     assert_eq!(dirs.len(), 4);
 }
+
+// ── #858: per-backend model support ───────────────────────────────
+
+#[cfg(not(feature = "sherpa-rocm"))]
+#[test]
+fn all_models_supported_on_non_rocm_backends() {
+    assert!(SherpaModel::ALL.iter().all(|m| m.supported_on_backend()));
+}
+
+#[cfg(feature = "sherpa-rocm")]
+#[test]
+fn rocm_backend_allows_only_cohere() {
+    // The 780M bring-up matrix (issue #858): Cohere was the one
+    // model MIGraphX ran correctly.
+    for m in SherpaModel::ALL {
+        assert_eq!(
+            m.supported_on_backend(),
+            *m == SherpaModel::CohereTranscribe14Lang,
+            "{m:?}"
+        );
+    }
+}
+
+#[cfg(not(feature = "sherpa-rocm"))]
+#[test]
+fn fallback_is_identity_when_every_model_is_supported() {
+    for m in SherpaModel::ALL {
+        assert_eq!(m.backend_supported_or_fallback(), *m, "{m:?}");
+    }
+}
+
+#[cfg(feature = "sherpa-rocm")]
+#[test]
+fn rocm_fallback_coerces_unsupported_models_to_cohere() {
+    // A fresh ROCm install inherits the persisted (or default) model
+    // from a non-ROCm world — coercion must always land on a model
+    // the backend can actually start, or the host `OnceLock` is
+    // poisoned with an init error and reloads are refused forever.
+    for m in SherpaModel::ALL {
+        assert_eq!(
+            m.backend_supported_or_fallback(),
+            SherpaModel::CohereTranscribe14Lang,
+            "{m:?}"
+        );
+    }
+}

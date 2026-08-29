@@ -80,6 +80,15 @@ pub(crate) const AUDIO_ENHANCEMENT_OFF_IDX: u32 = 2;
 /// must match the `AUDIO_ENHANCEMENT_*_IDX` constants above.
 const AUDIO_ENHANCEMENT_LABELS: &[&str] = &["Voice-band (default)", "Broadband", "Off"];
 
+/// Horizontal inset for the status label / progress bar under the
+/// model dropdown, matching the `AdwPreferencesGroup` gutter.
+const STATUS_AREA_MARGIN_H: i32 = 12;
+/// Vertical gap between the dropdown row and the status area.
+const STATUS_AREA_MARGIN_TOP: i32 = 4;
+/// Wrap width for status/error text — long per-backend messages
+/// (#858) must wrap here instead of forcing the panel wider.
+const STATUS_LABEL_MAX_WIDTH_CHARS: i32 = 48;
+
 #[cfg(feature = "sherpa")]
 const DISPLAY_MODE_LIVE_IDX: u32 = 0;
 /// `pub(crate)` so `window.rs` can gate the `Partial` handler on it.
@@ -918,15 +927,24 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         .halign(gtk4::Align::Start)
         .css_classes(["dim-label"])
         .visible(false)
-        .margin_start(12)
-        .margin_top(4)
+        .margin_start(STATUS_AREA_MARGIN_H)
+        .margin_end(STATUS_AREA_MARGIN_H)
+        .margin_top(STATUS_AREA_MARGIN_TOP)
+        // Long status/error text (e.g. the per-backend model-support
+        // message, #858) must wrap instead of forcing the panel — and
+        // with it the whole window — wider. xalign keeps wrapped
+        // lines left-aligned.
+        .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
+        .max_width_chars(STATUS_LABEL_MAX_WIDTH_CHARS)
+        .xalign(0.0)
         .build();
 
     let progress_bar = gtk4::ProgressBar::builder()
         .visible(false)
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(4)
+        .margin_start(STATUS_AREA_MARGIN_H)
+        .margin_end(STATUS_AREA_MARGIN_H)
+        .margin_top(STATUS_AREA_MARGIN_TOP)
         .build();
 
     // `WordChar` wraps on word boundaries OR mid-word when a single

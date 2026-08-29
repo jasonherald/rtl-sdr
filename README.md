@@ -58,10 +58,13 @@ Two mutually exclusive backends, selected at build time (see the install section
 - Optional GPU acceleration: CUDA (NVIDIA), ROCm/HIP (AMD), Vulkan, Metal
 - RMS-gated chunked inference with configurable silence threshold
 
-**Sherpa-onnx backend** — k2-fsa's sherpa-onnx, English only (today), streaming + offline
+**Sherpa-onnx backend** — k2-fsa's sherpa-onnx, English-first (Cohere Transcribe covers 14 languages), streaming + offline
 - **Streaming Zipformer** — true real-time transcription with word-by-word live captions
 - **Moonshine Tiny / Base** — UsefulSensors' edge-optimized offline models (27M / 61M params)
 - **Parakeet-TDT 0.6b v3** — NVIDIA, #1 on the OpenASR leaderboard (600M params, highest accuracy)
+- **Nemotron Speech Streaming 0.6b** — NVIDIA cache-aware streaming transducer, four lookahead variants (80/160/560/1120 ms)
+- **Canary 180M Flash / Parakeet Unified 0.6b** — additional NVIDIA offline models
+- **Cohere Transcribe** — offline, 14 languages; the one model supported on the experimental ROCm backend
 - **Runtime model swap** — change models from the dropdown without restarting the app
 - **Live captions with display mode toggle** — streaming models render an in-place italic line below the commit log; user can switch to "Final only" mode
 - **Silero VAD** — offline models use Silero voice activity detection with a user-tunable threshold slider for noisy RF audio (NFM/scanner)
@@ -139,7 +142,7 @@ Installs the binary, desktop entry, and icon for app launcher integration.
 
 ### Transcription backend (pick one)
 
-Whisper and Sherpa-onnx are mutually exclusive cargo features — you build with exactly one backend. Default is `whisper-cpu`. **Whisper** GPU builds require the corresponding toolkit installed on the build host (CUDA, ROCm, Vulkan SDK), because `whisper-rs` compiles its own kernels at build time. **Sherpa-cuda** resolves the CUDA runtime from system packages (Arch: `pacman -S cuda cudnn` plus the NVIDIA driver) — see the Sherpa CUDA notes below.
+Whisper and Sherpa-onnx are mutually exclusive cargo features — you build with exactly one backend. Default is `whisper-cpu`. **Whisper** GPU builds require the corresponding toolkit installed on the build host (CUDA, ROCm, Vulkan SDK), because `whisper-rs` compiles its own kernels at build time. **Sherpa-cuda** resolves the CUDA runtime from system packages (Arch: `pacman -S cuda cudnn` plus the NVIDIA driver) — see the Sherpa CUDA notes below. **Sherpa-rocm** is the AMD equivalent: system `onnxruntime-rocm` (MIGraphX EP) plus a one-time local build of the sherpa-onnx C libraries, cached under `~/.cache/sdr-rs/sherpa-rocm/`.
 
 ```bash
 # Whisper backend (default) — multilingual, mature GPU acceleration
@@ -148,12 +151,13 @@ make install CARGO_FLAGS="--release --features whisper-cuda"       # NVIDIA GPU
 make install CARGO_FLAGS="--release --features whisper-hipblas"    # AMD ROCm
 make install CARGO_FLAGS="--release --features whisper-vulkan"     # Cross-vendor GPU
 
-# Sherpa-onnx backend — Zipformer / Moonshine / Parakeet, English-only
+# Sherpa-onnx backend — Zipformer / Moonshine / Parakeet / Nemotron / Canary / Cohere (English-first; Cohere adds 14 languages)
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"   # Sherpa CPU
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda"  # Sherpa + NVIDIA GPU
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm"  # Sherpa + AMD GPU (MIGraphX; needs onnxruntime-rocm; Cohere Transcribe only)
 ```
 
-With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base, or Parakeet) at runtime from the transcript panel dropdown — no rebuild required, and switching is an in-place recognizer swap.
+With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base, Parakeet, Nemotron, Canary, or Cohere) at runtime from the transcript panel dropdown — no rebuild required, and switching is an in-place recognizer swap. The exception is `sherpa-rocm`, which is experimental and supports **Cohere Transcribe only**: the gfx1103 bring-up (issue #858) found the MIGraphX execution provider miscompiling or aborting on every other catalog model, so other selections are coerced to Cohere at startup and rejected with a clear error when picked from the dropdown.
 
 **Sherpa CUDA notes:**
 

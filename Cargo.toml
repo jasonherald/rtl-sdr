@@ -79,6 +79,7 @@ whisper-openblas = ["whisper", "gtk-frontend", "sdr-transcription/whisper-openbl
 #   sherpa-cuda — NVIDIA GPU via CUDA 12.x + cuDNN 9.x shared link (linux-x86_64 only)
 sherpa-cpu = ["sherpa", "gtk-frontend", "sdr-transcription/sherpa-cpu", "sdr-ui?/sherpa-cpu"]
 sherpa-cuda = ["sherpa", "gtk-frontend", "sdr-transcription/sherpa-cuda", "sdr-ui?/sherpa-cuda"]
+sherpa-rocm = ["sherpa", "gtk-frontend", "sdr-transcription/sherpa-rocm", "sdr-ui?/sherpa-rocm"]
 
 # GTK frontend stack — Linux only. The `sdr` binary on non-Linux targets
 # falls back to a stub `main()` (see src/main.rs) that prints a message
@@ -218,7 +219,7 @@ whisper-rs = "0.16"
 # `default-features = false` means the downstream feature set (sherpa-cpu
 # or sherpa-cuda in sdr-transcription) is responsible for picking a link
 # mode (static, shared, or cuda). See crates/sdr-transcription/Cargo.toml.
-sherpa-onnx = { git = "https://github.com/jasonherald/sherpa-onnx.git", rev = "8680356b14218c61e58a593034ef3599e0c4cb2f", default-features = false }
+sherpa-onnx = { git = "https://github.com/jasonherald/sherpa-onnx.git", rev = "2954af16cb79fc1a1ac8eb05965dac3e58e863ed", default-features = false }
 
 # System directories / libc
 dirs-next = "2"
