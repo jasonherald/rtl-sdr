@@ -11,15 +11,43 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 #[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
+/// True when a KFD topology node reports the gfx1103 target (Phoenix
+/// RDNA3 iGPU — Radeon 760M/780M class). KFD encodes
+/// `gfx_target_version` as major·10000 + minor·100 + step, so
+/// gfx1103 reads as 110003. A missing KFD sysfs tree (no
+/// ROCm-capable GPU, or the amdgpu/amdkfd driver isn't loaded)
+/// counts as "not found".
+#[cfg(feature = "sherpa-rocm")]
+fn rocm_host_has_gfx1103() -> bool {
+    /// gfx1103 in KFD's `gfx_target_version` encoding.
+    const GFX1103_TARGET_VERSION: &str = "110003";
+    let Ok(nodes) = std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes") else {
+        return false;
+    };
+    nodes.filter_map(Result::ok).any(|node| {
+        std::fs::read_to_string(node.path().join("properties")).is_ok_and(|props| {
+            props.lines().any(|line| {
+                line.strip_prefix("gfx_target_version")
+                    .is_some_and(|v| v.trim() == GFX1103_TARGET_VERSION)
+            })
+        })
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
 /// sherpa-rocm environment seeding, called FIRST in `main` before
 /// any thread spawns (`set_var` is unsafe once threads exist) and
 /// only for variables the user hasn't set. Per issue #858:
 /// - `HSA_OVERRIDE_GFX_VERSION=11.0.0`: consumer RDNA3 iGPUs (e.g.
 ///   the 780M's gfx1103) sit outside `ROCm`'s official gfx targets;
-///   gfx1100 is the well-known disguise.
+///   gfx1100 is the well-known disguise. Seeded only when a gfx1103
+///   device is actually present — spoofing the architecture on any
+///   other GPU would select incompatible kernels.
 /// - `ORT_MIGRAPHX_MODEL_CACHE_PATH`: unset, the `MIGraphX` EP's
 ///   compiled-model cache writes to `""` and the failed write
-///   hard-aborts the first GPU inference (verified live).
+///   hard-aborts the first GPU inference (verified live). A cache
+///   dir we can't create is that same abort deferred, so it's a
+///   startup error instead — the caller exits with the message.
 #[cfg(feature = "sherpa-rocm")]
 #[allow(
     unsafe_code,
@@ -27,24 +55,38 @@ use gtk4::prelude::*;
               thing in main before any thread spawns, so no concurrent \
               environment access exists — the one place this is sound"
 )]
-fn seed_rocm_env() {
-    if std::env::var_os("HSA_OVERRIDE_GFX_VERSION").is_none() {
+fn seed_rocm_env() -> Result<(), String> {
+    if std::env::var_os("HSA_OVERRIDE_GFX_VERSION").is_none() && rocm_host_has_gfx1103() {
         // SAFETY: pre-thread main, no concurrent env access.
         unsafe { std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "11.0.0") };
     }
-    if std::env::var_os("ORT_MIGRAPHX_MODEL_CACHE_PATH").is_none()
-        && let Some(home) = std::env::var_os("HOME")
-    {
+    if std::env::var_os("ORT_MIGRAPHX_MODEL_CACHE_PATH").is_none() {
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            "HOME is unset — cannot derive the MIGraphX model cache path. \
+             Set ORT_MIGRAPHX_MODEL_CACHE_PATH to a writable directory (#858)."
+                .to_owned()
+        })?;
         let dir = std::path::PathBuf::from(home).join(".cache/sdr-rs/migraphx");
-        let _ = std::fs::create_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            format!(
+                "cannot create the MIGraphX model cache dir {}: {e}. Without a \
+                 writable cache the first GPU inference hard-aborts (#858) — \
+                 set ORT_MIGRAPHX_MODEL_CACHE_PATH to a writable directory.",
+                dir.display()
+            )
+        })?;
         // SAFETY: pre-thread main, no concurrent env access.
         unsafe { std::env::set_var("ORT_MIGRAPHX_MODEL_CACHE_PATH", &dir) };
     }
+    Ok(())
 }
 
 fn main() -> glib::ExitCode {
     #[cfg(feature = "sherpa-rocm")]
-    seed_rocm_env();
+    if let Err(msg) = seed_rocm_env() {
+        eprintln!("sdr-rs: {msg}");
+        return glib::ExitCode::FAILURE;
+    }
 
     // Splash subprocess mode. The sdr-splash controller re-execs us
     // with `--splash` as argv[1] to render a tiny GTK splash window

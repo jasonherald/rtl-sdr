@@ -416,3 +416,27 @@ fn rocm_backend_allows_only_cohere() {
         );
     }
 }
+
+#[cfg(not(feature = "sherpa-rocm"))]
+#[test]
+fn fallback_is_identity_when_every_model_is_supported() {
+    for m in SherpaModel::ALL {
+        assert_eq!(m.backend_supported_or_fallback(), *m, "{m:?}");
+    }
+}
+
+#[cfg(feature = "sherpa-rocm")]
+#[test]
+fn rocm_fallback_coerces_unsupported_models_to_cohere() {
+    // A fresh ROCm install inherits the persisted (or default) model
+    // from a non-ROCm world — coercion must always land on a model
+    // the backend can actually start, or the host `OnceLock` is
+    // poisoned with an init error and reloads are refused forever.
+    for m in SherpaModel::ALL {
+        assert_eq!(
+            m.backend_supported_or_fallback(),
+            SherpaModel::CohereTranscribe14Lang,
+            "{m:?}"
+        );
+    }
+}

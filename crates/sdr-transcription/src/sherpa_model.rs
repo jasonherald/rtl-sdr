@@ -298,6 +298,25 @@ impl SherpaModel {
         }
     }
 
+    /// The model itself when the compiled backend supports it,
+    /// otherwise the first catalog entry the backend does support
+    /// (Cohere on `ROCm`). Guards the initial host spawn: a failed
+    /// init is stored in a `OnceLock` and permanently strands the
+    /// host — reloads are refused — so a persisted selection that
+    /// predates the backend allowlist must be coerced to a model
+    /// that can actually start rather than poisoning init.
+    #[must_use]
+    pub fn backend_supported_or_fallback(self) -> Self {
+        if self.supported_on_backend() {
+            return self;
+        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|m| m.supported_on_backend())
+            .unwrap_or(self)
+    }
+
     /// Mel filterbank dimension the model's acoustic frontend expects.
     /// Zipformer exports use sherpa's default 80; NVIDIA's Nemotron
     /// streaming export uses 128 — feeding the wrong dimension decodes

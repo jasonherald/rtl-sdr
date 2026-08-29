@@ -151,6 +151,7 @@ make install CARGO_FLAGS="--release --features whisper-vulkan"     # Cross-vendo
 # Sherpa-onnx backend — Zipformer / Moonshine / Parakeet, English-only
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"   # Sherpa CPU
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda"  # Sherpa + NVIDIA GPU
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm"  # Sherpa + AMD GPU (MIGraphX; needs onnxruntime-rocm)
 ```
 
 With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base, or Parakeet) at runtime from the transcript panel dropdown — no rebuild required, and switching is an in-place recognizer swap.

@@ -88,7 +88,24 @@ pub fn init_sherpa_host(model: SherpaModel) -> mpsc::Receiver<InitEvent> {
         return event_rx;
     }
 
-    SherpaHost::spawn(model)
+    // Coerce a backend-unsupported selection (e.g. a persisted
+    // non-Cohere model on a fresh ROCm build, #858) to a model that
+    // can actually start. Without this the worker stores the
+    // unsupported-model error in the `OnceLock` and the host is
+    // stranded — `reload_sherpa_host` refuses a host in the failed
+    // state, so not even a supported model could be loaded later.
+    // Reloads don't need the coercion: a reload rejection keeps the
+    // previous recognizer and surfaces the error to the UI.
+    let supported = model.backend_supported_or_fallback();
+    if supported != model {
+        tracing::warn!(
+            requested = ?model,
+            starting = ?supported,
+            "requested model is unsupported on this backend; starting fallback"
+        );
+    }
+
+    SherpaHost::spawn(supported)
 }
 
 /// Reload the sherpa-onnx host with a different model.

@@ -90,11 +90,17 @@ check-rocm-system-libs:
 	echo "  onnxruntime-rocm + HIP runtime present"
 
 # Build the sherpa-onnx C libraries against the system onnxruntime
-# once and cache them; the cached lib short-circuits rebuilds. Wipe
-# $(SHERPA_ROCM_BUILD) to force a rebuild after changing the fork.
+# once and cache them. The cache is keyed to the source checkout's
+# git revision (stamped in .source-rev): moving the checkout to a
+# different commit invalidates it automatically. A non-git source
+# tree can't be keyed, so it falls back to cache-if-present — wipe
+# $(SHERPA_ROCM_BUILD) to force a rebuild in that case.
 build-sherpa-rocm-libs:
-	@if [ -f "$(SHERPA_ROCM_BUILD)/lib/libsherpa-onnx-c-api.so" ]; then \
-		echo "  sherpa-onnx ROCm libs cached at $(SHERPA_ROCM_BUILD)/lib"; \
+	@src_rev=$$(git -C "$(SHERPA_ONNX_SRC)" rev-parse HEAD 2>/dev/null || echo unknown); \
+	cached_rev=$$(cat "$(SHERPA_ROCM_BUILD)/.source-rev" 2>/dev/null || echo none); \
+	if [ -f "$(SHERPA_ROCM_BUILD)/lib/libsherpa-onnx-c-api.so" ] \
+		&& { [ "$$src_rev" = "$$cached_rev" ] || [ "$$src_rev" = "unknown" ]; }; then \
+		echo "  sherpa-onnx ROCm libs cached at $(SHERPA_ROCM_BUILD)/lib (rev $$cached_rev)"; \
 	else \
 		echo "  building sherpa-onnx against system onnxruntime (one-time)"; \
 		test -d "$(SHERPA_ONNX_SRC)" || { \
@@ -111,7 +117,8 @@ build-sherpa-rocm-libs:
 			-DCMAKE_INSTALL_PREFIX="$(SHERPA_ROCM_BUILD)" >/dev/null \
 		&& cmake --build "$(SHERPA_ROCM_BUILD)/cmake" -j$$(nproc) >/dev/null \
 		&& cmake --install "$(SHERPA_ROCM_BUILD)/cmake" >/dev/null \
-		&& echo "  sherpa-onnx ROCm libs installed to $(SHERPA_ROCM_BUILD)/lib"; \
+		&& echo "$$src_rev" > "$(SHERPA_ROCM_BUILD)/.source-rev" \
+		&& echo "  sherpa-onnx ROCm libs installed to $(SHERPA_ROCM_BUILD)/lib (rev $$src_rev)"; \
 	fi
 
 # ─────────────────────────────────────────────────────────────────────
