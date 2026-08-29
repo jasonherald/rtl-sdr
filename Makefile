@@ -150,11 +150,12 @@ check-cuda-system-libs:
 	done; \
 	if [ -n "$$missing" ]; then \
 		echo "error: sherpa-cuda needs these system libraries:$$missing"; \
-		echo "       install them with: pacman -S cuda cudnn"; \
+		echo "       install your distribution's CUDA 13 + cuDNN 9 packages"; \
+		echo "       (Arch: pacman -S cuda cudnn)"; \
 		exit 1; \
 	fi; \
 	ldconfig -p | grep -q "libcuda.so.1 " || { \
-		echo "error: libcuda.so.1 not found — install the NVIDIA driver (pacman -S nvidia-utils)"; \
+		echo "error: libcuda.so.1 not found — install your distribution's NVIDIA driver (Arch: pacman -S nvidia-utils)"; \
 		exit 1; \
 	}; \
 	echo "  CUDA 13 + cuDNN 9 system libraries present"
