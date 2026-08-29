@@ -138,10 +138,20 @@ install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-d
 	@echo "  Desktop:  $(DESKTOPDIR)/com.sdr.rs.desktop"
 	@echo ""
 	@echo "Launch from your app menu or run: sdr-rs"
-	@if [ -f $(RESTART_SENTINEL) ]; then \
-		rm -f $(RESTART_SENTINEL); \
+	@if [ -f "$(RESTART_SENTINEL)" ]; then \
 		echo "  relaunching sdr-rs"; \
-		setsid -f $(BINDIR)/sdr-rs >/dev/null 2>&1 || true; \
+		setsid -f "$(BINDIR)/sdr-rs" >/dev/null 2>&1 || true; \
+		started=0; \
+		for i in $$(seq 1 15); do \
+			if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then started=1; break; fi; \
+			sleep 0.2; \
+		done; \
+		if [ "$$started" = "1" ]; then \
+			rm -f "$(RESTART_SENTINEL)"; \
+		else \
+			echo "error: relaunched sdr-rs did not appear within 3 s — sentinel kept, start it manually or re-run make install"; \
+			exit 1; \
+		fi; \
 	fi
 	@echo ""
 
@@ -152,8 +162,8 @@ install-bin:
 	@# unexpectedly. A sentinel with the app NOT running means a
 	@# previous install died after the stop — KEEP it, so this run's
 	@# completion heals the situation by relaunching.
-	@if [ -f $(RESTART_SENTINEL) ] && pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
-		rm -f $(RESTART_SENTINEL); \
+	@if [ -f "$(RESTART_SENTINEL)" ] && pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+		rm -f "$(RESTART_SENTINEL)"; \
 	fi
 	@# Stop a running sdr-rs INSIDE this recipe (which already
 	@# depends on `build`) so `make -j install` cannot TERM the app
@@ -165,7 +175,7 @@ install-bin:
 	@# replacement, so stopping them all is the correct radius.
 	@if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
 		echo "  sdr-rs is running — stopping it for the install (will relaunch)"; \
-		if ! mkdir -p $$(dirname $(RESTART_SENTINEL)) || ! touch $(RESTART_SENTINEL); then \
+		if ! mkdir -p "$$(dirname '$(RESTART_SENTINEL)')" || ! touch "$(RESTART_SENTINEL)"; then \
 			echo "error: cannot create $(RESTART_SENTINEL) — refusing to stop sdr-rs without a relaunch marker"; \
 			exit 1; \
 		fi; \
@@ -176,7 +186,7 @@ install-bin:
 		done; \
 		if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
 			echo "error: sdr-rs did not exit within 10 s — close it and re-run make install"; \
-			rm -f $(RESTART_SENTINEL); \
+			rm -f "$(RESTART_SENTINEL)"; \
 			exit 1; \
 		fi; \
 	fi
@@ -186,15 +196,15 @@ install-bin:
 	@# relaunched rather than leaving the user appless. Per CR
 	@# round 3 on PR #862.
 	@mkdir -p $(BINDIR)
-	@if install -m 755 target/release/sdr $(BINDIR)/.sdr-rs.tmp \
-		&& mv -f $(BINDIR)/.sdr-rs.tmp $(BINDIR)/sdr-rs; then \
+	@if install -m 755 target/release/sdr "$(BINDIR)/.sdr-rs.tmp" \
+		&& mv -f "$(BINDIR)/.sdr-rs.tmp" "$(BINDIR)/sdr-rs"; then \
 		:; \
 	else \
-		rm -f $(BINDIR)/.sdr-rs.tmp; \
-		if [ -f $(RESTART_SENTINEL) ]; then \
-			rm -f $(RESTART_SENTINEL); \
+		rm -f "$(BINDIR)/.sdr-rs.tmp"; \
+		if [ -f "$(RESTART_SENTINEL)" ]; then \
+			rm -f "$(RESTART_SENTINEL)"; \
 			echo "  binary copy failed — relaunching the previous sdr-rs"; \
-			setsid -f $(BINDIR)/sdr-rs >/dev/null 2>&1 || true; \
+			setsid -f "$(BINDIR)/sdr-rs" >/dev/null 2>&1 || true; \
 		fi; \
 		exit 1; \
 	fi
