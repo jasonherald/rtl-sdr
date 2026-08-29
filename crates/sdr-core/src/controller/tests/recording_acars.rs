@@ -413,9 +413,13 @@ fn source_switch_while_engaged_tears_down_on_type_change() {
     );
 }
 
-/// Airspy Mini firmware rate table (IQ, Hz) — the Mini has no
-/// 2.5 Msps entry, so the lock's requested rate clamps to 3 Msps.
-const AIRSPY_MINI_RATES_HZ: [f64; 2] = [3_000_000.0, 6_000_000.0];
+/// Airspy Mini firmware rate floor (IQ, Hz) — the Mini has no
+/// 2.5 Msps entry, so the lock's request clamps up to this.
+const AIRSPY_MINI_MIN_RATE_HZ: f64 = 3_000_000.0;
+/// Airspy Mini firmware rate ceiling (IQ, Hz).
+const AIRSPY_MINI_MAX_RATE_HZ: f64 = 6_000_000.0;
+/// Airspy Mini firmware rate table (IQ, Hz).
+const AIRSPY_MINI_RATES_HZ: [f64; 2] = [AIRSPY_MINI_MIN_RATE_HZ, AIRSPY_MINI_MAX_RATE_HZ];
 
 /// #849 (CR round 1 on PR #860) — geometry-only half of the Mini
 /// coverage: every Airspy Mini rate is an integer multiple of the
@@ -488,7 +492,9 @@ fn acars_engage_builds_bank_at_the_clamped_rate() {
     let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
     let mut state = DspState::new(dsp_tx.clone()).unwrap();
     state.source_type = SourceType::Airspy;
-    state.source = Some(Box::new(MiniLikeSource { rate: 6_000_000.0 }));
+    state.source = Some(Box::new(MiniLikeSource {
+        rate: AIRSPY_MINI_MAX_RATE_HZ,
+    }));
     let _ = drain(&dsp_rx);
 
     let _ = handle_set_acars_enabled(&mut state, true, &dsp_tx);
@@ -502,5 +508,5 @@ fn acars_engage_builds_bank_at_the_clamped_rate() {
     // value is what the DSP graph AND the bank were built from. The
     // clamp copies a table entry verbatim, so exact comparison is
     // the correct check.
-    assert!((state.sample_rate - 3_000_000.0).abs() < f64::EPSILON);
+    assert!((state.sample_rate - AIRSPY_MINI_MIN_RATE_HZ).abs() < f64::EPSILON);
 }
