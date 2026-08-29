@@ -76,6 +76,13 @@ build:
 # Install
 # ─────────────────────────────────────────────────────────────────────
 
+# The copy targets depend on `build` explicitly so `make -j install`
+# cannot race them against cargo writing target/release — prerequisite
+# ORDER in the install list alone doesn't serialize under -j. Per CR
+# round 2 on PR #859.
+install-bin: build
+install-sherpa-runtime-libs: build
+
 install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-desktop
 	@echo ""
 	@echo "SDR-RS installed successfully!"
