@@ -12,9 +12,10 @@ across all nine active channels simultaneously, surfacing:
 2. "Heard via Orbcomm" annotations in the Satellites activity panel
    (satellite name, last-heard age, self-reported position).
 
-The M2M message payloads are proprietary; we decode protocol structure,
-spacecraft ID, and the self-broadcast ephemeris — the established
-hobbyist scope. Reference implementation:
+We decode protocol structure, spacecraft ID, the self-broadcast
+ephemeris, and reassemble multi-packet messages for hex/ASCII display —
+the established hobbyist scope. The application-level payload encodings
+are proprietary and stay uninterpreted. Reference implementation:
 [fbieberly/ORBCOMM-receiver](https://github.com/fbieberly/ORBCOMM-receiver)
 (MIT-style; see its LICENSE), plus the Decode Systems Orbcomm page and
 the Orbcomm Serial Interface Specification E80050015 Rev F (both in the
@@ -107,6 +108,17 @@ Public API:
 - `OrbcommPacket` enum: `Sync { code, sat_id }`,
   `Ephemeris { sat_id, sat_time_utc, lat_deg, lon_deg, alt_m, vel_ms }`,
   `Message/UplinkInfo/DownlinkInfo/Network/Fill/Orbital { hex payload }`.
+- **Message reassembly** (`reassembly.rs`): consecutive `Message`-type
+  packets carry `msg_packet_num` / `msg_total_length` so multi-packet
+  messages can be stitched back together. A per-channel reassembler
+  buffers fragments and emits `OrbcommEvent::MessageComplete { bytes }`
+  when a sequence completes (checksum-valid fragments only; a broken
+  sequence flushes as partial with a flag). Payloads remain
+  application-encoded binary — the event carries raw bytes; rendering
+  (hexdump + printable-ASCII gutter) happens in the viewer, where
+  readable fragments surface when they exist. Incomplete/stale
+  sequences are dropped after a bounded age so the buffer can't grow
+  unbounded.
 - `sat_name(sat_id: u8) -> Option<&'static str>`.
 - Per-channel stats accessor for the activity strip (packet + checksum
   counters).
@@ -133,8 +145,11 @@ plus crate-level fixtures.
   `acars_viewer.rs` — per-channel activity strip across the top
   (9 fixed channels), monospace packet log below. Ephemeris rows render
   as `FM-114 · 51.2°N 7.4°E · 715 km · 7.45 km/s · 19:42:11Z`; other
-  packets as `type · sat/channel · hex`. Checksum-failed packets are
-  counted in the strip, not listed. Repaired packets get a marker.
+  packets as `type · sat/channel · hex`. Reassembled complete messages
+  render as a hexdump with a printable-ASCII gutter (the payoff view —
+  readable fragments pop out of the binary when present). Checksum-
+  failed packets are counted in the strip, not listed. Repaired packets
+  get a marker.
   Menu action + accelerator following the ACARS/SSTV pattern.
 - Satellites panel: new "Heard via Orbcomm" `AdwPreferencesGroup` —
   one row per heard spacecraft: name, last-heard relative age, last
@@ -164,6 +179,9 @@ Unit (TDD per layer):
 - Demod: synthesized SDPSK bursts with AWGN, CFO up to ±3.5 kHz
   (worst-case Doppler at 137 MHz), and sample-clock offset; require
   clean BER at reasonable SNR.
+- Reassembly: in-order completion, interleaved sequences on one
+  channel, missing-fragment flush-as-partial, and stale-sequence
+  eviction.
 - Channel bank: two simultaneous synthetic channels decode
   independently; out-of-span channels skipped.
 
@@ -179,8 +197,10 @@ Real-data gate (required before "done" — DSP rule):
 
 ## Non-goals (V1)
 
-- Decoding/storing M2M message payload contents (proprietary; raw hex
-  only).
+- Semantic interpretation of the proprietary application-level payload
+  encodings (V1 reassembles messages and renders bytes as hex + ASCII;
+  it does not claim to know any app's schema). No persistence of
+  payloads beyond the viewer log.
 - JSONL/UDP export, persistence of heard satellites across sessions.
 - Doppler-corrected per-satellite channel tracking; TLE cross-check
   UI beyond the position row.
