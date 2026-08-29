@@ -50,6 +50,12 @@ whisper-openblas = ["whisper", "whisper-rs/openblas"]
 # These are mutually exclusive (see the `compile_error!` guards in lib.rs).
 sherpa-cpu = ["sherpa", "sherpa-onnx/static"]
 sherpa-cuda = ["sherpa", "sherpa-onnx/cuda"]
+# AMD GPU via a locally built sherpa-onnx linked against the system
+# onnxruntime-rocm package (Arch). The sys crate's `shared` link mode
+# picks the libs up from SHERPA_ONNX_LIB_DIR, which `make` exports —
+# see the sherpa-rocm targets in the top-level Makefile. Per issue
+# #858.
+sherpa-rocm = ["sherpa", "sherpa-onnx/shared"]
 
 [dependencies]
 whisper-rs = { workspace = true, optional = true }

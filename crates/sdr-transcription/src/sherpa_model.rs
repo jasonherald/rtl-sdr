@@ -272,6 +272,32 @@ impl SherpaModel {
         }
     }
 
+    /// True when the model is usable on the compiled backend. The
+    /// `ROCm` (`MIGraphX`) backend is an ALLOWLIST — Cohere Transcribe
+    /// only — because the 780M bring-up (issue #858) found the
+    /// `MIGraphX` EP unfit for everything else: Moonshine trips an
+    /// internal JIT assertion (`split_reduce: n != 1`) and
+    /// hard-aborts; `NeMo` transducer encoders compute garbage
+    /// (offline Parakeets degrade badly, streaming Nemotron
+    /// collapses to a constant token — CPU-ing the decoder/joiner
+    /// didn't help, so the encoder itself is miscompiled); Canary
+    /// aborted with no output. Cohere was the one model that
+    /// transcribed correctly. Revisit with discrete AMD hardware
+    /// and/or fixed upstream `MIGraphX`. The model list itself stays
+    /// identical across backends (positions are persisted config
+    /// keys); the host refuses the load with a clear error instead.
+    #[must_use]
+    pub fn supported_on_backend(self) -> bool {
+        #[cfg(feature = "sherpa-rocm")]
+        {
+            matches!(self, Self::CohereTranscribe14Lang)
+        }
+        #[cfg(not(feature = "sherpa-rocm"))]
+        {
+            true
+        }
+    }
+
     /// Mel filterbank dimension the model's acoustic frontend expects.
     /// Zipformer exports use sherpa's default 80; NVIDIA's Nemotron
     /// streaming export uses 128 — feeding the wrong dimension decodes

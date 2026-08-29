@@ -10,7 +10,8 @@ CARGO       ?= cargo
 CARGO_FLAGS ?= --release
 
 .PHONY: all build install install-bin install-sherpa-runtime-libs \
-        check-cuda-system-libs install-icon install-desktop uninstall \
+        check-cuda-system-libs check-rocm-system-libs build-sherpa-rocm-libs \
+        install-icon install-desktop uninstall \
         test clippy fmt fmt-check \
         lint deny audit scan clean help
 
@@ -59,6 +60,59 @@ INSTALL_RUNTIME_LIB_TARGETS += check-cuda-system-libs install-sherpa-runtime-lib
 # on PR #859.
 build: check-cuda-system-libs
 endif
+
+# ── sherpa-rocm (issue #858) ─────────────────────────────────────────
+# AMD GPU transcription. No k2-fsa ROCm prebuilt exists, so we build
+# the sherpa-onnx C libraries locally (from the same fork checkout the
+# Rust crates pin) against Arch's `onnxruntime-rocm` system package,
+# and the Rust sys crate links them via SHERPA_ONNX_LIB_DIR in its
+# `shared` mode. The CUDA-era system-package pattern (#855) applies:
+# preflight before compile, actionable pacman hints.
+SHERPA_ONNX_SRC     ?= $(HOME)/source/sherpa-onnx
+SHERPA_ROCM_BUILD   := $(HOME)/.cache/sdr-rs/sherpa-rocm
+ifneq (,$(findstring sherpa-rocm,$(CARGO_FLAGS)))
+export SHERPA_ONNX_LIB_DIR := $(SHERPA_ROCM_BUILD)/lib
+INSTALL_RUNTIME_LIB_TARGETS += check-rocm-system-libs install-sherpa-runtime-libs
+build: check-rocm-system-libs build-sherpa-rocm-libs
+endif
+
+check-rocm-system-libs:
+	@missing=""; \
+	for lib in libonnxruntime.so libamdhip64.so; do \
+		ldconfig -p | grep -q "$$lib" || missing="$$missing $$lib"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "error: sherpa-rocm needs these system libraries:$$missing"; \
+		echo "       install your distribution's ROCm onnxruntime package"; \
+		echo "       (Arch: pacman -S onnxruntime-rocm)"; \
+		exit 1; \
+	fi; \
+	echo "  onnxruntime-rocm + HIP runtime present"
+
+# Build the sherpa-onnx C libraries against the system onnxruntime
+# once and cache them; the cached lib short-circuits rebuilds. Wipe
+# $(SHERPA_ROCM_BUILD) to force a rebuild after changing the fork.
+build-sherpa-rocm-libs:
+	@if [ -f "$(SHERPA_ROCM_BUILD)/lib/libsherpa-onnx-c-api.so" ]; then \
+		echo "  sherpa-onnx ROCm libs cached at $(SHERPA_ROCM_BUILD)/lib"; \
+	else \
+		echo "  building sherpa-onnx against system onnxruntime (one-time)"; \
+		test -d "$(SHERPA_ONNX_SRC)" || { \
+			echo "error: sherpa-onnx source not found at $(SHERPA_ONNX_SRC) (override with SHERPA_ONNX_SRC=...)"; \
+			exit 1; }; \
+		cmake -S "$(SHERPA_ONNX_SRC)" -B "$(SHERPA_ROCM_BUILD)/cmake" \
+			-DCMAKE_BUILD_TYPE=Release \
+			-DBUILD_SHARED_LIBS=ON \
+			-DSHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE=ON \
+			-DSHERPA_ONNX_ENABLE_TESTS=OFF \
+			-DSHERPA_ONNX_ENABLE_PYTHON=OFF \
+			-DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF \
+			-DSHERPA_ONNX_ENABLE_BINARY=OFF \
+			-DCMAKE_INSTALL_PREFIX="$(SHERPA_ROCM_BUILD)" >/dev/null \
+		&& cmake --build "$(SHERPA_ROCM_BUILD)/cmake" -j$$(nproc) >/dev/null \
+		&& cmake --install "$(SHERPA_ROCM_BUILD)/cmake" >/dev/null \
+		&& echo "  sherpa-onnx ROCm libs installed to $(SHERPA_ROCM_BUILD)/lib"; \
+	fi
 
 # ─────────────────────────────────────────────────────────────────────
 # Default
@@ -230,27 +284,42 @@ install-bin:
 # onnxruntime only ever dlopens it when a consumer asks for the
 # TensorRT provider. sdr-rs only asks for "cuda", so the tensorrt
 # provider is never loaded and shipping it would be dead weight.
+# The copy list is FLAVOR-AWARE because cargo does not clean
+# cross-feature artifacts in target/release: a sherpa-rocm build
+# after a sherpa-cuda one still finds the CUDA prebuilt's
+# libonnxruntime*.so lying around, and blindly globbing them would
+# ship ~600 MB of dead weight (inert — the loader matches sonames by
+# filename, so the system ORT still wins — but wasteful). rocm links
+# the SYSTEM onnxruntime, so only the sherpa libs ship. Per issue
+# #858.
+ifneq (,$(findstring sherpa-rocm,$(CARGO_FLAGS)))
+SHERPA_RUNTIME_LIB_NAMES := libsherpa-onnx-c-api.so libsherpa-onnx-cxx-api.so
+else
+SHERPA_RUNTIME_LIB_NAMES := libsherpa-onnx-c-api.so libsherpa-onnx-cxx-api.so \
+	libonnxruntime.so libonnxruntime_providers_cuda.so \
+	libonnxruntime_providers_shared.so
+endif
+
 install-sherpa-runtime-libs:
-	@# Prune the retired CUDA-12 redist sideload (#855): upgrades from
-	@# pre-system-package installs otherwise keep ~1.2 GB of dead
-	@# libraries (and a stale libcudnn.so.9 that would shadow the
-	@# system one via the binary's $$ORIGIN rpath ordering).
+	@# Prune the retired CUDA-12 redist sideload (#855) plus any
+	@# cross-flavor leftovers (#858): a rocm install must not keep a
+	@# stale bundled onnxruntime next to the binary.
 	@if [ -d $(LIBDIR) ]; then \
 		rm -f $(LIBDIR)/libcudart.so* $(LIBDIR)/libcublas*.so* \
 		      $(LIBDIR)/libcufft.so* $(LIBDIR)/libcurand.so* \
 		      $(LIBDIR)/libnvrtc*.so* $(LIBDIR)/libcudnn*.so* \
 		      $(LIBDIR)/libcudnn_*.so*; \
+		if echo "$(CARGO_FLAGS)" | grep -q "sherpa-rocm"; then \
+			rm -f $(LIBDIR)/libonnxruntime*.so*; \
+		fi; \
 	fi
 	@if ls target/release/libsherpa-onnx-c-api.so >/dev/null 2>&1; then \
 		mkdir -p $(LIBDIR); \
-		for so in target/release/libsherpa-onnx-c-api.so \
-		          target/release/libsherpa-onnx-cxx-api.so \
-		          target/release/libonnxruntime.so \
-		          target/release/libonnxruntime_providers_cuda.so \
-		          target/release/libonnxruntime_providers_shared.so; do \
+		for name in $(SHERPA_RUNTIME_LIB_NAMES); do \
+			so=target/release/$$name; \
 			if [ -f "$$so" ] || [ -L "$$so" ]; then \
 				cp -a "$$so" $(LIBDIR)/ || exit 1; \
-				echo "  installed $$(basename $$so)"; \
+				echo "  installed $$name"; \
 			fi; \
 		done; \
 	fi

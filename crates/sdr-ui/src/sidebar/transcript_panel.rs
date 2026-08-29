@@ -919,7 +919,16 @@ pub fn build_transcript_panel(config: &Arc<ConfigManager>) -> TranscriptPanel {
         .css_classes(["dim-label"])
         .visible(false)
         .margin_start(12)
+        .margin_end(12)
         .margin_top(4)
+        // Long status/error text (e.g. the per-backend model-support
+        // message, #858) must wrap instead of forcing the panel — and
+        // with it the whole window — wider. xalign keeps wrapped
+        // lines left-aligned.
+        .wrap(true)
+        .wrap_mode(gtk4::pango::WrapMode::WordChar)
+        .max_width_chars(48)
+        .xalign(0.0)
         .build();
 
     let progress_bar = gtk4::ProgressBar::builder()

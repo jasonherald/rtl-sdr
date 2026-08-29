@@ -139,7 +139,7 @@ Installs the binary, desktop entry, and icon for app launcher integration.
 
 ### Transcription backend (pick one)
 
-Whisper and Sherpa-onnx are mutually exclusive cargo features — you build with exactly one backend. Default is `whisper-cpu`. **Whisper** GPU builds require the corresponding toolkit installed on the build host (CUDA, ROCm, Vulkan SDK), because `whisper-rs` compiles its own kernels at build time. **Sherpa-cuda** resolves the CUDA runtime from system packages (Arch: `pacman -S cuda cudnn` plus the NVIDIA driver) — see the Sherpa CUDA notes below.
+Whisper and Sherpa-onnx are mutually exclusive cargo features — you build with exactly one backend. Default is `whisper-cpu`. **Whisper** GPU builds require the corresponding toolkit installed on the build host (CUDA, ROCm, Vulkan SDK), because `whisper-rs` compiles its own kernels at build time. **Sherpa-cuda** resolves the CUDA runtime from system packages (Arch: `pacman -S cuda cudnn` plus the NVIDIA driver) — see the Sherpa CUDA notes below. **Sherpa-rocm** is the AMD equivalent: system `onnxruntime-rocm` (MIGraphX EP) plus a one-time local build of the sherpa-onnx C libraries, cached under `~/.cache/sdr-rs/sherpa-rocm/`.
 
 ```bash
 # Whisper backend (default) — multilingual, mature GPU acceleration

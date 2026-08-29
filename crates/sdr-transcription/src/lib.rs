@@ -21,12 +21,17 @@ compile_error!(
      For sherpa, pass `--no-default-features --features sherpa-cpu` (or `sherpa-cuda`)."
 );
 
-#[cfg(all(feature = "sherpa-cpu", feature = "sherpa-cuda"))]
+#[cfg(any(
+    all(feature = "sherpa-cpu", feature = "sherpa-cuda"),
+    all(feature = "sherpa-cpu", feature = "sherpa-rocm"),
+    all(feature = "sherpa-cuda", feature = "sherpa-rocm")
+))]
 compile_error!(
-    "the `sherpa-cpu` and `sherpa-cuda` features are mutually exclusive. \
-     Pick exactly one link mode for the sherpa-onnx prebuilt: \
-     `sherpa-cpu` (CPU static link) or `sherpa-cuda` (shared link against \
-     the CUDA 13.x + cuDNN 9.x prebuilt)."
+    "the `sherpa-cpu`, `sherpa-cuda`, and `sherpa-rocm` features are mutually \
+     exclusive. Pick exactly one link mode for sherpa-onnx: \
+     `sherpa-cpu` (CPU static link), `sherpa-cuda` (shared link against \
+     the CUDA 13.x + cuDNN 9.x prebuilt), or `sherpa-rocm` (shared link \
+     against the locally built ROCm sherpa-onnx)."
 );
 
 // `sherpa` is an internal umbrella feature activated by the two
@@ -37,12 +42,17 @@ compile_error!(
 // clear actionable message.
 #[cfg(all(
     feature = "sherpa",
-    not(any(feature = "sherpa-cpu", feature = "sherpa-cuda"))
+    not(any(
+        feature = "sherpa-cpu",
+        feature = "sherpa-cuda",
+        feature = "sherpa-rocm"
+    ))
 ))]
 compile_error!(
     "the internal `sherpa` feature requires exactly one user-facing link mode. \
-     Enable either `sherpa-cpu` (CPU static link) or `sherpa-cuda` (shared link \
-     against the CUDA 12.x + cuDNN 9.x prebuilt) instead of `sherpa` directly."
+     Enable `sherpa-cpu` (CPU static link), `sherpa-cuda` (shared link against \
+     the CUDA 13.x + cuDNN 9.x prebuilt), or `sherpa-rocm` (shared link against \
+     the locally built ROCm sherpa-onnx) instead of `sherpa` directly."
 );
 
 #[cfg(not(any(feature = "whisper", feature = "sherpa")))]

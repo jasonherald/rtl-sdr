@@ -54,11 +54,14 @@ make install CARGO_FLAGS="--release --features whisper-vulkan"      # Cross-vend
 # Sherpa-onnx — Zipformer / Moonshine / Parakeet, English-only
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"   # Sherpa CPU
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda"  # Sherpa + NVIDIA GPU
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm"  # Sherpa + AMD GPU (MIGraphX)
 ```
 
 **`sherpa-cuda` resolves the CUDA runtime from system packages** (#855 — Arch: `pacman -S cuda cudnn`, i.e. CUDA 13.x + cuDNN 9.x, plus the `nvidia`/`nvidia-utils` driver). The former ~1.9 GB NVIDIA redist sideload is retired: k2-fsa now publishes a CUDA-13 flavor of the sherpa-onnx prebuilt and Arch packages cudnn, so the two ecosystem gaps that forced self-containment are gone — and system packages set the pattern for a future ROCm backend consumed the same way.
 
 `make install CARGO_FLAGS="... --features sherpa-cuda"` runs the `check-cuda-system-libs` preflight, which walks the prebuilt provider's exact `NEEDED` list through `ldconfig -p` and fails with the `pacman -S` command line if anything is missing. The sherpa-onnx/onnxruntime libraries still ship in `$(BINDIR)/sdr-rs-libs/`, resolved via the binary's `DT_RPATH` — forced to old-style via `-Wl,--disable-new-dtags` in `build.rs` so it cascades to onnxruntime's `dlopen` of the CUDA provider — while the CUDA layer resolves from the system loader. The install target prunes leftover sideloaded CUDA libs from pre-#855 setups. See `docs/cuda-runtime.md`.
+
+**`sherpa-rocm` (#858)** is the AMD counterpart: no k2-fsa ROCm prebuilt exists, so `make` builds the sherpa-onnx C libraries locally (from the fork checkout at `SHERPA_ONNX_SRC`, default `~/source/sherpa-onnx`) against the system `onnxruntime-rocm` package (Arch; MIGraphX is the only GPU EP upstream ORT still ships for AMD — the app's provider string "rocm" routes to it) and links them via the sys crate's `SHERPA_ONNX_LIB_DIR` shared mode. Cache at `~/.cache/sdr-rs/sherpa-rocm/`; `check-rocm-system-libs` preflights. Consumer RDNA3 iGPUs (gfx1103) get `HSA_OVERRIDE_GFX_VERSION=11.0.0` seeded at startup unless the user set their own.
 
 Linux x86_64 only. The first build downloads a ~230 MB sherpa-onnx CUDA-13 prebuilt from k2-fsa. The sherpa-onnx dep is pinned to the [jasonherald/sherpa-onnx](https://github.com/jasonherald/sherpa-onnx) fork on branch `feat/rust-sys-cuda-support` (upstream v1.13.6 + the `cuda` feature); a crates.io pin remains the exit ramp if the feature is ever upstreamed. Trade-off: the GPU path now tracks Arch's rolling CUDA major — when Arch jumps to CUDA 14 the preflight will fail clearly until k2-fsa ships a matching prebuilt.
 

@@ -23,6 +23,7 @@ whisper-openblas = ["whisper", "sdr-transcription/whisper-openblas"]
 
 sherpa-cpu = ["sherpa", "sdr-transcription/sherpa-cpu"]
 sherpa-cuda = ["sherpa", "sdr-transcription/sherpa-cuda"]
+sherpa-rocm = ["sherpa", "sdr-transcription/sherpa-rocm"]
 
 # sdr-ui is the GTK4 + libadwaita frontend and builds only on Linux. On
 # other platforms the crate compiles to an empty rlib via the top-of-file

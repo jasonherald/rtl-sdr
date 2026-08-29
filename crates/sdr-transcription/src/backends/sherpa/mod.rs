@@ -43,7 +43,9 @@ pub use silero_vad::SherpaSileroVad;
 /// disk for no benefit, so we gate it behind the dedicated feature.
 #[cfg(feature = "sherpa-cuda")]
 pub(crate) const SHERPA_PROVIDER: &str = "cuda";
-#[cfg(not(feature = "sherpa-cuda"))]
+#[cfg(feature = "sherpa-rocm")]
+pub(crate) const SHERPA_PROVIDER: &str = "rocm";
+#[cfg(not(any(feature = "sherpa-cuda", feature = "sherpa-rocm")))]
 pub(crate) const SHERPA_PROVIDER: &str = "cpu";
 
 use std::sync::atomic::{AtomicBool, Ordering};

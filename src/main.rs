@@ -11,7 +11,41 @@ use gtk4::glib;
 use gtk4::prelude::*;
 
 #[cfg(all(target_os = "linux", feature = "gtk-frontend"))]
+/// sherpa-rocm environment seeding, called FIRST in `main` before
+/// any thread spawns (`set_var` is unsafe once threads exist) and
+/// only for variables the user hasn't set. Per issue #858:
+/// - `HSA_OVERRIDE_GFX_VERSION=11.0.0`: consumer RDNA3 iGPUs (e.g.
+///   the 780M's gfx1103) sit outside `ROCm`'s official gfx targets;
+///   gfx1100 is the well-known disguise.
+/// - `ORT_MIGRAPHX_MODEL_CACHE_PATH`: unset, the `MIGraphX` EP's
+///   compiled-model cache writes to `""` and the failed write
+///   hard-aborts the first GPU inference (verified live).
+#[cfg(feature = "sherpa-rocm")]
+#[allow(
+    unsafe_code,
+    reason = "std::env::set_var is unsafe in edition 2024; called first \
+              thing in main before any thread spawns, so no concurrent \
+              environment access exists — the one place this is sound"
+)]
+fn seed_rocm_env() {
+    if std::env::var_os("HSA_OVERRIDE_GFX_VERSION").is_none() {
+        // SAFETY: pre-thread main, no concurrent env access.
+        unsafe { std::env::set_var("HSA_OVERRIDE_GFX_VERSION", "11.0.0") };
+    }
+    if std::env::var_os("ORT_MIGRAPHX_MODEL_CACHE_PATH").is_none()
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        let dir = std::path::PathBuf::from(home).join(".cache/sdr-rs/migraphx");
+        let _ = std::fs::create_dir_all(&dir);
+        // SAFETY: pre-thread main, no concurrent env access.
+        unsafe { std::env::set_var("ORT_MIGRAPHX_MODEL_CACHE_PATH", &dir) };
+    }
+}
+
 fn main() -> glib::ExitCode {
+    #[cfg(feature = "sherpa-rocm")]
+    seed_rocm_env();
+
     // Splash subprocess mode. The sdr-splash controller re-execs us
     // with `--splash` as argv[1] to render a tiny GTK splash window
     // during the otherwise-blocking sherpa init phase. Dispatch BEFORE

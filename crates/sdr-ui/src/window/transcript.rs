@@ -248,7 +248,7 @@ fn start_transcription_session(deps: &SessionDeps, row: &adw::SwitchRow) {
 /// it would still report "on" after a restart into WFM, or after the
 /// user switched to streaming Zipformer and the row went invisible —
 /// either of which would produce an unsupported session (streaming
-/// Zipformer rejects AutoBreak at session start; non-NFM modes never
+/// Zipformer rejects `AutoBreak` at session start; non-NFM modes never
 /// emit squelch edges so the state machine sits in Idle forever).
 #[cfg(feature = "sherpa")]
 fn auto_break_eligible(deps: &SessionDeps, model_idx: usize) -> bool {

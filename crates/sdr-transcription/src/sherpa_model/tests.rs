@@ -394,3 +394,25 @@ fn nemotron_variants_share_the_streaming_contract() {
     .collect();
     assert_eq!(dirs.len(), 4);
 }
+
+// ── #858: per-backend model support ───────────────────────────────
+
+#[cfg(not(feature = "sherpa-rocm"))]
+#[test]
+fn all_models_supported_on_non_rocm_backends() {
+    assert!(SherpaModel::ALL.iter().all(|m| m.supported_on_backend()));
+}
+
+#[cfg(feature = "sherpa-rocm")]
+#[test]
+fn rocm_backend_allows_only_cohere() {
+    // The 780M bring-up matrix (issue #858): Cohere was the one
+    // model MIGraphX ran correctly.
+    for m in SherpaModel::ALL {
+        assert_eq!(
+            m.supported_on_backend(),
+            *m == SherpaModel::CohereTranscribe14Lang,
+            "{m:?}"
+        );
+    }
+}

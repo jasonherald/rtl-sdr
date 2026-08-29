@@ -444,6 +444,17 @@ fn init_online(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
 ) -> Result<RecognizerState, ()> {
+    if !model.supported_on_backend() {
+        let msg = format!(
+            "{} is unavailable on the ROCm backend (#858) — use Cohere \
+             Transcribe.",
+            model.label()
+        );
+        tracing::warn!(%msg);
+        store_init_failure(BackendError::Init(msg.clone()));
+        let _ = event_tx.send(InitEvent::Failed { message: msg });
+        return Err(());
+    }
     if !sherpa_model::model_exists(model)
         && !download_and_extract_bundle(model, event_tx, model.label())
     {
@@ -530,6 +541,17 @@ fn init_offline(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
 ) -> Result<RecognizerState, ()> {
+    if !model.supported_on_backend() {
+        let msg = format!(
+            "{} is unavailable on the ROCm backend (#858) — use Cohere \
+             Transcribe.",
+            model.label()
+        );
+        tracing::warn!(%msg);
+        store_init_failure(BackendError::Init(msg.clone()));
+        let _ = event_tx.send(InitEvent::Failed { message: msg });
+        return Err(());
+    }
     // --- Silero VAD ---
     if !sherpa_model::silero_vad_exists() {
         tracing::info!("silero VAD not found locally, downloading");
