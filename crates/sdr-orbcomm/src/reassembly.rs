@@ -13,7 +13,7 @@
 //! subscriber or channel. A fragment whose `total` doesn't match the
 //! in-flight sequence is treated as the start of a new sequence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::packet::PacketType;
 
@@ -26,31 +26,35 @@ pub const MESSAGE_PAYLOAD_BYTES: usize = 8;
 /// this many further pushes (of any packet) is flushed as partial.
 pub const DEFAULT_MAX_AGE_PACKETS: u32 = 50;
 
-/// Sequence's total fragment count: low nibble of byte 1.
+/// Sequence's total fragment count: low nibble of byte 1. Returns `None`
+/// when `bytes` is too short to contain byte 1 — this function takes an
+/// unbounded slice (rather than `&[u8; 12]`) specifically so fixtures can
+/// probe it with arbitrary/malformed input without panicking.
 ///
 /// Nibble order is provisionally per the reference layout summary; the
 /// real-capture fixture (Task 9) is the arbiter — flip HERE if captures
 /// disagree.
 #[must_use]
-pub fn msg_total_len(bytes: &[u8]) -> u8 {
-    bytes[1] & 0x0F
+pub fn msg_total_len(bytes: &[u8]) -> Option<u8> {
+    bytes.get(1).map(|b| b & 0x0F)
 }
 
 /// Fragment's 1-based sequence number within its sequence: high nibble of
-/// byte 1.
+/// byte 1. Returns `None` when `bytes` is too short to contain byte 1.
 ///
 /// Nibble order is provisionally per the reference layout summary; the
 /// real-capture fixture (Task 9) is the arbiter — flip HERE if captures
 /// disagree.
 #[must_use]
-pub fn msg_seq_num(bytes: &[u8]) -> u8 {
-    bytes[1] >> 4
+pub fn msg_seq_num(bytes: &[u8]) -> Option<u8> {
+    bytes.get(1).map(|b| b >> 4)
 }
 
-/// A fragment's payload bytes, `bytes[2..10]`.
+/// A fragment's payload bytes, `bytes[2..10]`. Returns `None` when `bytes`
+/// is shorter than 10 bytes.
 #[must_use]
-pub fn msg_payload(bytes: &[u8]) -> &[u8] {
-    &bytes[2..2 + MESSAGE_PAYLOAD_BYTES]
+pub fn msg_payload(bytes: &[u8]) -> Option<&[u8]> {
+    bytes.get(2..2 + MESSAGE_PAYLOAD_BYTES)
 }
 
 /// A reassembled (or stale-flushed) subscriber message.
@@ -68,13 +72,19 @@ struct InFlight {
     /// This sequence's total fragment count, from the fragment that opened
     /// it. Every joining fragment must report the same total.
     total: u8,
-    /// Fragments seen so far, keyed by their 1-based sequence number.
-    /// A `BTreeMap` keeps concatenation order free (sorted iteration) even
-    /// though fragments may arrive out of order.
+    /// Fragments seen so far, keyed by their 1-based sequence number. A
+    /// `BTreeMap` keeps concatenation order free (sorted iteration) even
+    /// though fragments may arrive out of order. Only sequence numbers in
+    /// `1..=total` are ever inserted (see [`Reassembler::push`]), so
+    /// [`Self::is_complete`] and [`Self::concat_payloads`] never need to
+    /// re-check the range themselves. A fragment re-sent for a sequence
+    /// number already present overwrites the earlier one — last write
+    /// wins, silently.
     fragments: BTreeMap<u8, [u8; MESSAGE_PAYLOAD_BYTES]>,
-    /// Number of `push` calls (of any Message packet) since this sequence
-    /// started, incremented on every push while it's in flight. Compared
-    /// against `Reassembler::max_age_packets` to detect staleness.
+    /// Number of `push` calls (of any syntactically valid Message packet)
+    /// since this sequence started, incremented on every push while it's
+    /// in flight. Compared against `Reassembler::max_age_packets` to
+    /// detect staleness. Starts at 0 on the push that opens the sequence.
     age: u32,
 }
 
@@ -102,75 +112,98 @@ impl InFlight {
 /// Tracks a single in-flight sequence. Feed it every checksum-valid Message
 /// packet (`bytes[0] == 0x1A`, `bytes.len() == 12`) via [`Self::push`];
 /// non-Message input is the caller's responsibility to filter out —
-/// `push` simply ignores (returns `None` for) anything that doesn't match
-/// the Message header and length, rather than asserting, since the input
-/// is untrusted RF-derived data even after checksum validation.
+/// `push` simply ignores (returns whatever is queued, see below, rather
+/// than asserting) anything that doesn't match the Message header and
+/// length, since the input is untrusted RF-derived data even after
+/// checksum validation.
+///
+/// A fragment whose own sequence number falls outside `1..=total` (as
+/// reported by that same fragment) is likewise treated as inert: it does
+/// not age or otherwise perturb the in-flight sequence, and its payload is
+/// never inserted. This keeps a self-inconsistent (but checksum-valid)
+/// fragment from corrupting a completed message's byte order.
 pub struct Reassembler {
     max_age_packets: u32,
     inflight: Option<InFlight>,
+    /// Completed/flushed messages produced but not yet returned. `push`
+    /// returns only one `Option<CompletedMessage>` per call, but a single
+    /// call can produce two events (a flush of the superseded/stale
+    /// sequence *and* an immediate completion of the fragment that
+    /// triggered it — only possible for a single-fragment, `total == 1`
+    /// sequence). Both are queued in the order they occurred and drained
+    /// one-per-call (oldest first) by every subsequent `push`, so no
+    /// completed or flushed message is ever silently dropped — it's just
+    /// delayed until the next call(s) pop it off.
+    pending: VecDeque<CompletedMessage>,
 }
 
 impl Reassembler {
     /// Build a reassembler that flushes an in-flight sequence as partial
-    /// once it has gone `max_age_packets` pushes without completing.
+    /// once it goes stale.
+    ///
+    /// A sequence's age starts at 0 on the push that opens it and
+    /// increments by 1 on every later push of a syntactically valid
+    /// Message packet while it's in flight (regardless of which sequence
+    /// number that later push carries). Once age exceeds
+    /// `max_age_packets`, the sequence is flushed as partial on that push
+    /// — i.e. it takes `max_age_packets + 2` total Message pushes touching
+    /// this reassembler (the opening push, plus `max_age_packets + 1`
+    /// more) before a never-completing sequence flushes.
     #[must_use]
     pub fn new(max_age_packets: u32) -> Self {
         Self {
             max_age_packets,
             inflight: None,
+            pending: VecDeque::new(),
         }
     }
 
-    /// Feed one checksum-valid packet. Returns a [`CompletedMessage`] when
-    /// this call completes the in-flight sequence, or flushes it (stale, or
-    /// superseded by a fragment reporting a different `total`) as partial.
-    ///
-    /// When a push both triggers a stale/superseded flush of the old
-    /// sequence *and* the incoming fragment immediately completes the new
-    /// one it starts (only possible for a single-fragment, `total == 1`
-    /// sequence), the flush is returned and the new completion is left
-    /// in-flight — it will complete again, and be returned, on the very
-    /// next call if that call doesn't itself restart the sequence. This
-    /// keeps `push` to a single `Option` return without silently dropping
-    /// the old sequence's data.
+    /// Feed one checksum-valid packet. Returns the oldest not-yet-returned
+    /// [`CompletedMessage`] this reassembler has produced, if any — see the
+    /// [`Reassembler::pending`] doc for why a single call doesn't always
+    /// return the event it just produced.
     #[must_use]
     pub fn push(&mut self, bytes: &[u8]) -> Option<CompletedMessage> {
         if bytes.len() != PacketType::Message.packet_len()
             || bytes.first() != Some(&PacketType::Message.header_byte())
         {
-            return None;
+            return self.pending.pop_front();
         }
 
-        let total = msg_total_len(bytes);
-        let seq = msg_seq_num(bytes);
+        // `bytes.len() == 12` is already guaranteed above, so these are
+        // infallible in practice; handled without panicking regardless.
+        let (Some(total), Some(seq), Some(payload_slice)) =
+            (msg_total_len(bytes), msg_seq_num(bytes), msg_payload(bytes))
+        else {
+            return self.pending.pop_front();
+        };
+
+        // A fragment whose own seq is outside its own total's valid range
+        // is self-inconsistent — ignore it entirely (see struct doc).
+        if seq == 0 || seq > total {
+            return self.pending.pop_front();
+        }
+
         let mut payload = [0u8; MESSAGE_PAYLOAD_BYTES];
-        payload.copy_from_slice(msg_payload(bytes));
+        payload.copy_from_slice(payload_slice);
 
         // Age the in-flight sequence (if any) by this push, and flush it if
         // it's now stale.
-        let mut flushed = None;
         if let Some(inflight) = self.inflight.as_mut() {
             inflight.age += 1;
             if inflight.age > self.max_age_packets {
-                flushed = self.inflight.take().map(|f| CompletedMessage {
-                    bytes: f.concat_payloads(),
-                    partial: true,
-                });
+                self.flush_inflight(true);
             }
         }
 
         // A fragment reporting a different total than the (still-live)
         // in-flight sequence restarts: flush the old sequence as partial.
-        if flushed.is_none()
-            && self
-                .inflight
-                .as_ref()
-                .is_some_and(|inflight| inflight.total != total)
+        if self
+            .inflight
+            .as_ref()
+            .is_some_and(|inflight| inflight.total != total)
         {
-            flushed = self.inflight.take().map(|f| CompletedMessage {
-                bytes: f.concat_payloads(),
-                partial: true,
-            });
+            self.flush_inflight(true);
         }
 
         let inflight = self.inflight.get_or_insert_with(|| InFlight {
@@ -180,18 +213,23 @@ impl Reassembler {
         });
         inflight.fragments.insert(seq, payload);
 
-        if flushed.is_some() {
-            return flushed;
+        if inflight.is_complete() {
+            self.flush_inflight(false);
         }
 
-        if inflight.is_complete() {
-            return self.inflight.take().map(|f| CompletedMessage {
+        self.pending.pop_front()
+    }
+
+    /// Take the in-flight sequence, if any, concatenate its fragments, and
+    /// queue the result onto `pending` with the given `partial` flag.
+    /// No-op when nothing is in flight.
+    fn flush_inflight(&mut self, partial: bool) {
+        if let Some(f) = self.inflight.take() {
+            self.pending.push_back(CompletedMessage {
                 bytes: f.concat_payloads(),
-                partial: false,
+                partial,
             });
         }
-
-        None
     }
 }
 
@@ -256,11 +294,10 @@ mod tests {
         let mut r = Reassembler::new(max_age);
         let p1 = [0x11u8; MESSAGE_PAYLOAD_BYTES];
         assert_eq!(r.push(&msg_fragment(1, 3, p1)), None);
-        // Fragment 2 never arrives. Feed unrelated-looking pushes (still
-        // total==3, non-conflicting seq) to age the sequence without
-        // restarting it — actually simplest: push non-Message bytes, which
-        // `push` ignores and does NOT age (only Message pushes age).
-        // So age it with same-seq repeats which just overwrite fragment 1.
+        // Fragment 2 never arrives. Age the sequence with same-seq repeats
+        // (total unchanged, so no restart), which just overwrite fragment 1
+        // in place — harmless since we only assert the *fact* of a flush
+        // and the surviving payload below.
         for _ in 0..max_age {
             assert_eq!(r.push(&msg_fragment(1, 3, p1)), None);
         }
@@ -303,5 +340,73 @@ mod tests {
         let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
         assert_eq!(r.push(&[0u8; 12]), None);
         assert_eq!(r.push(&[PacketType::Message.header_byte()]), None);
+    }
+
+    /// Regression test for the same-push flush+completion race: a fragment
+    /// (B) that both triggers a restart-flush of an old, incomplete
+    /// sequence (A) AND itself immediately completes a `total == 1`
+    /// sequence must not have its own completed data silently overwritten
+    /// by the next fragment (C) that reuses the same sequence number. Both
+    /// B's and C's completions must eventually come back out, in order,
+    /// and A must come back out partial.
+    #[test]
+    fn flush_and_completion_in_the_same_push_are_both_eventually_returned() {
+        let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
+        let a1 = [0xA1u8; MESSAGE_PAYLOAD_BYTES];
+        let b = [0xB0u8; MESSAGE_PAYLOAD_BYTES];
+        let c = [0xC0u8; MESSAGE_PAYLOAD_BYTES];
+
+        // A: first fragment of a 3-fragment sequence, left incomplete.
+        assert_eq!(r.push(&msg_fragment(1, 3, a1)), None);
+
+        // B: a total==1 fragment restarts the sequence. In the same push,
+        // A's old sequence flushes partial AND B's new total==1 sequence
+        // completes. Only one `Option` can come back from this call; the
+        // flush comes back first (it was queued first).
+        let out1 = r.push(&msg_fragment(1, 1, b)).expect("A flushes partial");
+        assert!(out1.partial, "A must flush partial");
+        assert_eq!(out1.bytes, a1.to_vec());
+
+        // C: another total==1, seq==1 fragment arrives. It must build a
+        // *fresh* in-flight sequence rather than overwriting B's
+        // already-migrated (but not yet returned) completed data. This
+        // push returns B's queued completion.
+        let out2 = r
+            .push(&msg_fragment(1, 1, c))
+            .expect("B's completion, queued from the previous push");
+        assert!(!out2.partial, "B must come out complete, not partial");
+        assert_eq!(out2.bytes, b.to_vec(), "B's data must not be lost");
+
+        // Drain: any further push (even non-Message input, which performs
+        // no state mutation) pops the next queued item — C's completion.
+        let out3 = r
+            .push(&[0u8; 12])
+            .expect("C's completion, queued from the previous push");
+        assert!(!out3.partial, "C must come out complete too");
+        assert_eq!(out3.bytes, c.to_vec());
+    }
+
+    #[test]
+    fn out_of_range_seq_does_not_corrupt_completed_message() {
+        let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
+        let p1 = [0x11u8; MESSAGE_PAYLOAD_BYTES];
+        let p2 = [0x22u8; MESSAGE_PAYLOAD_BYTES];
+        let bogus = [0xFFu8; MESSAGE_PAYLOAD_BYTES];
+
+        assert_eq!(r.push(&msg_fragment(1, 2, p1)), None);
+        // seq==0 is outside 1..=2 for this fragment's own total — ignored.
+        assert_eq!(r.push(&msg_fragment(0, 2, bogus)), None);
+        // seq==3 is likewise outside 1..=2 — ignored.
+        assert_eq!(r.push(&msg_fragment(3, 2, bogus)), None);
+
+        let done = r.push(&msg_fragment(2, 2, p2)).expect("completes");
+        assert!(!done.partial);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&p1);
+        expected.extend_from_slice(&p2);
+        assert_eq!(
+            done.bytes, expected,
+            "bogus out-of-range fragment must not appear in the output"
+        );
     }
 }
