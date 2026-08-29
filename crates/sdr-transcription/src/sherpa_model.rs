@@ -84,6 +84,12 @@ pub enum ModelKind {
     /// tokens, per-decode language). Shares the VAD-gated offline
     /// session loop. Per issue #853.
     OfflineCohereTranscribe,
+    /// Offline NVIDIA Canary (`FastConformer` encoder + Transformer
+    /// decoder with task tokens). Uses `OfflineRecognizer` with
+    /// `OfflineCanaryModelConfig` (encoder + decoder + tokens,
+    /// src/tgt language + punctuation task tokens). Shares the
+    /// VAD-gated offline session loop. Per issue #853 wave 2.
+    OfflineCanary,
 }
 
 /// Available sherpa-onnx model variants.
@@ -117,6 +123,11 @@ pub enum SherpaModel {
     /// via the per-decode language setting. Offline (VAD-gated)
     /// decode. Per issue #853.
     CohereTranscribe14Lang,
+    /// NVIDIA Canary 180M Flash (en/es/de/fr, int8). Moonshine-class
+    /// footprint (~200 MB) with better reported accuracy — the fast
+    /// lightweight offline option. English ASR via task tokens.
+    /// Offline (VAD-gated) decode. Per issue #853 wave 2.
+    Canary180mFlash,
 }
 
 impl SherpaModel {
@@ -129,6 +140,7 @@ impl SherpaModel {
             Self::ParakeetTdt06bV3En => "Parakeet TDT 0.6b v3 (English)",
             Self::NemotronStreamingEn => "Nemotron Streaming 0.6b (English)",
             Self::CohereTranscribe14Lang => "Cohere Transcribe (English)",
+            Self::Canary180mFlash => "Canary 180M Flash (English)",
         }
     }
 
@@ -142,6 +154,7 @@ impl SherpaModel {
             Self::ParakeetTdt06bV3En => "parakeet-tdt-0.6b-v3-en",
             Self::NemotronStreamingEn => "nemotron-streaming-en",
             Self::CohereTranscribe14Lang => "cohere-transcribe-14-lang",
+            Self::Canary180mFlash => "canary-180m-flash",
         }
     }
 
@@ -160,6 +173,7 @@ impl SherpaModel {
             Self::CohereTranscribe14Lang => {
                 "sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01.tar.bz2"
             }
+            Self::Canary180mFlash => "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8.tar.bz2",
         }
     }
 
@@ -178,6 +192,7 @@ impl SherpaModel {
                 "sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25"
             }
             Self::CohereTranscribe14Lang => "sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01",
+            Self::Canary180mFlash => "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8",
         }
     }
 
@@ -200,6 +215,7 @@ impl SherpaModel {
             Self::MoonshineTinyEn | Self::MoonshineBaseEn => ModelKind::OfflineMoonshine,
             Self::ParakeetTdt06bV3En => ModelKind::OfflineNemoTransducer,
             Self::CohereTranscribe14Lang => ModelKind::OfflineCohereTranscribe,
+            Self::Canary180mFlash => ModelKind::OfflineCanary,
         }
     }
 
@@ -231,7 +247,8 @@ impl SherpaModel {
             ModelKind::OnlineTransducer => true,
             ModelKind::OfflineMoonshine
             | ModelKind::OfflineNemoTransducer
-            | ModelKind::OfflineCohereTranscribe => false,
+            | ModelKind::OfflineCohereTranscribe
+            | ModelKind::OfflineCanary => false,
         }
     }
 
@@ -243,6 +260,7 @@ impl SherpaModel {
         Self::ParakeetTdt06bV3En,
         Self::NemotronStreamingEn,
         Self::CohereTranscribe14Lang,
+        Self::Canary180mFlash,
     ];
 }
 
@@ -415,6 +433,11 @@ pub enum ModelFilePaths {
         cached_decoder: PathBuf,
         tokens: PathBuf,
     },
+    Canary {
+        encoder: PathBuf,
+        decoder: PathBuf,
+        tokens: PathBuf,
+    },
     CohereTranscribe {
         encoder: PathBuf,
         /// ONNX external-data sidecar holding the 2B encoder's
@@ -471,6 +494,11 @@ pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
                 tokens: dir.join("tokens.txt"),
             }
         }
+        SherpaModel::Canary180mFlash => ModelFilePaths::Canary {
+            encoder: dir.join("encoder.int8.onnx"),
+            decoder: dir.join("decoder.int8.onnx"),
+            tokens: dir.join("tokens.txt"),
+        },
         SherpaModel::CohereTranscribe14Lang => ModelFilePaths::CohereTranscribe {
             encoder: dir.join("encoder.int8.onnx"),
             encoder_data: dir.join("encoder.int8.onnx.data"),
@@ -502,6 +530,11 @@ pub fn model_exists(model: SherpaModel) -> bool {
                 && cached_decoder.is_file()
                 && tokens.is_file()
         }
+        ModelFilePaths::Canary {
+            encoder,
+            decoder,
+            tokens,
+        } => encoder.is_file() && decoder.is_file() && tokens.is_file(),
         ModelFilePaths::CohereTranscribe {
             encoder,
             encoder_data,

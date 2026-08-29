@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use sherpa_onnx::{
-    OfflineCohereTranscribeModelConfig, OfflineModelConfig, OfflineMoonshineModelConfig,
-    OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
+    OfflineCanaryModelConfig, OfflineCohereTranscribeModelConfig, OfflineModelConfig,
+    OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineTransducerModelConfig,
 };
 
 use crate::backend::{TranscriptionEvent, TranscriptionInput};
@@ -265,6 +266,60 @@ pub(super) fn build_nemo_transducer_recognizer_config(
         // Required — tells sherpa-onnx to use NeMo's TDT decode loop
         // instead of the generic transducer path.
         model_type: Some(NEMO_TRANSDUCER_MODEL_TYPE.to_owned()),
+        ..OfflineModelConfig::default()
+    };
+
+    Some(OfflineRecognizerConfig {
+        model_config,
+        ..OfflineRecognizerConfig::default()
+    })
+}
+
+/// Source/target language for Canary's task tokens. ASR (not
+/// translation) means src == tgt; this app targets English scanner
+/// audio. Per issue #853 wave 2.
+const CANARY_LANGUAGE: &str = "en";
+
+/// Build the `OfflineRecognizerConfig` for NVIDIA Canary 180M Flash.
+///
+/// Encoder + decoder + tokens through `OfflineCanaryModelConfig`,
+/// with src == tgt == "en" (plain ASR, no translation) and
+/// punctuation-and-capitalization enabled — same transcript-quality
+/// rationale as the Cohere builder's punct/ITN flags.
+pub(super) fn build_canary_recognizer_config(
+    model: SherpaModel,
+    provider: &str,
+) -> Option<OfflineRecognizerConfig> {
+    debug_assert_eq!(
+        model.kind(),
+        crate::sherpa_model::ModelKind::OfflineCanary,
+        "build_canary_recognizer_config called with non-OfflineCanary model"
+    );
+
+    let ModelFilePaths::Canary {
+        encoder,
+        decoder,
+        tokens,
+    } = sherpa_model::model_file_paths(model)
+    else {
+        // See build_moonshine_recognizer_config's else arm.
+        tracing::error!("build_canary_recognizer_config called with non-Canary layout");
+        return None;
+    };
+
+    let canary = OfflineCanaryModelConfig {
+        encoder: Some(encoder.to_string_lossy().into_owned()),
+        decoder: Some(decoder.to_string_lossy().into_owned()),
+        src_lang: Some(CANARY_LANGUAGE.to_owned()),
+        tgt_lang: Some(CANARY_LANGUAGE.to_owned()),
+        use_pnc: true,
+    };
+
+    let model_config = OfflineModelConfig {
+        canary,
+        tokens: Some(tokens.to_string_lossy().into_owned()),
+        provider: Some(provider.to_owned()),
+        num_threads: SHERPA_NUM_THREADS,
         ..OfflineModelConfig::default()
     };
 
