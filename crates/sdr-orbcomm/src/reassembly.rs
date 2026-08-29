@@ -13,6 +13,8 @@
 //! subscriber or channel. A fragment whose `total` doesn't match the
 //! in-flight sequence is treated as the start of a new sequence.
 
+use std::collections::BTreeMap;
+
 use crate::packet::PacketType;
 
 /// Number of payload bytes in a Message packet: 12 total, minus the header
@@ -69,7 +71,7 @@ struct InFlight {
     /// Fragments seen so far, keyed by their 1-based sequence number.
     /// A `BTreeMap` keeps concatenation order free (sorted iteration) even
     /// though fragments may arrive out of order.
-    fragments: std::collections::BTreeMap<u8, [u8; MESSAGE_PAYLOAD_BYTES]>,
+    fragments: BTreeMap<u8, [u8; MESSAGE_PAYLOAD_BYTES]>,
     /// Number of `push` calls (of any Message packet) since this sequence
     /// started, incremented on every push while it's in flight. Compared
     /// against `Reassembler::max_age_packets` to detect staleness.
@@ -173,7 +175,7 @@ impl Reassembler {
 
         let inflight = self.inflight.get_or_insert_with(|| InFlight {
             total,
-            fragments: std::collections::BTreeMap::new(),
+            fragments: BTreeMap::new(),
             age: 0,
         });
         inflight.fragments.insert(seq, payload);
