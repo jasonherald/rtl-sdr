@@ -1402,10 +1402,13 @@ fn auto_disable_acars_for_source_switch(
     // (#695) and emit a misleading failure for a switch that is
     // about to succeed.
     let defer_to_cleanup = state.iq_writer.is_some() && state.running;
-    if state.acars_pre_lock.is_some() && source_type != SourceType::RtlSdr && !defer_to_cleanup {
+    if state.acars_pre_lock.is_some()
+        && !crate::acars_airband_lock::source_supports_acars(source_type)
+        && !defer_to_cleanup
+    {
         tracing::info!(
             ?source_type,
-            "ACARS auto-disabling: source type changing to non-RTL-SDR"
+            "ACARS auto-disabling: source type changing to one without ACARS support"
         );
         handle_set_acars_enabled(state, false, dsp_tx)
     } else {

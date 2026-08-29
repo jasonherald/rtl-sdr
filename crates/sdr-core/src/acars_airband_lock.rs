@@ -270,12 +270,12 @@ pub struct PreLockSnapshot {
 /// the UI inside `DspToUi::AcarsEnabledChanged(Err(...))`.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum AcarsEnableError {
-    /// Active source isn't an RTL-SDR — ACARS is local-USB
-    /// only in v1 (network/file/`rtl_tcp` sources are rejected
-    /// by `engage` to avoid retuning a remote dongle the user
-    /// isn't physically driving). Spec section "Source-type
-    /// gate".
-    #[error("ACARS reception requires an RTL-SDR source (current: {0:?})")]
+    /// Active source isn't a local USB SDR — ACARS drives the
+    /// tuner directly, so network/file/`rtl_tcp` sources are
+    /// rejected by `engage` (never retune a remote dongle the
+    /// user isn't physically driving). Spec section
+    /// "Source-type gate"; Airspy added per issue #849.
+    #[error("ACARS reception requires a local USB SDR source — RTL-SDR or Airspy (current: {0:?})")]
     UnsupportedSourceType(SourceType),
 
     /// `ChannelBank::new` rejected the channel list. Wraps
@@ -355,14 +355,26 @@ pub struct DisengagePlan {
     pub target_frontend_decim: u32,
 }
 
+/// True for source types the ACARS airband lock can drive: local
+/// USB SDRs whose rate/tune the lock may retune at will. Remote
+/// (`rtl_tcp`), network, and file sources stay rejected — the lock
+/// must not retune a dongle the user isn't physically driving, and
+/// file playback has no tuner at all. Single source of truth for
+/// the engage gate AND the controller's switch-while-engaged
+/// auto-disable. Per issue #849.
+#[must_use]
+pub fn source_supports_acars(source_type: SourceType) -> bool {
+    matches!(source_type, SourceType::RtlSdr | SourceType::Airspy)
+}
+
 /// Compute the changes that engage the airband lock. Pure —
 /// the controller calls this BEFORE touching any source state.
 ///
 /// # Errors
 ///
-/// Returns [`AcarsEnableError::UnsupportedSourceType`] if the
-/// active source isn't `SourceType::RtlSdr`. Source-type gate
-/// in v1 — `rtl_tcp` / network / file sources are not supported.
+/// Returns [`AcarsEnableError::UnsupportedSourceType`] unless
+/// [`source_supports_acars`] — local USB sources only (RTL-SDR or
+/// Airspy; the lock's 2.5 Msps geometry is native to both).
 ///
 /// `region` selects which channel set the resulting plan tunes
 /// to (issue #581). The default is `AcarsRegion::Us6` —
@@ -372,7 +384,7 @@ pub fn engage(
     current: &CurrentSourceState,
     region: &AcarsRegion,
 ) -> Result<EngagePlan, AcarsEnableError> {
-    if current.source_type != SourceType::RtlSdr {
+    if !source_supports_acars(current.source_type) {
         return Err(AcarsEnableError::UnsupportedSourceType(current.source_type));
     }
     // Reject empty / invalid Custom regions before computing
@@ -482,6 +494,31 @@ mod tests {
         let region = AcarsRegion::Custom(Box::new([131_550_000.0, 131_525_000.0]));
         let plan = engage(&rtl_state(), &region).expect("valid Custom region engages");
         assert_eq!(plan.target_center_hz, region.center_hz());
+    }
+
+    #[test]
+    fn engage_accepts_airspy() {
+        // #849: the airband lock's geometry targets 2.5 Msps — the
+        // Airspy R2's exact native rate — so Airspy engages with the
+        // same plan shape as RTL, snapshotting the user's state for
+        // the disengage restore.
+        let mut state = rtl_state();
+        state.source_type = SourceType::Airspy;
+        state.source_rate_hz = 10_000_000.0;
+        let plan = engage(&state, &AcarsRegion::default()).expect("airspy engages");
+        assert_eq!(plan.target_source_rate_hz, ACARS_SOURCE_RATE_HZ);
+        assert_eq!(plan.target_frontend_decim, ACARS_FRONTEND_DECIM);
+        assert_eq!(plan.snapshot.source_type, SourceType::Airspy);
+        assert_eq!(plan.snapshot.source_rate_hz, 10_000_000.0);
+    }
+
+    #[test]
+    fn acars_capability_is_local_usb_only() {
+        assert!(source_supports_acars(SourceType::RtlSdr));
+        assert!(source_supports_acars(SourceType::Airspy));
+        assert!(!source_supports_acars(SourceType::Network));
+        assert!(!source_supports_acars(SourceType::File));
+        assert!(!source_supports_acars(SourceType::RtlTcp));
     }
 
     #[test]
