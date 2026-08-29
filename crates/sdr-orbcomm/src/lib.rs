@@ -2,6 +2,7 @@
 //! Pure decode: no I/O, no threads, no GTK. Issue #865; protocol
 //! reference in docs/superpowers/specs/2026-08-29-orbcomm-decoder-design.md.
 
+pub mod deframe;
 pub mod packet;
 pub mod sat_names;
 
