@@ -397,6 +397,48 @@ impl Default for SdpskDemod {
     }
 }
 
+/// Spec-literal SDPSK transmitter at `sps` samples per symbol: NRZ-M encode →
+/// ±90° phase steps → impulse train → RRC pulse shaping with the receiver's taps.
+///
+/// This is the *transmitter the specification describes*; whether the air
+/// interface agrees is what the Task 9 real-capture fixture decides (see
+/// [`bit_convention`]).
+///
+/// Test-only, but `pub(crate)` — the same pattern as
+/// `packet::encode_ephemeris_for_test` — so the channelizer's tests can
+/// synthesise a wideband multi-channel stream by modulating directly at the
+/// source rate (`sps = source_rate / SYMBOL_RATE_HZ`) instead of interpolating
+/// a 4 sps waveform up to it.
+///
+/// Returns an empty vector for `sps == 0`.
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn modulate_sdpsk_at_sps(bits: &[bool], sps: usize) -> Vec<Complex> {
+    let taps = rrc_taps(RRC_ALPHA, sps, RRC_SPAN_SYMBOLS);
+    if taps.is_empty() {
+        return Vec::new();
+    }
+    let mut phase = 0.0_f64;
+    let mut prev_coded = false;
+    let mut out = vec![Complex::default(); bits.len() * sps + taps.len() - 1];
+    for (n, &info) in bits.iter().enumerate() {
+        let coded = info != prev_coded;
+        prev_coded = coded;
+        phase += if coded {
+            std::f64::consts::FRAC_PI_2
+        } else {
+            -std::f64::consts::FRAC_PI_2
+        };
+        let symbol = Complex::new(phase.cos() as f32, phase.sin() as f32);
+        // Only the impulse positions carry energy, so skip the `sps - 1`
+        // zeros between them rather than convolving them.
+        for (j, &tap) in taps.iter().enumerate() {
+            out[n * sps + j] += symbol * tap;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -448,34 +490,9 @@ mod tests {
         }
     }
 
-    /// Spec-literal SDPSK transmitter: NRZ-M encode → ±90° phase steps → 4 sps impulse
-    /// train → RRC pulse shaping with the receiver's taps.
-    ///
-    /// This is the *transmitter the specification describes*; whether the air interface
-    /// agrees is what the Task 9 real-capture fixture decides (see [`bit_convention`]).
+    /// The spec-literal transmitter at the channel rate's 4 samples per symbol.
     fn modulate_sdpsk(bits: &[bool]) -> Vec<Complex> {
-        let taps = rrc_taps(RRC_ALPHA, SAMPLES_PER_SYMBOL, RRC_SPAN_SYMBOLS);
-        let mut phase = 0.0_f64;
-        let mut prev_coded = false;
-        let mut impulses = vec![Complex::default(); bits.len() * SAMPLES_PER_SYMBOL];
-        for (n, &info) in bits.iter().enumerate() {
-            let coded = info != prev_coded;
-            prev_coded = coded;
-            phase += if coded {
-                std::f64::consts::FRAC_PI_2
-            } else {
-                -std::f64::consts::FRAC_PI_2
-            };
-            impulses[n * SAMPLES_PER_SYMBOL] = Complex::new(phase.cos() as f32, phase.sin() as f32);
-        }
-
-        let mut out = vec![Complex::default(); impulses.len() + taps.len() - 1];
-        for (i, &s) in impulses.iter().enumerate() {
-            for (j, &tap) in taps.iter().enumerate() {
-                out[i + j] += s * tap;
-            }
-        }
-        out
+        modulate_sdpsk_at_sps(bits, SAMPLES_PER_SYMBOL)
     }
 
     fn apply_cfo(samples: &[Complex], cfo_hz: f64) -> Vec<Complex> {

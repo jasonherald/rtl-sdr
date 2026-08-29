@@ -96,6 +96,8 @@ pub struct Deframer {
     pending: VecDeque<bool>,
     /// Current acquisition state.
     state: State,
+    /// Locked strides that failed both the checksum and single-bit repair.
+    bad_strides: u64,
 }
 
 impl Default for Deframer {
@@ -111,7 +113,23 @@ impl Deframer {
         Self {
             pending: VecDeque::with_capacity(MAX_PENDING_BITS),
             state: State::Searching,
+            bad_strides: 0,
         }
+    }
+
+    /// Number of locked strides rejected so far: whole packet-length spans
+    /// consumed at the acquired phase whose Fletcher-16 failed and which
+    /// single-bit repair could not rescue.
+    ///
+    /// This is the only place a checksum failure is observable from outside
+    /// the deframer — [`Self::push_bit`] emits nothing for a rejected stride,
+    /// and `Searching` deliberately does not count its probes (it tests two
+    /// speculative bit offsets per bit, so nearly all of them fail by
+    /// construction and counting them would measure the search, not the
+    /// link). Monotonic; saturating.
+    #[must_use]
+    pub fn bad_strides(&self) -> u64 {
+        self.bad_strides
     }
 
     /// Push one demodulated bit (LSB-first within its byte) and return the
@@ -181,6 +199,7 @@ impl Deframer {
             });
         }
 
+        self.bad_strides = self.bad_strides.saturating_add(1);
         let bad = consecutive_bad.saturating_add(1);
         self.state = if bad >= MAX_CONSECUTIVE_BAD {
             State::Searching
@@ -420,6 +439,35 @@ mod tests {
             d.push_bit(bit);
         }
         assert_eq!(d.state, State::Locked { consecutive_bad: 0 });
+    }
+
+    #[test]
+    fn bad_strides_counts_only_rejected_locked_strides() {
+        let pkt = valid_sync_packet();
+        let mut d = Deframer::new();
+        // Acquisition probes many offsets that fail — none of them count.
+        for _ in 0..(3 * MIN_PACKET_BITS) {
+            d.push_bit(false);
+        }
+        for bit in bits_lsb_first(&pkt) {
+            d.push_bit(bit);
+        }
+        assert_eq!(d.bad_strides(), 0);
+
+        // A locked stride that neither checksums nor repairs counts once.
+        let mut corrupted: Vec<bool> = bits_lsb_first(&pkt).collect();
+        corrupted[40] = !corrupted[40];
+        corrupted[75] = !corrupted[75];
+        for bit in corrupted {
+            d.push_bit(bit);
+        }
+        assert_eq!(d.bad_strides(), 1);
+
+        // A clean stride after it does not.
+        for bit in bits_lsb_first(&pkt) {
+            d.push_bit(bit);
+        }
+        assert_eq!(d.bad_strides(), 1);
     }
 
     #[test]
