@@ -3,6 +3,7 @@
 //! reference in docs/superpowers/specs/2026-08-29-orbcomm-decoder-design.md.
 
 pub mod packet;
+pub mod sat_names;
 
 /// Active Orbcomm subscriber downlink channels (Hz), low to high.
 pub const ORBCOMM_CHANNELS_HZ: [f64; 9] = [
