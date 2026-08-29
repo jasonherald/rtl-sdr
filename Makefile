@@ -15,7 +15,10 @@ CARGO_FLAGS ?= --release
 CUDA_REDIST_CACHE     ?= $(HOME)/.cache/sdr-rs/cuda-redist
 CUDA_REDIST_DOWNLOADS := $(CUDA_REDIST_CACHE)/downloads
 CUDA_REDIST_STAGING   := $(CUDA_REDIST_CACHE)/staging
-CUDA_REDIST_SENTINEL  := $(CUDA_REDIST_CACHE)/.sentinel-v1
+# v2: + cuda_nvrtc (new NEEDED of the onnxruntime 1.27.1 provider,
+# sherpa-onnx v1.13.6 — issue #854). Bumping forces cached setups to
+# fetch the added archive.
+CUDA_REDIST_SENTINEL  := $(CUDA_REDIST_CACHE)/.sentinel-v2
 
 .PHONY: all build install install-bin install-sherpa-runtime-libs \
         install-cuda-redist-libs install-icon install-desktop uninstall \

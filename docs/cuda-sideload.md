@@ -86,6 +86,7 @@ When `make install CARGO_FLAGS="... --features sherpa-cuda"` runs:
    | `libcublas-linux-x86_64` | 12.6.4.1 | ~522 MB |
    | `libcufft-linux-x86_64` | 11.3.0.4 | ~476 MB |
    | `libcurand-linux-x86_64` | 10.3.7.77 | ~82 MB |
+   | `cuda_nvrtc-linux-x86_64` | 12.6.85 (as of sherpa-onnx v1.13.6, August 2026) | ~34 MB |
    | `cudnn-linux-x86_64` | 9.5.1.17 (cuda12) | ~745 MB |
 
 3. **SHA-256 verification** on each file. Versions and hashes are
@@ -123,8 +124,10 @@ When `make install CARGO_FLAGS="... --features sherpa-cuda"` runs:
 
 ## What we ship and why
 
-The set of runtime libs is the **exact `NEEDED` list** of
-`libonnxruntime_providers_cuda.so`:
+The provider's **direct dependencies** are its `NEEDED` list; the
+shipped set is that list **plus the sublibraries those entries load
+dynamically at runtime** (cuDNN 9 dlopens its per-domain sublibs,
+nvrtc dlopens `nvrtc-builtins`):
 
 ```console
 $ readelf -d libonnxruntime_providers_cuda.so | grep NEEDED
@@ -133,13 +136,22 @@ $ readelf -d libonnxruntime_providers_cuda.so | grep NEEDED
   libcurand.so.10     <- libcurand archive
   libcufft.so.11      <- libcufft archive
   libcudart.so.12     <- cuda_cudart archive
+  libnvrtc.so.12      <- cuda_nvrtc archive (NEEDED since the
+                         onnxruntime 1.27.1 provider, sherpa-onnx
+                         v1.13.6, August 2026 — issue #854)
   libcudnn.so.9       <- cudnn archive (plus sublibs dlopen'd by cuDNN 9)
 ```
 
 We do **not** ship:
 
-- `libcusparse`, `libcusolver`, `libnvrtc`, `libnvjitlink` — not in
-  `NEEDED`, `onnxruntime`'s CUDA path doesn't touch them.
+- `libcusparse`, `libcusolver`, `libnvjitlink` — not direct `NEEDED`
+  dependencies of the provider (nor of `libnvrtc.so.12.6.85`, whose
+  own `NEEDED` list is libc-family only — sherpa-onnx v1.13.6 pin,
+  August 2026). A transitive `dlopen` can't be ruled out from ELF
+  headers alone, but the sherpa transcription path was validated at
+  runtime on real hardware with none of these present on the search
+  path (all models, GPU provider active) — a lazy load would have
+  failed there. Re-verify both facts on version bumps.
 - `libonnxruntime_providers_tensorrt.so` — we never request the TensorRT
   provider, and it would pull `libnvinfer` which we don't provision.
 - `libcuda.so` from the stubs directory — that's a build-time driver
