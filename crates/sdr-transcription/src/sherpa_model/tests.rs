@@ -1,8 +1,8 @@
 use super::*;
 
-/// Registry size after the #853 wave-1 additions — the persisted
+/// Registry size after the #853 wave-2 additions — the persisted
 /// model index's upper bound.
-const SHERPA_MODEL_COUNT: usize = 6;
+const SHERPA_MODEL_COUNT: usize = 7;
 
 #[test]
 fn all_models_have_unique_directory_names() {
@@ -323,5 +323,35 @@ fn new_models_are_appended_after_existing_indices() {
     assert_eq!(
         SherpaModel::ALL[PRE_853_MODEL_COUNT + 1],
         SherpaModel::CohereTranscribe14Lang
+    );
+}
+
+// ── #853 wave 2: Canary 180M Flash ────────────────────────────────
+
+#[test]
+fn canary_is_offline_with_encoder_decoder_layout() {
+    let m = SherpaModel::Canary180mFlash;
+    assert_eq!(m.kind(), ModelKind::OfflineCanary);
+    assert!(!m.supports_partials());
+    assert_eq!(m.feature_dim(), 80);
+    let ModelFilePaths::Canary {
+        encoder,
+        decoder,
+        tokens,
+    } = model_file_paths(m)
+    else {
+        panic!("canary must be a Canary layout");
+    };
+    assert!(encoder.ends_with("canary-180m-flash/encoder.int8.onnx"));
+    assert!(decoder.ends_with("canary-180m-flash/decoder.int8.onnx"));
+    assert!(tokens.ends_with("canary-180m-flash/tokens.txt"));
+}
+
+#[test]
+fn canary_is_appended_last() {
+    assert_eq!(SherpaModel::ALL.len(), SHERPA_MODEL_COUNT);
+    assert_eq!(
+        SherpaModel::ALL[SHERPA_MODEL_COUNT - 1],
+        SherpaModel::Canary180mFlash
     );
 }

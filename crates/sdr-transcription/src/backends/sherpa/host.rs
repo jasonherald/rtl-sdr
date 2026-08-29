@@ -318,7 +318,8 @@ fn run_host_loop(
         // init_offline based on model.kind() again.
         ModelKind::OfflineMoonshine
         | ModelKind::OfflineNemoTransducer
-        | ModelKind::OfflineCohereTranscribe => match init_offline(model, &event_tx) {
+        | ModelKind::OfflineCohereTranscribe
+        | ModelKind::OfflineCanary => match init_offline(model, &event_tx) {
             Ok(state) => state,
             Err(()) => return,
         },
@@ -405,9 +406,8 @@ fn handle_reload_recognizer(
         crate::sherpa_model::ModelKind::OnlineTransducer => init_online(new_model, event_tx),
         crate::sherpa_model::ModelKind::OfflineMoonshine
         | crate::sherpa_model::ModelKind::OfflineNemoTransducer
-        | crate::sherpa_model::ModelKind::OfflineCohereTranscribe => {
-            init_offline(new_model, event_tx)
-        }
+        | crate::sherpa_model::ModelKind::OfflineCohereTranscribe
+        | crate::sherpa_model::ModelKind::OfflineCanary => init_offline(new_model, event_tx),
     };
 
     match new_state {
@@ -493,6 +493,9 @@ fn offline_recognizer_config_for(
         }
         crate::sherpa_model::ModelKind::OfflineCohereTranscribe => {
             super::offline::build_cohere_recognizer_config(model, super::SHERPA_PROVIDER)
+        }
+        crate::sherpa_model::ModelKind::OfflineCanary => {
+            super::offline::build_canary_recognizer_config(model, super::SHERPA_PROVIDER)
         }
         crate::sherpa_model::ModelKind::OnlineTransducer => {
             tracing::error!(
