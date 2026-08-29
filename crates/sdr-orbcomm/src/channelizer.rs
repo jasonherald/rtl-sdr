@@ -582,11 +582,13 @@ mod tests {
         p
     }
 
-    /// A checksum-valid 12-byte Message fragment.
+    /// A checksum-valid 12-byte Message fragment. `seq` is zero-based, and
+    /// byte 1 is `total` in the high nibble — see
+    /// [`crate::reassembly::msg_total_len`].
     fn message_fragment(seq: u8, total: u8, fill: u8) -> Vec<u8> {
         let mut p = vec![
             PacketType::Message.header_byte(),
-            (seq << 4) | (total & 0x0F),
+            (total << 4) | (seq & 0x0F),
         ];
         p.extend_from_slice(&[fill; 8]);
         let (c0, c1) = fletcher16_check_bytes(&p);
@@ -686,8 +688,8 @@ mod tests {
         // Two-fragment sequences over the air: only checksum-valid Message
         // packets reach the reassembler, and its completions surface as their
         // own event kind alongside the packet events that produced them.
-        let mut wire = message_fragment(1, 2, 0xA1);
-        wire.extend(message_fragment(2, 2, 0xB2));
+        let mut wire = message_fragment(0, 2, 0xA1);
+        wire.extend(message_fragment(1, 2, 0xB2));
         let bits = repeated_bits(&wire, 13);
         let mut iq = Vec::new();
         transmit_into(&mut iq, &bits, CHANNEL_A_HZ - CENTER_HZ);

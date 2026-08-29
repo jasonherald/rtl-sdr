@@ -1,10 +1,11 @@
 //! SDPSK demodulator for the Orbcomm subscriber downlink.
 //!
 //! Physical layer (see `docs/superpowers/specs/2026-08-29-orbcomm-decoder-design.md`):
-//! information bits are NRZ-M differentially encoded (`coded[n] = info[n] ^ coded[n-1]`),
-//! each *coded* bit selects a carrier phase **shift** (`1` ⇒ +90°, `0` ⇒ −90°), and the
-//! resulting symbol stream is pulse-shaped with an α = 0.4 root-raised-cosine filter at
-//! [`crate::SYMBOL_RATE_HZ`].
+//! each information bit selects a carrier phase **shift** (`1` ⇒ +90°, `0` ⇒ −90°), and
+//! the resulting symbol stream is pulse-shaped with an α = 0.4 root-raised-cosine filter
+//! at [`crate::SYMBOL_RATE_HZ`]. The ±90° phase-shift keying *is* the differential
+//! encoding — there is no separate NRZ-M layer stacked on top of it, which is what the
+//! Task 9 real-capture arbitration settled; see [`bit_convention`].
 //!
 //! The receive chain implemented here, in block order:
 //!
@@ -16,8 +17,7 @@
 //!    State: the fractional cursor, the tracked samples-per-symbol, the previous symbol
 //!    sample and an EWMA symbol-power estimate used to normalise the error.
 //! 3. **Delay-conjugate detector** — `d[n] = s[n] · conj(s[n-1])`; `im(d) > 0` means the
-//!    carrier advanced ⇒ a +90° shift.
-//! 4. **NRZ-M decode** — `info[n] = coded[n] ^ coded[n-1]`.
+//!    carrier advanced ⇒ a +90° shift ⇒ an information bit of `1`.
 //!
 //! The demodulator assumes the channelizer has already removed coarse Doppler: the
 //! contract is a **residual carrier offset of at most ±800 Hz**. The delay-conjugate
@@ -62,38 +62,54 @@ const INITIAL_CURSOR: f64 = 5.0;
 #[allow(clippy::cast_precision_loss)]
 const NOMINAL_SPS: f64 = SAMPLES_PER_SYMBOL as f64;
 
-/// `im(d) > 0` (carrier advanced, i.e. a +90° shift) is coded bit `1`.
+/// `im(d) > 0` (carrier advanced, i.e. a +90° shift) is information bit `1`.
 ///
-/// See [`bit_convention`] — flip there, never here.
+/// **Confirmed** against real captures — see [`bit_convention`]. Flip there, never here.
 const SHIFT_ADVANCE_IS_ONE: bool = true;
-/// Apply the NRZ-M differential decode (`info = coded ^ prev_coded`).
+/// Apply a second, NRZ-M differential decode (`info = coded ^ prev_coded`) on top of the
+/// delay-conjugate detector.
 ///
-/// See [`bit_convention`] — flip there, never here.
-const NRZ_M_DECODE: bool = true;
+/// **Confirmed off** against real captures — see [`bit_convention`]. Flip there, never
+/// here.
+const NRZ_M_DECODE: bool = false;
 
 /// Map a detected phase-shift bit to an information bit.
 ///
-/// **This is the single place where the two ambiguous conventions of the Orbcomm
-/// physical layer live.** The protocol description fixes the modulation but not, with
-/// certainty, (a) whether a *positive* phase shift is coded `1` or coded `0`, nor
-/// (b) whether the deframer downstream wants NRZ-M-decoded information bits or the raw
-/// coded bits. **The real-capture fixture in Task 9 is the arbiter.**
+/// **This is the single place where the conventions of the Orbcomm physical layer
+/// live.** The protocol description fixes the modulation but did not, on its own, settle
+/// (a) whether a *positive* phase shift carries `1` or `0`, nor (b) whether the deframer
+/// downstream wants a further NRZ-M decode of the detected shift bits or the shift bits
+/// themselves.
 ///
-/// While `NRZ_M_DECODE` is on, flipping the sign is a provable *no-op* — inverting every
-/// coded bit leaves `coded[n] ^ coded[n-1]` unchanged, which is the differential encoding
-/// doing its job (it also makes the demodulator immune to spectral inversion in the front
-/// end). That is asserted by `sign_flip_is_a_noop_while_nrz_m_is_enabled` in this
-/// module's tests. So there are only **three distinguishable configurations**, and the
-/// fixture should be tried against them in this order:
+/// # Arbitrated against real captures, Task 9
 ///
-/// 1. `NRZ_M_DECODE = true` — the shipped setting; the sign is irrelevant here.
-/// 2. `NRZ_M_DECODE = false`, `SHIFT_ADVANCE_IS_ONE = true` — raw coded bits.
-/// 3. `NRZ_M_DECODE = false`, `SHIFT_ADVANCE_IS_ONE = false` — raw coded bits, inverted.
+/// `crates/sdr-orbcomm/tests/real_capture.rs` decided it on the two off-air recordings
+/// shipped with the reference receiver (`original/ORBCOMM-receiver/data/*.mat`, 2 s of
+/// 1.2288 Msps at 137.5 MHz, ORBCOMM FM114 overhead). Checksum-valid packets decoded:
 ///
-/// Turning `NRZ_M_DECODE` off also means updating the `const` assertion in
-/// `sign_flip_is_a_noop_while_nrz_m_is_enabled`, which exists precisely so the no-op
-/// claim above cannot silently outlive the setting it depends on: that test guards the
-/// documentation, it does not forbid the flip.
+/// | `NRZ_M_DECODE` | `SHIFT_ADVANCE_IS_ONE` | `1552071892p6` | `1552072122p64` |
+/// |----------------|------------------------|----------------|-----------------|
+/// | `true`         | either (a no-op)       | 0              | 0               |
+/// | `false`        | `true` — **shipped**   | **46**         | **133**         |
+/// | `false`        | `false`                | 0              | 0               |
+///
+/// Both settings are therefore **confirmed**, not merely plausible: the winning row is
+/// the only one that decodes anything at all, and what it decodes is externally
+/// checkable — Sync code `65A8F9` / `sat_id 2C` and an ephemeris at 715.3 km doing
+/// 7151.4 m/s, matching the reference decoder's published output for the same file.
+///
+/// So the ±90° phase-shift keying *is* the differential encoding: the shift bit the
+/// delay-conjugate detector recovers is already the information bit, and XOR-ing it
+/// against its predecessor would encode the data a second time. This matches the
+/// reference decoder, which likewise takes `arg(s[n]) − arg(s[n−1]) > 0` straight to a
+/// packet bit (`original/ORBCOMM-receiver/file_decoder.py`, "Differential
+/// demodulation").
+///
+/// The sign is only a no-op while `NRZ_M_DECODE` is on, where inverting every detected
+/// bit leaves `coded[n] ^ coded[n-1]` unchanged. With the XOR off it is load-bearing —
+/// flipping it inverts every information bit, which is exactly why the third row above
+/// decodes nothing. `bit_convention_is_the_bare_shift_bit` in this module's tests pins
+/// both halves of that.
 ///
 /// Never scatter convention changes across the detector, the deframer or the descrambler.
 #[must_use]
@@ -214,7 +230,8 @@ pub struct SdpskDemod {
     sps: f64,
     /// Previous symbol sample — the delay-conjugate reference and the Gardner `y[k-1]`.
     prev_symbol: Option<Complex>,
-    /// Previous raw (pre-convention) coded bit, for the NRZ-M XOR.
+    /// Previous raw (pre-convention) detected shift bit. Only [`NRZ_M_DECODE`] consumes
+    /// it; it is kept unconditionally so the convention stays a single call site.
     prev_coded: Option<bool>,
     /// EWMA of the symbol power; normalises the timing error to be amplitude-independent.
     power: f32,
@@ -339,6 +356,11 @@ impl SdpskDemod {
             // Delay-conjugate detection of the ±90° phase shift.
             let d = curr * prev.conj();
             let coded = d.im > 0.0;
+            // The first detected shift bit is withheld because [`bit_convention`] takes a
+            // predecessor. With `NRZ_M_DECODE` off that predecessor is ignored, so this
+            // costs one bit at the very start of a channel's stream — immaterial next to
+            // the deframer's own acquisition, and the price of keeping the convention a
+            // single call site that can be flipped back without restructuring the loop.
             if let Some(prev_coded) = self.prev_coded {
                 bits_out.push(bit_convention(coded, prev_coded));
             }
@@ -397,12 +419,14 @@ impl Default for SdpskDemod {
     }
 }
 
-/// Spec-literal SDPSK transmitter at `sps` samples per symbol: NRZ-M encode →
-/// ±90° phase steps → impulse train → RRC pulse shaping with the receiver's taps.
+/// SDPSK transmitter at `sps` samples per symbol: ±90° phase steps → impulse
+/// train → RRC pulse shaping with the receiver's taps.
 ///
-/// This is the *transmitter the specification describes*; whether the air
-/// interface agrees is what the Task 9 real-capture fixture decides (see
-/// [`bit_convention`]).
+/// The inverse of the receive chain under the **confirmed** convention (see
+/// [`bit_convention`]): bit `1` advances the carrier by 90°, bit `0` retards it,
+/// and there is no NRZ-M layer. It has to track [`SHIFT_ADVANCE_IS_ONE`] and
+/// [`NRZ_M_DECODE`], or the loopback tests would only ever prove the demodulator
+/// self-consistent with a transmitter nobody flies.
 ///
 /// Test-only, but `pub(crate)` — the same pattern as
 /// `packet::encode_ephemeris_for_test` — so the channelizer's tests can
@@ -419,12 +443,20 @@ pub(crate) fn modulate_sdpsk_at_sps(bits: &[bool], sps: usize) -> Vec<Complex> {
         return Vec::new();
     }
     let mut phase = 0.0_f64;
-    let mut prev_coded = false;
+    // Mirror image of `bit_convention`: `signed` is the detected bit after the sign
+    // convention has been applied, `advance` the raw "the carrier moved forwards" flag
+    // that the delay-conjugate detector reads back off the air.
+    let mut prev_signed = false;
     let mut out = vec![Complex::default(); bits.len() * sps + taps.len() - 1];
     for (n, &info) in bits.iter().enumerate() {
-        let coded = info != prev_coded;
-        prev_coded = coded;
-        phase += if coded {
+        let signed = if NRZ_M_DECODE {
+            info != prev_signed
+        } else {
+            info
+        };
+        prev_signed = signed;
+        let advance = signed == SHIFT_ADVANCE_IS_ONE;
+        phase += if advance {
             std::f64::consts::FRAC_PI_2
         } else {
             -std::f64::consts::FRAC_PI_2
@@ -632,14 +664,21 @@ mod tests {
     }
 
     #[test]
-    fn sign_flip_is_a_noop_while_nrz_m_is_enabled() {
-        // Documents the claim made in `bit_convention`'s doc comment: inverting every
-        // coded bit leaves the NRZ-M-decoded information bits untouched.
-        const { assert!(NRZ_M_DECODE) };
-        for &coded in &[false, true] {
-            for &prev in &[false, true] {
-                assert_eq!(bit_convention(coded, prev), bit_convention(!coded, !prev));
-            }
+    fn bit_convention_is_the_bare_shift_bit() {
+        // Guards the two claims `bit_convention`'s doc comment makes about the
+        // arbitrated setting, so neither can silently outlive the constants.
+        const { assert!(!NRZ_M_DECODE) };
+
+        // (1) With the NRZ-M decode off, the predecessor is ignored: the detected
+        // shift bit *is* the information bit.
+        for &shift in &[false, true] {
+            assert_eq!(bit_convention(shift, false), bit_convention(shift, true));
+        }
+        // (2) ... and the sign is therefore no longer a no-op. Inverting the detected
+        // bit inverts the information bit, whichever way `SHIFT_ADVANCE_IS_ONE` points
+        // — which is why the capture decodes under one sign and not the other.
+        for &prev in &[false, true] {
+            assert_ne!(bit_convention(false, prev), bit_convention(true, prev));
         }
     }
 

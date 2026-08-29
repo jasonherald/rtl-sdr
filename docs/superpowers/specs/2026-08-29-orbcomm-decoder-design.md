@@ -27,9 +27,17 @@ reference repo's `literature/`).
 
 - SDPSK at **4800 baud**: bit 0 = −90° phase shift, bit 1 = +90° shift,
   pulse-shaped with a **0.4 roll-off root-raised-cosine** filter.
-- Information bits are additionally **NRZ-M differentially encoded**
-  (each bit XOR previous). Data words are 8 bits, **LSB transmitted
-  first**. RHCP polarization.
+- ~~Information bits are additionally **NRZ-M differentially encoded**
+  (each bit XOR previous).~~ **Corrected by the Task 9 real-capture
+  arbitration:** there is no second NRZ-M layer. The ±90° phase-shift
+  keying *is* the differential encoding, so the shift bit the
+  delay-conjugate detector recovers is already the information bit; a
+  further XOR against the predecessor decodes nothing (0 packets across
+  both reference captures, versus 46 and 133 without it). This matches
+  the reference decoder, which takes `arg(s[n]) − arg(s[n−1]) > 0`
+  straight to a packet bit. See `demod.rs::bit_convention`.
+- Data words are 8 bits, **LSB transmitted first** — confirmed by the
+  same captures. RHCP polarization.
 - Minor frame = 1 second = 4800 bits = 600 bytes; major frame = 16
   minor frames. (Frames are informational — packet alignment below does
   not depend on frame boundaries.)
@@ -47,7 +55,7 @@ reference repo's `literature/`).
   | Type          | Header | Notable fields (hex-char offsets, per reference) |
   |---------------|--------|--------------------------------------------------|
   | Sync          | `0x65` | code (0,6), sat_id (6,8)                         |
-  | Message       | `0x1A` | msg_total_length (2,3), msg_packet_num (3,4), data (4,22) |
+  | Message       | `0x1A` | msg_total_length (2,3) = byte 1 **high** nibble, msg_packet_num (3,4) = low nibble, **zero-based**; data (4,22) |
   | Uplink info   | `0x1B` | same layout as Message                           |
   | Downlink info | `0x1C` | same layout as Message                           |
   | Network       | `0x1D` | same layout as Message                           |

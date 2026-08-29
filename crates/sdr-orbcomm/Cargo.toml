@@ -11,5 +11,10 @@ sdr-dsp.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# Only the `real_capture` integration test uses this, to read the metadata
+# sidecar `scripts/orbcomm-mat-to-iq.py` writes next to the IQ fixture.
+serde_json.workspace = true
+
 [lints]
 workspace = true

@@ -2,11 +2,14 @@
 //!
 //! A subscriber message that doesn't fit in one 12-byte Message packet
 //! (header `0x1A`) is split across several packets. Byte 1 of each packet
-//! carries the fragment's sequence number and the sequence's total fragment
-//! count as two nibbles; [`Reassembler`] collects fragments for a single
-//! in-flight sequence and emits the concatenated payload once every
-//! fragment has arrived, or as a `partial` flush if the sequence stalls or
-//! is superseded.
+//! carries the sequence's total fragment count in its **high** nibble and the
+//! fragment's own **zero-based** sequence number in its low nibble;
+//! [`Reassembler`] collects fragments for a single in-flight sequence and
+//! emits the concatenated payload once every fragment has arrived, or as a
+//! `partial` flush if the sequence stalls or is superseded.
+//!
+//! Both the nibble order and the zero base were **confirmed against the real
+//! captures in Task 9** (`tests/real_capture.rs`); see [`msg_total_len`].
 //!
 //! Orbcomm interleaves multi-packet messages on a channel only rarely, so
 //! this tracks exactly one in-flight sequence — not one per originating
@@ -26,28 +29,38 @@ pub const MESSAGE_PAYLOAD_BYTES: usize = 8;
 /// this many further pushes (of any packet) is flushed as partial.
 pub const DEFAULT_MAX_AGE_PACKETS: u32 = 50;
 
-/// Sequence's total fragment count: low nibble of byte 1. Returns `None`
+/// Sequence's total fragment count: **high** nibble of byte 1. Returns `None`
 /// when `bytes` is too short to contain byte 1 — this function takes an
 /// unbounded slice (rather than `&[u8; 12]`) specifically so fixtures can
 /// probe it with arbitrary/malformed input without panicking.
 ///
-/// Nibble order is provisionally per the reference layout summary; the
-/// real-capture fixture (Task 9) is the arbiter — flip HERE if captures
-/// disagree.
+/// # Confirmed against real captures, Task 9
+///
+/// The nibble order shipped provisionally the other way round. The 41 Message
+/// fragments the two off-air recordings decode (`tests/real_capture.rs`) settle
+/// it: byte 1 takes values `10`, `20`, `21`, `30`, `31`, `32`, `40` … `43` —
+/// a constant high nibble across each burst, with the low nibble counting up
+/// from zero to one less than it. The high nibble is therefore the total and
+/// the low nibble the sequence number. That also matches the reference
+/// decoder's field table, which reads `msg_total_length` from hex character 2
+/// (the high nibble) and `msg_packet_num` from character 3
+/// (`original/ORBCOMM-receiver/orbcomm_packet.py`).
 #[must_use]
 pub fn msg_total_len(bytes: &[u8]) -> Option<u8> {
-    bytes.get(1).map(|b| b & 0x0F)
+    bytes.get(1).map(|b| b >> 4)
 }
 
-/// Fragment's 1-based sequence number within its sequence: high nibble of
-/// byte 1. Returns `None` when `bytes` is too short to contain byte 1.
+/// Fragment's **zero-based** sequence number within its sequence: low nibble of
+/// byte 1, valid over `0..total`. Returns `None` when `bytes` is too short to
+/// contain byte 1.
 ///
-/// Nibble order is provisionally per the reference layout summary; the
-/// real-capture fixture (Task 9) is the arbiter — flip HERE if captures
-/// disagree.
+/// Confirmed against real captures alongside the nibble order — see
+/// [`msg_total_len`] for the evidence. The reference decoder prints the same
+/// field starting at 0 (`msg_packet_num: 0 … msg_total_length: 2`, then
+/// `msg_packet_num: 1`), so the numbering is zero-based, not one-based.
 #[must_use]
 pub fn msg_seq_num(bytes: &[u8]) -> Option<u8> {
-    bytes.get(1).map(|b| b >> 4)
+    bytes.get(1).map(|b| b & 0x0F)
 }
 
 /// A fragment's payload bytes, `bytes[2..10]`. Returns `None` when `bytes`
@@ -72,10 +85,10 @@ struct InFlight {
     /// This sequence's total fragment count, from the fragment that opened
     /// it. Every joining fragment must report the same total.
     total: u8,
-    /// Fragments seen so far, keyed by their 1-based sequence number. A
+    /// Fragments seen so far, keyed by their zero-based sequence number. A
     /// `BTreeMap` keeps concatenation order free (sorted iteration) even
     /// though fragments may arrive out of order. Only sequence numbers in
-    /// `1..=total` are ever inserted (see [`Reassembler::push`]), so
+    /// `0..total` are ever inserted (see [`Reassembler::push`]), so
     /// [`Self::is_complete`] and [`Self::concat_payloads`] never need to
     /// re-check the range themselves. A fragment re-sent for a sequence
     /// number already present overwrites the earlier one — last write
@@ -89,9 +102,9 @@ struct InFlight {
 }
 
 impl InFlight {
-    /// Sequence numbers `1..=total` are all present.
+    /// Sequence numbers `0..total` are all present.
     fn is_complete(&self) -> bool {
-        self.total > 0 && (1..=self.total).all(|seq| self.fragments.contains_key(&seq))
+        self.total > 0 && (0..self.total).all(|seq| self.fragments.contains_key(&seq))
     }
 
     /// Concatenate fragment payloads in ascending sequence order. Missing
@@ -117,7 +130,7 @@ impl InFlight {
 /// length, since the input is untrusted RF-derived data even after
 /// checksum validation.
 ///
-/// A fragment whose own sequence number falls outside `1..=total` (as
+/// A fragment whose own sequence number falls outside `0..total` (as
 /// reported by that same fragment) is likewise treated as inert: it does
 /// not age or otherwise perturb the in-flight sequence, and its payload is
 /// never inserted. This keeps a self-inconsistent (but checksum-valid)
@@ -179,8 +192,10 @@ impl Reassembler {
         };
 
         // A fragment whose own seq is outside its own total's valid range
-        // is self-inconsistent — ignore it entirely (see struct doc).
-        if seq == 0 || seq > total {
+        // is self-inconsistent — ignore it entirely (see struct doc). Sequence
+        // numbers are zero-based, so `0..total` is the range and a `total` of
+        // zero admits nothing at all.
+        if seq >= total {
             return self.pending.pop_front();
         }
 
@@ -238,11 +253,13 @@ mod tests {
     use super::*;
     use crate::packet::fletcher16_check_bytes;
 
-    /// Build a checksum-valid 12-byte Message packet fragment.
+    /// Build a checksum-valid 12-byte Message packet fragment. `seq` is
+    /// zero-based; the on-air byte 1 is `total` in the high nibble and `seq`
+    /// in the low one (see [`msg_total_len`]).
     fn msg_fragment(seq: u8, total: u8, payload: [u8; MESSAGE_PAYLOAD_BYTES]) -> Vec<u8> {
         let mut p = vec![
             PacketType::Message.header_byte(),
-            (seq << 4) | (total & 0x0F),
+            (total << 4) | (seq & 0x0F),
         ];
         p.extend_from_slice(&payload);
         let (c0, c1) = fletcher16_check_bytes(&p);
@@ -253,15 +270,45 @@ mod tests {
     }
 
     #[test]
+    fn nibble_layout_matches_the_real_captures() {
+        // Verbatim byte-1 values decoded off air by `tests/real_capture.rs`, one
+        // burst per row: the high nibble is constant across a burst and the low
+        // nibble counts 0, 1, … total − 1. Anchoring the accessors to real wire
+        // bytes is what stops the pair silently swapping back — every other test
+        // in this module goes through `msg_fragment`, which would swap with them.
+        for (byte1, want_total, want_seq) in [
+            (0x10u8, 1u8, 0u8),
+            (0x20, 2, 0),
+            (0x21, 2, 1),
+            (0x30, 3, 0),
+            (0x31, 3, 1),
+            (0x32, 3, 2),
+            (0x40, 4, 0),
+            (0x43, 4, 3),
+        ] {
+            let packet = [PacketType::Message.header_byte(), byte1];
+            assert_eq!(
+                msg_total_len(&packet),
+                Some(want_total),
+                "byte1 {byte1:02X}"
+            );
+            assert_eq!(msg_seq_num(&packet), Some(want_seq), "byte1 {byte1:02X}");
+            // Every real fragment is self-consistent under this reading, which
+            // is the property the reassembler's range check leans on.
+            assert!(want_seq < want_total);
+        }
+    }
+
+    #[test]
     fn in_order_fragments_complete_and_concatenate() {
         let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
         let p1 = [1u8; MESSAGE_PAYLOAD_BYTES];
         let p2 = [2u8; MESSAGE_PAYLOAD_BYTES];
         let p3 = [3u8; MESSAGE_PAYLOAD_BYTES];
 
-        assert_eq!(r.push(&msg_fragment(1, 3, p1)), None);
-        assert_eq!(r.push(&msg_fragment(2, 3, p2)), None);
-        let done = r.push(&msg_fragment(3, 3, p3)).expect("completes");
+        assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
+        assert_eq!(r.push(&msg_fragment(1, 3, p2)), None);
+        let done = r.push(&msg_fragment(2, 3, p3)).expect("completes");
         assert!(!done.partial);
         let mut expected = Vec::new();
         expected.extend_from_slice(&p1);
@@ -277,9 +324,9 @@ mod tests {
         let p2 = [0xBBu8; MESSAGE_PAYLOAD_BYTES];
         let p3 = [0xCCu8; MESSAGE_PAYLOAD_BYTES];
 
-        assert_eq!(r.push(&msg_fragment(3, 3, p3)), None);
-        assert_eq!(r.push(&msg_fragment(1, 3, p1)), None);
-        let done = r.push(&msg_fragment(2, 3, p2)).expect("completes");
+        assert_eq!(r.push(&msg_fragment(2, 3, p3)), None);
+        assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
+        let done = r.push(&msg_fragment(1, 3, p2)).expect("completes");
         assert!(!done.partial);
         let mut expected = Vec::new();
         expected.extend_from_slice(&p1);
@@ -293,16 +340,16 @@ mod tests {
         let max_age = 3u32;
         let mut r = Reassembler::new(max_age);
         let p1 = [0x11u8; MESSAGE_PAYLOAD_BYTES];
-        assert_eq!(r.push(&msg_fragment(1, 3, p1)), None);
-        // Fragment 2 never arrives. Age the sequence with same-seq repeats
-        // (total unchanged, so no restart), which just overwrite fragment 1
+        assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
+        // Fragments 1 and 2 never arrive. Age the sequence with same-seq repeats
+        // (total unchanged, so no restart), which just overwrite fragment 0
         // in place — harmless since we only assert the *fact* of a flush
         // and the surviving payload below.
         for _ in 0..max_age {
-            assert_eq!(r.push(&msg_fragment(1, 3, p1)), None);
+            assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
         }
         let flushed = r
-            .push(&msg_fragment(1, 3, p1))
+            .push(&msg_fragment(0, 3, p1))
             .expect("stale flush on the push that exceeds max_age");
         assert!(flushed.partial);
         assert_eq!(flushed.bytes, p1.to_vec());
@@ -312,13 +359,13 @@ mod tests {
     fn fresh_sequence_restarts_after_a_flush() {
         let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
         let p1 = [0x01u8; MESSAGE_PAYLOAD_BYTES];
-        assert_eq!(r.push(&msg_fragment(1, 3, p1)), None);
+        assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
 
         // A fragment reporting a different total restarts the sequence,
-        // flushing the old one (fragment 1 of a total-3 sequence) partial.
+        // flushing the old one (fragment 0 of a total-3 sequence) partial.
         let restart_p1 = [0x02u8; MESSAGE_PAYLOAD_BYTES];
         let flushed = r
-            .push(&msg_fragment(1, 2, restart_p1))
+            .push(&msg_fragment(0, 2, restart_p1))
             .expect("old sequence flushed on restart");
         assert!(flushed.partial);
         assert_eq!(flushed.bytes, p1.to_vec());
@@ -326,7 +373,7 @@ mod tests {
         // The new total-2 sequence completes normally on its next fragment.
         let restart_p2 = [0x03u8; MESSAGE_PAYLOAD_BYTES];
         let done = r
-            .push(&msg_fragment(2, 2, restart_p2))
+            .push(&msg_fragment(1, 2, restart_p2))
             .expect("new sequence completes");
         assert!(!done.partial);
         let mut expected = Vec::new();
@@ -357,13 +404,13 @@ mod tests {
         let c = [0xC0u8; MESSAGE_PAYLOAD_BYTES];
 
         // A: first fragment of a 3-fragment sequence, left incomplete.
-        assert_eq!(r.push(&msg_fragment(1, 3, a1)), None);
+        assert_eq!(r.push(&msg_fragment(0, 3, a1)), None);
 
         // B: a total==1 fragment restarts the sequence. In the same push,
         // A's old sequence flushes partial AND B's new total==1 sequence
         // completes. Only one `Option` can come back from this call; the
         // flush comes back first (it was queued first).
-        let out1 = r.push(&msg_fragment(1, 1, b)).expect("A flushes partial");
+        let out1 = r.push(&msg_fragment(0, 1, b)).expect("A flushes partial");
         assert!(out1.partial, "A must flush partial");
         assert_eq!(out1.bytes, a1.to_vec());
 
@@ -372,7 +419,7 @@ mod tests {
         // already-migrated (but not yet returned) completed data. This
         // push returns B's queued completion.
         let out2 = r
-            .push(&msg_fragment(1, 1, c))
+            .push(&msg_fragment(0, 1, c))
             .expect("B's completion, queued from the previous push");
         assert!(!out2.partial, "B must come out complete, not partial");
         assert_eq!(out2.bytes, b.to_vec(), "B's data must not be lost");
@@ -393,13 +440,13 @@ mod tests {
         let p2 = [0x22u8; MESSAGE_PAYLOAD_BYTES];
         let bogus = [0xFFu8; MESSAGE_PAYLOAD_BYTES];
 
-        assert_eq!(r.push(&msg_fragment(1, 2, p1)), None);
-        // seq==0 is outside 1..=2 for this fragment's own total — ignored.
-        assert_eq!(r.push(&msg_fragment(0, 2, bogus)), None);
-        // seq==3 is likewise outside 1..=2 — ignored.
+        assert_eq!(r.push(&msg_fragment(0, 2, p1)), None);
+        // seq==2 is outside 0..2 for this fragment's own total — ignored.
+        assert_eq!(r.push(&msg_fragment(2, 2, bogus)), None);
+        // seq==3 is likewise outside 0..2 — ignored.
         assert_eq!(r.push(&msg_fragment(3, 2, bogus)), None);
 
-        let done = r.push(&msg_fragment(2, 2, p2)).expect("completes");
+        let done = r.push(&msg_fragment(1, 2, p2)).expect("completes");
         assert!(!done.partial);
         let mut expected = Vec::new();
         expected.extend_from_slice(&p1);
