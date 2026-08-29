@@ -202,9 +202,14 @@ install-bin:
 	else \
 		rm -f "$(BINDIR)/.sdr-rs.tmp"; \
 		if [ -f "$(RESTART_SENTINEL)" ]; then \
-			rm -f "$(RESTART_SENTINEL)"; \
 			echo "  binary copy failed — relaunching the previous sdr-rs"; \
 			setsid -f "$(BINDIR)/sdr-rs" >/dev/null 2>&1 || true; \
+			for i in $$(seq 1 15); do \
+				if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+					rm -f "$(RESTART_SENTINEL)"; break; \
+				fi; \
+				sleep 0.2; \
+			done; \
 		fi; \
 		exit 1; \
 	fi
