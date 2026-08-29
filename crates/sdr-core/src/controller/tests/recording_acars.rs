@@ -415,7 +415,7 @@ fn source_switch_while_engaged_tears_down_on_type_change() {
 
 /// #849 (CR round 1 on PR #860) — the Airspy Mini clamps a 2.5 Msps
 /// request to its nearest table entry (3 Msps). The engage path
-/// builds the ChannelBank from the POST-APPLY read-back rate, so the
+/// builds the `ChannelBank` from the POST-APPLY read-back rate, so the
 /// clamped rate must produce a valid bank: every Airspy rate is an
 /// integer multiple of the 12.5 kHz channel IF rate.
 #[test]
