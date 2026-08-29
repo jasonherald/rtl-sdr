@@ -73,6 +73,7 @@ sdr-rtltcp-discovery.workspace = true
 # rejects child-side `default-features = false` when inheriting.
 sdr-server-rtltcp = { path = "../sdr-server-rtltcp", default-features = false }
 sdr-acars.workspace = true
+sdr-orbcomm.workspace = true
 sdr-tray.workspace = true
 arrayvec.workspace = true
 thiserror.workspace = true
