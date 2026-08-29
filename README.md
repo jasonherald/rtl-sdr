@@ -151,10 +151,10 @@ make install CARGO_FLAGS="--release --features whisper-vulkan"     # Cross-vendo
 # Sherpa-onnx backend — Zipformer / Moonshine / Parakeet, English-only
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"   # Sherpa CPU
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda"  # Sherpa + NVIDIA GPU
-make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm"  # Sherpa + AMD GPU (MIGraphX; needs onnxruntime-rocm)
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm"  # Sherpa + AMD GPU (MIGraphX; needs onnxruntime-rocm; Cohere Transcribe only)
 ```
 
-With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base, or Parakeet) at runtime from the transcript panel dropdown — no rebuild required, and switching is an in-place recognizer swap.
+With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base, or Parakeet) at runtime from the transcript panel dropdown — no rebuild required, and switching is an in-place recognizer swap. The exception is `sherpa-rocm`, which is experimental and supports **Cohere Transcribe only**: the gfx1103 bring-up (issue #858) found the MIGraphX execution provider miscompiling or aborting on every other catalog model, so other selections are coerced to Cohere at startup and rejected with a clear error when picked from the dropdown.
 
 **Sherpa CUDA notes:**
 
