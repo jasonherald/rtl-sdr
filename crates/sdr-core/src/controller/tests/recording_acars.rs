@@ -374,3 +374,62 @@ fn acars_tap_records_init_failure_on_invalid_channel_list() {
     assert!(bank.is_none());
     assert!(init_failed, "bad channels should set init_failed");
 }
+
+/// #849 (review round 1 on PR #860) — the switch-while-engaged
+/// auto-disable is IDENTITY-based: any source-type change while
+/// engaged tears the lock down, because the pre-lock snapshot
+/// belongs to the old hardware and restoring its rate onto a
+/// different source would clamp through the new rate table instead
+/// of faithfully restoring the user's state. A same-type dispatch
+/// keeps the lock.
+#[test]
+fn source_switch_while_engaged_tears_down_on_type_change() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    state.acars_pre_lock = Some(test_pre_lock_snapshot());
+    let _ = drain(&dsp_rx);
+
+    // Same-type dispatch (snapshot is RtlSdr): lock survives.
+    handle_command(
+        &mut state,
+        &dsp_tx,
+        UiToDsp::SetSourceType(SourceType::RtlSdr),
+    );
+    assert!(
+        state.acars_pre_lock.is_some(),
+        "same-type dispatch must not tear ACARS down"
+    );
+
+    // RTL → Airspy: capable hardware, but DIFFERENT hardware — the
+    // snapshot can't restore faithfully, so the lock tears down.
+    handle_command(
+        &mut state,
+        &dsp_tx,
+        UiToDsp::SetSourceType(SourceType::Airspy),
+    );
+    assert!(
+        state.acars_pre_lock.is_none(),
+        "cross-type switch must tear ACARS down"
+    );
+}
+
+/// #849 (CR round 1 on PR #860) — the Airspy Mini clamps a 2.5 Msps
+/// request to its nearest table entry (3 Msps). The engage path
+/// builds the ChannelBank from the POST-APPLY read-back rate, so the
+/// clamped rate must produce a valid bank: every Airspy rate is an
+/// integer multiple of the 12.5 kHz channel IF rate.
+#[test]
+fn channel_bank_builds_at_airspy_mini_clamped_rates() {
+    for rate in [3_000_000.0, 6_000_000.0] {
+        let bank = sdr_acars::ChannelBank::new(
+            rate,
+            crate::acars_airband_lock::AcarsRegion::default().center_hz(),
+            crate::acars_airband_lock::AcarsRegion::default().channels(),
+        );
+        assert!(
+            bank.is_ok(),
+            "bank must build at {rate} Hz: {:?}",
+            bank.err()
+        );
+    }
+}
