@@ -33,6 +33,11 @@ CARGO_FLAGS ?= --release
 INSTALL_RUNTIME_LIB_TARGETS :=
 ifneq (,$(findstring sherpa-cuda,$(CARGO_FLAGS)))
 INSTALL_RUNTIME_LIB_TARGETS += check-cuda-system-libs install-sherpa-runtime-libs
+# Preflight BEFORE compiling, not just before the lib copy — a
+# missing package should fail in milliseconds with the pacman hint,
+# not after (or midway through) a full cargo build. Per CR round 1
+# on PR #859.
+build: check-cuda-system-libs
 endif
 
 # ─────────────────────────────────────────────────────────────────────
@@ -188,8 +193,12 @@ uninstall:
 	rm -f $(DESKTOPDIR)/com.sdr.rs.splash.desktop
 	@update-desktop-database $(DESKTOPDIR) 2>/dev/null || true
 	@echo "SDR-RS uninstalled"
-	@echo "  (NVIDIA redist cache at $(CUDA_REDIST_CACHE) preserved;"
-	@echo "   remove manually with: rm -rf $(CUDA_REDIST_CACHE))"
+	@# The redist cache was retired in #855; pre-#855 installs may
+	@# still carry it, so point at the literal path once.
+	@if [ -d $(HOME)/.cache/sdr-rs/cuda-redist ]; then \
+		echo "  (legacy NVIDIA redist cache found — reclaim ~1.9 GB with:"; \
+		echo "   rm -rf $(HOME)/.cache/sdr-rs/cuda-redist)"; \
+	fi
 
 # ─────────────────────────────────────────────────────────────────────
 # Quality
