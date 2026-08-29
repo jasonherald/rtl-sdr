@@ -9,20 +9,9 @@ DESKTOPDIR  ?= $(DATADIR)/applications
 CARGO       ?= cargo
 CARGO_FLAGS ?= --release
 
-# Persistent cache for downloaded NVIDIA CUDA 12 redistributables
-# (see the `fetch-cuda-redist` target). Sits outside the cargo target
-# dir on purpose so `cargo clean` doesn't nuke ~1.8 GB of blobs.
-CUDA_REDIST_CACHE     ?= $(HOME)/.cache/sdr-rs/cuda-redist
-CUDA_REDIST_DOWNLOADS := $(CUDA_REDIST_CACHE)/downloads
-CUDA_REDIST_STAGING   := $(CUDA_REDIST_CACHE)/staging
-# v2: + cuda_nvrtc (new NEEDED of the onnxruntime 1.27.1 provider,
-# sherpa-onnx v1.13.6 — issue #854). Bumping forces cached setups to
-# fetch the added archive.
-CUDA_REDIST_SENTINEL  := $(CUDA_REDIST_CACHE)/.sentinel-v2
-
 .PHONY: all build install install-bin install-sherpa-runtime-libs \
-        install-cuda-redist-libs install-icon install-desktop uninstall \
-        fetch-cuda-redist test clippy fmt fmt-check \
+        check-cuda-system-libs install-icon install-desktop uninstall \
+        test clippy fmt fmt-check \
         lint deny audit scan clean help
 
 # Runtime library copy targets are conditionally chained into `install`
@@ -43,13 +32,7 @@ CUDA_REDIST_SENTINEL  := $(CUDA_REDIST_CACHE)/.sentinel-v2
 # sherpa-cpu builds skip the runtime-lib plumbing entirely.
 INSTALL_RUNTIME_LIB_TARGETS :=
 ifneq (,$(findstring sherpa-cuda,$(CARGO_FLAGS)))
-INSTALL_RUNTIME_LIB_TARGETS += install-sherpa-runtime-libs install-cuda-redist-libs
-# Chain the fetch dep onto install-cuda-redist-libs (NOT onto `install`
-# directly) so the fetch runs BEFORE the copy from staging into
-# $(LIBDIR). Adding it to `install` would just append it to the
-# existing prereq list and run the fetch after the copy — which is
-# the bug that bit us the first time around.
-install-cuda-redist-libs: fetch-cuda-redist
+INSTALL_RUNTIME_LIB_TARGETS += check-cuda-system-libs install-sherpa-runtime-libs
 endif
 
 # ─────────────────────────────────────────────────────────────────────
@@ -69,7 +52,7 @@ help:
 	@echo "  make lint                Run all checks (fmt, clippy, test, deny, audit)"
 	@echo "  make scan                Run SonarQube scan"
 	@echo "  make clean               Remove build artifacts"
-	@echo "  make fetch-cuda-redist   Pre-populate the NVIDIA CUDA 12 redist cache"
+	@echo "  make check-cuda-system-libs  Verify the CUDA 13 + cuDNN 9 system packages"
 	@echo "                           (only needed for sherpa-cuda builds; runs"
 	@echo "                           transparently during 'make install' otherwise)"
 	@echo ""
@@ -123,6 +106,16 @@ install-bin:
 # TensorRT provider. sdr-rs only asks for "cuda", so the tensorrt
 # provider is never loaded and shipping it would be dead weight.
 install-sherpa-runtime-libs:
+	@# Prune the retired CUDA-12 redist sideload (#855): upgrades from
+	@# pre-system-package installs otherwise keep ~1.2 GB of dead
+	@# libraries (and a stale libcudnn.so.9 that would shadow the
+	@# system one via the binary's $$ORIGIN rpath ordering).
+	@if [ -d $(LIBDIR) ]; then \
+		rm -f $(LIBDIR)/libcudart.so* $(LIBDIR)/libcublas*.so* \
+		      $(LIBDIR)/libcufft.so* $(LIBDIR)/libcurand.so* \
+		      $(LIBDIR)/libnvrtc*.so* $(LIBDIR)/libcudnn*.so* \
+		      $(LIBDIR)/libcudnn_*.so*; \
+	fi
 	@if ls target/release/libsherpa-onnx-c-api.so >/dev/null 2>&1; then \
 		mkdir -p $(LIBDIR); \
 		for so in target/release/libsherpa-onnx-c-api.so \
@@ -137,41 +130,34 @@ install-sherpa-runtime-libs:
 		done; \
 	fi
 
-# Copy NVIDIA CUDA 12 runtime libs from the persistent cache into
-# $(LIBDIR). The cache is populated by `fetch-cuda-redist`, which the
-# `install` target pulls in automatically when `sherpa-cuda` is in
-# CARGO_FLAGS. No-op for non-cuda builds because the staging dir
-# doesn't exist.
+# Preflight for sherpa-cuda builds: the CUDA runtime now comes from
+# system packages, not the retired redist sideload (#855 — k2-fsa
+# publishes a CUDA 13 prebuilt and Arch packages cudnn, so the
+# original reason for self-containment is gone; system packages also
+# pave the way for a ROCm backend consumed the same way). Verify every
+# NEEDED library of the prebuilt's CUDA provider resolves via the
+# system loader BEFORE building, so a missing package fails with an
+# actionable message instead of a runtime dlopen error.
 #
-# `cp -a` (not `install -m 644`!) is required here to preserve the
-# symlink chain from the staging dir. The libraries form sonames like
-# `libfoo.so -> libfoo.so.12 -> libfoo.so.12.6.4.1`; the loader looks
-# up NEEDED entries against the middle link, and a plain `install`
-# dereferences the symlinks and produces three identical full-size
-# copies with different names, wasting gigabytes and breaking the
-# soname resolution.
-install-cuda-redist-libs:
-	@if [ -d $(CUDA_REDIST_STAGING) ] && [ -n "$$(ls -A $(CUDA_REDIST_STAGING) 2>/dev/null)" ]; then \
-		mkdir -p $(LIBDIR); \
-		cp -a $(CUDA_REDIST_STAGING)/. $(LIBDIR)/; \
-		echo "  installed $$(find $(CUDA_REDIST_STAGING) -maxdepth 1 \( -type f -o -type l \) -name 'lib*.so*' | wc -l) files from NVIDIA redist cache"; \
-	fi
-
-# Download and stage NVIDIA CUDA 12 + cuDNN 9 runtime libraries so
-# that a `sherpa-cuda` build runs on hosts that do not have CUDA 12
-# installed system-wide (notably Arch Linux, which ships CUDA 13).
-# The actual download/verify/extract logic lives in
-# `scripts/fetch-cuda-redist.sh` — see its header for the full
-# rationale and the list of libraries we pull. A sentinel file at
-# $(CUDA_REDIST_SENTINEL) short-circuits the target once the cache is
-# fully populated, so subsequent `make install` runs are instant.
-fetch-cuda-redist: $(CUDA_REDIST_SENTINEL)
-
-$(CUDA_REDIST_SENTINEL):
-	@./scripts/fetch-cuda-redist.sh \
-	    $(CUDA_REDIST_DOWNLOADS) \
-	    $(CUDA_REDIST_STAGING) \
-	    $(CUDA_REDIST_SENTINEL)
+# `libcuda.so.1` is the kernel-driver stub (nvidia-utils) and is
+# checked last with its own hint.
+check-cuda-system-libs:
+	@missing=""; \
+	for lib in libcudart.so.13 libcublas.so.13 libcublasLt.so.13 \
+	           libcufft.so.12 libcurand.so.10 libnvrtc.so.13 \
+	           libcudnn.so.9; do \
+		ldconfig -p | grep -q "$$lib " || missing="$$missing $$lib"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "error: sherpa-cuda needs these system libraries:$$missing"; \
+		echo "       install them with: pacman -S cuda cudnn"; \
+		exit 1; \
+	fi; \
+	ldconfig -p | grep -q "libcuda.so.1 " || { \
+		echo "error: libcuda.so.1 not found — install the NVIDIA driver (pacman -S nvidia-utils)"; \
+		exit 1; \
+	}; \
+	echo "  CUDA 13 + cuDNN 9 system libraries present"
 
 install-icon:
 	@mkdir -p $(ICONDIR)
