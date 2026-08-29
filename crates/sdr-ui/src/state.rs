@@ -417,6 +417,29 @@ pub struct AppState {
     /// auto-restore doesn't write 0.0 back to config or
     /// re-enter `send_dsp` from the value-changed handler.
     pub suppress_volume_notify: Cell<bool>,
+    /// Orbcomm toggle, ack-driven mirror of the DSP-side decode-tap
+    /// state (issue #865, Task 11). Unlike ACARS this is a plain
+    /// bool with no geometry lock to unwind, so there's no paired
+    /// `*_pending` flag — the viewer's enable switch tracks the ack
+    /// directly rather than optimistically, per
+    /// `crate::orbcomm_viewer`'s doc comments.
+    pub orbcomm_enabled: Cell<bool>,
+    /// Latest per-channel Orbcomm stats, populated by the
+    /// `DspToUi::OrbcommChannelStats` arm. Mirrors
+    /// `acars_channel_stats`; consumed by the viewer's
+    /// channel-activity strip (and, in a later task, a sidebar
+    /// panel).
+    pub orbcomm_channel_stats: RefCell<Vec<sdr_orbcomm::ChannelStats>>,
+    /// Currently-open Orbcomm viewer window, or `None` when no
+    /// viewer is open. `glib::WeakRef` so the `AppState` slot
+    /// doesn't keep the window alive past its natural lifetime.
+    /// Set by [`crate::orbcomm_viewer::open_orbcomm_viewer_if_needed`];
+    /// cleared by the window's `close-request` handler.
+    pub orbcomm_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
+    /// Per-viewer mutable handles (log view, channel-strip labels,
+    /// enable switch). `Some` only while a viewer window is open.
+    /// Mirrors `acars_viewer_handles`.
+    pub orbcomm_viewer_handles: RefCell<Option<Rc<crate::orbcomm_viewer::ViewerHandles>>>,
     /// Stash for the **full batch** of `RecorderAction`s a
     /// recorder tick yielded when ACARS was engaged. The
     /// recorder tick site detects a `StartAutoRecord` in the
@@ -525,6 +548,10 @@ impl AppState {
             acars_pending: Cell::new(false),
             acars_saved_volume: Cell::new(None),
             suppress_volume_notify: Cell::new(false),
+            orbcomm_enabled: Cell::new(false),
+            orbcomm_channel_stats: RefCell::new(Vec::new()),
+            orbcomm_viewer_window: RefCell::new(None),
+            orbcomm_viewer_handles: RefCell::new(None),
             pending_aos_actions: RefCell::new(None),
             recorder_action_interpreter: RefCell::new(None),
         })

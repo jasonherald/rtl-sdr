@@ -5,10 +5,12 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
 mod acars_events;
+mod orbcomm_events;
 mod scanner_events;
 use acars_events::{
     on_acars_channel_stats, on_acars_enabled_changed, on_acars_message, on_acars_output_error,
 };
+use orbcomm_events::{on_orbcomm_channel_stats, on_orbcomm_enabled_changed, on_orbcomm_event};
 use scanner_events::{
     on_scanner_active_channel_changed, on_scanner_empty_rotation, on_scanner_mutex_stopped,
     on_scanner_state_changed,
@@ -123,21 +125,11 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
         DspToUi::AcarsOutputError { kind, message } => {
             on_acars_output_error(ctx, kind, &message);
         }
-        // Orbcomm decode-tap plumbing (issue #865, sdr-core Task 10).
-        // UI wiring (viewer / stats panel) lands in a later task; stub
-        // arms here keep the match exhaustive in the meantime, same
-        // convention as `AcarsOutputError` above. Distinct bodies (vs.
-        // a shared no-op) so `clippy::match_same_arms` doesn't ask us
-        // to fold this into the unrelated `FftData` arm above.
-        DspToUi::OrbcommEvent(_) => {
-            tracing::trace!("Orbcomm event received; UI viewer not yet wired (#865)");
-        }
-        DspToUi::OrbcommChannelStats(_) => {
-            tracing::trace!("Orbcomm channel stats received; UI panel not yet wired (#865)");
-        }
-        DspToUi::OrbcommEnabledChanged(_) => {
-            tracing::trace!("Orbcomm enabled-changed ack received; UI toggle not yet wired (#865)");
-        }
+        // Orbcomm decode-tap plumbing (issue #865). Viewer wiring
+        // landed in Task 11; a sidebar stats panel is a later task.
+        DspToUi::OrbcommEvent(event) => on_orbcomm_event(ctx, &event),
+        DspToUi::OrbcommChannelStats(ch_stats) => on_orbcomm_channel_stats(ctx, ch_stats),
+        DspToUi::OrbcommEnabledChanged(enabled) => on_orbcomm_enabled_changed(ctx, enabled),
     }
 }
 

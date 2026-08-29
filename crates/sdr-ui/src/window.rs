@@ -689,6 +689,12 @@ pub fn build_window(
         // symmetric. Per epic #469 task 7.5.
         crate::lrpt_viewer::connect_lrpt_action(app, &parent_provider, &state);
         crate::sstv_viewer::connect_sstv_action(app, &parent_provider, &state);
+        // Orbcomm viewer wiring (`Ctrl+Shift+O` / `app.orbcomm-open`,
+        // issue #865). No `parent_provider` — like `acars_viewer`,
+        // the window pulls its parent app via the gio
+        // default-application registry rather than a caller-supplied
+        // window.
+        crate::orbcomm_viewer::connect_orbcomm_action(app, &state);
     }
 
     // Set initial status bar values and mode-specific control visibility.

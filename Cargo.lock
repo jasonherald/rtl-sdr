@@ -3458,6 +3458,7 @@ dependencies = [
  "sdr-core",
  "sdr-dsp",
  "sdr-lrpt",
+ "sdr-orbcomm",
  "sdr-pipeline",
  "sdr-radio",
  "sdr-radioreference",
