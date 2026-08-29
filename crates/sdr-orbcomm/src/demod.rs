@@ -77,20 +77,25 @@ const NRZ_M_DECODE: bool = true;
 /// physical layer live.** The protocol description fixes the modulation but not, with
 /// certainty, (a) whether a *positive* phase shift is coded `1` or coded `0`, nor
 /// (b) whether the deframer downstream wants NRZ-M-decoded information bits or the raw
-/// coded bits. **The real-capture fixture in Task 9 is the arbiter.** If that fixture
-/// decodes nothing:
+/// coded bits. **The real-capture fixture in Task 9 is the arbiter.**
 ///
-/// 1. flip [`SHIFT_ADVANCE_IS_ONE`] first, then
-/// 2. if it still decodes nothing, turn [`NRZ_M_DECODE`] off (and re-try both signs).
+/// While `NRZ_M_DECODE` is on, flipping the sign is a provable *no-op* — inverting every
+/// coded bit leaves `coded[n] ^ coded[n-1]` unchanged, which is the differential encoding
+/// doing its job (it also makes the demodulator immune to spectral inversion in the front
+/// end). That is asserted by `sign_flip_is_a_noop_while_nrz_m_is_enabled` in this
+/// module's tests. So there are only **three distinguishable configurations**, and the
+/// fixture should be tried against them in this order:
+///
+/// 1. `NRZ_M_DECODE = true` — the shipped setting; the sign is irrelevant here.
+/// 2. `NRZ_M_DECODE = false`, `SHIFT_ADVANCE_IS_ONE = true` — raw coded bits.
+/// 3. `NRZ_M_DECODE = false`, `SHIFT_ADVANCE_IS_ONE = false` — raw coded bits, inverted.
+///
+/// Turning `NRZ_M_DECODE` off also means updating the `const` assertion in
+/// `sign_flip_is_a_noop_while_nrz_m_is_enabled`, which exists precisely so the no-op
+/// claim above cannot silently outlive the setting it depends on: that test guards the
+/// documentation, it does not forbid the flip.
 ///
 /// Never scatter convention changes across the detector, the deframer or the descrambler.
-///
-/// Note — proven by `sign_flip_is_a_noop_while_nrz_m_is_enabled` in this module's tests —
-/// that while `NRZ_M_DECODE` is on the sign flip is a *no-op*: inverting every coded bit
-/// leaves `coded[n] ^ coded[n-1]` unchanged. That is exactly the differential encoding
-/// doing its job (it also makes the demodulator immune to spectral inversion in the
-/// front end). The sign therefore only becomes observable once the XOR is disabled,
-/// which is why step 2 above re-tries both signs.
 #[must_use]
 const fn bit_convention(coded: bool, prev_coded: bool) -> bool {
     // Both bits go through the same sign convention so the XOR stays consistent.
@@ -297,9 +302,10 @@ impl SdpskDemod {
             }
             let curr = interpolate(&self.pending, self.cursor);
             if !curr.re.is_finite() || !curr.im.is_finite() {
-                // A non-finite sample would poison the cursor through the loop filter
-                // and stall the drain, so skip it rather than let `pending` grow without
-                // bound.
+                // Keep non-finite samples out of the detector and out of `prev_symbol`.
+                // This is not the boundedness guarantee — the guard on the loop-filter
+                // output below is; `curr` is only one of the several ways a NaN can
+                // reach `error`.
                 self.cursor += self.sps;
                 continue;
             }
@@ -311,24 +317,24 @@ impl SdpskDemod {
                 continue;
             };
 
-            // Gardner timing-error detector: Re{ conj(y_mid) · (y[k] − y[k-1]) }.
-            // Insensitive to carrier phase (the rotation cancels between the two
-            // factors), which is what lets it run ahead of any carrier recovery.
             let mid = interpolate(&self.pending, mid_cursor);
-            let diff = curr - prev;
-            let raw_error = mid.re * diff.re + mid.im * diff.im;
-
-            let sample_power = curr.re * curr.re + curr.im * curr.im;
-            self.power += POWER_EWMA_ALPHA * (sample_power - self.power);
-            let error = f64::from(raw_error / (2.0 * self.power + POWER_FLOOR)).clamp(-1.0, 1.0);
-
-            // A positive error means we sampled late, so retard the cursor and shorten
-            // the symbol period.
-            self.sps = (self.sps - TIMING_LOOP_KI * error).clamp(
-                NOMINAL_SPS - SPS_TRACK_HALF_RANGE,
-                NOMINAL_SPS + SPS_TRACK_HALF_RANGE,
-            );
-            self.cursor += self.sps - TIMING_LOOP_KP * error;
+            match self.timing_error(curr, mid, curr - prev) {
+                Some(error) => {
+                    // A positive error means we sampled late, so retard the cursor and
+                    // shorten the symbol period.
+                    self.sps = (self.sps - TIMING_LOOP_KI * error).clamp(
+                        NOMINAL_SPS - SPS_TRACK_HALF_RANGE,
+                        NOMINAL_SPS + SPS_TRACK_HALF_RANGE,
+                    );
+                    self.cursor += self.sps - TIMING_LOOP_KP * error;
+                }
+                // Never let a non-finite error reach the loop filter: `cursor` and `sps`
+                // would go NaN, the symbol loop would stop advancing, `compact_pending`'s
+                // `max(0.0)` would swallow the NaN and `pending` would then grow by a
+                // whole block on every call, forever. Coast at the tracked rate instead;
+                // the loop picks up again as soon as the samples are finite.
+                None => self.cursor += self.sps,
+            }
 
             // Delay-conjugate detection of the ±90° phase shift.
             let d = curr * prev.conj();
@@ -339,6 +345,33 @@ impl SdpskDemod {
             self.prev_coded = Some(coded);
             self.prev_symbol = Some(curr);
         }
+    }
+
+    /// Gardner timing-error detector — `Re{ conj(y_mid) · (y[k] − y[k−1]) }`, normalised
+    /// by the tracked symbol power so the loop gain is amplitude-independent.
+    ///
+    /// Insensitive to carrier *phase* (the rotation cancels between the two factors),
+    /// which is what lets it run ahead of any carrier recovery.
+    ///
+    /// Also owns the symbol-power EWMA, because the two cannot be separated safely:
+    /// `mid` is drawn from a window of `pending` that the caller's guard on `curr` does
+    /// not cover, and a finite but enormous `curr` overflows `power` to infinity and then
+    /// to NaN on the next EWMA step. A poisoned estimate is re-seeded rather than carried
+    /// forward, and `None` is returned whenever the error is not finite.
+    fn timing_error(&mut self, curr: Complex, mid: Complex, diff: Complex) -> Option<f64> {
+        let raw_error = mid.re * diff.re + mid.im * diff.im;
+
+        let sample_power = curr.re * curr.re + curr.im * curr.im;
+        self.power = if self.power.is_finite() && sample_power.is_finite() {
+            self.power + POWER_EWMA_ALPHA * (sample_power - self.power)
+        } else if sample_power.is_finite() {
+            sample_power
+        } else {
+            0.0
+        };
+
+        let error = f64::from(raw_error / (2.0 * self.power + POWER_FLOOR)).clamp(-1.0, 1.0);
+        error.is_finite().then_some(error)
     }
 
     /// Drop the consumed prefix of `pending`, keeping the interpolator's look-behind.
@@ -484,6 +517,12 @@ mod tests {
 
     /// Simulate a sample-clock error of `ppm` parts per million.
     ///
+    /// Sign: output sample `m` is drawn from input time `m · (1 + ppm·1e-6)`, so a
+    /// *positive* `ppm` stretches the sampling grid — the receiver clock runs slow and
+    /// the demodulator sees slightly *fewer* than 4 samples per symbol (its tracked
+    /// `sps` settles below nominal). A negative `ppm` does the opposite. Both signs are
+    /// exercised, so this only matters when reading a single case.
+    ///
     /// An exact 1 + 50e-6 ratio through [`RationalResampler`] alone would need
     /// `interp = 19_201` polyphase branches over a multi-million-tap prototype, so the
     /// resampler does the tractable part — a clean 10× oversample — and the fractional
@@ -622,6 +661,9 @@ mod tests {
             start = end;
             size = size % 97 + 1;
         }
+        // Exact equality, not just an equivalent BER: the matched-filter delay line,
+        // the timing loop and the differential detector must all carry state across
+        // calls, so block boundaries have to be bit-for-bit invisible.
         assert_eq!(whole, fragmented);
         assert_recovered(&bits, &fragmented);
     }
@@ -634,7 +676,8 @@ mod tests {
         // channelizer's job; the demod contract is a residual of at most ±800 Hz
         // (60° bias, 30° of margin left).
         for (seed, cfo_hz) in [(0x5EED_0010_u64, -800.0_f64), (0x5EED_0011, 800.0)] {
-            let bits: Vec<bool> = (0..4096).map(|i| i % 3 == 0).collect();
+            let mut rng = Rng::new(seed);
+            let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
             let iq = add_awgn(&apply_cfo(&modulate_sdpsk(&bits), cfo_hz), 15.0, seed);
             assert_recovered(&bits, &demod_all(&iq));
         }
@@ -646,7 +689,8 @@ mod tests {
         // actually sensitive: at 1200 Hz the per-symbol bias is exactly 90°, the
         // decision boundary, and detection collapses. Anything past ±800 Hz belongs to
         // the channelizer's coarse frequency correction, not here.
-        let bits: Vec<bool> = (0..4096).map(|i| i % 3 == 0).collect();
+        let mut rng = Rng::new(0x5EED_0012);
+        let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
         let iq = add_awgn(
             &apply_cfo(&modulate_sdpsk(&bits), 1200.0),
             15.0,
@@ -659,8 +703,9 @@ mod tests {
     #[test]
     fn loopback_with_sample_clock_offset() {
         // ±50 ppm of symbol-clock error, the datasheet-grade spread of a TCXO pair.
-        for ppm in [-50.0_f64, 50.0] {
-            let bits: Vec<bool> = (0..4096).map(|i| i % 3 == 0).collect();
+        for (seed, ppm) in [(0x5EED_0013_u64, -50.0_f64), (0x5EED_0014, 50.0)] {
+            let mut rng = Rng::new(seed);
+            let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
             let iq = resample_ppm(&modulate_sdpsk(&bits), ppm);
             assert_recovered(&bits, &demod_all(&iq));
         }
@@ -677,6 +722,86 @@ mod tests {
             let iq = resample_ppm(&modulate_sdpsk(&bits), ppm);
             assert_recovered(&bits, &demod_all(&iq));
         }
+    }
+
+    #[test]
+    fn noise_margin_at_10_db_snr() {
+        // Soft ceiling so the noise numbers in the task report are a guard, not a note.
+        // `add_awgn`'s SNR is *per sample* at 4 samples/symbol, so 10 dB here reads as
+        // roughly 16 dB of Es/N0 — the interesting part is that this stays put.
+        let mut rng = Rng::new(0x5EED_0050);
+        let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
+        let iq = add_awgn(&apply_cfo(&modulate_sdpsk(&bits), 800.0), 10.0, 0x5EED_0051);
+        let ber = bit_error_rate(&bits, &demod_all(&iq));
+        assert!(
+            ber < 0.05,
+            "bit error rate {ber} regressed past 5 % at 10 dB SNR"
+        );
+    }
+
+    #[test]
+    fn non_finite_samples_cannot_stall_the_demodulator() {
+        // Regression: a non-finite value reaching the loop filter used to poison `cursor`
+        // and `sps`, after which the symbol loop stopped advancing, `compact_pending`'s
+        // `max(0.0)` swallowed the NaN, and `pending` grew by a whole block on every
+        // call — forever. Guarding `curr` alone is not enough: `mid` is interpolated from
+        // a different window, and a finite-but-enormous sample overflows the power
+        // estimate to infinity and then to NaN. Hence the guard on the error itself.
+        let mut rng = Rng::new(0x5EED_0040);
+        let bits: Vec<bool> = (0..6144).map(|_| rng.next_u64() & 1 == 1).collect();
+        // 500 ppm of clock offset, poisoned *after* resampling (poisoning before would
+        // smear the NaN through the resampler's own delay line). The offset is what makes
+        // the tail assertion bite: a loop that merely coasts — because a poisoned power
+        // estimate froze it — slips more than a symbol over the remaining record.
+        let mut iq = resample_ppm(&modulate_sdpsk(&bits), 500.0);
+        // Each poisoned sample smears over the 33-tap matched filter, and the timing
+        // cursor walks that run in ~4-sample steps — so whether `mid` lands inside the
+        // run while `curr` is already outside it depends on the run's phase. Spread the
+        // NaNs across all four residues mod `SAMPLES_PER_SYMBOL` so that case is hit
+        // deterministically, then add the infinities and the finite-but-enormous values
+        // that overflow the power estimate.
+        let poisons = [
+            (8000_usize, f32::NAN),
+            (8401, f32::NAN),
+            (8802, f32::NAN),
+            (9203, f32::NAN),
+            (9600, f32::INFINITY),
+            (9813, f32::NEG_INFINITY),
+            (10_000, 1e30),
+            (10_213, -1e30),
+        ];
+        for (index, poison) in poisons {
+            iq[index] = Complex::new(poison, poison);
+        }
+
+        let mut demod = SdpskDemod::new();
+        let mut out = Vec::new();
+        for chunk in iq.chunks(512) {
+            demod.process(chunk, &mut out);
+            assert!(
+                demod.cursor.is_finite() && demod.sps.is_finite(),
+                "loop state went non-finite: cursor {} sps {}",
+                demod.cursor,
+                demod.sps
+            );
+            assert!(
+                demod.pending.len() <= 32,
+                "pending grew to {} — the drain has stalled",
+                demod.pending.len()
+            );
+        }
+
+        // Symbols are still being produced at the symbol rate (each poisoned sample
+        // costs the ~8 symbols its matched-filter response touches, nothing more) ...
+        assert!(
+            out.len() + 64 >= bits.len(),
+            "recovered only {} bits from {}",
+            out.len(),
+            bits.len()
+        );
+        // ... and the stream after the disturbance decodes cleanly again.
+        let ber = bit_error_rate(&bits[bits.len() - 2048..], &out[out.len() - 2048..]);
+        assert!(ber <= MAX_BER, "post-disturbance bit error rate {ber}");
     }
 
     #[test]
