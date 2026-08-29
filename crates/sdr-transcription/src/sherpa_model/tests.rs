@@ -281,6 +281,7 @@ fn cohere_is_offline_with_encoder_decoder_layout() {
     assert!(!m.supports_partials());
     let ModelFilePaths::CohereTranscribe {
         encoder,
+        encoder_data,
         decoder,
         tokens,
     } = model_file_paths(m)
@@ -288,6 +289,11 @@ fn cohere_is_offline_with_encoder_decoder_layout() {
         panic!("cohere must be a CohereTranscribe layout");
     };
     assert!(encoder.ends_with("cohere-transcribe-14-lang/encoder.int8.onnx"));
+    // The 2B encoder ships as a ~3 MB ONNX graph plus a ~2.7 GB
+    // external-data sidecar — the sidecar IS the weights, and
+    // model_exists must demand it (CR round 2 on PR #857: a missing
+    // sidecar would skip the download and init an empty encoder).
+    assert!(encoder_data.ends_with("cohere-transcribe-14-lang/encoder.int8.onnx.data"));
     assert!(decoder.ends_with("cohere-transcribe-14-lang/decoder.int8.onnx"));
     assert!(tokens.ends_with("cohere-transcribe-14-lang/tokens.txt"));
 }

@@ -299,6 +299,9 @@ pub(super) fn build_cohere_recognizer_config(
 
     let ModelFilePaths::CohereTranscribe {
         encoder,
+        // Resolved by onnxruntime relative to `encoder`; only
+        // existence validation consumes the path.
+        encoder_data: _,
         decoder,
         tokens,
     } = sherpa_model::model_file_paths(model)

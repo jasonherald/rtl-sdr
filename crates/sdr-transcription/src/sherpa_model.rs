@@ -417,6 +417,13 @@ pub enum ModelFilePaths {
     },
     CohereTranscribe {
         encoder: PathBuf,
+        /// ONNX external-data sidecar holding the 2B encoder's
+        /// weights (~2.7 GB) — `encoder` itself is only the ~3 MB
+        /// graph. onnxruntime resolves the sidecar by name next to
+        /// the encoder, so only existence validation consumes this
+        /// path; a bundle without it is incomplete and must be
+        /// re-downloaded. Per CR round 2 on PR #857.
+        encoder_data: PathBuf,
         decoder: PathBuf,
         tokens: PathBuf,
     },
@@ -466,6 +473,7 @@ pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
         }
         SherpaModel::CohereTranscribe14Lang => ModelFilePaths::CohereTranscribe {
             encoder: dir.join("encoder.int8.onnx"),
+            encoder_data: dir.join("encoder.int8.onnx.data"),
             decoder: dir.join("decoder.int8.onnx"),
             tokens: dir.join("tokens.txt"),
         },
@@ -496,9 +504,10 @@ pub fn model_exists(model: SherpaModel) -> bool {
         }
         ModelFilePaths::CohereTranscribe {
             encoder,
+            encoder_data,
             decoder,
             tokens,
-        } => encoder.is_file() && decoder.is_file() && tokens.is_file(),
+        } => encoder.is_file() && encoder_data.is_file() && decoder.is_file() && tokens.is_file(),
     }
 }
 
