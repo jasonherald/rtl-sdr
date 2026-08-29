@@ -36,6 +36,16 @@ CARGO_FLAGS ?= --release
 # by sherpa-onnx-sys's build script) — but the cargo failure is
 # cryptic, so fail fast with the real reason. Per CR round 3 on
 # PR #859.
+# This Makefile installs into $(HOME)/.cargo/bin — a per-user layout
+# where root execution is never right: `sudo make install` would
+# install into /root, miss the user's running sdr-rs during the
+# stop-detection, and relaunch the app as root without the session's
+# Wayland/PipeWire sockets. Refuse up front. Per Codacy round 1 on
+# PR #862.
+ifeq ($(shell id -u),0)
+$(error this Makefile installs per-user into $$HOME/.cargo/bin — run it WITHOUT sudo)
+endif
+
 ifneq (,$(findstring --all-features,$(CARGO_FLAGS)))
 $(error --all-features is not buildable: transcription backends and sherpa link modes are mutually exclusive cargo features — pick exactly one, e.g. CARGO_FLAGS="--release --features whisper-cuda")
 endif
