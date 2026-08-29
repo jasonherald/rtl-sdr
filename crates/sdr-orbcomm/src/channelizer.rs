@@ -8,7 +8,9 @@
 //!    carried across `process` calls, so block boundaries introduce no phase
 //!    discontinuity.
 //! 2. **[`RationalResampler`]** down to [`CHANNEL_SAMPLE_RATE_HZ`] — this is
-//!    also the channel filter: everything past ±9.6 kHz is gone.
+//!    also the channel filter: its lowpass is `min(in, out) / 2 = 9.6 kHz`
+//!    with a ~960 Hz transition, so a neighbour at the real 20 kHz Orbcomm
+//!    channel spacing lands squarely in the Nuttall stopband.
 //! 3. **[`Fll`]** — coarse carrier-frequency correction, see its docs. Brings
 //!    the ±3.5 kHz of 137 MHz Doppler inside the demodulator's ±800 Hz
 //!    residual contract.
@@ -73,7 +75,9 @@ pub struct ChannelStats {
     pub packets_ok: u64,
     /// Locked strides rejected by the checksum (and by single-bit repair).
     pub checksum_fail: u64,
-    /// Packets that only passed after single-bit repair.
+    /// Packets that only passed after single-bit repair. A subset of
+    /// [`Self::packets_ok`] — a repair that did not yield a parsable packet is
+    /// not counted here.
     pub repaired: u64,
 }
 
@@ -88,10 +92,12 @@ const FLL_BLOCK_SAMPLES: usize = 256;
 /// With [`FLL_BLOCK_SAMPLES`] this puts the loop bandwidth at
 /// `FLL_GAIN · 19200 / 256 / 2π ≈ 6 Hz`.
 const FLL_GAIN: f64 = 0.5;
-/// Clamp on the integrated correction. Beyond ±8 kHz the delay-conjugate
-/// estimator is approaching its ±9.6 kHz (half the channel rate) ambiguity
-/// limit, and no real Doppler at 137 MHz gets close.
-const FLL_MAX_OFFSET_HZ: f64 = 8000.0;
+/// Clamp on the integrated correction, set just inside the loop's practical
+/// capture range (see [`Fll`]). Past ±6.2 kHz the offset has pushed the
+/// signal's upper sideband into the channel filter's stopband *before* the
+/// discriminator sees it, so the loop cannot usefully occupy that state — and
+/// no real Doppler at 137 MHz asks it to.
+const FLL_MAX_OFFSET_HZ: f64 = 6000.0;
 /// Slack added to the computed resampler output length. See
 /// [`ChannelDsp::decimated_capacity_for`] for why the computed part suffices.
 const RESAMPLER_OUTPUT_MARGIN: usize = 16;
@@ -136,9 +142,27 @@ fn wrap_phase(phase: f64) -> f64 {
 /// slews fastest and wraps, are weighted by their own near-zero amplitude
 /// instead of dominating the mean.
 ///
-/// The estimate is unambiguous for `|Δf| < fs/2 = 9.6 kHz`, so the capture
-/// range covers the full Doppler span with margin — no acquisition sweep, no
-/// squaring or 4th-power nonlinearity needed.
+/// # Capture range
+///
+/// The discriminator itself is unambiguous for `|Δf| < fs/2 = 9.6 kHz`, but
+/// that is **not** the binding limit: the FLL sits *downstream* of the
+/// resampler, whose lowpass cuts off at `min(in, out) / 2 = 9.6 kHz` with a
+/// ~960 Hz Nuttall transition. The RRC-shaped signal is
+/// `±(SYMBOL_RATE/2)(1 + α) = ±3.36 kHz` wide, so an offset only stays fully
+/// inside the passband while
+///
+/// ```text
+/// |Δf| + 3360 ≤ 9600   ⇒   |Δf| ≲ 6.2 kHz
+/// ```
+///
+/// Past that the upper sideband is attenuated before the discriminator ever
+/// sees it. **Practical capture is therefore ≈ ±6.2 kHz — about 1.8× the
+/// ±3.5 kHz worst-case Doppler at 137 MHz**, not the 2.7× the raw ambiguity
+/// limit would suggest. [`FLL_MAX_OFFSET_HZ`] clamps the integrator just
+/// inside it. That is still enough margin to need no acquisition sweep and no
+/// squaring or 4th-power nonlinearity; if a future front end pushes the
+/// initial offset past ~6 kHz (a large uncorrected LO error stacked on
+/// Doppler), the fix is a wider intermediate rate, not a bigger clamp.
 ///
 /// # Loop
 ///
@@ -215,11 +239,20 @@ impl Fll {
     fn update(&mut self) {
         let err_hz =
             self.acc_im.atan2(self.acc_re) * CHANNEL_SAMPLE_RATE_HZ / std::f64::consts::TAU;
-        // A block of non-finite samples poisons the accumulator; `atan2` then
-        // yields NaN, which would freeze the loop (`clamp` on a NaN keeps the
-        // NaN) and put a NaN phase on every later output sample. Drop such a
-        // block instead — including its reference sample, so a poisoned value
-        // cannot leak into the next block's first product.
+        // A non-finite sample poisons the accumulator; `atan2` then yields NaN,
+        // which would freeze the loop (`clamp` on a NaN keeps the NaN) and put
+        // a NaN phase on every later output sample. Drop such a block instead —
+        // including its reference sample, so a poisoned value cannot leak into
+        // the next block's first product.
+        //
+        // Note this is all-or-nothing: *one* bad sample discards the whole
+        // block of 256 products, costing ~13 ms of tracking. That is deliberate
+        // — the frequency estimate is only meaningful over a full averaging
+        // window, and salvaging a partial block would silently shorten it (and
+        // with it the modulation averaging the discriminator depends on) at
+        // exactly the moment the data is least trustworthy. The loop simply
+        // coasts at its current estimate and resumes on the next clean block,
+        // which `fll_survives_non_finite_samples` pins.
         if err_hz.is_finite() {
             self.freq_hz =
                 (self.freq_hz + FLL_GAIN * err_hz).clamp(-FLL_MAX_OFFSET_HZ, FLL_MAX_OFFSET_HZ);
@@ -454,11 +487,16 @@ impl Channel {
             let Some(frame) = dsp.deframer.push_bit(bit) else {
                 continue;
             };
-            if frame.repaired {
-                *repaired = repaired.saturating_add(1);
-            }
             if let Some(packet) = parse_packet(&frame.bytes) {
                 *packets_ok = packets_ok.saturating_add(1);
+                // Counted inside this arm, not beside it: `repaired` is
+                // documented as a subset of `packets_ok`, and only counting a
+                // repair that actually yielded a packet makes that structural
+                // rather than an invariant borrowed from the deframer's
+                // header/length checks happening to match `parse_packet`'s.
+                if frame.repaired {
+                    *repaired = repaired.saturating_add(1);
+                }
                 events.push(OrbcommEvent {
                     channel_hz: *freq_hz,
                     kind: OrbcommEventKind::Packet {
@@ -695,6 +733,88 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_channels_at_real_spacing_do_not_leak() {
+        // The real Orbcomm grid puts 137.440 and 137.460 MHz just 20 kHz apart,
+        // barely wider than the 19.2 kHz each channel's decimation keeps. This
+        // is the module doc's "a neighbour at the real spacing lands in the
+        // Nuttall stopband" claim, and it is what a real capture will stress.
+        const LOW_HZ: f64 = 137_440_000.0;
+        const HIGH_HZ: f64 = 137_460_000.0;
+        const PAIR_CENTER_HZ: f64 = 137_450_000.0;
+
+        let bits_low = repeated_bits(&sync_packet(0x11), PACKET_REPEATS);
+        let bits_high = repeated_bits(&sync_packet(0x22), PACKET_REPEATS);
+        let mut iq = Vec::new();
+        transmit_into(&mut iq, &bits_low, LOW_HZ - PAIR_CENTER_HZ);
+        transmit_into(&mut iq, &bits_high, HIGH_HZ - PAIR_CENTER_HZ);
+
+        let mut bank = ChannelBank::new(SOURCE_RATE_HZ, PAIR_CENTER_HZ, &[LOW_HZ, HIGH_HZ])
+            .expect("both channels in span");
+        let events = run(&mut bank, &iq);
+
+        let low = sat_ids_on(&events, LOW_HZ);
+        let high = sat_ids_on(&events, HIGH_HZ);
+        assert!(low.len() >= 4, "137.440 produced {} packets", low.len());
+        assert!(high.len() >= 4, "137.460 produced {} packets", high.len());
+        assert!(
+            low.iter().all(|&id| id == 0x11),
+            "137.460 leaked into 137.440: {low:?}"
+        );
+        assert!(
+            high.iter().all(|&id| id == 0x22),
+            "137.440 leaked into 137.460: {high:?}"
+        );
+    }
+
+    #[test]
+    fn repaired_packets_are_a_subset_of_parsed_packets() {
+        // One flipped bit inside an otherwise clean burst: the deframer is
+        // already locked when that stride arrives, repairs it, and emits the
+        // original packet with `repaired: true`. Both counters must move
+        // together — `repaired` is documented as a subset of `packets_ok`.
+        const CORRUPTED_PACKET: usize = 10;
+        let packet = sync_packet(0x2C);
+        let mut bits = repeated_bits(&packet, PACKET_REPEATS);
+        let flip = CORRUPTED_PACKET * packet.len() * 8 + 40;
+        bits[flip] = !bits[flip];
+
+        let mut iq = Vec::new();
+        transmit_into(&mut iq, &bits, CHANNEL_A_HZ - CENTER_HZ);
+        let mut bank =
+            ChannelBank::new(SOURCE_RATE_HZ, CENTER_HZ, &[CHANNEL_A_HZ]).expect("channel in span");
+        let events = run(&mut bank, &iq);
+
+        let stats = bank.stats();
+        assert_eq!(stats.len(), 1);
+        assert!(stats[0].repaired >= 1, "the flipped bit was never repaired");
+        assert!(
+            stats[0].repaired <= stats[0].packets_ok,
+            "repaired {} exceeds packets_ok {}",
+            stats[0].repaired,
+            stats[0].packets_ok
+        );
+
+        // Every repaired event still carries the *original* packet.
+        let repaired: Vec<&OrbcommPacket> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                OrbcommEventKind::Packet {
+                    packet,
+                    repaired: true,
+                } => Some(packet),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(repaired.len() as u64, stats[0].repaired);
+        for packet in repaired {
+            assert!(
+                matches!(packet, OrbcommPacket::Sync { sat_id: 0x2C, .. }),
+                "repair produced {packet:?}"
+            );
+        }
+    }
+
+    #[test]
     fn out_of_span_channel_flagged() {
         // 240 kHz of span around 137.5 MHz reaches ±120 kHz, so only the
         // 137.44 / 137.46 MHz pair fits (with their ±9.6 kHz of bandwidth).
@@ -724,11 +844,25 @@ mod tests {
                 assert_eq!(s.repaired, 0);
             }
         }
-        assert!(
-            events
-                .iter()
-                .all(|e| ORBCOMM_CHANNELS_HZ.contains(&e.channel_hz))
-        );
+        // Anything emitted must carry an *in-span* channel's frequency.
+        // (Asserting membership of ORBCOMM_CHANNELS_HZ would be vacuous —
+        // every event's `channel_hz` is copied from the requested list.)
+        let in_span: Vec<f64> = bank
+            .stats()
+            .iter()
+            .filter(|s| s.in_span)
+            .map(|s| s.freq_hz)
+            .collect();
+        assert_eq!(in_span.len(), 2);
+        for event in &events {
+            assert!(
+                in_span
+                    .iter()
+                    .any(|f| f.to_bits() == event.channel_hz.to_bits()),
+                "event from out-of-span channel {}",
+                event.channel_hz
+            );
+        }
     }
 
     #[test]
@@ -801,6 +935,38 @@ mod tests {
             self.0 = x;
             x.wrapping_mul(0x2545_F491_4F6C_DD1D)
         }
+        /// Uniform in `(0, 1)`.
+        fn next_f64(&mut self) -> f64 {
+            ((self.next_u64() >> 11) as f64 + 0.5) / 9_007_199_254_740_992.0
+        }
+        /// Standard normal via Box–Muller.
+        fn next_normal(&mut self) -> f64 {
+            let u1 = self.next_f64();
+            let u2 = self.next_f64();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+        }
+    }
+
+    /// Add complex AWGN at the requested per-sample SNR, the same convention
+    /// `demod.rs`'s loopback tests use (in-band, at the channel rate — so
+    /// 10 dB here reads as roughly 16 dB of Es/N0 at 4 samples/symbol).
+    fn add_awgn(samples: &mut [Complex], snr_db: f64, seed: u64) {
+        if samples.is_empty() {
+            return;
+        }
+        let signal_power = samples
+            .iter()
+            .map(|s| f64::from(s.re) * f64::from(s.re) + f64::from(s.im) * f64::from(s.im))
+            .sum::<f64>()
+            / samples.len() as f64;
+        let sigma = (signal_power / 10.0_f64.powf(snr_db / 10.0) / 2.0).sqrt();
+        let mut rng = Rng::new(seed);
+        for s in samples.iter_mut() {
+            *s = Complex::new(
+                s.re + (sigma * rng.next_normal()) as f32,
+                s.im + (sigma * rng.next_normal()) as f32,
+            );
+        }
     }
 
     fn apply_cfo(samples: &mut [Complex], cfo_hz: f64) {
@@ -872,13 +1038,61 @@ mod tests {
     }
 
     #[test]
+    fn fll_pulls_in_at_10_db_snr() {
+        // The discriminator runs on the decimated stream *before* the
+        // demodulator's matched filter, so it sees in-band noise out to
+        // ±9.6 kHz rather than the RRC's ±3.36 kHz. Bound that cost at the
+        // same 10 dB per-sample SNR `demod.rs` uses for its noise-margin test:
+        // pull-in from ±3 kHz must still land inside the ±800 Hz contract.
+        //
+        // This is a regression guard, not the cliff. Sweeping the SNR down,
+        // the loop still pulls in at −10 dB and only breaks near −14 dB — the
+        // 256-sample coherent average buys ~24 dB, so the demodulator (already
+        // at 5 % BER by 10 dB) fails long before the FLL does. The wider
+        // measurement bandwidth costs far less than it looked like it might.
+        for (seed, cfo_hz) in [(0x5EED_0110_u64, -3000.0_f64), (0x5EED_0111, 3000.0)] {
+            let mut rng = Rng::new(seed);
+            let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
+            let mut iq = modulate_sdpsk_at_sps(&bits, 4);
+            apply_cfo(&mut iq, cfo_hz);
+            add_awgn(&mut iq, 10.0, seed);
+
+            let mut fll = Fll::new();
+            fll.process(&mut iq);
+            let residual = cfo_hz - fll.freq_hz;
+            assert!(
+                residual.abs() < 800.0,
+                "cfo {cfo_hz} at 10 dB SNR: residual {residual} Hz"
+            );
+        }
+    }
+
+    #[test]
     fn fll_survives_non_finite_samples() {
-        let mut iq = vec![Complex::new(f32::NAN, f32::NAN); 1024];
-        iq[500] = Complex::new(f32::INFINITY, 1.0);
+        // A poisoned prefix must neither park the loop on a NaN nor stop it
+        // tracking: the poisoned blocks are discarded whole, then the clean
+        // tail behind them has to pull in normally.
+        const POISON: usize = 1024;
+        let mut poisoned = vec![Complex::new(f32::NAN, f32::NAN); POISON];
+        poisoned[500] = Complex::new(f32::INFINITY, 1.0);
+        poisoned[700] = Complex::new(1.0, f32::NEG_INFINITY);
+
         let mut fll = Fll::new();
-        fll.process(&mut iq);
+        fll.process(&mut poisoned);
         assert!(fll.freq_hz.is_finite(), "freq went to {}", fll.freq_hz);
         assert!(fll.phase.is_finite());
+
+        let mut rng = Rng::new(0x5EED_0104);
+        let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
+        let mut clean = modulate_sdpsk_at_sps(&bits, 4);
+        apply_cfo(&mut clean, 3000.0);
+        fll.process(&mut clean);
+        let residual = 3000.0 - fll.freq_hz;
+        assert!(
+            residual.abs() < 800.0,
+            "loop did not resume tracking after the poison: residual {residual} Hz"
+        );
+        assert!(clean.iter().all(|s| s.re.is_finite() && s.im.is_finite()));
     }
 
     #[test]
