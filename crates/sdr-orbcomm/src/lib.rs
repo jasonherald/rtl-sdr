@@ -2,6 +2,8 @@
 //! Pure decode: no I/O, no threads, no GTK. Issue #865; protocol
 //! reference in docs/superpowers/specs/2026-08-29-orbcomm-decoder-design.md.
 
+pub mod packet;
+
 /// Active Orbcomm subscriber downlink channels (Hz), low to high.
 pub const ORBCOMM_CHANNELS_HZ: [f64; 9] = [
     137_225_000.0,
