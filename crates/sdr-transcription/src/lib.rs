@@ -26,7 +26,7 @@ compile_error!(
     "the `sherpa-cpu` and `sherpa-cuda` features are mutually exclusive. \
      Pick exactly one link mode for the sherpa-onnx prebuilt: \
      `sherpa-cpu` (CPU static link) or `sherpa-cuda` (shared link against \
-     the CUDA 12.x + cuDNN 9.x prebuilt)."
+     the CUDA 13.x + cuDNN 9.x prebuilt)."
 );
 
 // `sherpa` is an internal umbrella feature activated by the two
