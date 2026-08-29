@@ -101,7 +101,12 @@ build:
 # ORDER in the install list alone doesn't serialize under -j. Per CR
 # round 2 on PR #859.
 install-bin: build
-install-sherpa-runtime-libs: build
+# Ordered strictly AFTER the binary replace (not a sibling): under
+# `make -j install`, a failed binary copy relaunches the OLD binary,
+# which must never race a concurrent prune/copy of the runtime libs
+# it is loading. Serializing makes stop → binary → libs one
+# transaction. Per CR round 4 on PR #862.
+install-sherpa-runtime-libs: install-bin
 
 # Never install over a RUNNING sdr-rs: replacing the executable (and
 # its adjacent sdr-rs-libs) under a live process leaves the dynamic
@@ -160,8 +165,10 @@ install-bin:
 	@# replacement, so stopping them all is the correct radius.
 	@if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
 		echo "  sdr-rs is running — stopping it for the install (will relaunch)"; \
-		mkdir -p $$(dirname $(RESTART_SENTINEL)); \
-		touch $(RESTART_SENTINEL); \
+		if ! mkdir -p $$(dirname $(RESTART_SENTINEL)) || ! touch $(RESTART_SENTINEL); then \
+			echo "error: cannot create $(RESTART_SENTINEL) — refusing to stop sdr-rs without a relaunch marker"; \
+			exit 1; \
+		fi; \
 		pkill -u $$(id -u) -x -TERM sdr-rs; \
 		for i in $$(seq 1 50); do \
 			pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1 || break; \
