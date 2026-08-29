@@ -51,10 +51,10 @@ make install CARGO_FLAGS="--release --features whisper-cuda"        # User's dai
 make install CARGO_FLAGS="--release --features whisper-hipblas"     # AMD ROCm
 make install CARGO_FLAGS="--release --features whisper-vulkan"      # Cross-vendor GPU
 
-# Sherpa-onnx — Zipformer / Moonshine / Parakeet, English-only
+# Sherpa-onnx — Zipformer / Moonshine / Parakeet / Nemotron / Canary / Cohere (English-first; Cohere adds 14 languages)
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"   # Sherpa CPU
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda"  # Sherpa + NVIDIA GPU
-make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm"  # Sherpa + AMD GPU (MIGraphX)
+make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm"  # Sherpa + AMD GPU (MIGraphX; Cohere only)
 ```
 
 **`sherpa-cuda` resolves the CUDA runtime from system packages** (#855 — Arch: `pacman -S cuda cudnn`, i.e. CUDA 13.x + cuDNN 9.x, plus the `nvidia`/`nvidia-utils` driver). The former ~1.9 GB NVIDIA redist sideload is retired: k2-fsa now publishes a CUDA-13 flavor of the sherpa-onnx prebuilt and Arch packages cudnn, so the two ecosystem gaps that forced self-containment are gone — and system packages set the pattern for a future ROCm backend consumed the same way.
@@ -65,7 +65,7 @@ make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm
 
 Linux x86_64 only. The first `sherpa-cuda` build downloads a ~230 MB sherpa-onnx CUDA-13 prebuilt from k2-fsa (`sherpa-rocm` builds locally instead, as above). The sherpa-onnx dep is pinned to the [jasonherald/sherpa-onnx](https://github.com/jasonherald/sherpa-onnx) fork on branch `feat/rust-sys-cuda-support` (upstream v1.13.6 + the `cuda` feature); a crates.io pin remains the exit ramp if the feature is ever upstreamed. Trade-off: the GPU path now tracks Arch's rolling CUDA major — when Arch jumps to CUDA 14 the preflight will fail clearly until k2-fsa ships a matching prebuilt.
 
-**Triple-build testing rule:** any change to `sdr-transcription` or its callers MUST be tested with `whisper-cuda`, `sherpa-cpu`, AND `sherpa-cuda` builds sequentially before pushing. The cfg gates make it easy to break one without noticing. CI runs `cargo check` on sherpa-cpu and sherpa-cuda (adding CUDA toolkit to CI runners is not worth the minutes, so whisper-cuda is user-verified locally).
+**Triple-build testing rule:** any change to `sdr-transcription` or its callers MUST be tested with `whisper-cuda`, `sherpa-cpu`, AND `sherpa-cuda` builds sequentially before pushing, plus a `sherpa-rocm` `cargo clippy`/`cargo check` when the ROCm prerequisites are present (system `onnxruntime-rocm` + the cached C-lib build, via `SHERPA_ONNX_LIB_DIR=~/.cache/sdr-rs/sherpa-rocm/lib`). The cfg gates make it easy to break one without noticing. CI runs `cargo check` on sherpa-cpu and sherpa-cuda only — sherpa-rocm needs the locally built C libraries and whisper-cuda needs the CUDA toolkit, so both are dev-box-verified.
 
 Runtime model selection for Sherpa builds is in-place (drop-old-recognizer-build-new) and does NOT require a restart — PR 5 architecture. The PR 2 "pre-GTK init" half of the heap-corruption workaround turned out to be unnecessary once the feature mutex was in place; only the first recognizer needs pre-GTK creation, and subsequent swaps post-GTK work fine.
 

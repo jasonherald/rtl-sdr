@@ -148,7 +148,7 @@ make install CARGO_FLAGS="--release --features whisper-cuda"       # NVIDIA GPU
 make install CARGO_FLAGS="--release --features whisper-hipblas"    # AMD ROCm
 make install CARGO_FLAGS="--release --features whisper-vulkan"     # Cross-vendor GPU
 
-# Sherpa-onnx backend — Zipformer / Moonshine / Parakeet, English-only
+# Sherpa-onnx backend — Zipformer / Moonshine / Parakeet / Nemotron / Canary / Cohere (English-first; Cohere adds 14 languages)
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cpu"   # Sherpa CPU
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda"  # Sherpa + NVIDIA GPU
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm"  # Sherpa + AMD GPU (MIGraphX; needs onnxruntime-rocm; Cohere Transcribe only)
