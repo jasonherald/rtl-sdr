@@ -117,7 +117,10 @@ install-sherpa-runtime-libs: build
 # not exit. This sentinel records the stop so `install`'s final
 # recipe relaunches the app; install-bin clears any stale copy from
 # an aborted earlier run before detection.
-RESTART_SENTINEL := /tmp/.sdr-rs-restart-$(shell id -u)
+# Under the user's own cache dir, not /tmp — a predictable /tmp path
+# could be pre-created by another local user (CWE-377), and the
+# sticky bit would then block our rm. Per CR round 3 on PR #862.
+RESTART_SENTINEL := $(HOME)/.cache/sdr-rs/.restart-sentinel
 
 install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-desktop
 	@echo ""
@@ -157,6 +160,7 @@ install-bin:
 	@# replacement, so stopping them all is the correct radius.
 	@if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
 		echo "  sdr-rs is running — stopping it for the install (will relaunch)"; \
+		mkdir -p $$(dirname $(RESTART_SENTINEL)); \
 		touch $(RESTART_SENTINEL); \
 		pkill -u $$(id -u) -x -TERM sdr-rs; \
 		for i in $$(seq 1 50); do \
@@ -169,11 +173,17 @@ install-bin:
 			exit 1; \
 		fi; \
 	fi
-	@# The copy itself is the failure-guarded step: on error the OLD
-	@# binary is still intact on disk, so relaunch it immediately
-	@# rather than leaving the user appless after a failed install.
+	@# The copy itself is the failure-guarded step, staged through a
+	@# temp file + atomic rename so a failed copy can NEVER leave a
+	@# truncated sdr-rs on disk — the old binary stays intact and is
+	@# relaunched rather than leaving the user appless. Per CR
+	@# round 3 on PR #862.
 	@mkdir -p $(BINDIR)
-	@if ! install -m 755 target/release/sdr $(BINDIR)/sdr-rs; then \
+	@if install -m 755 target/release/sdr $(BINDIR)/.sdr-rs.tmp \
+		&& mv -f $(BINDIR)/.sdr-rs.tmp $(BINDIR)/sdr-rs; then \
+		:; \
+	else \
+		rm -f $(BINDIR)/.sdr-rs.tmp; \
 		if [ -f $(RESTART_SENTINEL) ]; then \
 			rm -f $(RESTART_SENTINEL); \
 			echo "  binary copy failed — relaunching the previous sdr-rs"; \
