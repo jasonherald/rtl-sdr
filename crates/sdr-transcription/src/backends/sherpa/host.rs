@@ -316,12 +316,12 @@ fn run_host_loop(
         // Both offline kinds share init_offline — only the recognizer
         // config builder differs, and that branching happens inside
         // init_offline based on model.kind() again.
-        ModelKind::OfflineMoonshine | ModelKind::OfflineNemoTransducer => {
-            match init_offline(model, &event_tx) {
-                Ok(state) => state,
-                Err(()) => return,
-            }
-        }
+        ModelKind::OfflineMoonshine
+        | ModelKind::OfflineNemoTransducer
+        | ModelKind::OfflineCohereTranscribe => match init_offline(model, &event_tx) {
+            Ok(state) => state,
+            Err(()) => return,
+        },
     };
 
     // --- Phase 3: build SherpaHost and store in SHERPA_HOST ---
@@ -404,7 +404,8 @@ fn handle_reload_recognizer(
     let new_state = match new_model.kind() {
         crate::sherpa_model::ModelKind::OnlineTransducer => init_online(new_model, event_tx),
         crate::sherpa_model::ModelKind::OfflineMoonshine
-        | crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
+        | crate::sherpa_model::ModelKind::OfflineNemoTransducer
+        | crate::sherpa_model::ModelKind::OfflineCohereTranscribe => {
             init_offline(new_model, event_tx)
         }
     };
@@ -479,6 +480,43 @@ fn init_online(
 /// callers don't need to know which offline family they're using.
 /// Returns `Err(())` on any failure — the error has already been
 /// stored in `SHERPA_HOST` and emitted as `InitEvent::Failed`.
+/// Pick the offline recognizer config builder for `model`'s kind so
+/// `init_offline`'s Phase 1-2 (download VAD + bundle) stays generic
+/// across all offline models.
+///
+/// The `OnlineTransducer` arm should be unreachable in practice —
+/// every caller of `init_offline` (the dispatches in `run_host_loop`)
+/// only routes the offline kinds here. Still, library crates forbid
+/// `panic!` / `unreachable!` so it routes through the normal init
+/// failure path (publish `Failed`, return `None`) instead of
+/// aborting the process.
+fn offline_recognizer_config_for(
+    model: SherpaModel,
+    event_tx: &mpsc::Sender<InitEvent>,
+) -> Option<sherpa_onnx::OfflineRecognizerConfig> {
+    match model.kind() {
+        crate::sherpa_model::ModelKind::OfflineMoonshine => Some(
+            super::offline::build_moonshine_recognizer_config(model, super::SHERPA_PROVIDER),
+        ),
+        crate::sherpa_model::ModelKind::OfflineNemoTransducer => Some(
+            super::offline::build_nemo_transducer_recognizer_config(model, super::SHERPA_PROVIDER),
+        ),
+        crate::sherpa_model::ModelKind::OfflineCohereTranscribe => Some(
+            super::offline::build_cohere_recognizer_config(model, super::SHERPA_PROVIDER),
+        ),
+        crate::sherpa_model::ModelKind::OnlineTransducer => {
+            let msg = format!(
+                "init_offline called with online model {} — engine routing bug",
+                model.label()
+            );
+            tracing::error!(%msg);
+            store_init_failure(BackendError::Init(msg.clone()));
+            let _ = event_tx.send(InitEvent::Failed { message: msg });
+            None
+        }
+    }
+}
+
 fn init_offline(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
@@ -500,33 +538,8 @@ fn init_offline(
 
     // --- Build OfflineRecognizer ---
     let _ = event_tx.send(InitEvent::CreatingRecognizer);
-    // Both offline kinds use OfflineRecognizer but with different config
-    // builders. Branch here so init_offline's Phase 1-2 (download VAD +
-    // bundle) stays generic across all offline models.
-    //
-    // The `OnlineTransducer` arm should be unreachable in practice —
-    // every caller of `init_offline` (the two places in `run_host_loop`
-    // that dispatch on `model.kind()`) only routes `OfflineMoonshine`
-    // and `OfflineNemoTransducer` here. Still, library crates forbid
-    // `panic!` / `unreachable!` so we route through the normal init
-    // failure path instead of aborting the process.
-    let recognizer_config = match model.kind() {
-        crate::sherpa_model::ModelKind::OfflineMoonshine => {
-            super::offline::build_moonshine_recognizer_config(model, super::SHERPA_PROVIDER)
-        }
-        crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
-            super::offline::build_nemo_transducer_recognizer_config(model, super::SHERPA_PROVIDER)
-        }
-        crate::sherpa_model::ModelKind::OnlineTransducer => {
-            let msg = format!(
-                "init_offline called with online model {} — engine routing bug",
-                model.label()
-            );
-            tracing::error!(%msg);
-            store_init_failure(BackendError::Init(msg.clone()));
-            let _ = event_tx.send(InitEvent::Failed { message: msg });
-            return Err(());
-        }
+    let Some(recognizer_config) = offline_recognizer_config_for(model, event_tx) else {
+        return Err(());
     };
     tracing::info!(
         ?model,

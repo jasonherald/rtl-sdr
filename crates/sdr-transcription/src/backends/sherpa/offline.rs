@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use sherpa_onnx::{
-    OfflineModelConfig, OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
-    OfflineTransducerModelConfig,
+    OfflineCohereTranscribeModelConfig, OfflineModelConfig, OfflineMoonshineModelConfig,
+    OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
 };
 
 use crate::backend::{TranscriptionEvent, TranscriptionInput};
@@ -259,6 +259,62 @@ pub(super) fn build_nemo_transducer_recognizer_config(
         // Required — tells sherpa-onnx to use NeMo's TDT decode loop
         // instead of the generic transducer path.
         model_type: Some(NEMO_TRANSDUCER_MODEL_TYPE.to_owned()),
+        ..OfflineModelConfig::default()
+    };
+
+    OfflineRecognizerConfig {
+        model_config,
+        ..OfflineRecognizerConfig::default()
+    }
+}
+
+/// Language code Cohere Transcribe decodes with. The model is
+/// multilingual; this app targets English scanner audio, so the
+/// language is fixed rather than user-selectable (revisit if a
+/// multilingual use case appears). Per issue #853.
+const COHERE_TRANSCRIBE_LANGUAGE: &str = "en";
+
+/// Build the `OfflineRecognizerConfig` for Cohere Transcribe.
+///
+/// Encoder + decoder + tokens through
+/// `OfflineCohereTranscribeModelConfig`, with punctuation and inverse
+/// text normalization enabled — radio transcripts read better with
+/// "123" than "one two three", and the transcript panel does no
+/// post-processing of its own.
+pub(super) fn build_cohere_recognizer_config(
+    model: SherpaModel,
+    provider: &str,
+) -> OfflineRecognizerConfig {
+    debug_assert_eq!(
+        model.kind(),
+        crate::sherpa_model::ModelKind::OfflineCohereTranscribe,
+        "build_cohere_recognizer_config called with non-OfflineCohereTranscribe model"
+    );
+
+    let ModelFilePaths::CohereTranscribe {
+        encoder,
+        decoder,
+        tokens,
+    } = sherpa_model::model_file_paths(model)
+    else {
+        unreachable!(
+            "offline::build_cohere_recognizer_config called with non-CohereTranscribe layout"
+        )
+    };
+
+    let cohere_transcribe = OfflineCohereTranscribeModelConfig {
+        encoder: Some(encoder.to_string_lossy().into_owned()),
+        decoder: Some(decoder.to_string_lossy().into_owned()),
+        language: Some(COHERE_TRANSCRIBE_LANGUAGE.to_owned()),
+        use_punct: true,
+        use_itn: true,
+    };
+
+    let model_config = OfflineModelConfig {
+        cohere_transcribe,
+        tokens: Some(tokens.to_string_lossy().into_owned()),
+        provider: Some(provider.to_owned()),
+        num_threads: SHERPA_NUM_THREADS,
         ..OfflineModelConfig::default()
     };
 

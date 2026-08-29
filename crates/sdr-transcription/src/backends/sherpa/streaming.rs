@@ -57,6 +57,10 @@ pub(super) fn build_recognizer_config(
     config.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
     config.model_config.provider = Some(provider.to_owned());
     config.model_config.num_threads = SHERPA_NUM_THREADS;
+    // Per-model mel dimension: Zipformer exports use the default 80,
+    // Nemotron's cache-aware streaming export uses 128. A mismatch
+    // decodes silently to garbage rather than erroring. Per #853.
+    config.feat_config.feature_dim = model.feature_dim();
     config.enable_endpoint = true;
     config.decoding_method = Some("greedy_search".to_owned());
     config.rule1_min_trailing_silence = RULE1_MIN_TRAILING_SILENCE;

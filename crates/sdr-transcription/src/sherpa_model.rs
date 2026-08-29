@@ -78,6 +78,12 @@ pub enum ModelKind {
     /// offline session loop as `OfflineMoonshine`; only the recognizer
     /// config builder differs.
     OfflineNemoTransducer,
+    /// Offline Cohere Transcribe (Conformer encoder + Transformer
+    /// decoder). Uses `OfflineRecognizer` with
+    /// `OfflineCohereTranscribeModelConfig` (encoder + decoder +
+    /// tokens, per-decode language). Shares the VAD-gated offline
+    /// session loop. Per issue #853.
+    OfflineCohereTranscribe,
 }
 
 /// Available sherpa-onnx model variants.
@@ -98,6 +104,19 @@ pub enum SherpaModel {
     /// leaderboard. CPU-only today (sherpa-cuda follow-up tracked).
     /// Offline (VAD-gated) batch decode through a `NeMo` transducer.
     ParakeetTdt06bV3En,
+    /// NVIDIA Nemotron Speech Streaming 0.6b (English, int8, 560 ms
+    /// cache-aware chunk). Parakeet-class accuracy with STREAMING
+    /// decode — live partials at a fraction of the offline models'
+    /// latency. Runs through the standard `OnlineRecognizer`
+    /// transducer path (the NeMo-style stateful decoder is
+    /// auto-detected from the decoder session), with 128-dim
+    /// features. Per issue #853.
+    NemotronStreamingEn,
+    /// Cohere Transcribe (14 languages, int8). 2B-param Conformer —
+    /// the accuracy heavyweight (~2 GB bundle). English is dialed in
+    /// via the per-decode language setting. Offline (VAD-gated)
+    /// decode. Per issue #853.
+    CohereTranscribe14Lang,
 }
 
 impl SherpaModel {
@@ -108,6 +127,8 @@ impl SherpaModel {
             Self::MoonshineTinyEn => "Moonshine Tiny (English)",
             Self::MoonshineBaseEn => "Moonshine Base (English)",
             Self::ParakeetTdt06bV3En => "Parakeet TDT 0.6b v3 (English)",
+            Self::NemotronStreamingEn => "Nemotron Streaming 0.6b (English)",
+            Self::CohereTranscribe14Lang => "Cohere Transcribe (English)",
         }
     }
 
@@ -119,6 +140,8 @@ impl SherpaModel {
             Self::MoonshineTinyEn => "moonshine-tiny-en",
             Self::MoonshineBaseEn => "moonshine-base-en",
             Self::ParakeetTdt06bV3En => "parakeet-tdt-0.6b-v3-en",
+            Self::NemotronStreamingEn => "nemotron-streaming-en",
+            Self::CohereTranscribe14Lang => "cohere-transcribe-14-lang",
         }
     }
 
@@ -131,6 +154,12 @@ impl SherpaModel {
             Self::MoonshineTinyEn => "sherpa-onnx-moonshine-tiny-en-int8.tar.bz2",
             Self::MoonshineBaseEn => "sherpa-onnx-moonshine-base-en-int8.tar.bz2",
             Self::ParakeetTdt06bV3En => "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
+            Self::NemotronStreamingEn => {
+                "sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25.tar.bz2"
+            }
+            Self::CohereTranscribe14Lang => {
+                "sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01.tar.bz2"
+            }
         }
     }
 
@@ -145,6 +174,10 @@ impl SherpaModel {
             Self::MoonshineTinyEn => "sherpa-onnx-moonshine-tiny-en-int8",
             Self::MoonshineBaseEn => "sherpa-onnx-moonshine-base-en-int8",
             Self::ParakeetTdt06bV3En => "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+            Self::NemotronStreamingEn => {
+                "sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25"
+            }
+            Self::CohereTranscribe14Lang => "sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01",
         }
     }
 
@@ -163,9 +196,21 @@ impl SherpaModel {
     /// right recognizer type and session loop.
     pub fn kind(self) -> ModelKind {
         match self {
-            Self::StreamingZipformerEn => ModelKind::OnlineTransducer,
+            Self::StreamingZipformerEn | Self::NemotronStreamingEn => ModelKind::OnlineTransducer,
             Self::MoonshineTinyEn | Self::MoonshineBaseEn => ModelKind::OfflineMoonshine,
             Self::ParakeetTdt06bV3En => ModelKind::OfflineNemoTransducer,
+            Self::CohereTranscribe14Lang => ModelKind::OfflineCohereTranscribe,
+        }
+    }
+
+    /// Mel filterbank dimension the model's acoustic frontend expects.
+    /// Zipformer exports use sherpa's default 80; NVIDIA's Nemotron
+    /// streaming export uses 128 — feeding the wrong dimension decodes
+    /// silently to garbage rather than erroring. Per issue #853.
+    pub fn feature_dim(self) -> i32 {
+        match self {
+            Self::NemotronStreamingEn => 128,
+            _ => 80,
         }
     }
 
@@ -179,7 +224,9 @@ impl SherpaModel {
     pub fn supports_partials(self) -> bool {
         match self.kind() {
             ModelKind::OnlineTransducer => true,
-            ModelKind::OfflineMoonshine | ModelKind::OfflineNemoTransducer => false,
+            ModelKind::OfflineMoonshine
+            | ModelKind::OfflineNemoTransducer
+            | ModelKind::OfflineCohereTranscribe => false,
         }
     }
 
@@ -189,6 +236,8 @@ impl SherpaModel {
         Self::MoonshineTinyEn,
         Self::MoonshineBaseEn,
         Self::ParakeetTdt06bV3En,
+        Self::NemotronStreamingEn,
+        Self::CohereTranscribe14Lang,
     ];
 }
 
@@ -361,6 +410,11 @@ pub enum ModelFilePaths {
         cached_decoder: PathBuf,
         tokens: PathBuf,
     },
+    CohereTranscribe {
+        encoder: PathBuf,
+        decoder: PathBuf,
+        tokens: PathBuf,
+    },
 }
 
 /// Returns the full paths for all files needed by a sherpa model.
@@ -395,10 +449,19 @@ pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
         // to Zipformer. The `Transducer` ModelFilePaths variant is
         // reused — kind() tells the host which recognizer API to feed
         // them into (online for Zipformer vs offline for Parakeet).
-        SherpaModel::ParakeetTdt06bV3En => ModelFilePaths::Transducer {
+        // Nemotron streaming shares Parakeet's 4-file int8 transducer
+        // layout; kind() routes it to the ONLINE recognizer.
+        SherpaModel::ParakeetTdt06bV3En | SherpaModel::NemotronStreamingEn => {
+            ModelFilePaths::Transducer {
+                encoder: dir.join("encoder.int8.onnx"),
+                decoder: dir.join("decoder.int8.onnx"),
+                joiner: dir.join("joiner.int8.onnx"),
+                tokens: dir.join("tokens.txt"),
+            }
+        }
+        SherpaModel::CohereTranscribe14Lang => ModelFilePaths::CohereTranscribe {
             encoder: dir.join("encoder.int8.onnx"),
             decoder: dir.join("decoder.int8.onnx"),
-            joiner: dir.join("joiner.int8.onnx"),
             tokens: dir.join("tokens.txt"),
         },
     }
@@ -426,6 +489,11 @@ pub fn model_exists(model: SherpaModel) -> bool {
                 && cached_decoder.is_file()
                 && tokens.is_file()
         }
+        ModelFilePaths::CohereTranscribe {
+            encoder,
+            decoder,
+            tokens,
+        } => encoder.is_file() && decoder.is_file() && tokens.is_file(),
     }
 }
 

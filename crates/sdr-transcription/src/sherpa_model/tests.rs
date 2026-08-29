@@ -146,8 +146,8 @@ fn moonshine_archive_urls_are_well_formed() {
 }
 
 #[test]
-fn all_contains_four_variants() {
-    assert_eq!(SherpaModel::ALL.len(), 4);
+fn all_contains_six_variants() {
+    assert_eq!(SherpaModel::ALL.len(), 6);
 }
 
 #[test]
@@ -238,4 +238,70 @@ fn all_models_preserves_legacy_indices() {
 fn silero_vad_path_is_under_sherpa_models_dir() {
     let path = silero_vad_path();
     assert!(path.ends_with("silero-vad/silero_vad.onnx"));
+}
+
+// ── #853: Nemotron streaming + Cohere Transcribe ──────────────────
+
+#[test]
+fn nemotron_is_online_transducer_with_128_feature_dim() {
+    let m = SherpaModel::NemotronStreamingEn;
+    assert_eq!(m.kind(), ModelKind::OnlineTransducer);
+    assert!(m.supports_partials());
+    // NVIDIA's cache-aware streaming export uses 128-dim features —
+    // Zipformer's 80 would silently produce garbage decodes.
+    assert_eq!(m.feature_dim(), 128);
+    assert_eq!(SherpaModel::StreamingZipformerEn.feature_dim(), 80);
+}
+
+#[test]
+fn nemotron_file_paths_are_int8_transducer_layout() {
+    let ModelFilePaths::Transducer {
+        encoder,
+        decoder,
+        joiner,
+        tokens,
+    } = model_file_paths(SherpaModel::NemotronStreamingEn)
+    else {
+        panic!("nemotron must be a Transducer layout");
+    };
+    assert!(encoder.ends_with("nemotron-streaming-en/encoder.int8.onnx"));
+    assert!(decoder.ends_with("nemotron-streaming-en/decoder.int8.onnx"));
+    assert!(joiner.ends_with("nemotron-streaming-en/joiner.int8.onnx"));
+    assert!(tokens.ends_with("nemotron-streaming-en/tokens.txt"));
+}
+
+#[test]
+fn cohere_is_offline_with_encoder_decoder_layout() {
+    let m = SherpaModel::CohereTranscribe14Lang;
+    assert_eq!(m.kind(), ModelKind::OfflineCohereTranscribe);
+    assert!(!m.supports_partials());
+    let ModelFilePaths::CohereTranscribe {
+        encoder,
+        decoder,
+        tokens,
+    } = model_file_paths(m)
+    else {
+        panic!("cohere must be a CohereTranscribe layout");
+    };
+    assert!(encoder.ends_with("cohere-transcribe-14-lang/encoder.int8.onnx"));
+    assert!(decoder.ends_with("cohere-transcribe-14-lang/decoder.int8.onnx"));
+    assert!(tokens.ends_with("cohere-transcribe-14-lang/tokens.txt"));
+}
+
+#[test]
+fn new_models_are_appended_after_existing_indices() {
+    // The UI persists the selection as an index into ALL — existing
+    // entries' positions are config keys and must not move.
+    assert_eq!(
+        SherpaModel::ALL[..4],
+        [
+            SherpaModel::StreamingZipformerEn,
+            SherpaModel::MoonshineTinyEn,
+            SherpaModel::MoonshineBaseEn,
+            SherpaModel::ParakeetTdt06bV3En,
+        ]
+    );
+    assert_eq!(SherpaModel::ALL.len(), 6);
+    assert_eq!(SherpaModel::ALL[4], SherpaModel::NemotronStreamingEn);
+    assert_eq!(SherpaModel::ALL[5], SherpaModel::CohereTranscribe14Lang);
 }
