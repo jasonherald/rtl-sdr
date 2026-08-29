@@ -36,6 +36,16 @@ CARGO_FLAGS ?= --release
 # by sherpa-onnx-sys's build script) — but the cargo failure is
 # cryptic, so fail fast with the real reason. Per CR round 3 on
 # PR #859.
+# This Makefile installs into $(HOME)/.cargo/bin — a per-user layout
+# where root execution is never right: `sudo make install` would
+# install into /root, miss the user's running sdr-rs during the
+# stop-detection, and relaunch the app as root without the session's
+# Wayland/PipeWire sockets. Refuse up front. Per Codacy round 1 on
+# PR #862.
+ifeq ($(shell id -u),0)
+$(error this Makefile installs per-user into $$HOME/.cargo/bin — run it WITHOUT sudo)
+endif
+
 ifneq (,$(findstring --all-features,$(CARGO_FLAGS)))
 $(error --all-features is not buildable: transcription backends and sherpa link modes are mutually exclusive cargo features — pick exactly one, e.g. CARGO_FLAGS="--release --features whisper-cuda")
 endif
@@ -91,9 +101,48 @@ build:
 # ORDER in the install list alone doesn't serialize under -j. Per CR
 # round 2 on PR #859.
 install-bin: build
-install-sherpa-runtime-libs: build
+# Ordered strictly AFTER the binary replace (not a sibling): under
+# `make -j install`, a failed binary copy relaunches the OLD binary,
+# which must never race a concurrent prune/copy of the runtime libs
+# it is loading. Serializing makes stop → binary → libs one
+# transaction. Per CR round 4 on PR #862.
+install-sherpa-runtime-libs: install-bin
+
+# Never install over a RUNNING sdr-rs: replacing the executable (and
+# its adjacent sdr-rs-libs) under a live process leaves the dynamic
+# loader holding stale state, and the next dlopen — e.g. PipeWire
+# lazily loading an SPA plugin on an audio-route change — SIGSEGVs
+# inside ld-linux (observed 2026-08-29: bias-T toggle after a
+# mid-run install; the core's executable line read "(deleted)").
+# The stop runs INSIDE install-bin's recipe (after its `build`
+# prerequisite), so even `make -j install` keeps the app running
+# through the long compile — it is only down for the copy window.
+# Graceful SIGTERM so GTK runs its shutdown path (recordings
+# finalized, config flushed), bounded wait, hard error if it will
+# not exit. This sentinel records the stop so `install`'s final
+# recipe relaunches the app; install-bin clears any stale copy from
+# an aborted earlier run before detection.
+# Under the user's own cache dir, not /tmp — a predictable /tmp path
+# could be pre-created by another local user (CWE-377), and the
+# sticky bit would then block our rm. Per CR round 3 on PR #862.
+RESTART_SENTINEL := $(HOME)/.cache/sdr-rs/.restart-sentinel
 
 install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-desktop
+	@if [ -f "$(RESTART_SENTINEL)" ]; then \
+		echo "  relaunching sdr-rs"; \
+		setsid -f "$(BINDIR)/sdr-rs" >/dev/null 2>&1 || true; \
+		started=0; \
+		for i in $$(seq 1 15); do \
+			if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then started=1; break; fi; \
+			sleep 0.2; \
+		done; \
+		if [ "$$started" = "1" ]; then \
+			rm -f "$(RESTART_SENTINEL)"; \
+		else \
+			echo "error: relaunched sdr-rs did not appear within 3 s — sentinel kept, start it manually or re-run make install"; \
+			exit 1; \
+		fi; \
+	fi
 	@echo ""
 	@echo "SDR-RS installed successfully!"
 	@echo "  Binary:   $(BINDIR)/sdr-rs"
@@ -107,8 +156,62 @@ install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-d
 	@echo ""
 
 install-bin:
-	@mkdir -p $(BINDIR)
-	install -m 755 target/release/sdr $(BINDIR)/sdr-rs
+	@# Sentinel triage (CR round 2 on PR #862): a sentinel with the
+	@# app RUNNING is stale (user relaunched manually after an
+	@# aborted install) — clear it so this run doesn't relaunch
+	@# unexpectedly. A sentinel with the app NOT running means a
+	@# previous install died after the stop — KEEP it, so this run's
+	@# completion heals the situation by relaunching.
+	@if [ -f "$(RESTART_SENTINEL)" ] && pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+		rm -f "$(RESTART_SENTINEL)"; \
+	fi
+	@# Stop a running sdr-rs INSIDE this recipe (which already
+	@# depends on `build`) so `make -j install` cannot TERM the app
+	@# while cargo is still compiling — the app is only down for the
+	@# copy window. Graceful SIGTERM so GTK's shutdown path runs;
+	@# hard error rather than installing over a live binary. UID
+	@# scope (not session scope) is deliberate: any same-user
+	@# instance runs THIS binary path and would crash on the
+	@# replacement, so stopping them all is the correct radius.
+	@if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+		echo "  sdr-rs is running — stopping it for the install (will relaunch)"; \
+		if ! mkdir -p "$$(dirname '$(RESTART_SENTINEL)')" || ! touch "$(RESTART_SENTINEL)"; then \
+			echo "error: cannot create $(RESTART_SENTINEL) — refusing to stop sdr-rs without a relaunch marker"; \
+			exit 1; \
+		fi; \
+		pkill -u $$(id -u) -x -TERM sdr-rs; \
+		for i in $$(seq 1 50); do \
+			pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1 || break; \
+			sleep 0.2; \
+		done; \
+		if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+			echo "error: sdr-rs did not exit within 10 s — close it and re-run make install"; \
+			exit 1; \
+		fi; \
+	fi
+	@# The copy itself is the failure-guarded step, staged through a
+	@# temp file + atomic rename so a failed copy can NEVER leave a
+	@# truncated sdr-rs on disk — the old binary stays intact and is
+	@# relaunched rather than leaving the user appless. Per CR
+	@# round 3 on PR #862.
+	@if mkdir -p "$(BINDIR)" \
+		&& install -m 755 target/release/sdr "$(BINDIR)/.sdr-rs.tmp" \
+		&& mv -f "$(BINDIR)/.sdr-rs.tmp" "$(BINDIR)/sdr-rs"; then \
+		:; \
+	else \
+		rm -f "$(BINDIR)/.sdr-rs.tmp"; \
+		if [ -f "$(RESTART_SENTINEL)" ]; then \
+			echo "  binary copy failed — relaunching the previous sdr-rs"; \
+			setsid -f "$(BINDIR)/sdr-rs" >/dev/null 2>&1 || true; \
+			for i in $$(seq 1 15); do \
+				if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+					rm -f "$(RESTART_SENTINEL)"; break; \
+				fi; \
+				sleep 0.2; \
+			done; \
+		fi; \
+		exit 1; \
+	fi
 
 # When a sherpa-cuda build is active, sherpa-onnx is linked as a shared
 # library (the CUDA prebuilt doesn't ship a static archive). The sys
@@ -146,7 +249,7 @@ install-sherpa-runtime-libs:
 		          target/release/libonnxruntime_providers_cuda.so \
 		          target/release/libonnxruntime_providers_shared.so; do \
 			if [ -f "$$so" ] || [ -L "$$so" ]; then \
-				cp -a "$$so" $(LIBDIR)/; \
+				cp -a "$$so" $(LIBDIR)/ || exit 1; \
 				echo "  installed $$(basename $$so)"; \
 			fi; \
 		done; \
