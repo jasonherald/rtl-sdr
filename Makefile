@@ -30,6 +30,16 @@ CARGO_FLAGS ?= --release
 # `findstring` returns the matched substring on hit, empty on miss,
 # so `ifneq (,...)` is "if the flag is present". Whisper and
 # sherpa-cpu builds skip the runtime-lib plumbing entirely.
+# `--all-features` can never produce an installable binary here — it
+# enables whisper AND sherpa together (rejected by the transcription
+# feature mutex) and static+shared+cuda link modes together (rejected
+# by sherpa-onnx-sys's build script) — but the cargo failure is
+# cryptic, so fail fast with the real reason. Per CR round 3 on
+# PR #859.
+ifneq (,$(findstring --all-features,$(CARGO_FLAGS)))
+$(error --all-features is not buildable: transcription backends and sherpa link modes are mutually exclusive cargo features — pick exactly one, e.g. CARGO_FLAGS="--release --features whisper-cuda")
+endif
+
 INSTALL_RUNTIME_LIB_TARGETS :=
 ifneq (,$(findstring sherpa-cuda,$(CARGO_FLAGS)))
 INSTALL_RUNTIME_LIB_TARGETS += check-cuda-system-libs install-sherpa-runtime-libs
