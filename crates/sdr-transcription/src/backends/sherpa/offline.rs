@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use sherpa_onnx::{
-    OfflineModelConfig, OfflineMoonshineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
-    OfflineTransducerModelConfig,
+    OfflineCohereTranscribeModelConfig, OfflineModelConfig, OfflineMoonshineModelConfig,
+    OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
 };
 
 use crate::backend::{TranscriptionEvent, TranscriptionInput};
@@ -173,7 +173,7 @@ const STEREO_48K_TO_MONO_16K_CAPACITY_DIVISOR: usize =
 pub(super) fn build_moonshine_recognizer_config(
     model: SherpaModel,
     provider: &str,
-) -> OfflineRecognizerConfig {
+) -> Option<OfflineRecognizerConfig> {
     let ModelFilePaths::Moonshine {
         preprocessor,
         encoder,
@@ -182,7 +182,11 @@ pub(super) fn build_moonshine_recognizer_config(
         tokens,
     } = sherpa_model::model_file_paths(model)
     else {
-        unreachable!("offline::build_moonshine_recognizer_config called with non-Moonshine model")
+        // Statically tied to the model enum, so this can only fire on
+        // a routing bug — but library crates forbid panics, so log
+        // and let the caller surface an init failure.
+        tracing::error!("build_moonshine_recognizer_config called with non-Moonshine layout");
+        return None;
     };
 
     let moonshine = OfflineMoonshineModelConfig {
@@ -201,10 +205,10 @@ pub(super) fn build_moonshine_recognizer_config(
         ..OfflineModelConfig::default()
     };
 
-    OfflineRecognizerConfig {
+    Some(OfflineRecognizerConfig {
         model_config,
         ..OfflineRecognizerConfig::default()
-    }
+    })
 }
 
 /// Build the `OfflineRecognizerConfig` for a `NeMo` Parakeet-TDT model.
@@ -220,7 +224,7 @@ pub(super) fn build_moonshine_recognizer_config(
 pub(super) fn build_nemo_transducer_recognizer_config(
     model: SherpaModel,
     provider: &str,
-) -> OfflineRecognizerConfig {
+) -> Option<OfflineRecognizerConfig> {
     // `ModelFilePaths::Transducer` also matches `StreamingZipformerEn`
     // (same 4-file layout), so the destructuring alone wouldn't catch
     // a caller that passed the online Zipformer variant by mistake.
@@ -240,9 +244,11 @@ pub(super) fn build_nemo_transducer_recognizer_config(
         tokens,
     } = sherpa_model::model_file_paths(model)
     else {
-        unreachable!(
-            "offline::build_nemo_transducer_recognizer_config called with non-Transducer layout"
-        )
+        // See build_moonshine_recognizer_config's else arm.
+        tracing::error!(
+            "build_nemo_transducer_recognizer_config called with non-Transducer layout"
+        );
+        return None;
     };
 
     let transducer = OfflineTransducerModelConfig {
@@ -262,10 +268,69 @@ pub(super) fn build_nemo_transducer_recognizer_config(
         ..OfflineModelConfig::default()
     };
 
-    OfflineRecognizerConfig {
+    Some(OfflineRecognizerConfig {
         model_config,
         ..OfflineRecognizerConfig::default()
-    }
+    })
+}
+
+/// Language code Cohere Transcribe decodes with. The model is
+/// multilingual; this app targets English scanner audio, so the
+/// language is fixed rather than user-selectable (revisit if a
+/// multilingual use case appears). Per issue #853.
+const COHERE_TRANSCRIBE_LANGUAGE: &str = "en";
+
+/// Build the `OfflineRecognizerConfig` for Cohere Transcribe.
+///
+/// Encoder + decoder + tokens through
+/// `OfflineCohereTranscribeModelConfig`, with punctuation and inverse
+/// text normalization enabled — radio transcripts read better with
+/// "123" than "one two three", and the transcript panel does no
+/// post-processing of its own.
+pub(super) fn build_cohere_recognizer_config(
+    model: SherpaModel,
+    provider: &str,
+) -> Option<OfflineRecognizerConfig> {
+    debug_assert_eq!(
+        model.kind(),
+        crate::sherpa_model::ModelKind::OfflineCohereTranscribe,
+        "build_cohere_recognizer_config called with non-OfflineCohereTranscribe model"
+    );
+
+    let ModelFilePaths::CohereTranscribe {
+        encoder,
+        // Resolved by onnxruntime relative to `encoder`; only
+        // existence validation consumes the path.
+        encoder_data: _,
+        decoder,
+        tokens,
+    } = sherpa_model::model_file_paths(model)
+    else {
+        // See build_moonshine_recognizer_config's else arm.
+        tracing::error!("build_cohere_recognizer_config called with non-CohereTranscribe layout");
+        return None;
+    };
+
+    let cohere_transcribe = OfflineCohereTranscribeModelConfig {
+        encoder: Some(encoder.to_string_lossy().into_owned()),
+        decoder: Some(decoder.to_string_lossy().into_owned()),
+        language: Some(COHERE_TRANSCRIBE_LANGUAGE.to_owned()),
+        use_punct: true,
+        use_itn: true,
+    };
+
+    let model_config = OfflineModelConfig {
+        cohere_transcribe,
+        tokens: Some(tokens.to_string_lossy().into_owned()),
+        provider: Some(provider.to_owned()),
+        num_threads: SHERPA_NUM_THREADS,
+        ..OfflineModelConfig::default()
+    };
+
+    Some(OfflineRecognizerConfig {
+        model_config,
+        ..OfflineRecognizerConfig::default()
+    })
 }
 
 /// One offline transcription session. Dispatches to the VAD or Auto Break
