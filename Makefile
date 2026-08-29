@@ -138,14 +138,23 @@ install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-d
 	@echo ""
 
 install-bin:
-	@# Stale sentinel from an aborted earlier install must not make
-	@# THIS install relaunch unexpectedly — clear before detection.
-	@rm -f $(RESTART_SENTINEL)
+	@# Sentinel triage (CR round 2 on PR #862): a sentinel with the
+	@# app RUNNING is stale (user relaunched manually after an
+	@# aborted install) — clear it so this run doesn't relaunch
+	@# unexpectedly. A sentinel with the app NOT running means a
+	@# previous install died after the stop — KEEP it, so this run's
+	@# completion heals the situation by relaunching.
+	@if [ -f $(RESTART_SENTINEL) ] && pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+		rm -f $(RESTART_SENTINEL); \
+	fi
 	@# Stop a running sdr-rs INSIDE this recipe (which already
 	@# depends on `build`) so `make -j install` cannot TERM the app
 	@# while cargo is still compiling — the app is only down for the
 	@# copy window. Graceful SIGTERM so GTK's shutdown path runs;
-	@# hard error rather than installing over a live binary.
+	@# hard error rather than installing over a live binary. UID
+	@# scope (not session scope) is deliberate: any same-user
+	@# instance runs THIS binary path and would crash on the
+	@# replacement, so stopping them all is the correct radius.
 	@if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
 		echo "  sdr-rs is running — stopping it for the install (will relaunch)"; \
 		touch $(RESTART_SENTINEL); \
@@ -160,8 +169,18 @@ install-bin:
 			exit 1; \
 		fi; \
 	fi
+	@# The copy itself is the failure-guarded step: on error the OLD
+	@# binary is still intact on disk, so relaunch it immediately
+	@# rather than leaving the user appless after a failed install.
 	@mkdir -p $(BINDIR)
-	install -m 755 target/release/sdr $(BINDIR)/sdr-rs
+	@if ! install -m 755 target/release/sdr $(BINDIR)/sdr-rs; then \
+		if [ -f $(RESTART_SENTINEL) ]; then \
+			rm -f $(RESTART_SENTINEL); \
+			echo "  binary copy failed — relaunching the previous sdr-rs"; \
+			setsid -f $(BINDIR)/sdr-rs >/dev/null 2>&1 || true; \
+		fi; \
+		exit 1; \
+	fi
 
 # When a sherpa-cuda build is active, sherpa-onnx is linked as a shared
 # library (the CUDA prebuilt doesn't ship a static archive). The sys
