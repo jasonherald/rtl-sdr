@@ -124,8 +124,10 @@ When `make install CARGO_FLAGS="... --features sherpa-cuda"` runs:
 
 ## What we ship and why
 
-The set of runtime libs is the **exact `NEEDED` list** of
-`libonnxruntime_providers_cuda.so`:
+The provider's **direct dependencies** are its `NEEDED` list; the
+shipped set is that list **plus the sublibraries those entries load
+dynamically at runtime** (cuDNN 9 dlopens its per-domain sublibs,
+nvrtc dlopens `nvrtc-builtins`):
 
 ```console
 $ readelf -d libonnxruntime_providers_cuda.so | grep NEEDED
