@@ -598,6 +598,13 @@ pub enum UiToDsp {
     /// the prior source config and forces (2.5 `MSps`, 130.3375 MHz,
     /// frontend decim=1); `false` restores the snapshot.
     SetAcarsEnabled(bool),
+    /// Enable or disable the Orbcomm decode tap. Unlike ACARS,
+    /// this does not force source geometry — it decodes whatever
+    /// channels of `sdr_orbcomm::ORBCOMM_CHANNELS_HZ` fall inside
+    /// the currently live source span. `true`/`false` both clear
+    /// the bank + init-failure latch + tracked geometry so the next
+    /// tap call picks up the live geometry fresh. Issue #865.
+    SetOrbcommEnabled(bool),
     /// Toggle the ACARS JSONL log writer on/off. Issue #578.
     SetAcarsJsonlEnabled(bool),
     /// Update the JSONL log path. Empty string ⇒ default
@@ -618,13 +625,6 @@ pub enum UiToDsp {
     /// `station_id` field. Empty string ⇒ field omitted.
     /// Issue #578.
     SetAcarsStationId(String),
-    /// Enable or disable the Orbcomm decode tap. Unlike ACARS,
-    /// this does not force source geometry — it decodes whatever
-    /// channels of `sdr_orbcomm::ORBCOMM_CHANNELS_HZ` fall inside
-    /// the currently live source span. `true`/`false` both clear
-    /// the bank + init-failure latch so the next tap call picks
-    /// up the live geometry fresh. Issue #865.
-    SetOrbcommEnabled(bool),
 }
 
 #[cfg(test)]

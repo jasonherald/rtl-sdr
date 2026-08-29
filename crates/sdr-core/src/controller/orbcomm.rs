@@ -17,32 +17,72 @@ pub(super) const ORBCOMM_STATS_INTERVAL: std::time::Duration =
 /// takes `sdr_types::Complex` directly, so there is no layout gap to
 /// bridge here.
 ///
-/// Lazy-init: on the first call with `bank.is_none()` and
-/// `*init_failed == false`, builds the `ChannelBank` from
-/// `(source_rate_hz, center_hz, &ORBCOMM_CHANNELS_HZ)`. If
-/// construction fails, sets `*init_failed = true` and skips
-/// subsequent calls until the caller clears the flag — source stop,
-/// retune, or a sample-rate/decimation change (the geometry
-/// invalidation sites in `controller.rs` / `controller/source.rs`),
-/// or a fresh `SetOrbcommEnabled` dispatch.
+/// # Self-checking geometry (issue #865, CR round 1)
+///
+/// Unlike ACARS, Orbcomm has no airband-lock engage/disengage
+/// machinery gating every geometry-mutating command — a fixed set of
+/// call sites can't be enumerated and clear-guarded exhaustively.
+/// `controller/scanner.rs::handle_scanner_retune`, for one, writes
+/// `state.center_freq` and calls `frontend.set_decimation(...)`
+/// directly, bypassing `handle_tune` / `handle_set_decimation`
+/// entirely. So the tap self-checks instead: `geometry` tracks the
+/// `(source_rate_hz, center_hz)` pair the current `bank` /
+/// `init_failed` state was last attempted at — success OR failure.
+/// On every call, if the caller's `(source_rate_hz, center_hz)` no
+/// longer bit-matches `*geometry`, the tap drops the stale bank AND
+/// clears the failure latch (a geometry change may make a
+/// previously-failing attempt succeed, or a previously-succeeding
+/// one now decode the wrong channels' NCO mix) before proceeding.
+/// This makes every current and future geometry-mutating call site
+/// safe by construction, with no per-site invalidation clear needed
+/// — the only clear that remains is `cleanup()`'s, which releases
+/// the bank on source stop rather than reacting to a geometry change.
+///
+/// Lazy-init: once geometry is confirmed current, if `bank.is_none()`
+/// and `*init_failed == false`, builds the `ChannelBank` from
+/// `(source_rate_hz, center_hz, &ORBCOMM_CHANNELS_HZ)`, recording the
+/// attempted geometry regardless of the outcome. If construction
+/// fails, sets `*init_failed = true` and skips subsequent calls at
+/// the *same* geometry (no warn-spam); a later geometry change clears
+/// the latch and retries per the self-check above.
 ///
 /// Per-block: clears `events_scratch` (the caller-owned reuse
 /// buffer — avoids a per-block allocation), feeds `iq` through
 /// `bank.process(...)`, and forwards each event to `dsp_tx` boxed
 /// as `DspToUi::OrbcommEvent`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn orbcomm_decode_tap(
     bank: &mut Option<sdr_orbcomm::ChannelBank>,
     init_failed: &mut bool,
+    geometry: &mut Option<(f64, f64)>,
     source_rate_hz: f64,
     center_hz: f64,
     iq: &[sdr_types::Complex],
     events_scratch: &mut Vec<sdr_orbcomm::OrbcommEvent>,
     dsp_tx: &mpsc::Sender<DspToUi>,
 ) {
+    let stale = geometry.is_some_and(|(g_rate, g_center)| {
+        g_rate.to_bits() != source_rate_hz.to_bits() || g_center.to_bits() != center_hz.to_bits()
+    });
+    if stale {
+        tracing::info!(
+            source_rate_hz,
+            center_hz,
+            "Orbcomm geometry changed underneath the tap (retune / scanner hop / rate change); \
+             dropping the stale bank and rebuilding"
+        );
+        *bank = None;
+        *init_failed = false;
+    }
+
     if *init_failed {
         return;
     }
     if bank.is_none() {
+        // Record the attempt's geometry BEFORE the construction call
+        // so a subsequent mismatch check is correct regardless of
+        // whether this attempt succeeds or fails.
+        *geometry = Some((source_rate_hz, center_hz));
         match sdr_orbcomm::ChannelBank::new(
             source_rate_hz,
             center_hz,
@@ -72,12 +112,19 @@ pub(super) fn orbcomm_decode_tap(
 }
 
 /// Handler for `UiToDsp::SetOrbcommEnabled`. Sets the flag and
-/// clears the bank + init-failure latch on BOTH enable and disable
-/// so the next tap call lazy-rebuilds against the live geometry.
-/// Always acks — unlike ACARS engage, Orbcomm doesn't force source
-/// geometry, so there is no synchronous failure mode here; a
-/// `ChannelBank::new` failure surfaces later via the tap's latch
-/// (mirrors the LRPT pattern).
+/// clears the bank / init-failure latch / tracked geometry on BOTH
+/// enable and disable so the next tap call lazy-rebuilds against the
+/// live geometry. Always acks — unlike ACARS engage, Orbcomm doesn't
+/// force source geometry, so there is no synchronous failure mode
+/// here; a `ChannelBank::new` failure surfaces later via the tap's
+/// latch (mirrors the LRPT pattern).
+///
+/// Also the routing point [`super::cleanup`] uses to force the
+/// toggle off on source stop (issue #865, CR round 2) — `orbcomm_enabled`
+/// is the actual on/off state (unlike `acars_region`, a config
+/// preference that legitimately persists across a stop), so leaving
+/// it set across `cleanup()` would strand the UI toggle latched on
+/// with no live tap behind it.
 pub(super) fn handle_set_orbcomm_enabled(
     state: &mut DspState,
     dsp_tx: &mpsc::Sender<DspToUi>,
@@ -86,6 +133,7 @@ pub(super) fn handle_set_orbcomm_enabled(
     state.orbcomm_enabled = enable;
     state.orbcomm_bank = None;
     state.orbcomm_init_failed = false;
+    state.orbcomm_geometry = None;
     tracing::info!(enable, "Orbcomm enabled changed");
     let _ = dsp_tx.send(DspToUi::OrbcommEnabledChanged(enable));
 }

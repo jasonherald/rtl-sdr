@@ -647,17 +647,35 @@ struct DspState {
     /// Start-path invalidation window to work around — Orbcomm
     /// has no forced geometry, so `orbcomm_enabled` alone is the
     /// "should the tap run" signal. `None` means "not yet built
-    /// at the current geometry" (lazy-init pending or torn down
-    /// by a geometry-invalidation site). Issue #865.
+    /// at the current geometry" (lazy-init pending, torn down by
+    /// `cleanup()` on source stop, or dropped by the tap's own
+    /// self-check when `orbcomm_geometry` goes stale). Issue #865.
     orbcomm_bank: Option<sdr_orbcomm::ChannelBank>,
-    /// One-shot guard: a previous `ChannelBank::new` failed.
-    /// Mirrors `acars_init_failed` / `lrpt_init_failed` —
-    /// prevents warn-spam on every subsequent IQ block. Cleared
-    /// by every geometry-invalidation site and by
-    /// `SetOrbcommEnabled`. Issue #865.
+    /// One-shot guard: a previous `ChannelBank::new` failed AT THE
+    /// GEOMETRY RECORDED IN `orbcomm_geometry`. Mirrors
+    /// `acars_init_failed` / `lrpt_init_failed` — prevents warn-spam
+    /// on every subsequent IQ block at that same geometry. Cleared
+    /// by `cleanup()`, by `SetOrbcommEnabled`, and by the tap's own
+    /// self-check the moment the live geometry no longer matches
+    /// `orbcomm_geometry` (a geometry change may make a previously
+    /// failing attempt succeed). Issue #865.
     orbcomm_init_failed: bool,
+    /// `(source_rate_hz, center_hz)` the CURRENT `orbcomm_bank` /
+    /// `orbcomm_init_failed` state was last attempted at — success
+    /// or failure. `None` before the first attempt (or after
+    /// `cleanup()` / `SetOrbcommEnabled` resets it). `orbcomm_decode_tap`
+    /// compares this against its live `(source_rate_hz, center_hz)`
+    /// arguments on every call and self-rebuilds on a mismatch, so no
+    /// individual geometry-mutating call site (tune, sample-rate,
+    /// decimation, the scanner's direct retune, ...) needs its own
+    /// invalidation clear. Issue #865, CR round 1.
+    orbcomm_geometry: Option<(f64, f64)>,
     /// User-facing enable flag. Gates whether `process_iq_block`
-    /// calls `orbcomm_decode_tap` at all. Issue #865.
+    /// calls `orbcomm_decode_tap` at all. The actual on/off state
+    /// (unlike `acars_region`, a config preference) — `cleanup()`
+    /// force-clears this to `false` on every source stop, with an
+    /// `OrbcommEnabledChanged(false)` ack, so the UI toggle can't
+    /// stay latched on across a Stop. Issue #865, CR round 2.
     orbcomm_enabled: bool,
     /// Last `DspToUi::OrbcommChannelStats` emission timestamp.
     /// `None` until the first emission (so the first eligible
@@ -788,6 +806,7 @@ impl DspState {
             acars_last_user_network_addr: None,
             orbcomm_bank: None,
             orbcomm_init_failed: false,
+            orbcomm_geometry: None,
             orbcomm_enabled: false,
             orbcomm_stats_emitted_at: None,
             orbcomm_events_buf: Vec::new(),
@@ -1361,13 +1380,13 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
         let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
     }
 
-    // Orbcomm geometry invalidation (issue #865): source stop means
-    // the bank's (source_rate, center) is gone. `orbcomm_enabled`
-    // itself is a persisted user setting (mirrors `acars_region`)
-    // and stays as-is — the next Start's first IQ block lazy-
-    // rebuilds the bank at whatever geometry comes up.
-    state.orbcomm_bank = None;
-    state.orbcomm_init_failed = false;
+    // Orbcomm teardown (issue #865, CR round 2). Unlike `acars_region`
+    // (a config preference), `orbcomm_enabled` is the actual on/off
+    // toggle — force it off on every source stop, routed through the
+    // command handler so the bank/latch/geometry clear and the
+    // `OrbcommEnabledChanged(false)` ack live in exactly one place
+    // and the UI toggle can't stay latched on across a Stop.
+    handle_set_orbcomm_enabled(state, dsp_tx, false);
 
     if let Some(source) = &mut state.source {
         let _ = source.stop();
@@ -1665,11 +1684,17 @@ fn process_iq_block(
                 // rather than `state.sample_rate`. Tapped at the same
                 // point as the ACARS tap (before the VFO) so it sees
                 // the full instantaneous span rather than the VFO's
-                // narrowed channel.
+                // narrowed channel. The tap self-checks
+                // `orbcomm_geometry` against these live values every
+                // call and rebuilds on a mismatch (CR round 1), so no
+                // call site outside `cleanup()` needs its own
+                // invalidation clear — this covers the scanner's
+                // direct `center_freq` / decimation writes too.
                 if state.orbcomm_enabled {
                     orbcomm_decode_tap(
                         &mut state.orbcomm_bank,
                         &mut state.orbcomm_init_failed,
+                        &mut state.orbcomm_geometry,
                         state.frontend.effective_sample_rate(),
                         state.center_freq,
                         &state.processed_buf[..processed_count],
