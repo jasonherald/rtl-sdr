@@ -69,8 +69,13 @@ reference repo's `literature/`).
   **MAX_R = 8,378,155.0 m** and **MAX_V = 7,700.0 m/s**, following the
   serial-interface spec. ECEF → WGS84 lat/lon/alt via the standard
   ellipsoid conversion (a = 6378137.0, 1/f = 298.257223563).
-- `sat_id` maps to the public "FM-xx" spacecraft names via the
-  reference's `sat_db.py` table.
+- `sat_id` labeling (amended during implementation): no public
+  sat_id-byte → spacecraft-name table exists — the reference's
+  `sat_db.py` is keyed by name → NORAD/frequency and its decoders only
+  ever display the raw byte. V1 therefore labels spacecraft as
+  `Sat 0xNN` via `sat_label(sat_id)`; matching the self-broadcast
+  ephemeris position against an Orbcomm TLE set to recover real names
+  is the V2 path.
 
 ## Architecture
 
