@@ -58,10 +58,13 @@ Two mutually exclusive backends, selected at build time (see the install section
 - Optional GPU acceleration: CUDA (NVIDIA), ROCm/HIP (AMD), Vulkan, Metal
 - RMS-gated chunked inference with configurable silence threshold
 
-**Sherpa-onnx backend** — k2-fsa's sherpa-onnx, English only (today), streaming + offline
+**Sherpa-onnx backend** — k2-fsa's sherpa-onnx, English-first (Cohere Transcribe covers 14 languages), streaming + offline
 - **Streaming Zipformer** — true real-time transcription with word-by-word live captions
 - **Moonshine Tiny / Base** — UsefulSensors' edge-optimized offline models (27M / 61M params)
 - **Parakeet-TDT 0.6b v3** — NVIDIA, #1 on the OpenASR leaderboard (600M params, highest accuracy)
+- **Nemotron Speech Streaming 0.6b** — NVIDIA cache-aware streaming transducer, four lookahead variants (80/160/560/1120 ms)
+- **Canary 180M Flash / Parakeet Unified 0.6b** — additional NVIDIA offline models
+- **Cohere Transcribe** — offline, 14 languages; the one model supported on the experimental ROCm backend
 - **Runtime model swap** — change models from the dropdown without restarting the app
 - **Live captions with display mode toggle** — streaming models render an in-place italic line below the commit log; user can switch to "Final only" mode
 - **Silero VAD** — offline models use Silero voice activity detection with a user-tunable threshold slider for noisy RF audio (NFM/scanner)
@@ -154,7 +157,7 @@ make install CARGO_FLAGS="--release --no-default-features --features sherpa-cuda
 make install CARGO_FLAGS="--release --no-default-features --features sherpa-rocm"  # Sherpa + AMD GPU (MIGraphX; needs onnxruntime-rocm; Cohere Transcribe only)
 ```
 
-With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base, or Parakeet) at runtime from the transcript panel dropdown — no rebuild required, and switching is an in-place recognizer swap. The exception is `sherpa-rocm`, which is experimental and supports **Cohere Transcribe only**: the gfx1103 bring-up (issue #858) found the MIGraphX execution provider miscompiling or aborting on every other catalog model, so other selections are coerced to Cohere at startup and rejected with a clear error when picked from the dropdown.
+With a Sherpa build, you pick the specific model (Zipformer, Moonshine Tiny/Base, Parakeet, Nemotron, Canary, or Cohere) at runtime from the transcript panel dropdown — no rebuild required, and switching is an in-place recognizer swap. The exception is `sherpa-rocm`, which is experimental and supports **Cohere Transcribe only**: the gfx1103 bring-up (issue #858) found the MIGraphX execution provider miscompiling or aborting on every other catalog model, so other selections are coerced to Cohere at startup and rejected with a clear error when picked from the dropdown.
 
 **Sherpa CUDA notes:**
 
