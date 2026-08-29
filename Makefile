@@ -128,16 +128,6 @@ install-sherpa-runtime-libs: install-bin
 RESTART_SENTINEL := $(HOME)/.cache/sdr-rs/.restart-sentinel
 
 install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-desktop
-	@echo ""
-	@echo "SDR-RS installed successfully!"
-	@echo "  Binary:   $(BINDIR)/sdr-rs"
-	@if [ -d $(LIBDIR) ] && [ -n "$$(ls -A $(LIBDIR) 2>/dev/null)" ]; then \
-		echo "  Libs:     $(LIBDIR)/"; \
-	fi
-	@echo "  Icon:     $(ICONDIR)/com.sdr.rs.svg"
-	@echo "  Desktop:  $(DESKTOPDIR)/com.sdr.rs.desktop"
-	@echo ""
-	@echo "Launch from your app menu or run: sdr-rs"
 	@if [ -f "$(RESTART_SENTINEL)" ]; then \
 		echo "  relaunching sdr-rs"; \
 		setsid -f "$(BINDIR)/sdr-rs" >/dev/null 2>&1 || true; \
@@ -153,6 +143,16 @@ install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-d
 			exit 1; \
 		fi; \
 	fi
+	@echo ""
+	@echo "SDR-RS installed successfully!"
+	@echo "  Binary:   $(BINDIR)/sdr-rs"
+	@if [ -d $(LIBDIR) ] && [ -n "$$(ls -A $(LIBDIR) 2>/dev/null)" ]; then \
+		echo "  Libs:     $(LIBDIR)/"; \
+	fi
+	@echo "  Icon:     $(ICONDIR)/com.sdr.rs.svg"
+	@echo "  Desktop:  $(DESKTOPDIR)/com.sdr.rs.desktop"
+	@echo ""
+	@echo "Launch from your app menu or run: sdr-rs"
 	@echo ""
 
 install-bin:
@@ -186,7 +186,6 @@ install-bin:
 		done; \
 		if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
 			echo "error: sdr-rs did not exit within 10 s — close it and re-run make install"; \
-			rm -f "$(RESTART_SENTINEL)"; \
 			exit 1; \
 		fi; \
 	fi
@@ -195,8 +194,8 @@ install-bin:
 	@# truncated sdr-rs on disk — the old binary stays intact and is
 	@# relaunched rather than leaving the user appless. Per CR
 	@# round 3 on PR #862.
-	@mkdir -p $(BINDIR)
-	@if install -m 755 target/release/sdr "$(BINDIR)/.sdr-rs.tmp" \
+	@if mkdir -p "$(BINDIR)" \
+		&& install -m 755 target/release/sdr "$(BINDIR)/.sdr-rs.tmp" \
 		&& mv -f "$(BINDIR)/.sdr-rs.tmp" "$(BINDIR)/sdr-rs"; then \
 		:; \
 	else \
