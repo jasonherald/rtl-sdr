@@ -115,7 +115,22 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
         };
         let interleaved = match input {
             TranscriptionInput::Samples(s) => s,
-            TranscriptionInput::SquelchOpened | TranscriptionInput::SquelchClosed => continue,
+            TranscriptionInput::SquelchOpened => continue,
+            // Squelch close IS the utterance boundary on scanner
+            // audio. The tap is pre-gate, so after the squelch
+            // closes the model hears RF STATIC, not silence — and
+            // noise-robust models (Nemotron) keep emitting the odd
+            // token on static, resetting the trailing-blank counter
+            // so the silence-based endpoint rules never fire and
+            // partials never promote to finals. Commit the current
+            // hypothesis and reset the stream here instead of
+            // waiting for an endpoint that may never come. (The
+            // endpoint path below still handles pauses WITHIN a
+            // transmission.) Per issue #853 final-wave smoke.
+            TranscriptionInput::SquelchClosed => {
+                commit_utterance(recognizer, &stream, &mut last_partial, &event_tx);
+                continue;
+            }
         };
 
         mono_buf.clear();
@@ -167,24 +182,46 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
         }
 
         if recognizer.is_endpoint(&stream) {
-            // Commit whatever `last_partial` currently holds — it's
-            // the most recent non-empty hypothesis we saw, equivalent
-            // to the previous `current_text or last_partial` fallback.
-            if !last_partial.is_empty() {
-                let timestamp = crate::util::wall_clock_timestamp();
-                tracing::debug!(%timestamp, text = %last_partial, "sherpa committed utterance");
-                let _ = event_tx.send(TranscriptionEvent::Text {
-                    timestamp,
-                    text: last_partial.clone(),
-                });
-            }
-            recognizer.reset(&stream);
-            last_partial.clear();
+            commit_utterance(recognizer, &stream, &mut last_partial, &event_tx);
         }
     }
 
     finalize_session(recognizer, &stream, &last_partial, &event_tx);
     tracing::info!("sherpa session ended (audio channel disconnected)");
+}
+
+/// Commit the in-flight utterance: drain any decodable frames so the
+/// hypothesis includes the last audio before the boundary, emit the
+/// most recent non-empty text as a final `Text` event, then reset the
+/// stream and the partial tracker for the next utterance. Shared by
+/// the model-endpoint path (pauses within a transmission) and the
+/// squelch-close path (end of a transmission).
+fn commit_utterance(
+    recognizer: &OnlineRecognizer,
+    stream: &OnlineStream,
+    last_partial: &mut String,
+    event_tx: &mpsc::Sender<TranscriptionEvent>,
+) {
+    while recognizer.is_ready(stream) {
+        recognizer.decode(stream);
+    }
+    if let Some(result) = recognizer.get_result(stream) {
+        let trimmed = result.text.trim();
+        if !trimmed.is_empty() {
+            last_partial.clear();
+            last_partial.push_str(trimmed);
+        }
+    }
+    if !last_partial.is_empty() {
+        let timestamp = crate::util::wall_clock_timestamp();
+        tracing::debug!(%timestamp, text = %last_partial, "sherpa committed utterance");
+        let _ = event_tx.send(TranscriptionEvent::Text {
+            timestamp,
+            text: last_partial.clone(),
+        });
+    }
+    recognizer.reset(stream);
+    last_partial.clear();
 }
 
 /// Commit any in-flight partial hypothesis as a final `Text` event before
