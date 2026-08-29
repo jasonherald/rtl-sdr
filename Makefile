@@ -10,7 +10,7 @@ CARGO       ?= cargo
 CARGO_FLAGS ?= --release
 
 .PHONY: all build install install-bin install-sherpa-runtime-libs \
-        check-cuda-system-libs stop-running-app install-icon install-desktop uninstall \
+        check-cuda-system-libs install-icon install-desktop uninstall \
         test clippy fmt fmt-check \
         lint deny audit scan clean help
 
@@ -99,30 +99,15 @@ install-sherpa-runtime-libs: build
 # lazily loading an SPA plugin on an audio-route change — SIGSEGVs
 # inside ld-linux (observed 2026-08-29: bias-T toggle after a
 # mid-run install; the core's executable line read "(deleted)").
+# The stop runs INSIDE install-bin's recipe (after its `build`
+# prerequisite), so even `make -j install` keeps the app running
+# through the long compile — it is only down for the copy window.
 # Graceful SIGTERM so GTK runs its shutdown path (recordings
 # finalized, config flushed), bounded wait, hard error if it will
-# not exit. A sentinel records the stop so `install` relaunches the
-# app when done. Ordered after `build` (via install-bin's prereq
-# chain) so the app keeps running through the long compile and is
-# only down for the copy.
+# not exit. This sentinel records the stop so `install`'s final
+# recipe relaunches the app; install-bin clears any stale copy from
+# an aborted earlier run before detection.
 RESTART_SENTINEL := /tmp/.sdr-rs-restart-$(shell id -u)
-stop-running-app:
-	@if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
-		echo "  sdr-rs is running — stopping it for the install (will relaunch)"; \
-		touch $(RESTART_SENTINEL); \
-		pkill -u $$(id -u) -x -TERM sdr-rs; \
-		for i in $$(seq 1 50); do \
-			pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1 || break; \
-			sleep 0.2; \
-		done; \
-		if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
-			echo "error: sdr-rs did not exit within 10 s — close it and re-run make install"; \
-			rm -f $(RESTART_SENTINEL); \
-			exit 1; \
-		fi; \
-	fi
-
-install-bin: stop-running-app
 
 install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-desktop
 	@echo ""
@@ -143,6 +128,28 @@ install: build install-bin $(INSTALL_RUNTIME_LIB_TARGETS) install-icon install-d
 	@echo ""
 
 install-bin:
+	@# Stale sentinel from an aborted earlier install must not make
+	@# THIS install relaunch unexpectedly — clear before detection.
+	@rm -f $(RESTART_SENTINEL)
+	@# Stop a running sdr-rs INSIDE this recipe (which already
+	@# depends on `build`) so `make -j install` cannot TERM the app
+	@# while cargo is still compiling — the app is only down for the
+	@# copy window. Graceful SIGTERM so GTK's shutdown path runs;
+	@# hard error rather than installing over a live binary.
+	@if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+		echo "  sdr-rs is running — stopping it for the install (will relaunch)"; \
+		touch $(RESTART_SENTINEL); \
+		pkill -u $$(id -u) -x -TERM sdr-rs; \
+		for i in $$(seq 1 50); do \
+			pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1 || break; \
+			sleep 0.2; \
+		done; \
+		if pgrep -u $$(id -u) -x sdr-rs >/dev/null 2>&1; then \
+			echo "error: sdr-rs did not exit within 10 s — close it and re-run make install"; \
+			rm -f $(RESTART_SENTINEL); \
+			exit 1; \
+		fi; \
+	fi
 	@mkdir -p $(BINDIR)
 	install -m 755 target/release/sdr $(BINDIR)/sdr-rs
 

@@ -136,17 +136,13 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
         mono_buf.clear();
         resampler::downsample_stereo_to_mono_16k(&interleaved, &mut mono_buf);
 
-        while let Ok(extra) = audio_rx.try_recv() {
-            if cancel.load(Ordering::Relaxed) {
-                finalize_session(recognizer, &stream, &last_partial, &event_tx);
-                return;
-            }
-            if let TranscriptionInput::Samples(s) = extra {
-                resampler::downsample_stereo_to_mono_16k(&s, &mut mono_buf);
-            }
+        let outcome = drain_pending_audio(&audio_rx, &cancel, &mut mono_buf);
+        if outcome.cancelled {
+            finalize_session(recognizer, &stream, &last_partial, &event_tx);
+            return;
         }
 
-        if mono_buf.is_empty() {
+        if mono_buf.is_empty() && !outcome.squelch_closed {
             continue;
         }
 
@@ -181,13 +177,58 @@ pub(super) fn run_session(recognizer: &OnlineRecognizer, params: SessionParams) 
             }
         }
 
-        if recognizer.is_endpoint(&stream) {
+        if outcome.squelch_closed || recognizer.is_endpoint(&stream) {
             commit_utterance(recognizer, &stream, &mut last_partial, &event_tx);
         }
     }
 
     finalize_session(recognizer, &stream, &last_partial, &event_tx);
     tracing::info!("sherpa session ended (audio channel disconnected)");
+}
+
+/// What [`drain_pending_audio`] observed while batching.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DrainOutcome {
+    /// A `SquelchClosed` boundary arrived inside the batch — the
+    /// caller must commit the utterance AFTER feeding the batched
+    /// audio (which belongs to the closing transmission).
+    squelch_closed: bool,
+    /// The cancel flag flipped mid-drain.
+    cancelled: bool,
+}
+
+/// Drain everything already queued on the audio channel into
+/// `mono_buf`, WITHOUT dropping control events: draining stops at a
+/// `SquelchClosed` boundary (later messages belong to the next
+/// transmission and stay queued for the next loop iteration), and
+/// the boundary is reported so the caller commits after feeding.
+/// Split out (recognizer-free) so the no-event-loss contract is unit
+/// testable with a plain channel. Per Codacy round 1 on PR #862 —
+/// the previous inline drain silently discarded squelch events that
+/// arrived while samples were being batched.
+fn drain_pending_audio(
+    audio_rx: &mpsc::Receiver<TranscriptionInput>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mono_buf: &mut Vec<f32>,
+) -> DrainOutcome {
+    let mut outcome = DrainOutcome::default();
+    while let Ok(extra) = audio_rx.try_recv() {
+        if cancel.load(Ordering::Relaxed) {
+            outcome.cancelled = true;
+            return outcome;
+        }
+        match extra {
+            TranscriptionInput::Samples(s) => {
+                resampler::downsample_stereo_to_mono_16k(&s, mono_buf);
+            }
+            TranscriptionInput::SquelchOpened => {}
+            TranscriptionInput::SquelchClosed => {
+                outcome.squelch_closed = true;
+                return outcome;
+            }
+        }
+    }
+    outcome
 }
 
 /// Commit the in-flight utterance: drain any decodable frames so the
@@ -245,5 +286,69 @@ fn finalize_session(
             timestamp,
             text: final_text,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    /// Interleaved stereo at the pipeline AF rate downsamples to at
+    /// least one mono sample per frame pair — enough to observe that
+    /// sample batches actually landed in `mono_buf`.
+    fn samples(n_frames: usize) -> TranscriptionInput {
+        TranscriptionInput::Samples(vec![0.1_f32; n_frames * 2])
+    }
+
+    #[test]
+    fn drain_stops_at_squelch_close_without_dropping_it() {
+        // Codacy round 1 on PR #862: a SquelchClosed arriving while
+        // samples are batched must be REPORTED, not discarded — and
+        // messages after the boundary belong to the next transmission
+        // and must stay queued.
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        tx.send(samples(64)).unwrap();
+        tx.send(TranscriptionInput::SquelchClosed).unwrap();
+        tx.send(samples(64)).unwrap();
+
+        let mut mono = Vec::new();
+        let outcome = drain_pending_audio(&rx, &cancel, &mut mono);
+
+        assert!(outcome.squelch_closed, "boundary must be reported");
+        assert!(!outcome.cancelled);
+        assert!(!mono.is_empty(), "pre-boundary audio batched");
+        // The post-boundary batch is still queued for the next loop
+        // iteration.
+        assert!(matches!(rx.try_recv(), Ok(TranscriptionInput::Samples(_))));
+    }
+
+    #[test]
+    fn drain_ignores_squelch_open_and_batches_all_samples() {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        tx.send(TranscriptionInput::SquelchOpened).unwrap();
+        tx.send(samples(64)).unwrap();
+        tx.send(samples(64)).unwrap();
+
+        let mut mono = Vec::new();
+        let outcome = drain_pending_audio(&rx, &cancel, &mut mono);
+
+        assert_eq!(outcome, DrainOutcome::default());
+        assert!(rx.try_recv().is_err(), "channel fully drained");
+        assert!(!mono.is_empty());
+    }
+
+    #[test]
+    fn drain_reports_cancellation() {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(true));
+        tx.send(samples(64)).unwrap();
+
+        let mut mono = Vec::new();
+        let outcome = drain_pending_audio(&rx, &cancel, &mut mono);
+        assert!(outcome.cancelled);
     }
 }

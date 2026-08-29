@@ -3,6 +3,9 @@ use super::*;
 /// Registry size after the #853 final-wave additions — the
 /// persisted model index's upper bound.
 const SHERPA_MODEL_COUNT: usize = 11;
+/// Canary's frozen `ALL` position (wave-2 tail) — a persisted config
+/// key like every other index.
+const CANARY_MODEL_INDEX: usize = 6;
 
 #[test]
 fn all_models_have_unique_directory_names() {
@@ -352,7 +355,10 @@ fn final_wave_is_appended_after_canary() {
     assert_eq!(SherpaModel::ALL.len(), SHERPA_MODEL_COUNT);
     // Wave-2 tail position is frozen (persisted index), final wave
     // appends after it.
-    assert_eq!(SherpaModel::ALL[6], SherpaModel::Canary180mFlash);
+    assert_eq!(
+        SherpaModel::ALL[CANARY_MODEL_INDEX],
+        SherpaModel::Canary180mFlash
+    );
     assert_eq!(
         SherpaModel::ALL[SHERPA_MODEL_COUNT - 1],
         SherpaModel::ParakeetUnifiedEn06b
