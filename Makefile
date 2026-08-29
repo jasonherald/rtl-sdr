@@ -235,7 +235,7 @@ install-sherpa-runtime-libs:
 		          target/release/libonnxruntime_providers_cuda.so \
 		          target/release/libonnxruntime_providers_shared.so; do \
 			if [ -f "$$so" ] || [ -L "$$so" ]; then \
-				cp -a "$$so" $(LIBDIR)/; \
+				cp -a "$$so" $(LIBDIR)/ || exit 1; \
 				echo "  installed $$(basename $$so)"; \
 			fi; \
 		done; \
