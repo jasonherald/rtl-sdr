@@ -144,12 +144,14 @@ $ readelf -d libonnxruntime_providers_cuda.so | grep NEEDED
 
 We do **not** ship:
 
-- `libcusparse`, `libcusolver`, `libnvjitlink` — not in `NEEDED`,
-  `onnxruntime`'s CUDA path doesn't touch them. (Verified for
-  `libnvjitlink` specifically against `libnvrtc.so.12.6.85` — the
-  sherpa-onnx v1.13.6 pin, August 2026: nvrtc's own `NEEDED` list is
-  libc-family only, so shipping it does not pull nvjitlink in.
-  Re-check on version bumps.)
+- `libcusparse`, `libcusolver`, `libnvjitlink` — not direct `NEEDED`
+  dependencies of the provider (nor of `libnvrtc.so.12.6.85`, whose
+  own `NEEDED` list is libc-family only — sherpa-onnx v1.13.6 pin,
+  August 2026). A transitive `dlopen` can't be ruled out from ELF
+  headers alone, but the sherpa transcription path was validated at
+  runtime on real hardware with none of these present on the search
+  path (all models, GPU provider active) — a lazy load would have
+  failed there. Re-verify both facts on version bumps.
 - `libonnxruntime_providers_tensorrt.so` — we never request the TensorRT
   provider, and it would pull `libnvinfer` which we don't provision.
 - `libcuda.so` from the stubs directory — that's a build-time driver
