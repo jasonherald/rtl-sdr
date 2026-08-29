@@ -208,16 +208,16 @@ whisper-rs = "0.16"
 
 # Sherpa-onnx streaming ASR.
 #
-# Pinned to jasonherald/sherpa-onnx fork while the `cuda` feature awaits
-# upstream merge in k2-fsa/sherpa-onnx. The fork adds a `cuda` cargo
-# feature that links against the CUDA 12.x + cuDNN 9.x prebuilt archive;
-# everything else is upstream v1.12.36. Switch back to a crates.io
-# version pin once the upstream PR is merged and released.
+# Pinned to the jasonherald/sherpa-onnx fork: upstream v1.13.6 plus a
+# `cuda` cargo feature that links against the CUDA 12.x + cuDNN 9.x
+# prebuilt archive. The feature has NOT been proposed upstream yet —
+# if it ever merges and releases, switch back to a crates.io version
+# pin and retire the fork (issue #854).
 #
 # `default-features = false` means the downstream feature set (sherpa-cpu
 # or sherpa-cuda in sdr-transcription) is responsible for picking a link
 # mode (static, shared, or cuda). See crates/sdr-transcription/Cargo.toml.
-sherpa-onnx = { git = "https://github.com/jasonherald/sherpa-onnx.git", rev = "628c333f9851101e9d2c228a49833f21337ebf06", default-features = false }
+sherpa-onnx = { git = "https://github.com/jasonherald/sherpa-onnx.git", rev = "cc3f5db624c19fb315e368a2bf57188b0837bbf7", default-features = false }
 
 # System directories / libc
 dirs-next = "2"

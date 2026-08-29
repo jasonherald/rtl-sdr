@@ -26,11 +26,14 @@
 #       libcurand.so.10     <- libcurand archive
 #       libcufft.so.11      <- libcufft archive
 #       libcudart.so.12     <- cuda_cudart archive
+#       libnvrtc.so.12      <- cuda_nvrtc archive (new NEEDED as of the
+#                              onnxruntime 1.27.1 provider in sherpa-onnx
+#                              v1.13.6 — issue #854)
 #       libcudnn.so.9       <- cudnn archive (plus cuDNN 9's dlopen'd sublibs)
 #
 # Components NOT fetched (not in NEEDED, not used by the sherpa path):
 #
-#     libcusparse, libcusolver, libnvrtc, libnvjitlink, libnvinfer (TensorRT)
+#     libcusparse, libcusolver, libnvjitlink, libnvinfer (TensorRT)
 #
 # Static libraries inside each archive are filtered out during extract
 # to avoid shipping ~1 GB of .a files we never link against.
@@ -86,6 +89,9 @@ ARCHIVES=(
     "${CUDA_BASE}/libcurand/linux-x86_64/libcurand-linux-x86_64-10.3.7.77-archive.tar.xz"
     "981339cc86d7b8779e9a3c17e72d8c5e1a8a2d06c24db692eecabed8e746a3c7"
 
+    "${CUDA_BASE}/cuda_nvrtc/linux-x86_64/cuda_nvrtc-linux-x86_64-12.6.85-archive.tar.xz"
+    "a4289ba86f0deeccf4e1d94c58559eae4c8184fcb6eaade8fcab45584e6cf402"
+
     "${CUDNN_BASE}/cudnn/linux-x86_64/cudnn-linux-x86_64-9.5.1.17_cuda12-archive.tar.xz"
     "35dd20b9c68324ae1288ac36f66ab1f318d2bfecfafb703a82617aa283272be4"
 )
@@ -94,7 +100,7 @@ echo ""
 echo "Fetching NVIDIA CUDA 12 + cuDNN 9 runtime libs for sherpa-cuda"
 echo "  Downloads: $DOWNLOADS_DIR"
 echo "  Staging:   $STAGING_DIR"
-echo "  Size:      ~1.83 GB download, ~1.2 GB staged"
+echo "  Size:      ~1.87 GB download, ~1.3 GB staged"
 echo ""
 
 mkdir -p "$DOWNLOADS_DIR"
