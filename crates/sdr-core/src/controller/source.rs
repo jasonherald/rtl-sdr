@@ -1402,10 +1402,22 @@ fn auto_disable_acars_for_source_switch(
     // (#695) and emit a misleading failure for a switch that is
     // about to succeed.
     let defer_to_cleanup = state.iq_writer.is_some() && state.running;
-    if state.acars_pre_lock.is_some() && source_type != SourceType::RtlSdr && !defer_to_cleanup {
+    // Identity-based, not capability-based: even a switch between two
+    // ACARS-capable USB sources tears the lock down, because the
+    // pre-lock snapshot belongs to the OLD hardware — restoring its
+    // rate onto different hardware would silently clamp through the
+    // new source's rate table instead of faithfully restoring the
+    // user's state. Re-engaging on the new source takes one click
+    // and snapshots correctly. Per review round 1 on PR #860.
+    if state
+        .acars_pre_lock
+        .as_ref()
+        .is_some_and(|snap| snap.source_type != source_type)
+        && !defer_to_cleanup
+    {
         tracing::info!(
             ?source_type,
-            "ACARS auto-disabling: source type changing to non-RTL-SDR"
+            "ACARS auto-disabling: source type changing while engaged"
         );
         handle_set_acars_enabled(state, false, dsp_tx)
     } else {
