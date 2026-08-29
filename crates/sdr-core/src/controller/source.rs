@@ -1058,6 +1058,12 @@ pub(super) fn handle_tune(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, 
     tracing::info!(target: "tune", requested_hz = freq, "DSP_APPLY_REQUEST");
     on_tune_change(state);
     state.center_freq = freq;
+    // Orbcomm geometry invalidation (issue #865): `center_hz` is
+    // baked into the bank's per-channel NCO mix — a retune makes it
+    // stale. Clear both, same as the source-stop site in `cleanup`;
+    // the next enabled tap call lazy-rebuilds at the new center.
+    state.orbcomm_bank = None;
+    state.orbcomm_init_failed = false;
     // A centre-frequency tune is a fresh start for the VFO: the
     // UI already zeroes its overlay offset on every tune path
     // (`set_center_frequency`), but the engine kept demodulating
@@ -1099,6 +1105,12 @@ pub(super) fn handle_set_sample_rate(
     }
     tracing::debug!(sample_rate = rate, "set sample rate");
     state.configured_sample_rate = rate;
+    // Orbcomm geometry invalidation (issue #865): `source_rate_hz` is
+    // baked into the bank at construction. A rate change (plus the
+    // decimation auto-adjust `apply_rate_to_frontend` may also make)
+    // invalidates it; the next enabled tap call lazy-rebuilds.
+    state.orbcomm_bank = None;
+    state.orbcomm_init_failed = false;
     if let Some(source) = &mut state.source {
         if let Err(e) = source.set_sample_rate(rate) {
             tracing::warn!("set sample rate failed: {e}");
@@ -1164,6 +1176,12 @@ pub(super) fn handle_set_decimation(
         return;
     }
     tracing::debug!(ratio, "set decimation");
+    // Orbcomm geometry invalidation (issue #865): the bank is built
+    // at `frontend.effective_sample_rate()`, which decimation
+    // directly scales. Clear unconditionally (mirrors the sample-
+    // rate site) — the next enabled tap call lazy-rebuilds.
+    state.orbcomm_bank = None;
+    state.orbcomm_init_failed = false;
     if let Err(e) = state.frontend.set_decimation(ratio) {
         tracing::warn!("set decimation failed: {e}");
         let _ = dsp_tx.send(DspToUi::Error(format!("Decimation failed: {e}")));

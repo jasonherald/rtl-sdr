@@ -243,6 +243,24 @@ pub enum DspToUi {
         /// the file path or host:port).
         message: String,
     },
+    /// One decoded Orbcomm event (a parsed packet or a completed
+    /// multi-fragment message) from `orbcomm_decode_tap`. Boxed
+    /// for the same reason `AcarsMessage` is — keeps the enum's
+    /// stack footprint small. Issue #865.
+    OrbcommEvent(Box<sdr_orbcomm::OrbcommEvent>),
+    /// Per-channel Orbcomm stats. Emitted no more than once per
+    /// second while the tap is enabled. Boxed as a slice —
+    /// `ORBCOMM_CHANNELS_HZ` is a fixed 9-channel list, but the
+    /// slice keeps the same variable-width convention as
+    /// `AcarsChannelStats`. Issue #865.
+    OrbcommChannelStats(Box<[sdr_orbcomm::ChannelStats]>),
+    /// Ack for `UiToDsp::SetOrbcommEnabled`. Construction can't
+    /// fail synchronously the way ACARS engage can (Orbcomm
+    /// doesn't force source geometry), so unlike
+    /// `AcarsEnabledChanged` this always succeeds — a bank-init
+    /// failure surfaces later via the tap's latch (mirrors the
+    /// LRPT pattern) rather than through this ack. Issue #865.
+    OrbcommEnabledChanged(bool),
 }
 
 /// Available source types for IQ input.
@@ -600,6 +618,13 @@ pub enum UiToDsp {
     /// `station_id` field. Empty string ⇒ field omitted.
     /// Issue #578.
     SetAcarsStationId(String),
+    /// Enable or disable the Orbcomm decode tap. Unlike ACARS,
+    /// this does not force source geometry — it decodes whatever
+    /// channels of `sdr_orbcomm::ORBCOMM_CHANNELS_HZ` fall inside
+    /// the currently live source span. `true`/`false` both clear
+    /// the bank + init-failure latch so the next tap call picks
+    /// up the live geometry fresh. Issue #865.
+    SetOrbcommEnabled(bool),
 }
 
 #[cfg(test)]

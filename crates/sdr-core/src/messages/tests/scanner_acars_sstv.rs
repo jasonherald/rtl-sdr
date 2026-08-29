@@ -160,6 +160,58 @@ fn acars_output_ui_to_dsp_variants_construct() {
 }
 
 #[test]
+fn orbcomm_ui_to_dsp_variant_constructs() {
+    // Wire-contract pin for `SetOrbcommEnabled`, issue #865 —
+    // mirrors `acars_set_enabled_round_trips_debug`.
+    let cmd = UiToDsp::SetOrbcommEnabled(true);
+    let s = format!("{cmd:?}");
+    assert!(s.contains("SetOrbcommEnabled"), "got {s}");
+    assert!(s.contains("true"), "got {s}");
+}
+
+#[test]
+fn orbcomm_dsp_to_ui_variants_construct() {
+    // Shape regression for the three Orbcomm events added in
+    // issue #865. Catches silent payload changes the same way
+    // `sstv_dsp_to_ui_variants_construct` does for SSTV.
+    let event = DspToUi::OrbcommEvent(Box::new(sdr_orbcomm::OrbcommEvent {
+        channel_hz: 137_250_000.0,
+        kind: sdr_orbcomm::OrbcommEventKind::MessageComplete {
+            bytes: vec![0xA1, 0xB2],
+            partial: false,
+        },
+    }));
+    let DspToUi::OrbcommEvent(payload) = &event else {
+        unreachable!("just constructed as OrbcommEvent")
+    };
+    assert!(matches!(
+        **payload,
+        sdr_orbcomm::OrbcommEvent {
+            channel_hz,
+            kind: sdr_orbcomm::OrbcommEventKind::MessageComplete { partial: false, .. },
+        } if channel_hz.to_bits() == 137_250_000.0_f64.to_bits()
+    ));
+
+    let stats = DspToUi::OrbcommChannelStats(
+        vec![sdr_orbcomm::ChannelStats {
+            freq_hz: 137_250_000.0,
+            in_span: true,
+            packets_ok: 3,
+            checksum_fail: 0,
+            repaired: 0,
+        }]
+        .into_boxed_slice(),
+    );
+    assert!(matches!(stats, DspToUi::OrbcommChannelStats(ref s) if s.len() == 1));
+
+    let enabled_changed = DspToUi::OrbcommEnabledChanged(true);
+    assert!(matches!(
+        enabled_changed,
+        DspToUi::OrbcommEnabledChanged(true)
+    ));
+}
+
+#[test]
 fn sstv_dsp_to_ui_variants_construct() {
     // Shape regression for the two SSTV events added in
     // epic #472. Catches silent payload changes — if the

@@ -3161,6 +3161,7 @@ dependencies = [
  "sdr-acars",
  "sdr-config",
  "sdr-dsp",
+ "sdr-orbcomm",
  "sdr-pipeline",
  "sdr-radio",
  "sdr-scanner",
