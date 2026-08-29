@@ -1,8 +1,8 @@
 use super::*;
 
-/// Registry size after the #853 wave-2 additions — the persisted
-/// model index's upper bound.
-const SHERPA_MODEL_COUNT: usize = 7;
+/// Registry size after the #853 final-wave additions — the
+/// persisted model index's upper bound.
+const SHERPA_MODEL_COUNT: usize = 11;
 
 #[test]
 fn all_models_have_unique_directory_names() {
@@ -348,10 +348,43 @@ fn canary_is_offline_with_encoder_decoder_layout() {
 }
 
 #[test]
-fn canary_is_appended_last() {
+fn final_wave_is_appended_after_canary() {
     assert_eq!(SherpaModel::ALL.len(), SHERPA_MODEL_COUNT);
+    // Wave-2 tail position is frozen (persisted index), final wave
+    // appends after it.
+    assert_eq!(SherpaModel::ALL[6], SherpaModel::Canary180mFlash);
     assert_eq!(
         SherpaModel::ALL[SHERPA_MODEL_COUNT - 1],
-        SherpaModel::Canary180mFlash
+        SherpaModel::ParakeetUnifiedEn06b
     );
+}
+
+// ── #853 final wave: Nemotron lookahead variants ──────────────────
+
+#[test]
+fn nemotron_variants_share_the_streaming_contract() {
+    for m in [
+        SherpaModel::NemotronStreamingEn80ms,
+        SherpaModel::NemotronStreamingEn160ms,
+        SherpaModel::NemotronStreamingEn1120ms,
+    ] {
+        assert_eq!(m.kind(), ModelKind::OnlineTransducer, "{m:?}");
+        assert!(m.supports_partials(), "{m:?}");
+        assert_eq!(m.feature_dim(), 128, "{m:?}");
+        let ModelFilePaths::Transducer { encoder, .. } = model_file_paths(m) else {
+            panic!("{m:?} must be a Transducer layout");
+        };
+        assert!(encoder.ends_with("encoder.int8.onnx"), "{m:?}");
+    }
+    // Distinct storage dirs — variants must not clobber each other.
+    let dirs: std::collections::HashSet<_> = [
+        SherpaModel::NemotronStreamingEn,
+        SherpaModel::NemotronStreamingEn80ms,
+        SherpaModel::NemotronStreamingEn160ms,
+        SherpaModel::NemotronStreamingEn1120ms,
+    ]
+    .iter()
+    .map(|m| m.dir_name())
+    .collect();
+    assert_eq!(dirs.len(), 4);
 }

@@ -128,6 +128,21 @@ pub enum SherpaModel {
     /// lightweight offline option. English ASR via task tokens.
     /// Offline (VAD-gated) decode. Per issue #853 wave 2.
     Canary180mFlash,
+    /// Nemotron streaming, 80 ms cache-aware chunk — the
+    /// lowest-latency variant (fastest partials, lowest accuracy of
+    /// the family). Same contract as [`Self::NemotronStreamingEn`].
+    /// Per issue #853 final wave.
+    NemotronStreamingEn80ms,
+    /// Nemotron streaming, 160 ms chunk. Per issue #853 final wave.
+    NemotronStreamingEn160ms,
+    /// Nemotron streaming, 1120 ms chunk — the accuracy end of the
+    /// family (slowest partials). Per issue #853 final wave.
+    NemotronStreamingEn1120ms,
+    /// NVIDIA Parakeet unified 0.6b (English, int8, non-streaming) —
+    /// the successor line to Parakeet-TDT v3. Standard 4-file `NeMo`
+    /// transducer; offline (VAD-gated) decode through the existing
+    /// `OfflineNemoTransducer` path. Per issue #853 final wave.
+    ParakeetUnifiedEn06b,
 }
 
 impl SherpaModel {
@@ -141,6 +156,10 @@ impl SherpaModel {
             Self::NemotronStreamingEn => "Nemotron Streaming 0.6b (English)",
             Self::CohereTranscribe14Lang => "Cohere Transcribe (English)",
             Self::Canary180mFlash => "Canary 180M Flash (English)",
+            Self::NemotronStreamingEn80ms => "Nemotron Streaming 0.6b — 80 ms (English)",
+            Self::NemotronStreamingEn160ms => "Nemotron Streaming 0.6b — 160 ms (English)",
+            Self::NemotronStreamingEn1120ms => "Nemotron Streaming 0.6b — 1120 ms (English)",
+            Self::ParakeetUnifiedEn06b => "Parakeet Unified 0.6b (English)",
         }
     }
 
@@ -155,6 +174,10 @@ impl SherpaModel {
             Self::NemotronStreamingEn => "nemotron-streaming-en",
             Self::CohereTranscribe14Lang => "cohere-transcribe-14-lang",
             Self::Canary180mFlash => "canary-180m-flash",
+            Self::NemotronStreamingEn80ms => "nemotron-streaming-en-80ms",
+            Self::NemotronStreamingEn160ms => "nemotron-streaming-en-160ms",
+            Self::NemotronStreamingEn1120ms => "nemotron-streaming-en-1120ms",
+            Self::ParakeetUnifiedEn06b => "parakeet-unified-en-0.6b",
         }
     }
 
@@ -174,6 +197,18 @@ impl SherpaModel {
                 "sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01.tar.bz2"
             }
             Self::Canary180mFlash => "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8.tar.bz2",
+            Self::NemotronStreamingEn80ms => {
+                "sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25.tar.bz2"
+            }
+            Self::NemotronStreamingEn160ms => {
+                "sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25.tar.bz2"
+            }
+            Self::NemotronStreamingEn1120ms => {
+                "sherpa-onnx-nemotron-speech-streaming-en-0.6b-1120ms-int8-2026-04-25.tar.bz2"
+            }
+            Self::ParakeetUnifiedEn06b => {
+                "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2"
+            }
         }
     }
 
@@ -193,6 +228,18 @@ impl SherpaModel {
             }
             Self::CohereTranscribe14Lang => "sherpa-onnx-cohere-transcribe-14-lang-int8-2026-04-01",
             Self::Canary180mFlash => "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8",
+            Self::NemotronStreamingEn80ms => {
+                "sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25"
+            }
+            Self::NemotronStreamingEn160ms => {
+                "sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25"
+            }
+            Self::NemotronStreamingEn1120ms => {
+                "sherpa-onnx-nemotron-speech-streaming-en-0.6b-1120ms-int8-2026-04-25"
+            }
+            Self::ParakeetUnifiedEn06b => {
+                "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
+            }
         }
     }
 
@@ -211,9 +258,15 @@ impl SherpaModel {
     /// right recognizer type and session loop.
     pub fn kind(self) -> ModelKind {
         match self {
-            Self::StreamingZipformerEn | Self::NemotronStreamingEn => ModelKind::OnlineTransducer,
+            Self::StreamingZipformerEn
+            | Self::NemotronStreamingEn
+            | Self::NemotronStreamingEn80ms
+            | Self::NemotronStreamingEn160ms
+            | Self::NemotronStreamingEn1120ms => ModelKind::OnlineTransducer,
             Self::MoonshineTinyEn | Self::MoonshineBaseEn => ModelKind::OfflineMoonshine,
-            Self::ParakeetTdt06bV3En => ModelKind::OfflineNemoTransducer,
+            Self::ParakeetTdt06bV3En | Self::ParakeetUnifiedEn06b => {
+                ModelKind::OfflineNemoTransducer
+            }
             Self::CohereTranscribe14Lang => ModelKind::OfflineCohereTranscribe,
             Self::Canary180mFlash => ModelKind::OfflineCanary,
         }
@@ -230,7 +283,10 @@ impl SherpaModel {
         /// NVIDIA's Nemotron streaming export trains on 128-dim mels.
         const NEMOTRON_FEATURE_DIM: i32 = 128;
         match self {
-            Self::NemotronStreamingEn => NEMOTRON_FEATURE_DIM,
+            Self::NemotronStreamingEn
+            | Self::NemotronStreamingEn80ms
+            | Self::NemotronStreamingEn160ms
+            | Self::NemotronStreamingEn1120ms => NEMOTRON_FEATURE_DIM,
             _ => DEFAULT_FEATURE_DIM,
         }
     }
@@ -261,6 +317,10 @@ impl SherpaModel {
         Self::NemotronStreamingEn,
         Self::CohereTranscribe14Lang,
         Self::Canary180mFlash,
+        Self::NemotronStreamingEn80ms,
+        Self::NemotronStreamingEn160ms,
+        Self::NemotronStreamingEn1120ms,
+        Self::ParakeetUnifiedEn06b,
     ];
 }
 
@@ -486,14 +546,17 @@ pub fn model_file_paths(model: SherpaModel) -> ModelFilePaths {
         // them into (online for Zipformer vs offline for Parakeet).
         // Nemotron streaming shares Parakeet's 4-file int8 transducer
         // layout; kind() routes it to the ONLINE recognizer.
-        SherpaModel::ParakeetTdt06bV3En | SherpaModel::NemotronStreamingEn => {
-            ModelFilePaths::Transducer {
-                encoder: dir.join("encoder.int8.onnx"),
-                decoder: dir.join("decoder.int8.onnx"),
-                joiner: dir.join("joiner.int8.onnx"),
-                tokens: dir.join("tokens.txt"),
-            }
-        }
+        SherpaModel::ParakeetTdt06bV3En
+        | SherpaModel::NemotronStreamingEn
+        | SherpaModel::NemotronStreamingEn80ms
+        | SherpaModel::NemotronStreamingEn160ms
+        | SherpaModel::NemotronStreamingEn1120ms
+        | SherpaModel::ParakeetUnifiedEn06b => ModelFilePaths::Transducer {
+            encoder: dir.join("encoder.int8.onnx"),
+            decoder: dir.join("decoder.int8.onnx"),
+            joiner: dir.join("joiner.int8.onnx"),
+            tokens: dir.join("tokens.txt"),
+        },
         SherpaModel::Canary180mFlash => ModelFilePaths::Canary {
             encoder: dir.join("encoder.int8.onnx"),
             decoder: dir.join("decoder.int8.onnx"),
