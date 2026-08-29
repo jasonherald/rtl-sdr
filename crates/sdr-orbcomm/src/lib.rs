@@ -4,6 +4,7 @@
 
 pub mod deframe;
 pub mod packet;
+pub mod reassembly;
 pub mod sat_names;
 
 /// Active Orbcomm subscriber downlink channels (Hz), low to high.
