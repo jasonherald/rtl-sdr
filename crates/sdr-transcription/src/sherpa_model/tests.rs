@@ -1,5 +1,9 @@
 use super::*;
 
+/// Registry size after the #853 wave-1 additions — the persisted
+/// model index's upper bound.
+const SHERPA_MODEL_COUNT: usize = 6;
+
 #[test]
 fn all_models_have_unique_directory_names() {
     let names: Vec<_> = SherpaModel::ALL.iter().map(|m| m.dir_name()).collect();
@@ -147,7 +151,7 @@ fn moonshine_archive_urls_are_well_formed() {
 
 #[test]
 fn all_contains_six_variants() {
-    assert_eq!(SherpaModel::ALL.len(), 6);
+    assert_eq!(SherpaModel::ALL.len(), SHERPA_MODEL_COUNT);
 }
 
 #[test]
@@ -292,8 +296,12 @@ fn cohere_is_offline_with_encoder_decoder_layout() {
 fn new_models_are_appended_after_existing_indices() {
     // The UI persists the selection as an index into ALL — existing
     // entries' positions are config keys and must not move.
+    /// Number of models shipped before #853 — their `ALL` positions
+    /// are frozen by persisted configs.
+    const PRE_853_MODEL_COUNT: usize = 4;
+
     assert_eq!(
-        SherpaModel::ALL[..4],
+        SherpaModel::ALL[..PRE_853_MODEL_COUNT],
         [
             SherpaModel::StreamingZipformerEn,
             SherpaModel::MoonshineTinyEn,
@@ -301,7 +309,13 @@ fn new_models_are_appended_after_existing_indices() {
             SherpaModel::ParakeetTdt06bV3En,
         ]
     );
-    assert_eq!(SherpaModel::ALL.len(), 6);
-    assert_eq!(SherpaModel::ALL[4], SherpaModel::NemotronStreamingEn);
-    assert_eq!(SherpaModel::ALL[5], SherpaModel::CohereTranscribe14Lang);
+    assert_eq!(SherpaModel::ALL.len(), SHERPA_MODEL_COUNT);
+    assert_eq!(
+        SherpaModel::ALL[PRE_853_MODEL_COUNT],
+        SherpaModel::NemotronStreamingEn
+    );
+    assert_eq!(
+        SherpaModel::ALL[PRE_853_MODEL_COUNT + 1],
+        SherpaModel::CohereTranscribe14Lang
+    );
 }

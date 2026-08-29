@@ -208,9 +208,14 @@ impl SherpaModel {
     /// streaming export uses 128 — feeding the wrong dimension decodes
     /// silently to garbage rather than erroring. Per issue #853.
     pub fn feature_dim(self) -> i32 {
+        /// sherpa-onnx's default mel dimension, used by every export
+        /// in the catalog except Nemotron.
+        const DEFAULT_FEATURE_DIM: i32 = 80;
+        /// NVIDIA's Nemotron streaming export trains on 128-dim mels.
+        const NEMOTRON_FEATURE_DIM: i32 = 128;
         match self {
-            Self::NemotronStreamingEn => 128,
-            _ => 80,
+            Self::NemotronStreamingEn => NEMOTRON_FEATURE_DIM,
+            _ => DEFAULT_FEATURE_DIM,
         }
     }
 
@@ -268,8 +273,8 @@ const SILERO_VAD_URL: &str =
 const SILERO_VAD_REQUEST_TIMEOUT_MINS: u64 = 5;
 
 /// Total-request timeout for the sherpa-onnx ASR bundle
-/// downloads. These are tarballs in the 250 MB – 1.2 GB range
-/// depending on the model (Parakeet is the largest), and
+/// downloads. These are tarballs in the 250 MB – 2 GB range
+/// depending on the model (Cohere Transcribe is the largest), and
 /// unlike the VAD file they can legitimately take a long time
 /// over rural broadband. 1 hour is our "give up" threshold —
 /// generous enough that a user on a 5 Mbps connection can

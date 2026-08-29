@@ -313,7 +313,7 @@ fn run_host_loop(
             Ok(state) => state,
             Err(()) => return, // init_online already published Failed and stored the error
         },
-        // Both offline kinds share init_offline — only the recognizer
+        // All offline kinds share init_offline — only the recognizer
         // config builder differs, and that branching happens inside
         // init_offline based on model.kind() again.
         ModelKind::OfflineMoonshine
@@ -470,16 +470,6 @@ fn init_online(
     Ok(RecognizerState::Online(recognizer))
 }
 
-/// Phase 1-2 for any offline model (`OfflineMoonshine` or
-/// `OfflineNemoTransducer`): download the Silero VAD if missing,
-/// download the model bundle if missing, then build the right
-/// `OfflineRecognizerConfig` for the model's kind and create the
-/// `OfflineRecognizer` + `SherpaSileroVad`.
-///
-/// The recognizer config builder is selected via `model.kind()` so
-/// callers don't need to know which offline family they're using.
-/// Returns `Err(())` on any failure — the error has already been
-/// stored in `SHERPA_HOST` and emitted as `InitEvent::Failed`.
 /// Pick the offline recognizer config builder for `model`'s kind so
 /// `init_offline`'s Phase 1-2 (download VAD + bundle) stays generic
 /// across all offline models.
@@ -494,29 +484,45 @@ fn offline_recognizer_config_for(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
 ) -> Option<sherpa_onnx::OfflineRecognizerConfig> {
-    match model.kind() {
-        crate::sherpa_model::ModelKind::OfflineMoonshine => Some(
-            super::offline::build_moonshine_recognizer_config(model, super::SHERPA_PROVIDER),
-        ),
-        crate::sherpa_model::ModelKind::OfflineNemoTransducer => Some(
-            super::offline::build_nemo_transducer_recognizer_config(model, super::SHERPA_PROVIDER),
-        ),
-        crate::sherpa_model::ModelKind::OfflineCohereTranscribe => Some(
-            super::offline::build_cohere_recognizer_config(model, super::SHERPA_PROVIDER),
-        ),
+    let config = match model.kind() {
+        crate::sherpa_model::ModelKind::OfflineMoonshine => {
+            super::offline::build_moonshine_recognizer_config(model, super::SHERPA_PROVIDER)
+        }
+        crate::sherpa_model::ModelKind::OfflineNemoTransducer => {
+            super::offline::build_nemo_transducer_recognizer_config(model, super::SHERPA_PROVIDER)
+        }
+        crate::sherpa_model::ModelKind::OfflineCohereTranscribe => {
+            super::offline::build_cohere_recognizer_config(model, super::SHERPA_PROVIDER)
+        }
         crate::sherpa_model::ModelKind::OnlineTransducer => {
-            let msg = format!(
+            tracing::error!(
                 "init_offline called with online model {} — engine routing bug",
                 model.label()
             );
-            tracing::error!(%msg);
-            store_init_failure(BackendError::Init(msg.clone()));
-            let _ = event_tx.send(InitEvent::Failed { message: msg });
             None
         }
+    };
+    if config.is_none() {
+        let msg = format!(
+            "no offline recognizer config for {} — engine routing bug",
+            model.label()
+        );
+        store_init_failure(BackendError::Init(msg.clone()));
+        let _ = event_tx.send(InitEvent::Failed { message: msg });
     }
+    config
 }
 
+/// Phase 1-2 for any offline model (`OfflineMoonshine`,
+/// `OfflineNemoTransducer`, or `OfflineCohereTranscribe`): download
+/// the Silero VAD if missing, download the model bundle if missing,
+/// then build the right `OfflineRecognizerConfig` for the model's
+/// kind and create the `OfflineRecognizer` + `SherpaSileroVad`.
+///
+/// The recognizer config builder is selected via `model.kind()` so
+/// callers don't need to know which offline family they're using.
+/// Returns `Err(())` on any failure — the error has already been
+/// stored in `SHERPA_HOST` and emitted as `InitEvent::Failed`.
 fn init_offline(
     model: SherpaModel,
     event_tx: &mpsc::Sender<InitEvent>,
@@ -529,7 +535,7 @@ fn init_offline(
         }
     }
 
-    // --- Moonshine model bundle ---
+    // --- Model bundle ---
     if !sherpa_model::model_exists(model)
         && !download_and_extract_bundle(model, event_tx, model.label())
     {

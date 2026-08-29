@@ -176,6 +176,42 @@ mod tests {
     use crate::sherpa_model::{self, SherpaModel};
 
     #[test]
+    fn cohere_config_enables_punct_itn_and_english() {
+        // Codacy round 1 on PR #857 claimed these were missing —
+        // pin them so a regression (or a future reviewer) has a
+        // test to point at. Config building needs no model files
+        // on disk.
+        let config = offline::build_cohere_recognizer_config(
+            SherpaModel::CohereTranscribe14Lang,
+            SHERPA_PROVIDER,
+        )
+        .expect("cohere kind routes to the cohere builder");
+        let cohere = &config.model_config.cohere_transcribe;
+        assert!(cohere.use_punct);
+        assert!(cohere.use_itn);
+        assert_eq!(cohere.language.as_deref(), Some("en"));
+        assert!(
+            cohere
+                .encoder
+                .as_deref()
+                .is_some_and(|p| p.ends_with("encoder.int8.onnx"))
+        );
+        assert!(
+            cohere
+                .decoder
+                .as_deref()
+                .is_some_and(|p| p.ends_with("decoder.int8.onnx"))
+        );
+        assert!(
+            config
+                .model_config
+                .tokens
+                .as_deref()
+                .is_some_and(|p| p.ends_with("tokens.txt"))
+        );
+    }
+
+    #[test]
     fn sherpa_backend_supports_partials() {
         let backend = SherpaBackend::new();
         assert!(backend.supports_partials());
