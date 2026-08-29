@@ -86,7 +86,7 @@ When `make install CARGO_FLAGS="... --features sherpa-cuda"` runs:
    | `libcublas-linux-x86_64` | 12.6.4.1 | ~522 MB |
    | `libcufft-linux-x86_64` | 11.3.0.4 | ~476 MB |
    | `libcurand-linux-x86_64` | 10.3.7.77 | ~82 MB |
-   | `cuda_nvrtc-linux-x86_64` | 12.6.85 | ~34 MB |
+   | `cuda_nvrtc-linux-x86_64` | 12.6.85 (as of sherpa-onnx v1.13.6, August 2026) | ~34 MB |
    | `cudnn-linux-x86_64` | 9.5.1.17 (cuda12) | ~745 MB |
 
 3. **SHA-256 verification** on each file. Versions and hashes are
@@ -136,7 +136,7 @@ $ readelf -d libonnxruntime_providers_cuda.so | grep NEEDED
   libcudart.so.12     <- cuda_cudart archive
   libnvrtc.so.12      <- cuda_nvrtc archive (NEEDED since the
                          onnxruntime 1.27.1 provider, sherpa-onnx
-                         v1.13.6 — issue #854)
+                         v1.13.6, August 2026 — issue #854)
   libcudnn.so.9       <- cudnn archive (plus sublibs dlopen'd by cuDNN 9)
 ```
 
@@ -144,8 +144,10 @@ We do **not** ship:
 
 - `libcusparse`, `libcusolver`, `libnvjitlink` — not in `NEEDED`,
   `onnxruntime`'s CUDA path doesn't touch them. (Verified for
-  `libnvjitlink` specifically: `libnvrtc.so.12.6.85`'s own `NEEDED`
-  list is libc-family only, so shipping nvrtc does not pull it in.)
+  `libnvjitlink` specifically against `libnvrtc.so.12.6.85` — the
+  sherpa-onnx v1.13.6 pin, August 2026: nvrtc's own `NEEDED` list is
+  libc-family only, so shipping it does not pull nvjitlink in.
+  Re-check on version bumps.)
 - `libonnxruntime_providers_tensorrt.so` — we never request the TensorRT
   provider, and it would pull `libnvinfer` which we don't provision.
 - `libcuda.so` from the stubs directory — that's a build-time driver
