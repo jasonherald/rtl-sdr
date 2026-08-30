@@ -35,7 +35,7 @@ use tracing::warn;
 use crate::deframe::{DeframedPacket, Deframer};
 use crate::demod::SdpskDemod;
 use crate::packet::{PacketType, parse_packet};
-use crate::reassembly::{DEFAULT_MAX_AGE_PACKETS, Reassembler};
+use crate::reassembly::{CompletedMessage, DEFAULT_MAX_AGE_PACKETS, Reassembler};
 use crate::{CHANNEL_SAMPLE_RATE_HZ, OrbcommError, packet::OrbcommPacket};
 
 /// Something a channel produced, tagged with the channel it came from.
@@ -446,6 +446,16 @@ struct ChannelDsp {
     /// calls. A single bit can yield two: the one that confirms an
     /// acquisition also releases the candidate it confirmed.
     frames: Vec<DeframedPacket>,
+    /// Messages the reassembler emitted for the current Message packet,
+    /// reused across calls — the [`Reassembler::push`] sink-style
+    /// counterpart to `frames` above. A single push can yield two: a flush
+    /// of a superseded/stale sequence and the immediate completion of the
+    /// fragment that triggered it. Draining both from `out` in the same
+    /// call (rather than a one-`Option`-per-call return the caller might
+    /// only re-poll on the next packet) is what keeps a completed
+    /// message from ever waiting behind a later, unrelated packet before
+    /// it's surfaced as an event.
+    messages: Vec<CompletedMessage>,
 }
 
 impl ChannelDsp {
@@ -464,6 +474,7 @@ impl ChannelDsp {
             decimated: Vec::new(),
             bits: Vec::new(),
             frames: Vec::new(),
+            messages: Vec::new(),
         })
     }
 }
@@ -616,6 +627,7 @@ impl Channel {
             decimated,
             bits,
             frames,
+            messages,
         } = dsp;
 
         // 1. Mix the channel down to DC, phase-continuously across blocks.
@@ -698,22 +710,30 @@ impl Channel {
                 }
                 // Only Message packets carry reassembly fragments; the
                 // reassembler wants their raw bytes, header and check bytes
-                // included.
+                // included. `push` is sink-style (like `deframer.push_bit`
+                // above): it appends every message it completes or flushes
+                // from THIS push to `messages`, which can hold two — see
+                // the `messages` field doc — so both land as their own
+                // event from this one bit rather than one of them waiting
+                // behind a later, unrelated packet.
                 if frame
                     .bytes
                     .first()
                     .copied()
                     .and_then(PacketType::from_header)
                     == Some(PacketType::Message)
-                    && let Some(message) = reassembler.push(&frame.bytes)
                 {
-                    events.push(OrbcommEvent {
-                        channel_hz: *freq_hz,
-                        kind: OrbcommEventKind::MessageComplete {
-                            bytes: message.bytes,
-                            partial: message.partial,
-                        },
-                    });
+                    messages.clear();
+                    reassembler.push(&frame.bytes, messages);
+                    for message in messages.drain(..) {
+                        events.push(OrbcommEvent {
+                            channel_hz: *freq_hz,
+                            kind: OrbcommEventKind::MessageComplete {
+                                bytes: message.bytes,
+                                partial: message.partial,
+                            },
+                        });
+                    }
                 }
             }
         }

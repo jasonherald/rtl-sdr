@@ -16,7 +16,7 @@
 //! subscriber or channel. A fragment whose `total` doesn't match the
 //! in-flight sequence is treated as the start of a new sequence.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use crate::packet::PacketType;
 
@@ -125,8 +125,8 @@ impl InFlight {
 /// Tracks a single in-flight sequence. Feed it every checksum-valid Message
 /// packet (`bytes[0] == 0x1A`, `bytes.len() == 12`) via [`Self::push`];
 /// non-Message input is the caller's responsibility to filter out —
-/// `push` simply ignores (returns whatever is queued, see below, rather
-/// than asserting) anything that doesn't match the Message header and
+/// `push` simply does nothing (appends nothing to `out`, rather than
+/// asserting) for anything that doesn't match the Message header and
 /// length, since the input is untrusted RF-derived data even after
 /// checksum validation.
 ///
@@ -138,16 +138,6 @@ impl InFlight {
 pub struct Reassembler {
     max_age_packets: u32,
     inflight: Option<InFlight>,
-    /// Completed/flushed messages produced but not yet returned. `push`
-    /// returns only one `Option<CompletedMessage>` per call, but a single
-    /// call can produce two events (a flush of the superseded/stale
-    /// sequence *and* an immediate completion of the fragment that
-    /// triggered it — only possible for a single-fragment, `total == 1`
-    /// sequence). Both are queued in the order they occurred and drained
-    /// one-per-call (oldest first) by every subsequent `push`, so no
-    /// completed or flushed message is ever silently dropped — it's just
-    /// delayed until the next call(s) pop it off.
-    pending: VecDeque<CompletedMessage>,
 }
 
 impl Reassembler {
@@ -167,20 +157,31 @@ impl Reassembler {
         Self {
             max_age_packets,
             inflight: None,
-            pending: VecDeque::new(),
         }
     }
 
-    /// Feed one checksum-valid packet. Returns the oldest not-yet-returned
-    /// [`CompletedMessage`] this reassembler has produced, if any — see the
-    /// [`Reassembler::pending`] doc for why a single call doesn't always
-    /// return the event it just produced.
-    #[must_use]
-    pub fn push(&mut self, bytes: &[u8]) -> Option<CompletedMessage> {
+    /// Feed one checksum-valid packet. Sink-style, mirroring
+    /// [`crate::deframe::Deframer::push_bit`]: every [`CompletedMessage`]
+    /// this call produces is appended to `out`, in the order produced —
+    /// `out` is never cleared here, so the caller owns a reused scratch
+    /// buffer the same way `Deframer::push_bit`'s callers do.
+    ///
+    /// A single call can produce **two** events — a flush of a
+    /// superseded/stale sequence *and* an immediate completion of the
+    /// fragment that triggered it (only possible when the fragment starts
+    /// a `total == 1` sequence) — and both land in `out` from that one
+    /// call, flush first. Earlier revisions returned at most one
+    /// `Option<CompletedMessage>` per call and queued the rest for a later
+    /// call to drain; that let a completed message sit unrendered until
+    /// the *next* Message packet arrived, which could be minutes away on a
+    /// live channel. Appending everything to an out-parameter closes that
+    /// gap by construction: nothing is ever deferred past the call that
+    /// produced it.
+    pub fn push(&mut self, bytes: &[u8], out: &mut Vec<CompletedMessage>) {
         if bytes.len() != PacketType::Message.packet_len()
             || bytes.first() != Some(&PacketType::Message.header_byte())
         {
-            return self.pending.pop_front();
+            return;
         }
 
         // `bytes.len() == 12` is already guaranteed above, so these are
@@ -188,7 +189,7 @@ impl Reassembler {
         let (Some(total), Some(seq), Some(payload_slice)) =
             (msg_total_len(bytes), msg_seq_num(bytes), msg_payload(bytes))
         else {
-            return self.pending.pop_front();
+            return;
         };
 
         // A fragment whose own seq is outside its own total's valid range
@@ -196,7 +197,7 @@ impl Reassembler {
         // numbers are zero-based, so `0..total` is the range and a `total` of
         // zero admits nothing at all.
         if seq >= total {
-            return self.pending.pop_front();
+            return;
         }
 
         let mut payload = [0u8; MESSAGE_PAYLOAD_BYTES];
@@ -207,7 +208,7 @@ impl Reassembler {
         if let Some(inflight) = self.inflight.as_mut() {
             inflight.age += 1;
             if inflight.age > self.max_age_packets {
-                self.flush_inflight(true);
+                self.flush_inflight(true, out);
             }
         }
 
@@ -218,7 +219,7 @@ impl Reassembler {
             .as_ref()
             .is_some_and(|inflight| inflight.total != total)
         {
-            self.flush_inflight(true);
+            self.flush_inflight(true, out);
         }
 
         let inflight = self.inflight.get_or_insert_with(|| InFlight {
@@ -229,18 +230,16 @@ impl Reassembler {
         inflight.fragments.insert(seq, payload);
 
         if inflight.is_complete() {
-            self.flush_inflight(false);
+            self.flush_inflight(false, out);
         }
-
-        self.pending.pop_front()
     }
 
     /// Take the in-flight sequence, if any, concatenate its fragments, and
-    /// queue the result onto `pending` with the given `partial` flag.
-    /// No-op when nothing is in flight.
-    fn flush_inflight(&mut self, partial: bool) {
+    /// append the result to `out` with the given `partial` flag. No-op when
+    /// nothing is in flight.
+    fn flush_inflight(&mut self, partial: bool, out: &mut Vec<CompletedMessage>) {
         if let Some(f) = self.inflight.take() {
-            self.pending.push_back(CompletedMessage {
+            out.push(CompletedMessage {
                 bytes: f.concat_payloads(),
                 partial,
             });
@@ -267,6 +266,28 @@ mod tests {
         p.push(c1);
         assert_eq!(p.len(), PacketType::Message.packet_len());
         p
+    }
+
+    /// Push one packet and return everything it produced, as a fresh `Vec`
+    /// — the sink-style convenience most tests below want, since most
+    /// pushes in these tests produce 0 or 1 events. Tests that must observe
+    /// two events from a single call use `r.push(..., &mut out)` directly.
+    fn push_all(r: &mut Reassembler, bytes: &[u8]) -> Vec<CompletedMessage> {
+        let mut out = Vec::new();
+        r.push(bytes, &mut out);
+        out
+    }
+
+    /// Assert `push_all` produced no events.
+    fn assert_none(r: &mut Reassembler, bytes: &[u8]) {
+        assert_eq!(push_all(r, bytes), Vec::new(), "expected no events");
+    }
+
+    /// Assert `push_all` produced exactly one event and return it.
+    fn expect_one(r: &mut Reassembler, bytes: &[u8], msg: &str) -> CompletedMessage {
+        let mut out = push_all(r, bytes);
+        assert_eq!(out.len(), 1, "{msg}: got {out:?}");
+        out.remove(0)
     }
 
     #[test]
@@ -306,9 +327,9 @@ mod tests {
         let p2 = [2u8; MESSAGE_PAYLOAD_BYTES];
         let p3 = [3u8; MESSAGE_PAYLOAD_BYTES];
 
-        assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
-        assert_eq!(r.push(&msg_fragment(1, 3, p2)), None);
-        let done = r.push(&msg_fragment(2, 3, p3)).expect("completes");
+        assert_none(&mut r, &msg_fragment(0, 3, p1));
+        assert_none(&mut r, &msg_fragment(1, 3, p2));
+        let done = expect_one(&mut r, &msg_fragment(2, 3, p3), "completes");
         assert!(!done.partial);
         let mut expected = Vec::new();
         expected.extend_from_slice(&p1);
@@ -324,9 +345,9 @@ mod tests {
         let p2 = [0xBBu8; MESSAGE_PAYLOAD_BYTES];
         let p3 = [0xCCu8; MESSAGE_PAYLOAD_BYTES];
 
-        assert_eq!(r.push(&msg_fragment(2, 3, p3)), None);
-        assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
-        let done = r.push(&msg_fragment(1, 3, p2)).expect("completes");
+        assert_none(&mut r, &msg_fragment(2, 3, p3));
+        assert_none(&mut r, &msg_fragment(0, 3, p1));
+        let done = expect_one(&mut r, &msg_fragment(1, 3, p2), "completes");
         assert!(!done.partial);
         let mut expected = Vec::new();
         expected.extend_from_slice(&p1);
@@ -340,17 +361,19 @@ mod tests {
         let max_age = 3u32;
         let mut r = Reassembler::new(max_age);
         let p1 = [0x11u8; MESSAGE_PAYLOAD_BYTES];
-        assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
+        assert_none(&mut r, &msg_fragment(0, 3, p1));
         // Fragments 1 and 2 never arrive. Age the sequence with same-seq repeats
         // (total unchanged, so no restart), which just overwrite fragment 0
         // in place — harmless since we only assert the *fact* of a flush
         // and the surviving payload below.
         for _ in 0..max_age {
-            assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
+            assert_none(&mut r, &msg_fragment(0, 3, p1));
         }
-        let flushed = r
-            .push(&msg_fragment(0, 3, p1))
-            .expect("stale flush on the push that exceeds max_age");
+        let flushed = expect_one(
+            &mut r,
+            &msg_fragment(0, 3, p1),
+            "stale flush on the push that exceeds max_age",
+        );
         assert!(flushed.partial);
         assert_eq!(flushed.bytes, p1.to_vec());
     }
@@ -359,22 +382,26 @@ mod tests {
     fn fresh_sequence_restarts_after_a_flush() {
         let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
         let p1 = [0x01u8; MESSAGE_PAYLOAD_BYTES];
-        assert_eq!(r.push(&msg_fragment(0, 3, p1)), None);
+        assert_none(&mut r, &msg_fragment(0, 3, p1));
 
         // A fragment reporting a different total restarts the sequence,
         // flushing the old one (fragment 0 of a total-3 sequence) partial.
         let restart_p1 = [0x02u8; MESSAGE_PAYLOAD_BYTES];
-        let flushed = r
-            .push(&msg_fragment(0, 2, restart_p1))
-            .expect("old sequence flushed on restart");
+        let flushed = expect_one(
+            &mut r,
+            &msg_fragment(0, 2, restart_p1),
+            "old sequence flushed on restart",
+        );
         assert!(flushed.partial);
         assert_eq!(flushed.bytes, p1.to_vec());
 
         // The new total-2 sequence completes normally on its next fragment.
         let restart_p2 = [0x03u8; MESSAGE_PAYLOAD_BYTES];
-        let done = r
-            .push(&msg_fragment(1, 2, restart_p2))
-            .expect("new sequence completes");
+        let done = expect_one(
+            &mut r,
+            &msg_fragment(1, 2, restart_p2),
+            "new sequence completes",
+        );
         assert!(!done.partial);
         let mut expected = Vec::new();
         expected.extend_from_slice(&restart_p1);
@@ -385,52 +412,87 @@ mod tests {
     #[test]
     fn non_message_input_is_ignored() {
         let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
-        assert_eq!(r.push(&[0u8; 12]), None);
-        assert_eq!(r.push(&[PacketType::Message.header_byte()]), None);
+        assert_none(&mut r, &[0u8; 12]);
+        assert_none(&mut r, &[PacketType::Message.header_byte()]);
     }
 
     /// Regression test for the same-push flush+completion race: a fragment
     /// (B) that both triggers a restart-flush of an old, incomplete
     /// sequence (A) AND itself immediately completes a `total == 1`
-    /// sequence must not have its own completed data silently overwritten
-    /// by the next fragment (C) that reuses the same sequence number. Both
-    /// B's and C's completions must eventually come back out, in order,
-    /// and A must come back out partial.
+    /// sequence must emit BOTH events from that one `push` call, flush
+    /// first — not silently lose B, and not make the caller wait for a
+    /// later call to see it. A following fragment (C) that reuses the same
+    /// wire bytes as B must build a *fresh* sequence and emit exactly its
+    /// own completion, not B's.
     #[test]
-    fn flush_and_completion_in_the_same_push_are_both_eventually_returned() {
+    fn flush_and_completion_in_the_same_push_both_come_out_together() {
         let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
         let a1 = [0xA1u8; MESSAGE_PAYLOAD_BYTES];
         let b = [0xB0u8; MESSAGE_PAYLOAD_BYTES];
         let c = [0xC0u8; MESSAGE_PAYLOAD_BYTES];
 
         // A: first fragment of a 3-fragment sequence, left incomplete.
-        assert_eq!(r.push(&msg_fragment(0, 3, a1)), None);
+        assert_none(&mut r, &msg_fragment(0, 3, a1));
 
         // B: a total==1 fragment restarts the sequence. In the same push,
         // A's old sequence flushes partial AND B's new total==1 sequence
-        // completes. Only one `Option` can come back from this call; the
-        // flush comes back first (it was queued first).
-        let out1 = r.push(&msg_fragment(0, 1, b)).expect("A flushes partial");
-        assert!(out1.partial, "A must flush partial");
-        assert_eq!(out1.bytes, a1.to_vec());
+        // completes — both must land in `out` from this one call, flush
+        // first (that's the order they're discovered in).
+        let mut out = Vec::new();
+        r.push(&msg_fragment(0, 1, b), &mut out);
+        assert_eq!(out.len(), 2, "expected both events from one call: {out:?}");
+        assert!(out[0].partial, "A must flush partial, and come out first");
+        assert_eq!(out[0].bytes, a1.to_vec());
+        assert!(!out[1].partial, "B must come out complete");
+        assert_eq!(out[1].bytes, b.to_vec(), "B's data must not be lost");
 
-        // C: another total==1, seq==1 fragment arrives. It must build a
-        // *fresh* in-flight sequence rather than overwriting B's
-        // already-migrated (but not yet returned) completed data. This
-        // push returns B's queued completion.
-        let out2 = r
-            .push(&msg_fragment(0, 1, c))
-            .expect("B's completion, queued from the previous push");
-        assert!(!out2.partial, "B must come out complete, not partial");
-        assert_eq!(out2.bytes, b.to_vec(), "B's data must not be lost");
+        // C: another total==1, seq==0 fragment arrives after B already
+        // completed (and was returned). It must build a fresh sequence and
+        // emit exactly its own completion — not B's, which is already gone.
+        let done = expect_one(&mut r, &msg_fragment(0, 1, c), "C completes on its own");
+        assert!(!done.partial, "C must come out complete too");
+        assert_eq!(done.bytes, c.to_vec());
+    }
 
-        // Drain: any further push (even non-Message input, which performs
-        // no state mutation) pops the next queued item — C's completion.
-        let out3 = r
-            .push(&[0u8; 12])
-            .expect("C's completion, queued from the previous push");
-        assert!(!out3.partial, "C must come out complete too");
-        assert_eq!(out3.bytes, c.to_vec());
+    /// Regression test for the overnight live-smoke display-lag defect: an
+    /// orphaned second-of-two fragment (no fragment 0 ever arrived) sits
+    /// in flight, then a single-fragment message (B) restarts the
+    /// sequence. The old API returned only the flush from that push and
+    /// queued B's completion for a *later* Message packet — which, on a
+    /// live channel, rendered B's bytes under the *next* message's log
+    /// entry, potentially minutes later. The fixed sink-style `push` must
+    /// emit both the orphan's partial flush and B's completion from the
+    /// single push that produced them, and a following message (C) must
+    /// emit exactly C.
+    #[test]
+    fn orphan_flush_and_message_completion_land_in_the_same_push() {
+        let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
+        let orphan = [0x77u8; MESSAGE_PAYLOAD_BYTES];
+        let b = [0xB1u8; MESSAGE_PAYLOAD_BYTES];
+        let c = [0xC2u8; MESSAGE_PAYLOAD_BYTES];
+
+        // An orphan: fragment 1 of a two-fragment sequence, with fragment 0
+        // never arriving.
+        assert_none(&mut r, &msg_fragment(1, 2, orphan));
+
+        // Message B (total==1, seq==0) restarts the sequence: the orphan
+        // flushes partial AND B completes, both from this one push.
+        let mut out = Vec::new();
+        r.push(&msg_fragment(0, 1, b), &mut out);
+        assert_eq!(
+            out.len(),
+            2,
+            "orphan flush and B's completion must land together: {out:?}"
+        );
+        assert!(out[0].partial, "the orphan flushes partial, first");
+        assert_eq!(out[0].bytes, orphan.to_vec());
+        assert!(!out[1].partial, "B completes");
+        assert_eq!(out[1].bytes, b.to_vec());
+
+        // Message C (also total==1, seq==0) must emit exactly C — not B.
+        let done = expect_one(&mut r, &msg_fragment(0, 1, c), "C completes on its own");
+        assert!(!done.partial);
+        assert_eq!(done.bytes, c.to_vec(), "C must not come back as B's bytes");
     }
 
     #[test]
@@ -440,13 +502,13 @@ mod tests {
         let p2 = [0x22u8; MESSAGE_PAYLOAD_BYTES];
         let bogus = [0xFFu8; MESSAGE_PAYLOAD_BYTES];
 
-        assert_eq!(r.push(&msg_fragment(0, 2, p1)), None);
+        assert_none(&mut r, &msg_fragment(0, 2, p1));
         // seq==2 is outside 0..2 for this fragment's own total — ignored.
-        assert_eq!(r.push(&msg_fragment(2, 2, bogus)), None);
+        assert_none(&mut r, &msg_fragment(2, 2, bogus));
         // seq==3 is likewise outside 0..2 — ignored.
-        assert_eq!(r.push(&msg_fragment(3, 2, bogus)), None);
+        assert_none(&mut r, &msg_fragment(3, 2, bogus));
 
-        let done = r.push(&msg_fragment(1, 2, p2)).expect("completes");
+        let done = expect_one(&mut r, &msg_fragment(1, 2, p2), "completes");
         assert!(!done.partial);
         let mut expected = Vec::new();
         expected.extend_from_slice(&p1);
