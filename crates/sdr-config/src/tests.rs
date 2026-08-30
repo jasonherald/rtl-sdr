@@ -107,7 +107,13 @@ fn test_auto_save() {
     // the deadline. Reads racing the atomic temp+rename publish (#760)
     // see either the old or the new complete file, so the parse guard
     // below never observes torn JSON.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    /// Upper bound for the debounced auto-save flush to land — generous
+    /// because coverage-instrumented CI runners are slow (#863).
+    const FLUSH_DEADLINE: Duration = Duration::from_secs(10);
+    /// Poll cadence while waiting for the flush.
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    let deadline = std::time::Instant::now() + FLUSH_DEADLINE;
     loop {
         // Track what the poll last observed so a timeout names the
         // actual failure stage (missing file vs bad JSON vs stale
@@ -122,9 +128,9 @@ fn test_auto_save() {
         };
         assert!(
             std::time::Instant::now() < deadline,
-            "auto-save did not flush volume=0.75 within 10 s; last observed: {last_state}"
+            "auto-save did not flush volume=0.75 within {FLUSH_DEADLINE:?}; last observed: {last_state}"
         );
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(POLL_INTERVAL);
     }
 
     mgr.disable_auto_save();
