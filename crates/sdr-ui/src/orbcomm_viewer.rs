@@ -42,10 +42,11 @@ const ORBCOMM_VIEWER_WINDOW_HEIGHT: i32 = 600;
 
 /// Cap on retained log entries; the oldest is trimmed once this is
 /// exceeded. Mirrors the ACARS viewer's bounded store — a multi-hour
-/// unattended session shouldn't grow UI memory without bound. Each
-/// "line" here is one `format_packet_row` result, which may itself
-/// span several text lines (a `MessageComplete` hexdump block).
-const MAX_LOG_LINES: usize = 500;
+/// unattended session shouldn't grow UI memory without bound. Named
+/// `_ENTRIES` rather than `_LINES`: one entry is one `format_packet_row`
+/// result, which may itself span several rendered text lines (a
+/// `MessageComplete` hexdump block).
+const MAX_LOG_ENTRIES: usize = 500;
 
 /// Pixel tolerance for the "scrolled to bottom" auto-follow check.
 /// `GtkAdjustment` values are fractional, so an exact compare against
@@ -239,12 +240,14 @@ pub struct ViewerHandles {
     /// Bounded ring of rendered log entries — one
     /// [`format_packet_row`] result per entry (a single line for a
     /// `Packet` event, a multi-line hexdump block for a
-    /// `MessageComplete` event). Capped at [`MAX_LOG_LINES`], oldest
-    /// dropped first. The `log_view` buffer is fully re-rendered
-    /// from this ring on every append — simpler to get right than
-    /// incremental `GtkTextIter` surgery, and cheap at this cap and
-    /// this decode rate (Orbcomm packets arrive at most a few times
-    /// a second across all 9 channels combined).
+    /// `MessageComplete` event). Capped at [`MAX_LOG_ENTRIES`], oldest
+    /// dropped first. The `log_view` buffer is fully re-rendered from
+    /// this ring on every append — simpler to get right than
+    /// incremental `GtkTextIter` surgery. The join borrows each
+    /// entry's bytes (`String::as_str`, no clone) rather than
+    /// duplicating the ring, so the cost of a re-render is one
+    /// allocation the size of the rendered log — bounded by
+    /// `MAX_LOG_ENTRIES`, not by decode rate.
     pub log_entries: std::cell::RefCell<VecDeque<String>>,
 }
 
@@ -421,17 +424,23 @@ fn channel_label_text(freq_hz: f64, stats: Option<&ChannelStats>) -> String {
 /// Refresh every channel-strip label from a fresh `ChannelStats`
 /// slice (`DspToUi::OrbcommChannelStats` order matches
 /// `ORBCOMM_CHANNELS_HZ` order, so this zips by index rather than
-/// searching by frequency). Channels outside the source span get the
+/// searching by frequency — but once a stats entry exists for that
+/// index, `s.freq_hz` is the authoritative frequency, not the
+/// constant: an order/length mismatch between the emitted slice and
+/// `ORBCOMM_CHANNELS_HZ` would otherwise silently pair the wrong
+/// counts with the wrong label. `ORBCOMM_CHANNELS_HZ[i]` is used only
+/// as the pre-first-tick placeholder, when no stats entry exists yet
+/// for that index at all). Channels outside the source span get the
 /// `dim-label` CSS class + `set_sensitive(false)`, same convention as
 /// the rest of the sidebar (see `status_bar.rs`'s role badge).
 pub(crate) fn refresh_channel_strip(handles: &ViewerHandles, stats: &[ChannelStats]) {
     for (i, label) in handles.channel_labels.iter().enumerate() {
-        let freq_hz = sdr_orbcomm::ORBCOMM_CHANNELS_HZ[i];
         let Some(s) = stats.get(i) else {
+            let freq_hz = sdr_orbcomm::ORBCOMM_CHANNELS_HZ[i];
             label.set_label(&channel_label_text(freq_hz, None));
             continue;
         };
-        label.set_label(&channel_label_text(freq_hz, Some(s)));
+        label.set_label(&channel_label_text(s.freq_hz, Some(s)));
         if s.in_span {
             label.remove_css_class("dim-label");
             label.set_sensitive(true);
@@ -458,7 +467,7 @@ pub(crate) fn apply_enabled_ack(handles: &ViewerHandles, enabled: bool) {
 }
 
 /// Append one rendered log entry (a [`format_packet_row`] result) to
-/// the viewer's log, trimming from the front once [`MAX_LOG_LINES`]
+/// the viewer's log, trimming from the front once [`MAX_LOG_ENTRIES`]
 /// is exceeded, and auto-scrolling to the bottom if the user was
 /// already there (mirrors `acars_viewer`'s auto-scroll-to-top for its
 /// newest-first sort — this log is oldest-first, so the anchor is the
@@ -472,15 +481,38 @@ pub(crate) fn append_log_entry(handles: &ViewerHandles, entry: &str) {
     let joined = {
         let mut entries = handles.log_entries.borrow_mut();
         entries.push_back(entry.to_string());
-        while entries.len() > MAX_LOG_LINES {
+        while entries.len() > MAX_LOG_ENTRIES {
             entries.pop_front();
         }
-        entries.iter().cloned().collect::<Vec<_>>().join("\n")
+        // Reference each entry (`String::as_str`) rather than
+        // cloning it — the ring already owns every entry's bytes
+        // once, so this join is the only content copy on the append
+        // path (into the new joined `String`), not two.
+        entries
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     handles.log_view.buffer().set_text(&joined);
 
     if was_at_bottom {
-        adj.set_value(adj.upper());
+        // GTK4 recomputes `GtkTextView`'s adjustment bounds on the
+        // next size-allocate pass, not synchronously inside
+        // `set_text` — reading `adj.upper()` right here can still
+        // observe the PRE-append bound and leave the view one entry
+        // short on every auto-follow. Defer the scroll to the next
+        // main-loop idle (same `glib::idle_add_local_once` idiom
+        // `dsp_events/acars_events.rs::drain_deferred_aos_actions`
+        // uses to run after the current dispatch) so it reads the
+        // bound only after GTK has recomputed it. Weak ref: if the
+        // window closes before the idle fires, just drop the scroll.
+        let adj_weak = adj.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(adj) = adj_weak.upgrade() {
+                adj.set_value(adj.upper());
+            }
+        });
     }
 }
 
