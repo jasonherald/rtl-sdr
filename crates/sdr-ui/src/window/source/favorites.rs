@@ -222,10 +222,16 @@ pub(super) fn rebuild_favorites_popover(
     let mut entries: Vec<&sidebar::source_panel::FavoriteEntry> = favorites.values().collect();
     sort_favorites_for_display(&mut entries);
     for entry in entries {
+        // `use_markup(false)`: `nickname` and the subtitle's
+        // `key` (hostname:port) segment originate from mDNS
+        // TXT-record / hostname data captured at star time —
+        // attacker-controlled on a hostile LAN. Same treatment
+        // as the discovery-row builder in discovery.rs.
         let row = adw::ActionRow::builder()
             .title(&entry.nickname)
             .subtitle(format_favorite_subtitle(entry, now))
             .activatable(false)
+            .use_markup(false)
             .build();
         attach_favorite_row_actions(&row, entry, ctx);
         list.append(&row);
@@ -342,10 +348,6 @@ fn attach_favorite_connect_button(
         on_favorite_connect_clicked(&connect_ctx, &connect_key, &connect_nickname);
     });
     row.add_suffix(&connect_btn);
-
-    // Copy button — writes `host:port` to the clipboard. Lets
-    // the user grab the endpoint for pasting into another tool
-    // without having to hand-transcribe the subtitle.
 }
 
 /// Click body of the favorite Connect button: parse the key, upgrade
@@ -417,6 +419,9 @@ fn attach_favorite_copy_unstar_buttons(
     entry: &sidebar::source_panel::FavoriteEntry,
     ctx: &Rc<FavoriteRowContext>,
 ) {
+    // Copy button — writes `host:port` to the clipboard. Lets
+    // the user grab the endpoint for pasting into another tool
+    // without having to hand-transcribe the subtitle.
     let copy_btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
     copy_btn.set_tooltip_text(Some("Copy host:port"));
     copy_btn.add_css_class("flat");
