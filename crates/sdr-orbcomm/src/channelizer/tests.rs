@@ -2,7 +2,7 @@ use super::*;
 use crate::demod::modulate_sdpsk_at_sps;
 use crate::packet::{PacketType, fletcher16_check_bytes};
 use crate::testutil::{Rng, add_awgn, apply_cfo};
-use crate::{ORBCOMM_CHANNELS_HZ, SYMBOL_RATE_HZ};
+use crate::{ORBCOMM_CHANNELS_HZ, SAMPLES_PER_SYMBOL, SYMBOL_RATE_HZ};
 
 /// Wideband source rate used by the synthesis tests.
 const SOURCE_RATE_HZ: f64 = 2_400_000.0;
@@ -519,7 +519,7 @@ fn fll_pulls_in_worst_case_doppler() {
     for cfo_hz in [-3500.0_f64, -3000.0, 3000.0, 3500.0] {
         let mut rng = Rng::new(0x5EED_0100);
         let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
-        let iq = modulate_sdpsk_at_sps(&bits, 4);
+        let iq = modulate_sdpsk_at_sps(&bits, SAMPLES_PER_SYMBOL);
         let mut iq = apply_cfo(&iq, cfo_hz);
 
         let mut fll = Fll::new();
@@ -540,7 +540,7 @@ fn fll_pull_in_time_is_bounded() {
     const BUDGET: usize = 2048;
     let mut rng = Rng::new(0x5EED_0101);
     let bits: Vec<bool> = (0..1024).map(|_| rng.next_u64() & 1 == 1).collect();
-    let iq = modulate_sdpsk_at_sps(&bits, 4);
+    let iq = modulate_sdpsk_at_sps(&bits, SAMPLES_PER_SYMBOL);
     let mut iq = apply_cfo(&iq, 3500.0);
     assert!(iq.len() > BUDGET);
 
@@ -559,7 +559,7 @@ fn fll_stays_put_with_no_offset() {
     // into a walk-off on a signal that has no offset to correct.
     let mut rng = Rng::new(0x5EED_0102);
     let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
-    let mut iq = modulate_sdpsk_at_sps(&bits, 4);
+    let mut iq = modulate_sdpsk_at_sps(&bits, SAMPLES_PER_SYMBOL);
     let mut fll = Fll::new();
     fll.process(&mut iq);
     assert!(
@@ -585,7 +585,7 @@ fn fll_pulls_in_at_10_db_snr() {
     for (seed, cfo_hz) in [(0x5EED_0110_u64, -3000.0_f64), (0x5EED_0111, 3000.0)] {
         let mut rng = Rng::new(seed);
         let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
-        let iq = modulate_sdpsk_at_sps(&bits, 4);
+        let iq = modulate_sdpsk_at_sps(&bits, SAMPLES_PER_SYMBOL);
         let iq = apply_cfo(&iq, cfo_hz);
         let mut iq = add_awgn(&iq, 10.0, seed);
 
@@ -616,7 +616,7 @@ fn fll_survives_non_finite_samples() {
 
     let mut rng = Rng::new(0x5EED_0104);
     let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
-    let clean = modulate_sdpsk_at_sps(&bits, 4);
+    let clean = modulate_sdpsk_at_sps(&bits, SAMPLES_PER_SYMBOL);
     let mut clean = apply_cfo(&clean, 3000.0);
     fll.process(&mut clean);
     let residual = 3000.0 - fll.freq_hz;
@@ -631,7 +631,7 @@ fn fll_survives_non_finite_samples() {
 fn fll_block_boundaries_are_invisible() {
     let mut rng = Rng::new(0x5EED_0103);
     let bits: Vec<bool> = (0..2048).map(|_| rng.next_u64() & 1 == 1).collect();
-    let iq = modulate_sdpsk_at_sps(&bits, 4);
+    let iq = modulate_sdpsk_at_sps(&bits, SAMPLES_PER_SYMBOL);
     let iq = apply_cfo(&iq, 2000.0);
 
     let mut whole = iq.clone();
