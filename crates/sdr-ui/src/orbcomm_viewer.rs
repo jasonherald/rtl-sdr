@@ -107,15 +107,19 @@ fn format_ephemeris_line(eph: &Ephemeris) -> String {
 }
 
 /// Latitude with an `N`/`S` hemisphere letter derived from sign, one
-/// decimal place, e.g. `51.2°N` / `33.9°S`.
-fn format_lat(lat_deg: f64) -> String {
+/// decimal place, e.g. `51.2°N` / `33.9°S`. `pub(crate)` — also used
+/// by the "Heard via Orbcomm" panel group's subtitle formatter
+/// (`window/satellites/heard.rs`, issue #865 Task 12) so the two
+/// coordinate renderings can't drift apart.
+pub(crate) fn format_lat(lat_deg: f64) -> String {
     let hemi = if lat_deg < 0.0 { 'S' } else { 'N' };
     format!("{:.1}°{hemi}", lat_deg.abs())
 }
 
 /// Longitude with an `E`/`W` hemisphere letter derived from sign, one
-/// decimal place, e.g. `7.4°E` / `18.4°W`.
-fn format_lon(lon_deg: f64) -> String {
+/// decimal place, e.g. `7.4°E` / `18.4°W`. `pub(crate)` — see
+/// [`format_lat`]'s doc for why.
+pub(crate) fn format_lon(lon_deg: f64) -> String {
     let hemi = if lon_deg < 0.0 { 'W' } else { 'E' };
     format!("{:.1}°{hemi}", lon_deg.abs())
 }

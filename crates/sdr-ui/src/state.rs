@@ -440,6 +440,23 @@ pub struct AppState {
     /// enable switch). `Some` only while a viewer window is open.
     /// Mirrors `acars_viewer_handles`.
     pub orbcomm_viewer_handles: RefCell<Option<Rc<crate::orbcomm_viewer::ViewerHandles>>>,
+    /// "Heard via Orbcomm" session tracker (issue #865, Task 12):
+    /// every spacecraft `sat_id` seen this session, when it was last
+    /// heard, and its last-known position. Updated by the
+    /// `DspToUi::OrbcommEvent` arm on every `Sync` / `Ephemeris`
+    /// packet; read by `window/satellites/heard.rs`'s render
+    /// closure. Deliberately data-only (no GTK type) so the
+    /// `dsp_events` handler doesn't need to know about the Satellites
+    /// panel's widgets — mirrors `orbcomm_channel_stats`.
+    pub orbcomm_heard: RefCell<crate::sidebar::satellites_heard::HeardSatellites>,
+    /// Weak handle to the "Heard via Orbcomm" group's render closure,
+    /// built by `window/satellites/heard.rs::wire_heard_group`. Lets
+    /// a recorded event trigger an immediate row rebuild instead of
+    /// waiting for the next 5 s tick. `None` before the panel wires
+    /// up; upgrade failure (the tick's `GLib` source — the closure's
+    /// strong owner — has been dropped) is a silent no-op. Mirrors
+    /// `recorder_action_interpreter`.
+    pub orbcomm_heard_render: RefCell<Option<Weak<dyn Fn()>>>,
     /// Stash for the **full batch** of `RecorderAction`s a
     /// recorder tick yielded when ACARS was engaged. The
     /// recorder tick site detects a `StartAutoRecord` in the
@@ -552,6 +569,8 @@ impl AppState {
             orbcomm_channel_stats: RefCell::new(Vec::new()),
             orbcomm_viewer_window: RefCell::new(None),
             orbcomm_viewer_handles: RefCell::new(None),
+            orbcomm_heard: RefCell::new(crate::sidebar::satellites_heard::HeardSatellites::new()),
+            orbcomm_heard_render: RefCell::new(None),
             pending_aos_actions: RefCell::new(None),
             recorder_action_interpreter: RefCell::new(None),
         })
