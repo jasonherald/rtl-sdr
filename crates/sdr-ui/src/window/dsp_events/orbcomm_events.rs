@@ -72,6 +72,11 @@ fn render_heard_group_if_wired(state: &Rc<AppState>) {
         .and_then(Weak::upgrade)
     {
         render();
+    } else {
+        tracing::trace!(
+            "Orbcomm heard-group render closure unavailable (panel not wired yet, or dropped); \
+             falling back to the periodic tick"
+        );
     }
 }
 

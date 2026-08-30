@@ -116,7 +116,9 @@ Public API:
 - `ChannelBank::new(source_rate_hz, center_hz, &channels) -> Result<Self, OrbcommError>`
   (channels outside the source span are skipped with a per-channel flag,
   matching ACARS behavior).
-- `ChannelBank::process(&[Complex]) -> Vec<OrbcommEvent>`.
+- `ChannelBank::process(&[Complex], &mut Vec<OrbcommEvent>)` — shipped as
+  an out-param rather than a returned `Vec` so the caller owns (and
+  reuses) the event buffer, keeping the per-block path allocation-free.
 - `OrbcommEvent { channel_hz, packet: OrbcommPacket, repaired: bool }`.
 - `OrbcommPacket` enum: `Sync { code, sat_id }`,
   `Ephemeris { sat_id, sat_time_utc, lat_deg, lon_deg, alt_m, vel_ms }`,
@@ -132,7 +134,9 @@ Public API:
   readable fragments surface when they exist. Incomplete/stale
   sequences are dropped after a bounded age so the buffer can't grow
   unbounded.
-- `sat_name(sat_id: u8) -> Option<&'static str>`.
+- `sat_label(sat_id: u8) -> String` — shipped as an always-available
+  `Sat 0xNN` label rather than an optional catalog name lookup; the
+  downlink carries no field that maps a `sat_id` to an FM designator.
 - Per-channel stats accessor for the activity strip (packet + checksum
   counters).
 
@@ -157,7 +161,8 @@ plus crate-level fixtures.
 - `crates/sdr-ui/src/orbcomm_viewer.rs`: window modeled on
   `acars_viewer.rs` — per-channel activity strip across the top
   (9 fixed channels), monospace packet log below. Ephemeris rows render
-  as `FM-114 · 51.2°N 7.4°E · 715 km · 7.45 km/s · 19:42:11Z`; other
+  as `Sat 0x2C · 51.2°N 7.4°E · 715 km · 7.45 km/s · 19:42:11Z` (the
+  `sat_label` form above, not an FM designator); other
   packets as `type · sat/channel · hex`. Reassembled complete messages
   render as a hexdump with a printable-ASCII gutter (the payoff view —
   readable fragments pop out of the binary when present). Checksum-

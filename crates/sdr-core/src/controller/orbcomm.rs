@@ -10,6 +10,11 @@ use super::{DspState, DspToUi, mpsc};
 pub(super) const ORBCOMM_STATS_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(1_000);
 
+/// Leading text of the user-visible `DspToUi::Error` raised when
+/// `ChannelBank::new` fails. A constant so the tap and the test that
+/// pins "exactly once" agree on what to look for.
+pub(super) const ORBCOMM_INIT_ERROR_PREFIX: &str = "Orbcomm decoder could not start";
+
 /// Orbcomm decode tap. Mirrors `acars_decode_tap`'s lazy-init/latch
 /// shape (`controller/acars.rs::acars_decode_tap`), minus the
 /// output-writer plumbing ACARS has (Orbcomm has no JSONL/UDP sinks
@@ -42,9 +47,13 @@ pub(super) const ORBCOMM_STATS_INTERVAL: std::time::Duration =
 /// and `*init_failed == false`, builds the `ChannelBank` from
 /// `(source_rate_hz, center_hz, &ORBCOMM_CHANNELS_HZ)`, recording the
 /// attempted geometry regardless of the outcome. If construction
-/// fails, sets `*init_failed = true` and skips subsequent calls at
-/// the *same* geometry (no warn-spam); a later geometry change clears
-/// the latch and retries per the self-check above.
+/// fails, sends one user-visible [`DspToUi::Error`] (prefixed
+/// [`ORBCOMM_INIT_ERROR_PREFIX`], carrying the `OrbcommError` display
+/// text) so the toggle can't sit on with a dead strip behind it, sets
+/// `*init_failed = true`, and skips subsequent calls at the *same*
+/// geometry — so the message is emitted exactly once per failing
+/// geometry, not per block. A later geometry change clears the latch
+/// and retries per the self-check above.
 ///
 /// Per-block: clears `events_scratch` (the caller-owned reuse
 /// buffer — avoids a per-block allocation), feeds `iq` through
@@ -98,6 +107,13 @@ pub(super) fn orbcomm_decode_tap(
             }
             Err(e) => {
                 tracing::warn!("Orbcomm bank init failed: {e}");
+                // Surface it once, not per block: the caller's toggle is
+                // still ON with a dead strip behind it, and the latch set
+                // below is what keeps this to a single message per geometry
+                // (design spec, "Error handling"). `DspToUi::Error` is the
+                // codebase's one-shot pipeline-error idiom — see
+                // `controller/scanner.rs` and `controller/audio.rs`.
+                let _ = dsp_tx.send(DspToUi::Error(format!("{ORBCOMM_INIT_ERROR_PREFIX}: {e}")));
                 *init_failed = true;
                 return;
             }

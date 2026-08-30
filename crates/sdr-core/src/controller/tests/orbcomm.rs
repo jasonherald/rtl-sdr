@@ -141,13 +141,29 @@ fn tap_lazy_inits_and_emits_events() {
     assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 }
 
+/// Count the `DspToUi::Error` messages whose text starts with the
+/// Orbcomm init-failure prefix.
+fn orbcomm_init_errors(events: &[DspToUi]) -> Vec<&String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            DspToUi::Error(text)
+                if text.starts_with(crate::controller::orbcomm::ORBCOMM_INIT_ERROR_PREFIX) =>
+            {
+                Some(text)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn init_failure_latches_at_the_same_geometry() {
     let mut bank: Option<sdr_orbcomm::ChannelBank> = None;
     let mut init_failed = false;
     let mut geometry: Option<(f64, f64)> = None;
     let mut events = Vec::new();
-    let (tx, _rx) = mpsc::channel::<DspToUi>();
+    let (tx, rx) = mpsc::channel::<DspToUi>();
     let iq = vec![Complex::default(); 16];
 
     // Absurd geometry: a zero source rate is never in-span for any
@@ -167,26 +183,51 @@ fn init_failure_latches_at_the_same_geometry() {
     assert!(init_failed, "bad geometry should set the latch");
     assert_eq!(geometry, Some((0.0, TEST_CENTER_HZ)));
 
-    // A second call at the exact SAME (still-bad) geometry must
+    // Several more calls at the exact SAME (still-bad) geometry must
     // no-op — no repeated construction attempt, no warn-spam. This
     // is the steady-state case: same block cadence, same geometry,
     // every call.
-    super::orbcomm_decode_tap(
-        &mut bank,
-        &mut init_failed,
-        &mut geometry,
-        0.0,
-        TEST_CENTER_HZ,
-        &iq,
-        &mut events,
-        &tx,
-    );
+    for _ in 0..5 {
+        super::orbcomm_decode_tap(
+            &mut bank,
+            &mut init_failed,
+            &mut geometry,
+            0.0,
+            TEST_CENTER_HZ,
+            &iq,
+            &mut events,
+            &tx,
+        );
+    }
     assert!(
         bank.is_none(),
         "latched init_failed must skip the retry at unchanged geometry"
     );
     assert!(init_failed);
     assert_eq!(geometry, Some((0.0, TEST_CENTER_HZ)));
+
+    // Final review, C2 — the failure has to reach the user, not just
+    // the log: the toggle stays ON with a dead activity strip behind
+    // it otherwise. Exactly one error across all six calls, and it
+    // must carry the `OrbcommError` display text so the message says
+    // *why*.
+    let sent = drain(&rx);
+    let errors = orbcomm_init_errors(&sent);
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one surfaced init error across 6 tap calls, got {sent:?}"
+    );
+    let expected =
+        sdr_orbcomm::ChannelBank::new(0.0, TEST_CENTER_HZ, &sdr_orbcomm::ORBCOMM_CHANNELS_HZ)
+            .err()
+            .map(|e| e.to_string())
+            .expect("the absurd geometry must fail to construct");
+    assert!(
+        errors[0].ends_with(&expected),
+        "surfaced error {:?} does not carry the OrbcommError text {expected:?}",
+        errors[0]
+    );
 }
 
 /// Issue #865, CR round 1 — the tap must self-check its tracked
