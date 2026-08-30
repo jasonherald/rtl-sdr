@@ -15,7 +15,7 @@ pub(in crate::window) use status::{
 
 use super::{
     AdvertiseOptions, Advertiser, DEVICE_RTLSDR, InitialDeviceState, Rc, RefCell, SAMPLE_RATES,
-    Server, ServerConfig, SidebarPanels, TxtRecord, adw, glib, local_hostname, plain_toast,
+    Server, ServerConfig, SidebarPanels, TxtRecord, adw, gio, glib, local_hostname, plain_toast,
 };
 
 /// Owned handle for a running `rtl_tcp` server + optional mDNS
@@ -283,17 +283,72 @@ pub(super) fn connect_share_switch(
     let current_auth_key: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
     let auth_key_revealed: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
-    // If auth was restored as ON from config, eagerly load the
-    // key from the keyring so the key row reflects real state
-    // before the user interacts with anything. The server isn't
-    // running yet (that requires the share_row flip), so no
-    // `set_auth_key` call here — just UI state.
+    // If auth was restored as ON from config, load the key from
+    // the keyring so the key row reflects real state before the
+    // user interacts with anything. The server isn't running yet
+    // (that requires the share_row flip), so no `set_auth_key`
+    // call here — just UI state.
+    //
+    // The load is a synchronous Secret Service D-Bus round trip
+    // (and potentially a WRITE, when the keyring is empty/corrupt)
+    // — running it inline here would block window construction on
+    // a locked or slow keyring (issue #845). Instead it's pushed
+    // onto a `gio::spawn_blocking` worker and applied back on the
+    // main context via `glib::spawn_future_local`, same pattern as
+    // `sstv_viewer.rs::export_png_async`. Weak refs so a window
+    // torn down before the round trip lands is a silent no-op; the
+    // key row simply appears a beat later on slow keyrings, which
+    // is acceptable and intended.
+    //
+    // Defense in depth #1 (#845, `CodeRabbit` round 1 on PR #873):
+    // while `current_auth_key` is still empty and "Require key" is
+    // active, `share_row` is held insensitive too. Without this, a
+    // fast click (or scripted input) on Share during the pending
+    // window would flip sharing on with `current_auth_key` still
+    // `None` — `start_shared_server`'s hard guard
+    // (`auth_key_ready_to_start`) backstops that even if this UI
+    // gate is ever bypassed, but gating here is what keeps the
+    // click from silently no-op'ing/reverting in the user's face.
     if panels.server.auth_require_row.is_active() {
-        let key = ensure_server_auth_key();
-        *current_auth_key.borrow_mut() = Some(key);
-        panels.server.auth_key_row.set_visible(true);
-        // Leave subtitle as the masked placeholder (widget
-        // default) — user clicks Reveal to see the real value.
+        let current_auth_key_for_seed = Rc::clone(&current_auth_key);
+        let key_row_weak = panels.server.auth_key_row.downgrade();
+        let share_row_weak_for_seed = panels.server.share_row.downgrade();
+        let require_row_weak_for_seed = panels.server.auth_require_row.downgrade();
+        panels.server.share_row.set_sensitive(false);
+        // Hold "Require key" insensitive too: flipping it OFF while
+        // the load is in flight would let a stale completion seed the
+        // key and show the key row for a toggle that's no longer on
+        // (CodeRabbit round 2 on PR #873) — and could overlap a fresh
+        // toggle-on load of its own.
+        panels.server.auth_require_row.set_sensitive(false);
+        glib::spawn_future_local(async move {
+            let join = gio::spawn_blocking(ensure_server_auth_key).await;
+            // Re-sensitize both rows regardless of outcome below —
+            // the pending window is over either way.
+            let share_row = share_row_weak_for_seed.upgrade();
+            if let Some(share_row) = &share_row {
+                share_row.set_sensitive(true);
+            }
+            if let Some(require_row) = require_row_weak_for_seed.upgrade() {
+                require_row.set_sensitive(true);
+            }
+            let Some(key_row) = key_row_weak.upgrade() else {
+                // Window closed before the keyring round trip
+                // finished — nothing left to seed.
+                return;
+            };
+            let key = match join {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::warn!("startup rtl_tcp auth-key keyring-load worker panicked: {e:?}");
+                    return;
+                }
+            };
+            *current_auth_key_for_seed.borrow_mut() = Some(key);
+            key_row.set_visible(true);
+            // Leave subtitle as the masked placeholder (widget
+            // default) — user clicks Reveal to see the real value.
+        });
     }
 
     // Clone `current_auth_key` for the share_row closure before
@@ -477,6 +532,44 @@ fn start_shared_server(
     // `Server::start` receives. Per `CodeRabbit` round 1
     // on PR #406.
     let pending_auth_key = current_key_for_share.borrow().clone();
+
+    // Defense in depth #2 (#845, `CodeRabbit` round 1 on PR #873):
+    // hard guard at the config-assembly boundary. The UI gating in
+    // `connect_share_switch` (site 1) and `enable_auth_requirement_async`
+    // (site 2) is meant to keep Share insensitive while a keyring
+    // load is pending, but this check is what actually makes a
+    // `Server::start` with `auth_key: None` while "Require key" is
+    // active IMPOSSIBLE, regardless of any future UI-ordering
+    // mistake — an unauthenticated server despite the toggle
+    // reading "on" is a CWE-306 missing-authentication bug, not
+    // just a UI glitch.
+    if !auth_key_ready_to_start(
+        widgets.auth_require_row.is_active(),
+        pending_auth_key.as_deref(),
+    ) {
+        tracing::warn!(
+            "rtl_tcp share-start blocked: auth required but no key is available (load pending or failed)"
+        );
+        // The message covers both reachable states: a load still in
+        // flight (retry-in-a-moment works) and the near-unreachable
+        // worker-panic path, where the key stays absent until the
+        // user re-toggles Require key — which re-runs the load.
+        // (`ensure_server_auth_key` never returns an error itself;
+        // only a worker panic leaves the key unset.) Per CodeRabbit
+        // outside-diff on PR #873.
+        if let Some(overlay) = toast_overlay_weak.upgrade() {
+            overlay.add_toast(plain_toast(
+                "Auth key not ready — wait a moment, or toggle \u{201c}Require key\u{201d} off and on to retry",
+            ));
+        }
+        reentry_guard.set(true);
+        if let Some(share) = share_row_weak.upgrade() {
+            share.set_active(false);
+        }
+        reentry_guard.set(false);
+        return;
+    }
+
     let config = build_server_config_from_panel(widgets, pending_auth_key);
     match Server::start(config) {
         Ok(server) => {
@@ -548,6 +641,22 @@ pub(super) const DIRECT_SAMPLING_Q_BRANCH: i32 = 2;
 /// keeping the UI honest about "we're not overriding this" rather
 /// than pinning a value the server may later tune.
 pub(super) const SERVER_BUFFER_CAPACITY_DEFAULT: usize = 0;
+
+/// Pure guard (issue #845, `CodeRabbit` round 1 on PR #873): is it
+/// safe to start the server with this `auth_required` / pending-key
+/// combination? `false` ONLY for "Require key" active with no key
+/// bytes yet — the one combination that must never reach
+/// `Server::start` (it would silently start an unauthenticated
+/// server, CWE-306). Auth off never needs a key, and auth on with
+/// bytes already loaded is the normal path.
+///
+/// Kept as a standalone pure function (rather than inlined at the
+/// call site) so it's unit-testable without a GTK harness — see
+/// `share/auth_guard_tests.rs`.
+#[must_use]
+pub(super) fn auth_key_ready_to_start(auth_required: bool, pending_key: Option<&[u8]>) -> bool {
+    !auth_required || pending_key.is_some()
+}
 
 /// Read the server panel widget values and build a `ServerConfig`
 /// off them. Takes the widget bundle by reference so the arg list
@@ -665,10 +774,6 @@ pub(super) fn set_controls_locked(panel: &ServerSwitchWidgets, locked: bool) {
     panel.device_defaults_row.set_sensitive(sensitive);
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod server_panel_format_tests;
-
 /// Frequency / sample-rate / gain / DSP portion of the panel read.
 /// Split out per the 50-NLOC gate (#817).
 #[allow(
@@ -777,3 +882,10 @@ fn read_server_gain_settings(
         },
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod server_panel_format_tests;
+
+#[cfg(test)]
+mod auth_guard_tests;

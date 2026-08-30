@@ -7,7 +7,7 @@
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
-use super::super::{Rc, RefCell, SidebarPanels, adw, glib, plain_toast};
+use super::super::{Rc, RefCell, SidebarPanels, adw, gio, glib, plain_toast};
 use super::{RunningServer, ServerSwitchWidgets, ServerSwitchWidgetsWeak, build_advertiser};
 
 /// Read the `rtl_tcp` server auth key from the OS keyring, if
@@ -257,6 +257,7 @@ fn wire_auth_require_toggle(
         current_key: Rc::clone(current_auth_key),
         revealed: Rc::clone(auth_key_revealed),
         reveal_button: panels.server.auth_key_reveal_button.downgrade(),
+        share_row: panels.server.share_row.downgrade(),
     };
     panels
         .server
@@ -271,6 +272,13 @@ fn wire_auth_require_toggle(
 /// failure. Split out per the 50-NLOC gate (#817).
 /// Everything the require-key toggle handler reads or mutates,
 /// captured once by the closure in `wire_auth_require_toggle`.
+///
+/// `Clone` so the keyring-cold-path (issue #845) can hand an owned
+/// copy into a `glib::spawn_future_local` continuation that outlives
+/// the synchronous signal-handler call — every field is either an
+/// `Rc`/`Cell` (main-thread-only, cheap to clone) or a `glib::WeakRef`
+/// (never upgraded off the main thread), so this stays GTK-safe.
+#[derive(Clone)]
 struct AuthToggleDeps {
     reentry_guard: Rc<std::cell::Cell<bool>>,
     key_row: glib::WeakRef<adw::ActionRow>,
@@ -280,6 +288,11 @@ struct AuthToggleDeps {
     current_key: Rc<RefCell<Option<Vec<u8>>>>,
     revealed: Rc<std::cell::Cell<bool>>,
     reveal_button: glib::WeakRef<gtk4::Button>,
+    /// Master share switch — gated insensitive alongside the
+    /// require-row for the duration of the async keyring load
+    /// (issue #845, `CodeRabbit` round 1 on PR #873) so the user
+    /// can't flip sharing on while `current_key` is still empty.
+    share_row: glib::WeakRef<adw::SwitchRow>,
 }
 
 fn on_auth_require_toggled(row: &adw::SwitchRow, deps: &AuthToggleDeps) {
@@ -292,6 +305,7 @@ fn on_auth_require_toggled(row: &adw::SwitchRow, deps: &AuthToggleDeps) {
         current_key: current_key_for_toggle,
         revealed: revealed_for_toggle,
         reveal_button: reveal_button_for_toggle,
+        share_row: _,
     } = deps;
     if auth_toggle_guard_for_handler.get() {
         // Re-entered from our own `set_active` revert
@@ -305,22 +319,34 @@ fn on_auth_require_toggled(row: &adw::SwitchRow, deps: &AuthToggleDeps) {
     let widgets = widgets_weak_for_auth_toggle.upgrade();
 
     if row.is_active() {
-        let ok = enable_auth_requirement(
-            widgets.as_ref(),
-            running_for_auth_toggle,
-            toast_overlay_for_auth_toggle,
-            current_key_for_toggle,
-            revealed_for_toggle,
-            &key_row,
-            reveal_button_for_toggle,
-        );
-        if !ok {
-            // Revert the switch. UI stays on the pre-toggle
-            // state; the user can click again after resolving
-            // the server issue.
-            auth_toggle_guard_for_handler.set(true);
-            row.set_active(false);
-            auth_toggle_guard_for_handler.set(false);
+        // Zero-I/O fast path: a key was already seeded (startup
+        // restore, an earlier toggle-on, or Regenerate this
+        // session) — apply it synchronously, no keyring round
+        // trip needed. Otherwise fall to the async cold-load path
+        // (#845) so a locked/slow Secret Service D-Bus call never
+        // blocks this handler.
+        let cached_key = current_key_for_toggle.borrow().clone();
+        if let Some(key) = cached_key {
+            let ok = apply_auth_key_and_reveal(
+                widgets.as_ref(),
+                running_for_auth_toggle,
+                toast_overlay_for_auth_toggle,
+                current_key_for_toggle,
+                revealed_for_toggle,
+                &key_row,
+                reveal_button_for_toggle,
+                key,
+            );
+            if !ok {
+                // Revert the switch. UI stays on the pre-toggle
+                // state; the user can click again after resolving
+                // the server issue.
+                auth_toggle_guard_for_handler.set(true);
+                row.set_active(false);
+                auth_toggle_guard_for_handler.set(false);
+            }
+        } else {
+            enable_auth_requirement_async(row, deps);
         }
     } else {
         let ok = disable_auth_requirement(
@@ -368,12 +394,27 @@ fn disable_auth_requirement(
     true
 }
 
-/// Toggle-ON half of the require-key handler: generate/load the key,
-/// apply it to the live server + advertiser, then reveal the key row
-/// in masked state. Returns `false` when the live-server apply failed
-/// and the caller must revert the switch. Split out per the 50-NLOC
-/// gate (#817).
-fn enable_auth_requirement(
+/// Toggle-ON half of the require-key handler: apply an already-known
+/// key to the live server + advertiser, then reveal the key row in
+/// masked state. Returns `false` when the live-server apply failed
+/// and the caller must revert the switch.
+///
+/// Takes the key as a plain argument rather than calling
+/// `ensure_server_auth_key()` itself — the caller has already
+/// resolved it, either synchronously from the `current_auth_key`
+/// cache or asynchronously off the keyring (issue #845;
+/// [`enable_auth_requirement_async`]). Keeping this function
+/// keyring-free is what lets the cached-key path stay fully
+/// synchronous with zero D-Bus I/O. Split out per the 50-NLOC gate
+/// (#817).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extra `key: Vec<u8>` param over the 7-arg threshold vs. the \
+              prior `enable_auth_requirement` — splitting further would scatter \
+              the shared auth-row state across more helpers without improving \
+              clarity"
+)]
+fn apply_auth_key_and_reveal(
     widgets: Option<&ServerSwitchWidgets>,
     running_for_auth_toggle: &Rc<RefCell<Option<RunningServer>>>,
     toast_overlay_for_auth_toggle: &glib::WeakRef<adw::ToastOverlay>,
@@ -381,12 +422,8 @@ fn enable_auth_requirement(
     revealed_for_toggle: &Rc<std::cell::Cell<bool>>,
     key_row: &adw::ActionRow,
     reveal_button_for_toggle: &glib::WeakRef<gtk4::Button>,
+    key: Vec<u8>,
 ) -> bool {
-    // Pending key is the single source of truth for
-    // both the server and any subsequent Reveal /
-    // Copy. Generate / load once, reuse everywhere.
-    let key = ensure_server_auth_key();
-
     // Step 1+2: apply to live server + refresh mDNS.
     let server_result = apply_live_auth_change(
         running_for_auth_toggle,
@@ -412,6 +449,93 @@ fn enable_auth_requirement(
         rb.update_property(&[gtk4::accessible::Property::Label("Reveal key")]);
     }
     true
+}
+
+/// Toggle-ON, keyring-cold-path (issue #845): `current_auth_key` is
+/// empty, so the pending key has to come from the OS keyring — a
+/// synchronous Secret Service D-Bus round trip (and potentially a
+/// WRITE, when the keyring is empty/corrupt and a fresh key gets
+/// generated + saved). Running that on the GTK main thread freezes
+/// the whole UI when the keyring is locked or slow, so it's pushed
+/// onto a `gio::spawn_blocking` worker and the result is applied
+/// back on the main context via `glib::spawn_future_local`, mirroring
+/// the established pattern in `sstv_viewer.rs::export_png_async`.
+///
+/// The require-row goes insensitive for the duration so a second
+/// click can't race the in-flight load, and re-sensitizes as soon as
+/// the worker returns (success OR failure) — before the apply
+/// path runs, so a failed apply's switch-revert click lands on a
+/// row the user can actually interact with again. On failure
+/// (worker panic, missing widgets, or a failed live-server apply)
+/// the switch reverts to off via the same reentry-guard trick the
+/// synchronous path uses, so the programmatic `set_active(false)`
+/// doesn't re-enter this handler.
+///
+/// Also gates the master Share switch insensitive for the same
+/// duration (issue #845, `CodeRabbit` round 1 on PR #873, CWE-306):
+/// without this, the user could flip sharing on while
+/// `current_auth_key` is still empty and "Require key" reads
+/// active, which would reach `Server::start` with `auth_key: None`
+/// — an unauthenticated server despite the UI claiming otherwise.
+/// `start_shared_server`'s `auth_key_ready_to_start` guard backstops
+/// this even if the gate here is ever bypassed.
+fn enable_auth_requirement_async(row: &adw::SwitchRow, deps: &AuthToggleDeps) {
+    let row_weak = row.downgrade();
+    let deps = deps.clone();
+    row.set_sensitive(false);
+    if let Some(share_row) = deps.share_row.upgrade() {
+        share_row.set_sensitive(false);
+    }
+    glib::spawn_future_local(async move {
+        let join = gio::spawn_blocking(ensure_server_auth_key).await;
+        // Re-sensitize both rows regardless of outcome below — the
+        // pending window is over either way.
+        if let Some(share_row) = deps.share_row.upgrade() {
+            share_row.set_sensitive(true);
+        }
+        let Some(row) = row_weak.upgrade() else {
+            // Window torn down before the keyring round trip
+            // finished — nothing left to update.
+            return;
+        };
+        row.set_sensitive(true);
+
+        let key = match join {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::warn!("rtl_tcp auth-key keyring-load worker panicked: {e:?}");
+                deps.reentry_guard.set(true);
+                row.set_active(false);
+                deps.reentry_guard.set(false);
+                return;
+            }
+        };
+        let Some(key_row) = deps.key_row.upgrade() else {
+            // Key-display row is gone (window closing) — can't
+            // safely turn auth on without it, so revert.
+            deps.reentry_guard.set(true);
+            row.set_active(false);
+            deps.reentry_guard.set(false);
+            return;
+        };
+        let widgets = deps.widgets_weak.upgrade();
+
+        let ok = apply_auth_key_and_reveal(
+            widgets.as_ref(),
+            &deps.running,
+            &deps.toast_overlay,
+            &deps.current_key,
+            &deps.revealed,
+            &key_row,
+            &deps.reveal_button,
+            key,
+        );
+        if !ok {
+            deps.reentry_guard.set(true);
+            row.set_active(false);
+            deps.reentry_guard.set(false);
+        }
+    });
 }
 
 /// Reveal/conceal + copy buttons for the auth-key row.
