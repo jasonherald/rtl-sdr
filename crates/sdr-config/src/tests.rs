@@ -90,6 +90,12 @@ fn test_write_and_save() {
 
 #[test]
 fn test_auto_save() {
+    /// Upper bound for the debounced auto-save flush to land — generous
+    /// because coverage-instrumented CI runners are slow (#863).
+    const FLUSH_DEADLINE: Duration = Duration::from_secs(10);
+    /// Poll cadence while waiting for the flush.
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
     let path = temp_path("test_autosave.json");
     let _ = fs::remove_file(&path);
 
@@ -107,12 +113,6 @@ fn test_auto_save() {
     // the deadline. Reads racing the atomic temp+rename publish (#760)
     // see either the old or the new complete file, so the parse guard
     // below never observes torn JSON.
-    /// Upper bound for the debounced auto-save flush to land — generous
-    /// because coverage-instrumented CI runners are slow (#863).
-    const FLUSH_DEADLINE: Duration = Duration::from_secs(10);
-    /// Poll cadence while waiting for the flush.
-    const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
     let deadline = std::time::Instant::now() + FLUSH_DEADLINE;
     loop {
         // Track what the poll last observed so a timeout names the
