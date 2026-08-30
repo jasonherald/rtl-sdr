@@ -750,3 +750,35 @@ fn wire_sample_rate_selector(
         apply_source_bandwidth_advisory.clone(),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEVICE_FILE, DEVICE_NETWORK, DEVICE_RTLSDR, DEVICE_RTLTCP, SourceType, sidebar,
+        source_type_for_device_index,
+    };
+
+    #[test]
+    fn maps_every_known_device_index_to_its_source_type() {
+        // Table test over the full index -> SourceType mapping,
+        // including the out-of-range None case (transient GTK
+        // ComboRow indices during widget-model churn).
+        let device_airspy = sidebar::source_panel::DEVICE_AIRSPY;
+        let cases = [
+            (DEVICE_RTLSDR, Some(SourceType::RtlSdr)),
+            (DEVICE_NETWORK, Some(SourceType::Network)),
+            (DEVICE_FILE, Some(SourceType::File)),
+            (DEVICE_RTLTCP, Some(SourceType::RtlTcp)),
+            (device_airspy, Some(SourceType::Airspy)),
+            (device_airspy + 1, None),
+            (u32::MAX, None),
+        ];
+        for (index, expected) in cases {
+            assert_eq!(
+                source_type_for_device_index(index),
+                expected,
+                "index {index} mapped incorrectly"
+            );
+        }
+    }
+}

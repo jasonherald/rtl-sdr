@@ -16,8 +16,11 @@ use super::super::connect::{
     invalidate_rtl_tcp_active_server_on_edit, persist_role_preference, restore_rtl_tcp_client_state,
 };
 
-/// `rtl_tcp` client role + auth-key rows with last-good-bytes cache and per-server restore (#396).
-/// Split out per the 50-NLOC gate (#817).
+/// Startup restore of the `rtl_tcp` client's last-used role + auth
+/// key (#396) — a thin wrapper over `restore_rtl_tcp_client_state`.
+/// The role/server-key ROW WIRING itself lives in
+/// `wire_role_and_server_key_rows`. Split out per the 50-NLOC gate
+/// (#817).
 pub(in crate::window::source) fn wire_rtl_tcp_client_rows(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
@@ -191,7 +194,14 @@ pub(in crate::window::source) fn wire_network_source_rows(
         });
     }
 
+    // Explicit dispatch — NOT a tail-call chain — so the full row
+    // set this entry point wires is visible in one place instead of
+    // buried across nested calls. Order matches the original chain
+    // exactly: hostname, then port/protocol, then protocol alone.
+    // Split out per CR round 2 on #846.
     wire_network_hostname_row(panels, state, config);
+    wire_network_port_and_protocol(panels, state, config);
+    wire_network_protocol_row(panels, state, config);
 }
 
 /// Connection-role picker + server-key entry (#394/#396).
@@ -248,7 +258,12 @@ pub(in crate::window::source) fn wire_role_and_server_key_rows(
             );
         });
 
-    wire_server_key_entry(panels, state, config, last_good_auth_key);
+    // Explicit dispatch — NOT a tail-call chain — so both row
+    // groups this entry point wires are visible in one place.
+    // Order matches the original chain exactly: server-key entry,
+    // then file path. Split out per CR round 2 on #846.
+    wire_server_key_entry(panels, state, last_good_auth_key);
+    wire_file_path_row(panels, state, config);
 }
 
 /// Role-picker dispatch (#396): resolve the auth key (empty → None,
@@ -362,8 +377,6 @@ fn wire_network_port_and_protocol(
             });
         }
     });
-
-    wire_network_protocol_row(panels, state, config);
 }
 
 /// Server key entry (#394/#396): per-edit config rebuild + last-good cache.
@@ -371,7 +384,6 @@ fn wire_network_port_and_protocol(
 fn wire_server_key_entry(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
-    config: &std::sync::Arc<sdr_config::ConfigManager>,
     last_good_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
 ) {
     // Server key entry (#394 + #396). On every edit we rebuild
@@ -457,8 +469,6 @@ fn wire_server_key_entry(
                 auth_key,
             });
         });
-
-    wire_file_path_row(panels, state, config);
 }
 
 /// Network hostname — per-edit dispatch so Play always has the current value.
@@ -536,8 +546,6 @@ fn wire_network_hostname_row(
             });
         }
     });
-
-    wire_network_port_and_protocol(panels, state, config);
 }
 
 /// Network protocol selector.

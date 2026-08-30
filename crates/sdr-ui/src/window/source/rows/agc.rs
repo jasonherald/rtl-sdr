@@ -195,11 +195,7 @@ fn wire_agc_notify_handler(
         // The engine treats hardware and software AGC as
         // independent flags; the UI is the policy layer that
         // mutually excludes them.
-        let (hw, sw) = match agc_type {
-            sidebar::source_panel::AgcType::Off => (false, false),
-            sidebar::source_panel::AgcType::Hardware => (true, false),
-            sidebar::source_panel::AgcType::Software => (false, true),
-        };
+        let (hw, sw) = agc_flags(agc_type);
         state_agc.send_dsp(UiToDsp::SetAgc(hw));
         state_agc.send_dsp(UiToDsp::SetSoftwareAgc(sw));
 
@@ -209,8 +205,8 @@ fn wire_agc_notify_handler(
         sidebar::source_panel::save_agc_type(&config_for_agc, agc_type);
 
         let agc_active = !matches!(agc_type, sidebar::source_panel::AgcType::Off);
-        apply_agc_gain_mutex(&gain_row_for_agc, agc_active);
-        apply_agc_squelch_mutex(
+        apply_agc_mutexes(
+            &gain_row_for_agc,
             &squelch_enabled_for_agc,
             &squelch_level_for_agc,
             &auto_squelch_for_agc,
@@ -254,20 +250,71 @@ fn restore_agc_type_selection(
             .agc_row
             .set_selected(sidebar::source_panel::selected_from_agc_type(persisted));
 
-        let (hw, sw) = match persisted {
-            sidebar::source_panel::AgcType::Off => (false, false),
-            sidebar::source_panel::AgcType::Hardware => (true, false),
-            sidebar::source_panel::AgcType::Software => (false, true),
-        };
+        let (hw, sw) = agc_flags(persisted);
         state.send_dsp(UiToDsp::SetAgc(hw));
         state.send_dsp(UiToDsp::SetSoftwareAgc(sw));
         let agc_active = !matches!(persisted, sidebar::source_panel::AgcType::Off);
-        apply_agc_gain_mutex(&panels.source.gain_row, agc_active);
-        apply_agc_squelch_mutex(
+        apply_agc_mutexes(
+            &panels.source.gain_row,
             &panels.radio.squelch_enabled_row,
             &panels.radio.squelch_level_row,
             &panels.radio.auto_squelch_row,
             agc_active,
         );
+    }
+}
+
+/// Map an `AgcType` to the `(hardware, software)` flag pair the
+/// controller expects. The engine treats the two as independent
+/// flags; the UI is the policy layer that mutually excludes them —
+/// exactly one is ever true. Pure — see `mod tests` below. Split
+/// out of the notify-handler / restore-path duplication per CR
+/// round 2 on #846.
+fn agc_flags(agc_type: sidebar::source_panel::AgcType) -> (bool, bool) {
+    match agc_type {
+        sidebar::source_panel::AgcType::Off => (false, false),
+        sidebar::source_panel::AgcType::Hardware => (true, false),
+        sidebar::source_panel::AgcType::Software => (false, true),
+    }
+}
+
+/// Apply both AGC mutexes (gain row + the three squelch rows) for
+/// the given active state. Shared by `wire_agc_notify_handler` and
+/// `restore_agc_type_selection` so the two paths can't drift out of
+/// sync with each other. Split out per CR round 2 on #846.
+fn apply_agc_mutexes(
+    gain_row: &adw::SpinRow,
+    squelch_enabled_row: &adw::SwitchRow,
+    squelch_level_row: &adw::SpinRow,
+    auto_squelch_row: &adw::SwitchRow,
+    agc_active: bool,
+) {
+    apply_agc_gain_mutex(gain_row, agc_active);
+    apply_agc_squelch_mutex(
+        squelch_enabled_row,
+        squelch_level_row,
+        auto_squelch_row,
+        agc_active,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agc_flags;
+    use crate::sidebar::source_panel::AgcType;
+
+    #[test]
+    fn off_disables_both_flags() {
+        assert_eq!(agc_flags(AgcType::Off), (false, false));
+    }
+
+    #[test]
+    fn hardware_sets_only_the_hardware_flag() {
+        assert_eq!(agc_flags(AgcType::Hardware), (true, false));
+    }
+
+    #[test]
+    fn software_sets_only_the_software_flag() {
+        assert_eq!(agc_flags(AgcType::Software), (false, true));
     }
 }

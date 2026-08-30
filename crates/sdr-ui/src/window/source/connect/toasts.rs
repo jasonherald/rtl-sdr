@@ -20,20 +20,10 @@ use super::keyring::{clear_client_auth_key_from_keyring, save_client_auth_key_to
 /// `prev_disc != now_disc` and stored the new discriminant.
 /// Per issue #396.
 #[allow(
-    clippy::too_many_arguments,
-    reason = "toast composition needs read access to multiple panel widgets \
-              + a dispatch handle; collapsing into a single context struct \
-              would move the same argument count one layer up"
-)]
-#[allow(
     clippy::doc_markdown,
     reason = "doc references to Connected / ControllerBusy / AuthRequired / \
               AuthFailed are type variants — enum paths would make the prose \
               unreadable; backticks on each would overwhelm the paragraph"
-)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear arm-by-arm toast + row + state handling for all 8 rtl_tcp connection-state variants; splitting would scatter the shared setup (pending-toasts sweep, edge-log) and obscure the 1:1 mapping from variant to UX gesture"
 )]
 pub(in crate::window) fn handle_rtl_tcp_state_toast(
     state_val: &sdr_types::RtlTcpConnectionState,
