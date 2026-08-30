@@ -548,11 +548,18 @@ fn start_shared_server(
         pending_auth_key.as_deref(),
     ) {
         tracing::warn!(
-            "rtl_tcp share-start blocked: auth required but the key is still loading from the keyring"
+            "rtl_tcp share-start blocked: auth required but no key is available (load pending or failed)"
         );
+        // The message covers both reachable states: a load still in
+        // flight (retry-in-a-moment works) and the near-unreachable
+        // worker-panic path, where the key stays absent until the
+        // user re-toggles Require key — which re-runs the load.
+        // (`ensure_server_auth_key` never returns an error itself;
+        // only a worker panic leaves the key unset.) Per CodeRabbit
+        // outside-diff on PR #873.
         if let Some(overlay) = toast_overlay_weak.upgrade() {
             overlay.add_toast(plain_toast(
-                "Auth key still loading — try again in a moment",
+                "Auth key not ready — wait a moment, or toggle \u{201c}Require key\u{201d} off and on to retry",
             ));
         }
         reentry_guard.set(true);
