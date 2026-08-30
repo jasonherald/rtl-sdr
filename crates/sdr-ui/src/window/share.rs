@@ -313,14 +313,24 @@ pub(super) fn connect_share_switch(
         let current_auth_key_for_seed = Rc::clone(&current_auth_key);
         let key_row_weak = panels.server.auth_key_row.downgrade();
         let share_row_weak_for_seed = panels.server.share_row.downgrade();
+        let require_row_weak_for_seed = panels.server.auth_require_row.downgrade();
         panels.server.share_row.set_sensitive(false);
+        // Hold "Require key" insensitive too: flipping it OFF while
+        // the load is in flight would let a stale completion seed the
+        // key and show the key row for a toggle that's no longer on
+        // (CodeRabbit round 2 on PR #873) — and could overlap a fresh
+        // toggle-on load of its own.
+        panels.server.auth_require_row.set_sensitive(false);
         glib::spawn_future_local(async move {
             let join = gio::spawn_blocking(ensure_server_auth_key).await;
-            // Re-sensitize Share regardless of outcome below — the
-            // pending window is over either way.
+            // Re-sensitize both rows regardless of outcome below —
+            // the pending window is over either way.
             let share_row = share_row_weak_for_seed.upgrade();
             if let Some(share_row) = &share_row {
                 share_row.set_sensitive(true);
+            }
+            if let Some(require_row) = require_row_weak_for_seed.upgrade() {
+                require_row.set_sensitive(true);
             }
             let Some(key_row) = key_row_weak.upgrade() else {
                 // Window closed before the keyring round trip
@@ -757,13 +767,6 @@ pub(super) fn set_controls_locked(panel: &ServerSwitchWidgets, locked: bool) {
     panel.device_defaults_row.set_sensitive(sensitive);
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod server_panel_format_tests;
-
-#[cfg(test)]
-mod auth_guard_tests;
-
 /// Frequency / sample-rate / gain / DSP portion of the panel read.
 /// Split out per the 50-NLOC gate (#817).
 #[allow(
@@ -872,3 +875,10 @@ fn read_server_gain_settings(
         },
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod server_panel_format_tests;
+
+#[cfg(test)]
+mod auth_guard_tests;
