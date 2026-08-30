@@ -35,15 +35,18 @@ pub(super) const ORBCOMM_INIT_ERROR_PREFIX: &str = "Orbcomm decoder could not st
 /// clears the failure latch (a geometry change may make a
 /// previously-failing attempt succeed, or a previously-succeeding
 /// one now decode the wrong channels' NCO mix) before proceeding.
-/// This is a safety net for ordinary retunes / rate changes while
-/// enabled (`handle_tune`, `handle_set_sample_rate`, etc. need no
-/// invalidation clear of their own) — it is NOT what keeps the
-/// scanner from corrupting the tap's geometry; that is
+/// This is a safety net for `handle_tune` specifically — a retune
+/// changes `center_hz` but never `frontend.decim_ratio()`, and is
+/// deliberately left un-rejected (see [`orbcomm_lock_rejects_geometry_change`])
+/// precisely because this self-check is the mechanism designed to
+/// absorb it without losing decoded packets. It is NOT what keeps
+/// decimation-mutating commands or the scanner from corrupting the
+/// tap's geometry — those are rejected outright while engaged
+/// (`orbcomm_lock_rejects_geometry_change`, CR round 4, and
 /// `handle_set_orbcomm_enabled` / `handle_set_scanner_enabled`'s
-/// mutual-exclusion refusal below (CR round 3, smoke-test fix), since
-/// the scanner mutates frontend decimation directly and self-checking
-/// alone can't recover a span that decimation shrank below an Orbcomm
-/// channel's bandwidth.
+/// mutual exclusion, CR round 3) rather than self-corrected after the
+/// fact, since a shrunk span can't be "corrected" — the packets in
+/// flight during the narrow window are simply lost.
 ///
 /// Lazy-init: once geometry is confirmed current, if `bank.is_none()`
 /// and `*init_failed == false`, builds the `ChannelBank` from
@@ -127,6 +130,57 @@ pub(super) fn orbcomm_decode_tap(
     for event in events_scratch.drain(..) {
         let _ = dsp_tx.send(DspToUi::OrbcommEvent(Box::new(event)));
     }
+}
+
+/// Orbcomm-engaged rejection of decim-affecting commands (issue #865,
+/// CR round 4 — the defect the round-3 fix closed reopens via a
+/// different trigger without this). Mirrors
+/// `acars_lock_rejects_geometry_change` exactly — same shape, same
+/// one-shot `DspToUi::Error` wording style — keyed on
+/// `orbcomm_pre_decim.is_some()` (the canonical "Orbcomm has forced
+/// decim=1" signal, mirroring `acars_pre_lock`) instead of
+/// `acars_pre_lock`.
+///
+/// # Which commands, and why not all of ACARS's list
+///
+/// ACARS guards `Tune` / `SetDemodMode` / `SetSampleRate` /
+/// `SetDecimation` / `SetVfoOffset` because its airband lock forces
+/// the FULL geometry (source rate, center, decim) and any of those
+/// five commands could disturb some part of it. Orbcomm only forces
+/// decimation, so only the commands that mutate or auto-adjust
+/// `frontend.decim_ratio()` need rejecting here:
+///
+/// - `SetDemodMode` (`handle_set_demod_mode`) — auto-adjusts
+///   decimation for the new mode's IF rate.
+/// - `SetSampleRate` (`handle_set_sample_rate` →
+///   `apply_rate_to_frontend`) — auto-selects decimation for the new
+///   rate.
+/// - `SetDecimation` (`handle_set_decimation`) — sets it directly.
+///
+/// `Tune` and `SetVfoOffset` are deliberately NOT guarded: neither
+/// touches decimation, and `orbcomm_decode_tap`'s geometry self-check
+/// (CR round 1, see its doc comment above) is exactly the mechanism
+/// designed to let a retune keep working while Orbcomm is engaged —
+/// rejecting `Tune` here would take away working functionality ACARS
+/// only gives up because its OWN lock (not Orbcomm's) needs the
+/// center frozen.
+pub(super) fn orbcomm_lock_rejects_geometry_change(
+    state: &DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    cmd_label: &str,
+) -> bool {
+    if state.orbcomm_pre_decim.is_some() {
+        tracing::warn!(
+            cmd = cmd_label,
+            "Orbcomm decim lock active: ignoring {cmd_label} command"
+        );
+        let _ = dsp_tx.send(DspToUi::Error(format!(
+            "{cmd_label} ignored: Orbcomm decode is active. \
+             Disable Orbcomm to change decimation."
+        )));
+        return true;
+    }
+    false
 }
 
 /// Handler for `UiToDsp::SetOrbcommEnabled`. Dispatches to

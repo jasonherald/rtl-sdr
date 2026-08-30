@@ -2,7 +2,7 @@
 
 use super::{
     DspState, DspToUi, acars_lock_rejects_geometry_change, auto_decimation_ratio, mpsc,
-    on_tune_change, rebuild_vfo_echoing,
+    on_tune_change, orbcomm_lock_rejects_geometry_change, rebuild_vfo_echoing,
 };
 use sdr_types::DemodMode;
 
@@ -14,6 +14,12 @@ pub(super) fn handle_set_demod_mode(
     mode: DemodMode,
 ) {
     if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDemodMode") {
+        return;
+    }
+    // Mode switches auto-adjust frontend decimation for the new IF
+    // rate below — that would silently walk it away from Orbcomm's
+    // forced 1 while engaged. Issue #865, CR round 4.
+    if orbcomm_lock_rejects_geometry_change(state, dsp_tx, "SetDemodMode") {
         return;
     }
     // INFO-level so silent-fail demod regressions can be diagnosed

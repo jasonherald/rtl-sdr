@@ -217,7 +217,10 @@ use acars::{
 use apt::apt_decode_tap;
 use audio::{iq_recording_rejects_rate_change, recording_write_error_message, stop_any_recording};
 use lrpt::lrpt_decode_tap;
-use orbcomm::{ORBCOMM_STATS_INTERVAL, handle_set_orbcomm_enabled, orbcomm_decode_tap};
+use orbcomm::{
+    ORBCOMM_STATS_INTERVAL, handle_set_orbcomm_enabled, orbcomm_decode_tap,
+    orbcomm_lock_rejects_geometry_change,
+};
 use scanner::{apply_scanner_commands, scanner_carrier_present};
 use source::{
     auto_decimation_ratio, on_tune_change, poll_rtl_tcp_connection_state, rebuild_frontend,

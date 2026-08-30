@@ -6,7 +6,7 @@ use super::{
     DspState, DspToUi, IqFrontend, NetworkSinkStatus, RTL_TCP_STATE_POLL_INTERVAL, RtlSdrSource,
     RtlTcpConnectionState, RxVfo, Source, SourceType, acars_lock_rejects_geometry_change,
     apply_acars_geometry, apply_bias_tee_idle, cleanup, handle_set_acars_enabled,
-    iq_recording_rejects_rate_change, mpsc,
+    iq_recording_rejects_rate_change, mpsc, orbcomm_lock_rejects_geometry_change,
 };
 
 /// Poll the active source's projected `rtl_tcp_connection_state()`
@@ -1098,14 +1098,17 @@ pub(super) fn handle_set_sample_rate(
     if acars_lock_rejects_geometry_change(state, dsp_tx, "SetSampleRate") {
         return;
     }
+    // `apply_rate_to_frontend` below auto-selects decimation for the
+    // new rate — that would silently walk it away from Orbcomm's
+    // forced 1 while engaged. Issue #865, CR round 4.
+    if orbcomm_lock_rejects_geometry_change(state, dsp_tx, "SetSampleRate") {
+        return;
+    }
     if iq_recording_rejects_rate_change(state, dsp_tx, "SetSampleRate") {
         return;
     }
     tracing::debug!(sample_rate = rate, "set sample rate");
     state.configured_sample_rate = rate;
-    // No explicit Orbcomm invalidation needed here (issue #865, CR
-    // round 1) — the tap's geometry self-check picks up the changed
-    // `frontend.effective_sample_rate()` on its next call.
     if let Some(source) = &mut state.source {
         if let Err(e) = source.set_sample_rate(rate) {
             tracing::warn!("set sample rate failed: {e}");
@@ -1170,9 +1173,13 @@ pub(super) fn handle_set_decimation(
     if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDecimation") {
         return;
     }
+    // Issue #865, CR round 4 — this command sets decimation directly,
+    // which is exactly what Orbcomm's engage forces to 1; reject it
+    // outright while engaged rather than let it silently walk away.
+    if orbcomm_lock_rejects_geometry_change(state, dsp_tx, "SetDecimation") {
+        return;
+    }
     tracing::debug!(ratio, "set decimation");
-    // No explicit Orbcomm invalidation needed here (issue #865, CR
-    // round 1) — same self-check rationale as `handle_set_sample_rate`.
     if let Err(e) = state.frontend.set_decimation(ratio) {
         tracing::warn!("set decimation failed: {e}");
         let _ = dsp_tx.send(DspToUi::Error(format!("Decimation failed: {e}")));

@@ -471,3 +471,156 @@ fn tap_rebuilds_on_geometry_mismatch() {
     assert!(!init_failed);
     assert_eq!(geometry, Some((TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ)));
 }
+
+/// `true` if any event is an `Error` mentioning "orbcomm"
+/// (case-insensitively) — the shared assertion the three
+/// decim-affecting-command refusal tests below use, since each
+/// command's exact wording differs only in the `cmd_label` prefix.
+fn has_orbcomm_refusal(events: &[DspToUi]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, DspToUi::Error(msg) if msg.to_lowercase().contains("orbcomm")))
+}
+
+/// Issue #865, CR round 4 — the round-3 fix (force decim=1 while
+/// engaged, refuse scanner enable) reopens the original defect via a
+/// different trigger: a demod-mode change while Orbcomm is engaged
+/// auto-adjusts frontend decimation for the new mode's IF rate
+/// (`handle_set_demod_mode`), silently walking it away from the
+/// forced 1. `orbcomm_lock_rejects_geometry_change` must reject the
+/// command outright — mirroring `acars_lock_rejects_geometry_change`
+/// — so it never reaches that auto-adjust.
+#[test]
+fn set_demod_mode_refused_while_orbcomm_enabled() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, true);
+    assert!(state.orbcomm_enabled, "test setup: orbcomm must be engaged");
+    assert_eq!(state.frontend.decim_ratio(), 1, "test setup: decim forced");
+    let mode_before = state.radio.current_mode();
+    let _ = drain(&dsp_rx);
+
+    handle_command(
+        &mut state,
+        &dsp_tx,
+        UiToDsp::SetDemodMode(sdr_types::DemodMode::Nfm),
+    );
+
+    assert_eq!(
+        state.frontend.decim_ratio(),
+        1,
+        "a refused SetDemodMode must not touch decimation"
+    );
+    assert_eq!(
+        state.radio.current_mode(),
+        mode_before,
+        "a refused SetDemodMode must not change the demod mode"
+    );
+    let events = drain(&dsp_rx);
+    assert!(
+        has_orbcomm_refusal(&events),
+        "expected an orbcomm-related refusal Error, got {events:?}"
+    );
+
+    // Succeeds again after disable — same command, no refusal this time.
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, false);
+    let _ = drain(&dsp_rx);
+    handle_command(
+        &mut state,
+        &dsp_tx,
+        UiToDsp::SetDemodMode(sdr_types::DemodMode::Nfm),
+    );
+    let events = drain(&dsp_rx);
+    assert!(
+        !has_orbcomm_refusal(&events),
+        "SetDemodMode must succeed after disable, got {events:?}"
+    );
+    assert_eq!(
+        state.radio.current_mode(),
+        sdr_types::DemodMode::Nfm,
+        "SetDemodMode must actually apply after disable"
+    );
+}
+
+/// Issue #865, CR round 4 — `handle_set_sample_rate` →
+/// `apply_rate_to_frontend` auto-selects decimation for the new rate;
+/// reject the command outright while Orbcomm is engaged.
+#[test]
+fn set_sample_rate_refused_while_orbcomm_enabled() {
+    const NEW_RATE_HZ: f64 = 1_024_000.0;
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, true);
+    assert!(state.orbcomm_enabled, "test setup: orbcomm must be engaged");
+    assert_eq!(state.frontend.decim_ratio(), 1, "test setup: decim forced");
+    let configured_before = state.configured_sample_rate;
+    let _ = drain(&dsp_rx);
+
+    handle_command(&mut state, &dsp_tx, UiToDsp::SetSampleRate(NEW_RATE_HZ));
+
+    assert_eq!(
+        state.frontend.decim_ratio(),
+        1,
+        "a refused SetSampleRate must not touch decimation"
+    );
+    assert!(
+        (state.configured_sample_rate - configured_before).abs() < f64::EPSILON,
+        "a refused SetSampleRate must not change the configured rate"
+    );
+    let events = drain(&dsp_rx);
+    assert!(
+        has_orbcomm_refusal(&events),
+        "expected an orbcomm-related refusal Error, got {events:?}"
+    );
+
+    // Succeeds again after disable.
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, false);
+    let _ = drain(&dsp_rx);
+    handle_command(&mut state, &dsp_tx, UiToDsp::SetSampleRate(NEW_RATE_HZ));
+    let events = drain(&dsp_rx);
+    assert!(
+        !has_orbcomm_refusal(&events),
+        "SetSampleRate must succeed after disable, got {events:?}"
+    );
+    assert!(
+        (state.configured_sample_rate - NEW_RATE_HZ).abs() < f64::EPSILON,
+        "SetSampleRate must actually apply after disable"
+    );
+}
+
+/// Issue #865, CR round 4 — `handle_set_decimation` sets
+/// `frontend.decim_ratio()` directly, which is exactly what Orbcomm's
+/// engage forces to 1; reject it outright while engaged.
+#[test]
+fn set_decimation_refused_while_orbcomm_enabled() {
+    const NEW_DECIM: u32 = 4;
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, true);
+    assert!(state.orbcomm_enabled, "test setup: orbcomm must be engaged");
+    assert_eq!(state.frontend.decim_ratio(), 1, "test setup: decim forced");
+    let _ = drain(&dsp_rx);
+
+    handle_command(&mut state, &dsp_tx, UiToDsp::SetDecimation(NEW_DECIM));
+
+    assert_eq!(
+        state.frontend.decim_ratio(),
+        1,
+        "a refused SetDecimation must not change the ratio"
+    );
+    let events = drain(&dsp_rx);
+    assert!(
+        has_orbcomm_refusal(&events),
+        "expected an orbcomm-related refusal Error, got {events:?}"
+    );
+
+    // Succeeds again after disable.
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, false);
+    let _ = drain(&dsp_rx);
+    handle_command(&mut state, &dsp_tx, UiToDsp::SetDecimation(NEW_DECIM));
+    assert_eq!(
+        state.frontend.decim_ratio(),
+        NEW_DECIM,
+        "SetDecimation must actually apply after disable"
+    );
+}
