@@ -101,11 +101,26 @@ fn test_auto_save() {
         v["volume"] = json!(0.75);
     });
 
-    thread::sleep(Duration::from_millis(1500));
-
-    let content = fs::read_to_string(&path).unwrap();
-    let on_disk: Value = serde_json::from_str(&content).unwrap();
-    assert_eq!(on_disk["volume"], 0.75);
+    // The debounced auto-save worker flushes on its own schedule; a
+    // fixed sleep raced it under coverage instrumentation on loaded CI
+    // runners (#863). Poll until the flush lands, asserting only at
+    // the deadline. Reads racing the atomic temp+rename publish (#760)
+    // see either the old or the new complete file, so the parse guard
+    // below never observes torn JSON.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(content) = fs::read_to_string(&path)
+            && let Ok(on_disk) = serde_json::from_str::<Value>(&content)
+            && on_disk["volume"] == json!(0.75)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "auto-save did not flush volume=0.75 within 10 s"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 
     mgr.disable_auto_save();
     let _ = fs::remove_file(&path);
