@@ -32,7 +32,7 @@ use sdr_dsp::multirate::RationalResampler;
 use sdr_types::Complex;
 use tracing::warn;
 
-use crate::deframe::Deframer;
+use crate::deframe::{DeframedPacket, Deframer};
 use crate::demod::SdpskDemod;
 use crate::packet::{PacketType, parse_packet};
 use crate::reassembly::{DEFAULT_MAX_AGE_PACKETS, Reassembler};
@@ -442,6 +442,10 @@ struct ChannelDsp {
     decimated: Vec<Complex>,
     /// Demodulated bits for the current block, reused across calls.
     bits: Vec<bool>,
+    /// Packets the deframer emitted for the current bit, reused across
+    /// calls. A single bit can yield two: the one that confirms an
+    /// acquisition also releases the candidate it confirmed.
+    frames: Vec<DeframedPacket>,
 }
 
 impl ChannelDsp {
@@ -459,6 +463,7 @@ impl ChannelDsp {
             reassembler: Reassembler::new(DEFAULT_MAX_AGE_PACKETS),
             decimated: Vec::new(),
             bits: Vec::new(),
+            frames: Vec::new(),
         })
     }
 }
@@ -610,6 +615,7 @@ impl Channel {
             reassembler,
             decimated,
             bits,
+            frames,
         } = dsp;
 
         // 1. Mix the channel down to DC, phase-continuously across blocks.
@@ -668,44 +674,47 @@ impl Channel {
 
         // 5. Deframe, parse, reassemble.
         for &bit in bits.iter() {
-            let Some(frame) = deframer.push_bit(bit) else {
-                continue;
-            };
-            if let Some(packet) = parse_packet(&frame.bytes) {
-                *packets_ok = packets_ok.saturating_add(1);
-                // Counted inside this arm, not beside it: `repaired` is
-                // documented as a subset of `packets_ok`, and only counting a
-                // repair that actually yielded a packet makes that structural
-                // rather than an invariant borrowed from the deframer's
-                // header/length checks happening to match `parse_packet`'s.
-                if frame.repaired {
-                    *repaired = repaired.saturating_add(1);
+            frames.clear();
+            deframer.push_bit(bit, frames);
+            for frame in frames.iter() {
+                if let Some(packet) = parse_packet(&frame.bytes) {
+                    *packets_ok = packets_ok.saturating_add(1);
+                    // Counted inside this arm, not beside it: `repaired` is
+                    // documented as a subset of `packets_ok`, and only counting
+                    // a repair that actually yielded a packet makes that
+                    // structural rather than an invariant borrowed from the
+                    // deframer's header/length checks happening to match
+                    // `parse_packet`'s.
+                    if frame.repaired {
+                        *repaired = repaired.saturating_add(1);
+                    }
+                    events.push(OrbcommEvent {
+                        channel_hz: *freq_hz,
+                        kind: OrbcommEventKind::Packet {
+                            packet,
+                            repaired: frame.repaired,
+                        },
+                    });
                 }
-                events.push(OrbcommEvent {
-                    channel_hz: *freq_hz,
-                    kind: OrbcommEventKind::Packet {
-                        packet,
-                        repaired: frame.repaired,
-                    },
-                });
-            }
-            // Only Message packets carry reassembly fragments; the reassembler
-            // wants their raw bytes, header and check bytes included.
-            if frame
-                .bytes
-                .first()
-                .copied()
-                .and_then(PacketType::from_header)
-                == Some(PacketType::Message)
-                && let Some(message) = reassembler.push(&frame.bytes)
-            {
-                events.push(OrbcommEvent {
-                    channel_hz: *freq_hz,
-                    kind: OrbcommEventKind::MessageComplete {
-                        bytes: message.bytes,
-                        partial: message.partial,
-                    },
-                });
+                // Only Message packets carry reassembly fragments; the
+                // reassembler wants their raw bytes, header and check bytes
+                // included.
+                if frame
+                    .bytes
+                    .first()
+                    .copied()
+                    .and_then(PacketType::from_header)
+                    == Some(PacketType::Message)
+                    && let Some(message) = reassembler.push(&frame.bytes)
+                {
+                    events.push(OrbcommEvent {
+                        channel_hz: *freq_hz,
+                        kind: OrbcommEventKind::MessageComplete {
+                            bytes: message.bytes,
+                            partial: message.partial,
+                        },
+                    });
+                }
             }
         }
         // The deframer swallows a failed stride rather than emitting it, so
