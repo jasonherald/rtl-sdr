@@ -113,6 +113,7 @@ members = [
     "crates/sdr-config",
     "crates/sdr-radioreference",
     "crates/sdr-sat",
+    "crates/sdr-orbcomm",
     "crates/sdr-lrpt",
     "crates/sdr-transcription",
     "crates/sdr-core",
@@ -167,6 +168,7 @@ sdr-sat = { path = "crates/sdr-sat" }
 # feature (and its clap / hound / tracing-subscriber deps) out of the
 # app's tree — this workspace uses the decoder library, not the CLI.
 sdr-acars = { version = "0.1", default-features = false }
+sdr-orbcomm = { path = "crates/sdr-orbcomm" }
 sdr-lrpt = { path = "crates/sdr-lrpt" }
 sdr-transcription = { path = "crates/sdr-transcription" }
 sdr-core = { path = "crates/sdr-core" }

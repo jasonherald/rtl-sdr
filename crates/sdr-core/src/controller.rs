@@ -201,6 +201,7 @@ mod acars;
 mod apt;
 mod audio;
 mod lrpt;
+mod orbcomm;
 mod radio;
 mod scanner;
 mod source;
@@ -216,6 +217,10 @@ use acars::{
 use apt::apt_decode_tap;
 use audio::{iq_recording_rejects_rate_change, recording_write_error_message, stop_any_recording};
 use lrpt::lrpt_decode_tap;
+use orbcomm::{
+    ORBCOMM_STATS_INTERVAL, handle_set_orbcomm_enabled, orbcomm_decode_tap,
+    orbcomm_lock_rejects_geometry_change,
+};
 use scanner::{apply_scanner_commands, scanner_carrier_present};
 use source::{
     auto_decimation_ratio, on_tune_change, poll_rtl_tcp_connection_state, rebuild_frontend,
@@ -641,6 +646,71 @@ struct DspState {
     /// Same pattern as `acars_last_user_jsonl_path` for the
     /// UDP feeder. CR round 2 on PR #598.
     acars_last_user_network_addr: Option<String>,
+    /// Live Orbcomm bank. Unlike `acars_bank`, this never has a
+    /// Start-path invalidation window to work around. `None` means
+    /// "not yet built at the current geometry" (lazy-init pending,
+    /// torn down by `cleanup()` on source stop, or dropped by the
+    /// tap's own self-check when `orbcomm_geometry` goes stale).
+    /// Issue #865.
+    orbcomm_bank: Option<sdr_orbcomm::ChannelBank>,
+    /// One-shot guard: a previous `ChannelBank::new` failed AT THE
+    /// GEOMETRY RECORDED IN `orbcomm_geometry`. Mirrors
+    /// `acars_init_failed` / `lrpt_init_failed` — prevents warn-spam
+    /// on every subsequent IQ block at that same geometry. Cleared
+    /// by `cleanup()`, by `SetOrbcommEnabled`, and by the tap's own
+    /// self-check the moment the live geometry no longer matches
+    /// `orbcomm_geometry` (a geometry change may make a previously
+    /// failing attempt succeed). Issue #865.
+    orbcomm_init_failed: bool,
+    /// `(source_rate_hz, center_hz)` the CURRENT `orbcomm_bank` /
+    /// `orbcomm_init_failed` state was last attempted at — success
+    /// or failure. `None` before the first attempt (or after
+    /// `cleanup()` / `SetOrbcommEnabled` resets it). `orbcomm_decode_tap`
+    /// compares this against its live `(source_rate_hz, center_hz)`
+    /// arguments on every call and self-rebuilds on a mismatch — a
+    /// safety net for retunes and any other geometry drift that
+    /// happens while enabled (`handle_tune`, `handle_set_sample_rate`,
+    /// etc. need no invalidation clear of their own). Issue #865,
+    /// CR round 1.
+    orbcomm_geometry: Option<(f64, f64)>,
+    /// Frontend decimation ratio saved when Orbcomm forced it to 1
+    /// (see `orbcomm_enabled`'s doc). `Some(ratio)` is the CANONICAL
+    /// "Orbcomm is engaged" signal — mirrors `acars_pre_lock` — and
+    /// is what a disable / `cleanup()` restores the frontend to.
+    /// `None` when not engaged. Issue #865, CR round 3 (smoke-test
+    /// fix).
+    orbcomm_pre_decim: Option<u32>,
+    /// User-facing enable flag. Gates whether `process_iq_block`
+    /// calls `orbcomm_decode_tap` at all. The actual on/off state
+    /// (unlike `acars_region`, a config preference).
+    ///
+    /// Unlike ACARS, Orbcomm doesn't force source rate/center — but
+    /// it DOES force frontend decimation to 1 while enabled, the way
+    /// ACARS's engage path does (mirrored, not the full airband
+    /// lock): the tap reads the post-frontend-decimation buffer at
+    /// `frontend.effective_sample_rate()`, and a narrow-mode
+    /// decimation both shrinks the tapped span below any Orbcomm
+    /// channel's bandwidth and can produce a rate `plan_resampling`
+    /// can't plan. `handle_set_orbcomm_enabled`'s engage path saves
+    /// the prior decimation into `orbcomm_pre_decim` and forces 1;
+    /// disable / `cleanup()` restores it. Engage is refused while the
+    /// scanner is running (it mutates decimation directly), and the
+    /// scanner refuses to enable while this is `true` — symmetric
+    /// mutual exclusion, mirroring ACARS's own scanner guards.
+    /// `cleanup()` force-clears this to `false` on every source stop,
+    /// with an `OrbcommEnabledChanged(false)` ack, so the UI toggle
+    /// can't stay latched on across a Stop. Issue #865, CR rounds 2-3.
+    orbcomm_enabled: bool,
+    /// Last `DspToUi::OrbcommChannelStats` emission timestamp.
+    /// `None` until the first emission (so the first eligible
+    /// block emits immediately rather than waiting a full
+    /// interval). Throttles emission to ~1 Hz, matching ACARS.
+    /// Issue #865.
+    orbcomm_stats_emitted_at: Option<std::time::Instant>,
+    /// Reusable scratch buffer for `orbcomm_decode_tap`'s output
+    /// events — avoids a per-block `Vec` allocation. Cleared at
+    /// the top of every tap call. Issue #865.
+    orbcomm_events_buf: Vec<sdr_orbcomm::OrbcommEvent>,
 }
 
 impl DspState {
@@ -758,6 +828,13 @@ impl DspState {
                 .map_err(|e| format!("ACARS output writer thread: {e}"))?,
             acars_last_user_jsonl_path: None,
             acars_last_user_network_addr: None,
+            orbcomm_bank: None,
+            orbcomm_init_failed: false,
+            orbcomm_geometry: None,
+            orbcomm_pre_decim: None,
+            orbcomm_enabled: false,
+            orbcomm_stats_emitted_at: None,
+            orbcomm_events_buf: Vec::new(),
         })
     }
 }
@@ -1239,6 +1316,9 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
         UiToDsp::SetAcarsStationId(id) => {
             handle_set_acars_station_id(state, &id);
         }
+        UiToDsp::SetOrbcommEnabled(enable) => {
+            handle_set_orbcomm_enabled(state, dsp_tx, enable);
+        }
     }
 }
 
@@ -1324,6 +1404,14 @@ fn cleanup(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     if acars_forced_off {
         let _ = dsp_tx.send(DspToUi::AcarsEnabledChanged(Ok(false)));
     }
+
+    // Orbcomm teardown (issue #865, CR round 2). Unlike `acars_region`
+    // (a config preference), `orbcomm_enabled` is the actual on/off
+    // toggle — force it off on every source stop, routed through the
+    // command handler so the bank/latch/geometry clear and the
+    // `OrbcommEnabledChanged(false)` ack live in exactly one place
+    // and the UI toggle can't stay latched on across a Stop.
+    handle_set_orbcomm_enabled(state, dsp_tx, false);
 
     if let Some(source) = &mut state.source {
         let _ = source.stop();
@@ -1611,6 +1699,47 @@ fn process_iq_block(
                             ch_stats.to_vec().into_boxed_slice(),
                         ));
                         state.acars_stats_emitted_at = now;
+                    }
+                }
+
+                // Orbcomm decode tap (#865). Unlike ACARS, Orbcomm
+                // doesn't force frontend decim=1 — it reads whatever
+                // effective (post-decimation) rate + center is
+                // currently live, via `frontend.effective_sample_rate()`
+                // rather than `state.sample_rate`. Tapped at the same
+                // point as the ACARS tap (before the VFO) so it sees
+                // the full instantaneous span rather than the VFO's
+                // narrowed channel. The tap self-checks
+                // `orbcomm_geometry` against these live values every
+                // call and rebuilds on a mismatch (CR round 1), so no
+                // call site outside `cleanup()` needs its own
+                // invalidation clear — this covers the scanner's
+                // direct `center_freq` / decimation writes too.
+                if state.orbcomm_enabled {
+                    orbcomm_decode_tap(
+                        &mut state.orbcomm_bank,
+                        &mut state.orbcomm_init_failed,
+                        &mut state.orbcomm_geometry,
+                        state.frontend.effective_sample_rate(),
+                        state.center_freq,
+                        &state.processed_buf[..processed_count],
+                        &mut state.orbcomm_events_buf,
+                        dsp_tx,
+                    );
+
+                    // ~1 Hz channel-stats emission throttle. `None`
+                    // means "never emitted" — treated as due so the
+                    // first eligible block emits immediately rather
+                    // than waiting a full interval.
+                    let now = std::time::Instant::now();
+                    let due = state
+                        .orbcomm_stats_emitted_at
+                        .is_none_or(|at| now.duration_since(at) >= ORBCOMM_STATS_INTERVAL);
+                    if due && let Some(bank) = state.orbcomm_bank.as_ref() {
+                        let ch_stats = bank.stats();
+                        let _ =
+                            dsp_tx.send(DspToUi::OrbcommChannelStats(ch_stats.into_boxed_slice()));
+                        state.orbcomm_stats_emitted_at = Some(now);
                     }
                 }
 

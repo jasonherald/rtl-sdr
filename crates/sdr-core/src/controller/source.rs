@@ -6,7 +6,7 @@ use super::{
     DspState, DspToUi, IqFrontend, NetworkSinkStatus, RTL_TCP_STATE_POLL_INTERVAL, RtlSdrSource,
     RtlTcpConnectionState, RxVfo, Source, SourceType, acars_lock_rejects_geometry_change,
     apply_acars_geometry, apply_bias_tee_idle, cleanup, handle_set_acars_enabled,
-    iq_recording_rejects_rate_change, mpsc,
+    iq_recording_rejects_rate_change, mpsc, orbcomm_lock_rejects_geometry_change,
 };
 
 /// Poll the active source's projected `rtl_tcp_connection_state()`
@@ -1058,6 +1058,10 @@ pub(super) fn handle_tune(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, 
     tracing::info!(target: "tune", requested_hz = freq, "DSP_APPLY_REQUEST");
     on_tune_change(state);
     state.center_freq = freq;
+    // No explicit Orbcomm invalidation needed here (issue #865, CR
+    // round 1) — `orbcomm_decode_tap` self-checks its tracked
+    // geometry against the live `state.center_freq` every call and
+    // rebuilds on a mismatch.
     // A centre-frequency tune is a fresh start for the VFO: the
     // UI already zeroes its overlay offset on every tune path
     // (`set_center_frequency`), but the engine kept demodulating
@@ -1092,6 +1096,12 @@ pub(super) fn handle_set_sample_rate(
     rate: f64,
 ) {
     if acars_lock_rejects_geometry_change(state, dsp_tx, "SetSampleRate") {
+        return;
+    }
+    // `apply_rate_to_frontend` below auto-selects decimation for the
+    // new rate — that would silently walk it away from Orbcomm's
+    // forced 1 while engaged. Issue #865, CR round 4.
+    if orbcomm_lock_rejects_geometry_change(state, dsp_tx, "SetSampleRate") {
         return;
     }
     if iq_recording_rejects_rate_change(state, dsp_tx, "SetSampleRate") {
@@ -1161,6 +1171,12 @@ pub(super) fn handle_set_decimation(
     ratio: u32,
 ) {
     if acars_lock_rejects_geometry_change(state, dsp_tx, "SetDecimation") {
+        return;
+    }
+    // Issue #865, CR round 4 — this command sets decimation directly,
+    // which is exactly what Orbcomm's engage forces to 1; reject it
+    // outright while engaged rather than let it silently walk away.
+    if orbcomm_lock_rejects_geometry_change(state, dsp_tx, "SetDecimation") {
         return;
     }
     tracing::debug!(ratio, "set decimation");

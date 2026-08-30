@@ -5,10 +5,12 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
 mod acars_events;
+mod orbcomm_events;
 mod scanner_events;
 use acars_events::{
     on_acars_channel_stats, on_acars_enabled_changed, on_acars_message, on_acars_output_error,
 };
+use orbcomm_events::{on_orbcomm_channel_stats, on_orbcomm_enabled_changed, on_orbcomm_event};
 use scanner_events::{
     on_scanner_active_channel_changed, on_scanner_empty_rotation, on_scanner_mutex_stopped,
     on_scanner_state_changed,
@@ -123,6 +125,11 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
         DspToUi::AcarsOutputError { kind, message } => {
             on_acars_output_error(ctx, kind, &message);
         }
+        // Orbcomm decode-tap plumbing (issue #865). Viewer wiring
+        // landed in Task 11; a sidebar stats panel is a later task.
+        DspToUi::OrbcommEvent(event) => on_orbcomm_event(ctx, &event),
+        DspToUi::OrbcommChannelStats(ch_stats) => on_orbcomm_channel_stats(ctx, ch_stats),
+        DspToUi::OrbcommEnabledChanged(enabled) => on_orbcomm_enabled_changed(ctx, enabled),
     }
 }
 

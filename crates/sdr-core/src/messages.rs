@@ -243,6 +243,37 @@ pub enum DspToUi {
         /// the file path or host:port).
         message: String,
     },
+    /// One decoded Orbcomm event (a parsed packet or a completed
+    /// multi-fragment message) from `orbcomm_decode_tap`. Boxed
+    /// for the same reason `AcarsMessage` is — keeps the enum's
+    /// stack footprint small. Issue #865.
+    OrbcommEvent(Box<sdr_orbcomm::OrbcommEvent>),
+    /// Per-channel Orbcomm stats. Emitted no more than once per
+    /// second while the tap is enabled. Boxed as a slice —
+    /// `ORBCOMM_CHANNELS_HZ` is a fixed 9-channel list, but the
+    /// slice keeps the same variable-width convention as
+    /// `AcarsChannelStats`. Issue #865.
+    OrbcommChannelStats(Box<[sdr_orbcomm::ChannelStats]>),
+    /// Ack for `UiToDsp::SetOrbcommEnabled`, carrying the state the
+    /// engine actually settled on — which is not always the state
+    /// the UI asked for. An enable is refused synchronously in two
+    /// cases, and both ack `false` after a `DspToUi::Error`
+    /// explaining why:
+    ///
+    /// - the scanner is running (the two are mutually exclusive —
+    ///   the scanner writes frontend decimation directly);
+    /// - forcing frontend decimation to 1 failed (`engage_orbcomm`
+    ///   rolls the ratio back before acking).
+    ///
+    /// Unlike `AcarsEnabledChanged` this is a plain `bool` rather
+    /// than a `Result`: the refusal reason is already a user-facing
+    /// `DspToUi::Error`, and the UI switch only needs the settled
+    /// state to follow. A *bank-init* failure is a third, later
+    /// failure mode that this ack never carries at all — it happens
+    /// on the first block after engage and surfaces through the
+    /// tap's own one-shot `DspToUi::Error` latch (mirrors the LRPT
+    /// pattern). Issue #865.
+    OrbcommEnabledChanged(bool),
 }
 
 /// Available source types for IQ input.
@@ -580,6 +611,13 @@ pub enum UiToDsp {
     /// the prior source config and forces (2.5 `MSps`, 130.3375 MHz,
     /// frontend decim=1); `false` restores the snapshot.
     SetAcarsEnabled(bool),
+    /// Enable or disable the Orbcomm decode tap. Unlike ACARS,
+    /// this does not force source geometry — it decodes whatever
+    /// channels of `sdr_orbcomm::ORBCOMM_CHANNELS_HZ` fall inside
+    /// the currently live source span. `true`/`false` both clear
+    /// the bank + init-failure latch + tracked geometry so the next
+    /// tap call picks up the live geometry fresh. Issue #865.
+    SetOrbcommEnabled(bool),
     /// Toggle the ACARS JSONL log writer on/off. Issue #578.
     SetAcarsJsonlEnabled(bool),
     /// Update the JSONL log path. Empty string ⇒ default

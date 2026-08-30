@@ -41,5 +41,6 @@ mod command_handlers;
 mod frontend_vfo;
 mod lifecycle;
 mod lrpt;
+mod orbcomm;
 mod recording_acars;
 mod sstv;
