@@ -26,6 +26,7 @@ sdr-sink-audio        → PipeWire output (depends on: types, pipeline, config)
 sdr-sink-network      → TCP/UDP audio output (depends on: types, pipeline, config)
 sdr-radio             → Radio decoder, demod, IF/AF chains, APT image buffer (depends on: types, dsp, pipeline)
 sdr-lrpt              → Meteor-M LRPT decode pipeline (QPSK → Viterbi → RS → JPEG)
+sdr-orbcomm           → Orbcomm downlink decoder — 9-channel SDPSK, packets/ephemeris/message reassembly (depends on: types, dsp)
 sdr-radioreference    → RadioReference.com SOAP client (depends on: types, config)
 sdr-sat               → Satellite pass prediction (SGP4) + TLE cache + ground-station catalog
 sdr-scanner           → Multi-channel scanner engine — projection, dwell/hang, lockout
@@ -158,6 +159,9 @@ NOAA APT (epic #468), Meteor-M LRPT (epic #469), and ISS SSTV (epic #472) are al
 - `crates/sdr-ui/src/lrpt_viewer.rs` — Multi-channel live LRPT viewer with per-APID Cairo surfaces, dynamic channel dropdown, Pause/Resume + Export PNG header buttons. Polls the shared `LrptImage` at 4 Hz; PNG export uses `gio::spawn_blocking` so encoding doesn't freeze the GTK main loop.
 - `crates/sdr-radio/src/sstv_image.rs` — Shared SSTV image handle (`Arc<Mutex<Inner>>`). DSP tap writes via `write_line`; UI reads via `snapshot()`; `take_completed()` drains the finished frame and resets for the next VIS detection. `SstvImage::clear()` convenience wrapper delegates to the handle.
 - `crates/sdr-ui/src/sstv_viewer.rs` — Live SSTV viewer. `SstvImageRenderer` owns the Cairo ARGB32 surface; `SstvImageView` is the GTK widget (cloneable via Rc). `open_sstv_viewer_if_needed` opens the window and wires `UiToDsp::SetSstvImage`. `write_sstv_rgb_png` is the Cairo-based PNG encoder used by both manual Export and the auto-record LOS save. Wired via `connect_sstv_action` (`Ctrl+Shift+V`).
+- `crates/sdr-orbcomm/src/lib.rs` — Orbcomm decoder crate (#865): `ChannelBank` decodes all 9 downlink channels (`ORBCOMM_CHANNELS_HZ`) from wideband IQ — per-channel NCO+decimate → FLL (±6 kHz capture) → SDPSK demod → deframer → typed packets + message reassembly. Conventions arbitrated against real captures (Task 9): NRZ-M is OFF (the ±90° PSK is the differential layer). Real-capture gate: `crates/sdr-orbcomm/tests/real_capture.rs` (`#[ignore]`, fixture via `scripts/orbcomm-mat-to-iq.py`).
+- `crates/sdr-core/src/controller/orbcomm.rs` — `orbcomm_decode_tap`, geometry-self-checking (rebuilds the bank when center/rate change — scanner retunes included); enable state clears+acks on source stop.
+- `crates/sdr-ui/src/orbcomm_viewer.rs` — viewer window (`<Ctrl><Shift>o`): channel-activity strip, packet log, hexdump+ASCII message rendering. `crates/sdr-ui/src/sidebar/satellites_heard.rs` + the "Heard via Orbcomm" group in `satellites_panel.rs` — spacecraft heard this session (labels are `Sat 0xNN`; no public sat_id→name table exists — ephemeris-vs-TLE matching is the V2 path).
 
 **User-facing walkthroughs:** `docs/guides/apt-reception.md`, `docs/guides/lrpt-reception.md`, `docs/guides/sstv-reception.md`. The two onboarding entry points are `docs/guides/getting-started.md` (first-FM-station tour) and `docs/guides/sdr-concepts.md` (IQ / sample rate / decimation / FFT / bandwidth, against this app's UI).
 
