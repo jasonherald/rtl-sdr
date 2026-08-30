@@ -363,7 +363,7 @@ impl TapHarness {
 }
 
 #[test]
-fn tap_lazy_inits_and_emits_events() {
+fn tap_lazy_inits_the_bank() {
     let (tx, rx) = mpsc::channel::<DspToUi>();
     let mut tap = TapHarness::new(4096);
 

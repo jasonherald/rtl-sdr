@@ -1,6 +1,7 @@
 use super::*;
 use crate::demod::modulate_sdpsk_at_sps;
 use crate::packet::{PacketType, fletcher16_check_bytes};
+use crate::testutil::{Rng, add_awgn, apply_cfo};
 use crate::{ORBCOMM_CHANNELS_HZ, SYMBOL_RATE_HZ};
 
 /// Wideband source rate used by the synthesis tests.
@@ -504,65 +505,11 @@ fn sample_rate_ratio_matches_the_test_modulator() {
 }
 
 // --- FLL ---------------------------------------------------------------
-
-/// Deterministic xorshift64* PRNG — tests must never be flaky.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    /// Uniform in `(0, 1)`.
-    fn next_f64(&mut self) -> f64 {
-        ((self.next_u64() >> 11) as f64 + 0.5) / 9_007_199_254_740_992.0
-    }
-    /// Standard normal via Box–Muller.
-    fn next_normal(&mut self) -> f64 {
-        let u1 = self.next_f64();
-        let u2 = self.next_f64();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-    }
-}
-
-/// Add complex AWGN at the requested per-sample SNR, the same convention
-/// `demod.rs`'s loopback tests use (in-band, at the channel rate — so
-/// 10 dB here reads as roughly 16 dB of Es/N0 at 4 samples/symbol).
-fn add_awgn(samples: &mut [Complex], snr_db: f64, seed: u64) {
-    if samples.is_empty() {
-        return;
-    }
-    let signal_power = samples
-        .iter()
-        .map(|s| f64::from(s.re) * f64::from(s.re) + f64::from(s.im) * f64::from(s.im))
-        .sum::<f64>()
-        / samples.len() as f64;
-    let sigma = (signal_power / 10.0_f64.powf(snr_db / 10.0) / 2.0).sqrt();
-    let mut rng = Rng::new(seed);
-    for s in samples.iter_mut() {
-        *s = Complex::new(
-            s.re + (sigma * rng.next_normal()) as f32,
-            s.im + (sigma * rng.next_normal()) as f32,
-        );
-    }
-}
-
-fn apply_cfo(samples: &mut [Complex], cfo_hz: f64) {
-    let step = std::f64::consts::TAU * cfo_hz / CHANNEL_SAMPLE_RATE_HZ;
-    let mut phase = 0.0_f64;
-    for s in samples.iter_mut() {
-        let (sin, cos) = phase.sin_cos();
-        *s = *s * Complex::new(cos as f32, sin as f32);
-        phase = wrap_phase(phase + step);
-    }
-}
+//
+// `Rng`, `add_awgn` and `apply_cfo` are shared with `demod::tests` via
+// `crate::testutil` — same seeds, same noise convention (in-band, at the
+// channel rate, so 10 dB here reads as roughly 16 dB of Es/N0 at 4
+// samples/symbol).
 
 #[test]
 fn fll_pulls_in_worst_case_doppler() {
@@ -572,8 +519,8 @@ fn fll_pulls_in_worst_case_doppler() {
     for cfo_hz in [-3500.0_f64, -3000.0, 3000.0, 3500.0] {
         let mut rng = Rng::new(0x5EED_0100);
         let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
-        let mut iq = modulate_sdpsk_at_sps(&bits, 4);
-        apply_cfo(&mut iq, cfo_hz);
+        let iq = modulate_sdpsk_at_sps(&bits, 4);
+        let mut iq = apply_cfo(&iq, cfo_hz);
 
         let mut fll = Fll::new();
         fll.process(&mut iq);
@@ -593,8 +540,8 @@ fn fll_pull_in_time_is_bounded() {
     const BUDGET: usize = 2048;
     let mut rng = Rng::new(0x5EED_0101);
     let bits: Vec<bool> = (0..1024).map(|_| rng.next_u64() & 1 == 1).collect();
-    let mut iq = modulate_sdpsk_at_sps(&bits, 4);
-    apply_cfo(&mut iq, 3500.0);
+    let iq = modulate_sdpsk_at_sps(&bits, 4);
+    let mut iq = apply_cfo(&iq, 3500.0);
     assert!(iq.len() > BUDGET);
 
     let mut fll = Fll::new();
@@ -638,9 +585,9 @@ fn fll_pulls_in_at_10_db_snr() {
     for (seed, cfo_hz) in [(0x5EED_0110_u64, -3000.0_f64), (0x5EED_0111, 3000.0)] {
         let mut rng = Rng::new(seed);
         let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
-        let mut iq = modulate_sdpsk_at_sps(&bits, 4);
-        apply_cfo(&mut iq, cfo_hz);
-        add_awgn(&mut iq, 10.0, seed);
+        let iq = modulate_sdpsk_at_sps(&bits, 4);
+        let iq = apply_cfo(&iq, cfo_hz);
+        let mut iq = add_awgn(&iq, 10.0, seed);
 
         let mut fll = Fll::new();
         fll.process(&mut iq);
@@ -669,8 +616,8 @@ fn fll_survives_non_finite_samples() {
 
     let mut rng = Rng::new(0x5EED_0104);
     let bits: Vec<bool> = (0..4096).map(|_| rng.next_u64() & 1 == 1).collect();
-    let mut clean = modulate_sdpsk_at_sps(&bits, 4);
-    apply_cfo(&mut clean, 3000.0);
+    let clean = modulate_sdpsk_at_sps(&bits, 4);
+    let mut clean = apply_cfo(&clean, 3000.0);
     fll.process(&mut clean);
     let residual = 3000.0 - fll.freq_hz;
     assert!(
@@ -684,8 +631,8 @@ fn fll_survives_non_finite_samples() {
 fn fll_block_boundaries_are_invisible() {
     let mut rng = Rng::new(0x5EED_0103);
     let bits: Vec<bool> = (0..2048).map(|_| rng.next_u64() & 1 == 1).collect();
-    let mut iq = modulate_sdpsk_at_sps(&bits, 4);
-    apply_cfo(&mut iq, 2000.0);
+    let iq = modulate_sdpsk_at_sps(&bits, 4);
+    let iq = apply_cfo(&iq, 2000.0);
 
     let mut whole = iq.clone();
     let mut a = Fll::new();

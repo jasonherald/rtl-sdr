@@ -8,6 +8,13 @@ pub mod demod;
 pub mod packet;
 pub mod reassembly;
 pub mod sat_names;
+#[cfg(test)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub(crate) mod testutil;
 
 pub use channelizer::{ChannelBank, ChannelStats, OrbcommEvent, OrbcommEventKind};
 
