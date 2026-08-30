@@ -75,6 +75,41 @@ pub(super) fn orbcomm_decode_tap(
     events_scratch: &mut Vec<sdr_orbcomm::OrbcommEvent>,
     dsp_tx: &mpsc::Sender<DspToUi>,
 ) {
+    if !ensure_orbcomm_bank(
+        bank,
+        init_failed,
+        geometry,
+        source_rate_hz,
+        center_hz,
+        dsp_tx,
+    ) {
+        return;
+    }
+    let Some(bank) = bank.as_mut() else { return };
+    events_scratch.clear();
+    bank.process(iq, events_scratch);
+    for event in events_scratch.drain(..) {
+        let _ = dsp_tx.send(DspToUi::OrbcommEvent(Box::new(event)));
+    }
+}
+
+/// Geometry self-check + lazy bank construction, split out of
+/// [`orbcomm_decode_tap`] so the per-block decode path reads as the
+/// three steps it is. Returns `true` when `bank` is ready to process
+/// this block, `false` when the caller must skip it (latched failure,
+/// or a construction attempt that just failed).
+///
+/// See [`orbcomm_decode_tap`]'s doc comment for the full rationale of
+/// both the self-check and the one-error-per-failing-geometry latch;
+/// this function is only their mechanical half.
+fn ensure_orbcomm_bank(
+    bank: &mut Option<sdr_orbcomm::ChannelBank>,
+    init_failed: &mut bool,
+    geometry: &mut Option<(f64, f64)>,
+    source_rate_hz: f64,
+    center_hz: f64,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+) -> bool {
     let stale = geometry.is_some_and(|(g_rate, g_center)| {
         g_rate.to_bits() != source_rate_hz.to_bits() || g_center.to_bits() != center_hz.to_bits()
     });
@@ -90,45 +125,42 @@ pub(super) fn orbcomm_decode_tap(
     }
 
     if *init_failed {
-        return;
+        return false;
     }
-    if bank.is_none() {
-        // Record the attempt's geometry BEFORE the construction call
-        // so a subsequent mismatch check is correct regardless of
-        // whether this attempt succeeds or fails.
-        *geometry = Some((source_rate_hz, center_hz));
-        match sdr_orbcomm::ChannelBank::new(
-            source_rate_hz,
-            center_hz,
-            &sdr_orbcomm::ORBCOMM_CHANNELS_HZ,
-        ) {
-            Ok(b) => {
-                tracing::info!(
-                    "Orbcomm bank initialised: source_rate={source_rate_hz} \
-                     center={center_hz} n_channels={}",
-                    sdr_orbcomm::ORBCOMM_CHANNELS_HZ.len()
-                );
-                *bank = Some(b);
-            }
-            Err(e) => {
-                tracing::warn!("Orbcomm bank init failed: {e}");
-                // Surface it once, not per block: the caller's toggle is
-                // still ON with a dead strip behind it, and the latch set
-                // below is what keeps this to a single message per geometry
-                // (design spec, "Error handling"). `DspToUi::Error` is the
-                // codebase's one-shot pipeline-error idiom — see
-                // `controller/scanner.rs` and `controller/audio.rs`.
-                let _ = dsp_tx.send(DspToUi::Error(format!("{ORBCOMM_INIT_ERROR_PREFIX}: {e}")));
-                *init_failed = true;
-                return;
-            }
+    if bank.is_some() {
+        return true;
+    }
+
+    // Record the attempt's geometry BEFORE the construction call
+    // so a subsequent mismatch check is correct regardless of
+    // whether this attempt succeeds or fails.
+    *geometry = Some((source_rate_hz, center_hz));
+    match sdr_orbcomm::ChannelBank::new(
+        source_rate_hz,
+        center_hz,
+        &sdr_orbcomm::ORBCOMM_CHANNELS_HZ,
+    ) {
+        Ok(b) => {
+            tracing::info!(
+                "Orbcomm bank initialised: source_rate={source_rate_hz} \
+                 center={center_hz} n_channels={}",
+                sdr_orbcomm::ORBCOMM_CHANNELS_HZ.len()
+            );
+            *bank = Some(b);
+            true
         }
-    }
-    let Some(bank) = bank.as_mut() else { return };
-    events_scratch.clear();
-    bank.process(iq, events_scratch);
-    for event in events_scratch.drain(..) {
-        let _ = dsp_tx.send(DspToUi::OrbcommEvent(Box::new(event)));
+        Err(e) => {
+            tracing::warn!("Orbcomm bank init failed: {e}");
+            // Surface it once, not per block: the caller's toggle is
+            // still ON with a dead strip behind it, and the latch set
+            // below is what keeps this to a single message per geometry
+            // (design spec, "Error handling"). `DspToUi::Error` is the
+            // codebase's one-shot pipeline-error idiom — see
+            // `controller/scanner.rs` and `controller/audio.rs`.
+            let _ = dsp_tx.send(DspToUi::Error(format!("{ORBCOMM_INIT_ERROR_PREFIX}: {e}")));
+            *init_failed = true;
+            false
+        }
     }
 }
 
@@ -259,6 +291,22 @@ fn engage_orbcomm(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     let prior_decim = state.frontend.decim_ratio();
     if let Err(e) = force_orbcomm_decim(state, dsp_tx, 1) {
         tracing::warn!("Orbcomm engage: forcing frontend decim=1 failed: {e}");
+        // [`force_orbcomm_decim`] mutates in steps: `set_decimation(1)`
+        // commits on the live frontend before the frontend/VFO rebuilds
+        // run, so a failure in a LATER step leaves the frontend pinned at
+        // 1 — and `state.orbcomm_pre_decim` is only set on the success
+        // path below, so nothing would remain that could ever restore the
+        // user's ratio. Roll it back here (issue #865, CR round 1 on PR
+        // #871). Best effort: if the rollback itself fails, the ratio has
+        // still been put back by its own `set_decimation` and the only
+        // casualty is the dependent rebuild, so log and carry on to the
+        // refusal ack rather than masking the original error.
+        if let Err(rollback_err) = force_orbcomm_decim(state, dsp_tx, prior_decim) {
+            tracing::warn!(
+                "Orbcomm engage: rolling the frontend back to decim={prior_decim} \
+                 after the failed engage also failed: {rollback_err}"
+            );
+        }
         let _ = dsp_tx.send(DspToUi::Error(format!("Orbcomm enable failed: {e}")));
         let _ = dsp_tx.send(DspToUi::OrbcommEnabledChanged(false));
         return;
@@ -317,6 +365,13 @@ fn disengage_orbcomm(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
 /// to match — the same sequence `apply_acars_geometry` uses for its
 /// `target_frontend_decim` step, scoped to just decimation since
 /// Orbcomm doesn't touch source rate or center.
+///
+/// **Not atomic**: `set_decimation` commits on the live frontend before
+/// the two rebuilds run, so an `Err` from either rebuild leaves the ratio
+/// already changed. Callers that care must roll it back themselves —
+/// [`engage_orbcomm`] does, [`disengage_orbcomm`] deliberately doesn't
+/// (there is nothing better to roll back TO once the user's saved ratio
+/// is what already failed).
 fn force_orbcomm_decim(
     state: &mut DspState,
     dsp_tx: &mpsc::Sender<DspToUi>,

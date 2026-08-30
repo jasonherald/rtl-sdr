@@ -31,9 +31,9 @@
 // report under `--nocapture` and asserts rather than propagating errors.
 #![allow(clippy::print_stdout, clippy::panic)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use sdr_orbcomm::packet::{OrbcommPacket, PacketType};
+use sdr_orbcomm::packet::{Ephemeris, OrbcommPacket, PacketType};
 use sdr_orbcomm::{
     ChannelBank, ORBCOMM_CHANNELS_HZ, OrbcommEvent, OrbcommEventKind, reassembly, sat_names,
 };
@@ -67,7 +67,8 @@ struct Metadata {
     tles: Vec<String>,
 }
 
-/// Read `<prefix>.json` and `<prefix>.iq`.
+/// Read `<prefix>.json` and `<prefix>.iq`, with `<prefix>` taken from
+/// [`FIXTURE_ENV`].
 fn load_fixture() -> (Metadata, Vec<Complex>) {
     let prefix = std::env::var(FIXTURE_ENV).unwrap_or_else(|_| {
         panic!(
@@ -77,11 +78,15 @@ fn load_fixture() -> (Metadata, Vec<Complex>) {
              {FIXTURE_ENV}=<prefix>."
         )
     });
+    (
+        read_metadata(&PathBuf::from(format!("{prefix}.json"))),
+        read_iq(&PathBuf::from(format!("{prefix}.iq"))),
+    )
+}
 
-    let json_path = PathBuf::from(format!("{prefix}.json"));
-    let iq_path = PathBuf::from(format!("{prefix}.iq"));
-
-    let json_text = std::fs::read_to_string(&json_path)
+/// Parse the converter's `<prefix>.json` sidecar.
+fn read_metadata(json_path: &Path) -> Metadata {
+    let json_text = std::fs::read_to_string(json_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", json_path.display()));
     let json: serde_json::Value = serde_json::from_str(&json_text)
         .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", json_path.display()));
@@ -102,24 +107,26 @@ fn load_fixture() -> (Metadata, Vec<Complex>) {
             .unwrap_or_default()
     };
 
-    let meta = Metadata {
+    Metadata {
         center_hz: number("center_hz"),
         sample_rate: number("sample_rate"),
         timestamp: number("timestamp"),
         sats: strings("sats"),
         tles: strings("tles"),
-    };
+    }
+}
 
-    let raw = std::fs::read(&iq_path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", iq_path.display()));
+/// Read `<prefix>.iq` — little-endian f32 interleaved IQ.
+fn read_iq(iq_path: &Path) -> Vec<Complex> {
+    let raw =
+        std::fs::read(iq_path).unwrap_or_else(|e| panic!("cannot read {}: {e}", iq_path.display()));
     assert!(
-        raw.len() % 8 == 0 && !raw.is_empty(),
+        raw.len().is_multiple_of(8) && !raw.is_empty(),
         "{} is {} bytes — not a non-empty run of interleaved f32 pairs",
         iq_path.display(),
         raw.len()
     );
-    let iq: Vec<Complex> = raw
-        .as_chunks::<8>()
+    raw.as_chunks::<8>()
         .0
         .iter()
         .map(|c| {
@@ -129,9 +136,7 @@ fn load_fixture() -> (Metadata, Vec<Complex>) {
             let im = [c[4], c[5], c[6], c[7]];
             Complex::new(f32::from_le_bytes(re), f32::from_le_bytes(im))
         })
-        .collect();
-
-    (meta, iq)
+        .collect()
 }
 
 /// Human-readable name of a decoded packet's type.
@@ -163,12 +168,14 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-#[test]
-#[ignore = "needs local IQ fixture — see scripts/orbcomm-mat-to-iq.py"]
-#[allow(clippy::too_many_lines)]
-fn real_capture_decodes() {
-    let (meta, iq) = load_fixture();
+/// One decoded packet event, flattened: the packet itself, the channel it
+/// arrived on, and whether it needed single-bit repair.
+type PacketEvent<'a> = (&'a OrbcommPacket, f64, bool);
 
+/// Print the capture header and feed the whole recording through a fresh
+/// [`ChannelBank`] in [`FEED_BLOCK`]-sized blocks, printing the resulting
+/// per-channel stats. Returns every event the bank produced.
+fn decode_fixture(meta: &Metadata, iq: &[Complex]) -> Vec<OrbcommEvent> {
     println!("=== capture ===");
     println!("  samples      {}", iq.len());
     println!("  sample rate  {} Hz", meta.sample_rate);
@@ -200,8 +207,12 @@ fn real_capture_decodes() {
             s.repaired
         );
     }
+    events
+}
 
-    let packets: Vec<(&OrbcommPacket, f64, bool)> = events
+/// The `Packet` half of the event stream, flattened.
+fn packet_events(events: &[OrbcommEvent]) -> Vec<PacketEvent<'_>> {
+    events
         .iter()
         .filter_map(|e| match &e.kind {
             OrbcommEventKind::Packet { packet, repaired } => {
@@ -209,8 +220,11 @@ fn real_capture_decodes() {
             }
             OrbcommEventKind::MessageComplete { .. } => None,
         })
-        .collect();
+        .collect()
+}
 
+/// Per-type packet counts, plus the sync beacons in full.
+fn report_packets(packets: &[PacketEvent<'_>]) {
     println!("\n=== packet types ===");
     let mut kinds: Vec<&str> = packets.iter().map(|(p, ..)| type_name(p)).collect();
     kinds.sort_unstable();
@@ -229,7 +243,7 @@ fn real_capture_decodes() {
     );
 
     println!("\n=== sync beacons ===");
-    for (packet, channel_hz, repaired) in &packets {
+    for (packet, channel_hz, repaired) in packets {
         if let OrbcommPacket::Sync { code, sat_id } = packet {
             println!(
                 "  {:.4} MHz  code {code:06X}  sat_id {sat_id:02X} ({}){}",
@@ -239,9 +253,12 @@ fn real_capture_decodes() {
             );
         }
     }
+}
 
+/// Decoded ephemerides, printed and returned for the gate below.
+fn report_ephemeris<'a>(packets: &[PacketEvent<'a>]) -> Vec<&'a Ephemeris> {
     println!("\n=== ephemeris ===");
-    let ephemerides: Vec<_> = packets
+    let ephemerides: Vec<&Ephemeris> = packets
         .iter()
         .filter_map(|(p, ..)| match p {
             OrbcommPacket::Ephemeris(e) => Some(e),
@@ -259,10 +276,11 @@ fn real_capture_decodes() {
             e.vel_ms
         );
     }
-    // Checksum-valid ephemeris packets whose position failed `decode_ephemeris`'s
-    // plausibility gate come back as `Other` — worth surfacing, since a wrong
-    // nibble layout would show up here rather than as a decode failure.
-    for (packet, ..) in &packets {
+    // Checksum-valid ephemeris packets whose position or timestamp failed
+    // `decode_ephemeris`'s plausibility gates come back as `Other` — worth
+    // surfacing, since a wrong nibble layout would show up here rather than
+    // as a decode failure.
+    for (packet, ..) in packets {
         if let OrbcommPacket::Other {
             packet_type: PacketType::Ephemeris,
             bytes,
@@ -271,7 +289,13 @@ fn real_capture_decodes() {
             println!("  IMPLAUSIBLE ephemeris payload: {}", hex(bytes));
         }
     }
+    ephemerides
+}
 
+/// Completed/flushed messages plus the raw Message fragments behind them —
+/// the latter is the evidence that arbitrated the nibble order (see
+/// `reassembly.rs`).
+fn report_messages(events: &[OrbcommEvent], packets: &[PacketEvent<'_>]) {
     println!("\n=== message reassembly ===");
     let completions: Vec<_> = events
         .iter()
@@ -312,8 +336,11 @@ fn real_capture_decodes() {
             hex(reassembly::msg_payload(bytes).unwrap_or_default())
         );
     }
+}
 
-    // --- the gate ---------------------------------------------------------
+/// The gate proper: enough checksum-valid traffic, at least one sync
+/// beacon, and every decoded ephemeris physically plausible.
+fn assert_decode_gate(packets: &[PacketEvent<'_>], ephemerides: &[&Ephemeris]) {
     assert!(
         packets.len() >= MIN_PACKETS,
         "only {} checksum-valid packets decoded from the capture (need {MIN_PACKETS}) — \
@@ -329,7 +356,7 @@ fn real_capture_decodes() {
         "no Sync beacon in {} decoded packets (need {MIN_SYNC_PACKETS})",
         packets.len()
     );
-    for e in &ephemerides {
+    for e in ephemerides {
         assert!(
             (MIN_ALT_M..=MAX_ALT_M).contains(&e.alt_m),
             "ephemeris altitude {:.1} km outside the plausible Orbcomm band",
@@ -340,4 +367,18 @@ fn real_capture_decodes() {
             "ephemeris carries a non-finite field: {e:?}"
         );
     }
+}
+
+#[test]
+#[ignore = "needs local IQ fixture — see scripts/orbcomm-mat-to-iq.py"]
+fn real_capture_decodes() {
+    let (meta, iq) = load_fixture();
+    let events = decode_fixture(&meta, &iq);
+    let packets = packet_events(&events);
+
+    report_packets(&packets);
+    let ephemerides = report_ephemeris(&packets);
+    report_messages(&events, &packets);
+
+    assert_decode_gate(&packets, &ephemerides);
 }

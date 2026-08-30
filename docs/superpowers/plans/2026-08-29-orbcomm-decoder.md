@@ -442,6 +442,25 @@ Test helpers `valid_sync_packet()` and `bits_lsb_first(&[u8]) -> impl Iterator<I
 
 ### Task 6: Message reassembly
 
+> **Superseded during execution.** The task body below is kept as the historical
+> plan; the contract that actually shipped differs on four points, and new work
+> must follow the shipped one (`crates/sdr-orbcomm/src/reassembly.rs`), not this:
+>
+> - **Payload is `bytes[2..10]` — 8 bytes**, not 9. Byte 10 and 11 are the
+>   Fletcher-16 check bytes of a 12-byte packet (`MESSAGE_PAYLOAD_BYTES = 8`).
+> - **Nibble order is the reverse of the guess below**: `total` is the **high**
+>   nibble of `bytes[1]`, `seq` the **low** nibble, and `seq` is **zero-based**
+>   over `0..total`. Arbitrated against the real captures in Task 9.
+> - **`push` is sink-style**: `push(&mut self, bytes: &[u8], out: &mut Vec<CompletedMessage>)`,
+>   appending every message a single push completes or flushes (one push can
+>   produce two). There is **no `tick()`** — age accounting happens inside `push`.
+> - **Sequence boundaries are monotonic**: a fragment joins the in-flight
+>   sequence only when its `seq` strictly exceeds every `seq` already collected;
+>   an equal, lower, or different-`total` fragment flushes the in-flight
+>   sequence as partial and starts a new one. Out-of-order tolerance was
+>   removed in review round 1 on PR #871 — it let a stale fragment merge into
+>   the next same-`total` sequence.
+
 **Files:**
 - Create: `crates/sdr-orbcomm/src/reassembly.rs`
 

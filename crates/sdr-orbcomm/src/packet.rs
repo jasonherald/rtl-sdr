@@ -1,5 +1,11 @@
 //! Orbcomm packet handling — framing, checksums, decoding.
 
+/// Modulus of the Fletcher-16 running sums. The Orbcomm downlink uses the
+/// mod-**256** variant (each sum is one byte wide), not the more common
+/// mod-255 one — named here so [`fletcher16`] and
+/// [`fletcher16_check_bytes`] can never drift onto different moduli.
+const FLETCHER_MODULUS: u32 = 256;
+
 /// Fletcher-16 with mod-256 running sums, as used by the Orbcomm
 /// downlink (reference: `helpers.py::fletcher_checksum`). A valid
 /// packet (payload + 2 trailing check bytes) sums to zero.
@@ -9,8 +15,8 @@ pub fn fletcher16(bytes: &[u8]) -> u16 {
     let mut sum1: u32 = 0;
     let mut sum2: u32 = 0;
     for b in bytes {
-        sum1 = (sum1 + u32::from(*b)) % 256;
-        sum2 = (sum2 + sum1) % 256;
+        sum1 = (sum1 + u32::from(*b)) % FLETCHER_MODULUS;
+        sum2 = (sum2 + sum1) % FLETCHER_MODULUS;
     }
     ((sum2 as u16) << 8) | (sum1 as u16)
 }
@@ -26,8 +32,8 @@ pub fn fletcher16_check_bytes(payload: &[u8]) -> (u8, u8) {
     // After appending c0: sum1' = (s1 + c0) % 256; sum2' = (s2 + s1 + c0) % 256
     // After appending c1: sum1'' = (s1 + c0 + c1) % 256; sum2'' = (s2 + 2*s1 + 2*c0 + c1) % 256
     // For both to be zero: c0 ≡ -(s1 + s2) (mod 256); c1 ≡ -(s1 + c0) (mod 256)
-    let c0 = (256 - (s1 + s2) % 256) % 256;
-    let c1 = (256 - (s1 + c0) % 256) % 256;
+    let c0 = (FLETCHER_MODULUS - (s1 + s2) % FLETCHER_MODULUS) % FLETCHER_MODULUS;
+    let c1 = (FLETCHER_MODULUS - (s1 + c0) % FLETCHER_MODULUS) % FLETCHER_MODULUS;
     (c0 as u8, c1 as u8)
 }
 
@@ -240,9 +246,10 @@ pub struct Ephemeris {
 }
 
 /// Decode the ephemeris payload of a 24-byte, checksum-valid packet.
-/// Returns `None` when the packet is the wrong length or the decoded
-/// altitude falls outside the plausible Orbcomm band — a cheap guard
-/// against payloads that survived the checksum but are not ephemeris.
+/// Returns `None` when the packet is the wrong length, the GPS time of
+/// week is out of range, or the decoded altitude falls outside the
+/// plausible Orbcomm band — cheap guards against payloads that survived
+/// the checksum but are not ephemeris.
 pub(crate) fn decode_ephemeris(bytes: &[u8]) -> Option<Ephemeris> {
     if bytes.len() != PacketType::Ephemeris.packet_len() {
         return None;
@@ -251,6 +258,14 @@ pub(crate) fn decode_ephemeris(bytes: &[u8]) -> Option<Ephemeris> {
 
     let week = i64::from(nibbles_be(&nib, NIB_WEEK, 4));
     let time_of_week = i64::from(nibbles_be(&nib, NIB_TOW, 6));
+    // The field is 24 bits wide but a GPS time of week only spans
+    // `0..SECONDS_PER_WEEK`, so anything at or above a full week means we
+    // decoded something that is not an ephemeris timestamp. Reject it the
+    // same way the altitude gate below does — `parse_packet` keeps the raw
+    // bytes as `Other` rather than publishing a bogus time.
+    if time_of_week >= SECONDS_PER_WEEK {
+        return None;
+    }
     let sat_time_unix = GPS_EPOCH_UNIX + week * SECONDS_PER_WEEK + time_of_week;
 
     // val = 2 * raw * MAX / 2^20 - MAX
@@ -563,6 +578,44 @@ mod tests {
             }) => {}
             other => panic!("expected raw fallback, got {other:?}"),
         }
+    }
+
+    /// `CodeRabbit` round 1 on PR #871: the 24-bit time-of-week field can
+    /// express values far beyond a GPS week, and a noise payload that
+    /// happens to checksum could carry one. Such a packet must degrade to
+    /// raw `Other` rather than publish a satellite time days out.
+    #[test]
+    #[allow(clippy::panic)]
+    fn out_of_range_time_of_week_degrades_to_raw() {
+        // A position/velocity pair that passes the altitude gate, so the
+        // time-of-week check is the only thing that can reject the packet.
+        let pos = [3_000_000.0, 4_000_000.0, 4_900_000.0];
+        let vel = [-5_000.0, 3_000.0, 2_000.0];
+
+        // One second past the end of the week: the first invalid value.
+        // The encoder masks to 24 bits, and 604_800 < 0xFF_FFFF, so it
+        // reaches `decode_ephemeris` intact.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let over = encode_ephemeris_for_test(0x2C, 2434, SECONDS_PER_WEEK as u32, pos, vel);
+        match parse_packet(&over) {
+            Some(OrbcommPacket::Other {
+                packet_type: PacketType::Ephemeris,
+                ..
+            }) => {}
+            other => panic!("expected raw fallback for an over-limit TOW, got {other:?}"),
+        }
+
+        // The last valid instant of the week still decodes.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let last = encode_ephemeris_for_test(0x2C, 2434, SECONDS_PER_WEEK as u32 - 1, pos, vel);
+        let parsed = parse_packet(&last);
+        let Some(OrbcommPacket::Ephemeris(e)) = parsed else {
+            panic!("expected the last second of the week to decode, got {parsed:?}");
+        };
+        assert_eq!(
+            e.sat_time_unix,
+            GPS_EPOCH_UNIX + 2434 * SECONDS_PER_WEEK + SECONDS_PER_WEEK - 1
+        );
     }
 
     #[test]

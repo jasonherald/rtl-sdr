@@ -272,33 +272,113 @@ fn scanner_enable_refused_while_orbcomm_enabled() {
     );
 }
 
+/// Issue #865, CR round 1 on PR #871 — `force_orbcomm_decim` is not
+/// atomic: its `set_decimation(1)` commits on the live frontend before
+/// the frontend/VFO rebuilds run. A failure in one of those later steps
+/// used to leave the frontend pinned at decim=1 with
+/// `orbcomm_pre_decim` still `None` — nothing left anywhere that could
+/// restore the user's ratio. A refused engage must put it back.
+///
+/// The failure is injected by zeroing `state.sample_rate`, which only
+/// `rebuild_frontend` reads: `set_decimation` validates against the
+/// frontend's OWN (still valid) rate and commits, then the rebuild
+/// fails — exactly the step-two shape the rollback exists for.
+#[test]
+fn failed_engage_rolls_the_frontend_back_to_the_prior_decim() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let prior_decim = state.frontend.decim_ratio();
+    assert_ne!(
+        prior_decim, 1,
+        "test assumes the default decimation isn't 1"
+    );
+    state.sample_rate = 0.0;
+    let _ = drain(&dsp_rx);
+
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, true);
+
+    assert!(!state.orbcomm_enabled, "a failed engage must not latch on");
+    assert!(
+        state.orbcomm_pre_decim.is_none(),
+        "a failed engage must not record a saved decimation"
+    );
+    assert_eq!(
+        state.frontend.decim_ratio(),
+        prior_decim,
+        "a failed engage must roll the frontend back off the forced decim=1"
+    );
+    let events = drain(&dsp_rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DspToUi::OrbcommEnabledChanged(false))),
+        "expected OrbcommEnabledChanged(false), got {events:?}"
+    );
+    assert!(
+        has_orbcomm_refusal(&events),
+        "expected an orbcomm-related failure Error, got {events:?}"
+    );
+}
+
+/// The tap's four caller-owned pieces of state plus its input block,
+/// bundled so a test can invoke `orbcomm_decode_tap` without restating
+/// its eight arguments at every call site (several tests call it three
+/// or more times in a row).
+struct TapHarness {
+    bank: Option<sdr_orbcomm::ChannelBank>,
+    init_failed: bool,
+    geometry: Option<(f64, f64)>,
+    events: Vec<sdr_orbcomm::OrbcommEvent>,
+    iq: Vec<Complex>,
+}
+
+impl TapHarness {
+    /// A harness fed `iq_len` zero-filled samples. Zero-filled IQ carries
+    /// no signal, so it never produces packet/message events —
+    /// real-signal decode coverage is `sdr_orbcomm`'s own job (see the
+    /// module doc comment above).
+    fn new(iq_len: usize) -> Self {
+        Self {
+            bank: None,
+            init_failed: false,
+            geometry: None,
+            events: Vec::new(),
+            iq: vec![Complex::default(); iq_len],
+        }
+    }
+
+    /// One `orbcomm_decode_tap` call at the given geometry.
+    fn run(&mut self, source_rate_hz: f64, center_hz: f64, tx: &mpsc::Sender<DspToUi>) {
+        super::orbcomm_decode_tap(
+            &mut self.bank,
+            &mut self.init_failed,
+            &mut self.geometry,
+            source_rate_hz,
+            center_hz,
+            &self.iq,
+            &mut self.events,
+            tx,
+        );
+    }
+}
+
 #[test]
 fn tap_lazy_inits_and_emits_events() {
-    let mut bank: Option<sdr_orbcomm::ChannelBank> = None;
-    let mut init_failed = false;
-    let mut geometry: Option<(f64, f64)> = None;
-    let mut events = Vec::new();
     let (tx, rx) = mpsc::channel::<DspToUi>();
-    let iq = vec![Complex::default(); 4096];
+    let mut tap = TapHarness::new(4096);
 
-    super::orbcomm_decode_tap(
-        &mut bank,
-        &mut init_failed,
-        &mut geometry,
-        TEST_SOURCE_RATE_HZ,
-        TEST_CENTER_HZ,
-        &iq,
-        &mut events,
-        &tx,
+    tap.run(TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ, &tx);
+
+    assert!(
+        tap.bank.is_some(),
+        "first call should lazily build the bank"
     );
-
-    assert!(bank.is_some(), "first call should lazily build the bank");
-    assert!(!init_failed);
-    assert_eq!(geometry, Some((TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ)));
-    // Zero-filled IQ carries no signal, so no packet/message events —
-    // real-signal decode coverage is `sdr_orbcomm`'s own job (see the
-    // module doc comment above).
-    assert!(events.is_empty(), "zero-filled IQ must not produce events");
+    assert!(!tap.init_failed);
+    assert_eq!(tap.geometry, Some((TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ)));
+    assert!(
+        tap.events.is_empty(),
+        "zero-filled IQ must not produce events"
+    );
     assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 }
 
@@ -320,52 +400,30 @@ fn orbcomm_init_errors(events: &[DspToUi]) -> Vec<&String> {
 
 #[test]
 fn init_failure_latches_at_the_same_geometry() {
-    let mut bank: Option<sdr_orbcomm::ChannelBank> = None;
-    let mut init_failed = false;
-    let mut geometry: Option<(f64, f64)> = None;
-    let mut events = Vec::new();
     let (tx, rx) = mpsc::channel::<DspToUi>();
-    let iq = vec![Complex::default(); 16];
+    let mut tap = TapHarness::new(16);
 
     // Absurd geometry: a zero source rate is never in-span for any
     // channel (`channel_in_span`'s `source_rate_hz <= 0.0` guard),
     // so construction fails deterministically.
-    super::orbcomm_decode_tap(
-        &mut bank,
-        &mut init_failed,
-        &mut geometry,
-        0.0,
-        TEST_CENTER_HZ,
-        &iq,
-        &mut events,
-        &tx,
-    );
-    assert!(bank.is_none());
-    assert!(init_failed, "bad geometry should set the latch");
-    assert_eq!(geometry, Some((0.0, TEST_CENTER_HZ)));
+    tap.run(0.0, TEST_CENTER_HZ, &tx);
+    assert!(tap.bank.is_none());
+    assert!(tap.init_failed, "bad geometry should set the latch");
+    assert_eq!(tap.geometry, Some((0.0, TEST_CENTER_HZ)));
 
     // Several more calls at the exact SAME (still-bad) geometry must
     // no-op — no repeated construction attempt, no warn-spam. This
     // is the steady-state case: same block cadence, same geometry,
     // every call.
     for _ in 0..5 {
-        super::orbcomm_decode_tap(
-            &mut bank,
-            &mut init_failed,
-            &mut geometry,
-            0.0,
-            TEST_CENTER_HZ,
-            &iq,
-            &mut events,
-            &tx,
-        );
+        tap.run(0.0, TEST_CENTER_HZ, &tx);
     }
     assert!(
-        bank.is_none(),
+        tap.bank.is_none(),
         "latched init_failed must skip the retry at unchanged geometry"
     );
-    assert!(init_failed);
-    assert_eq!(geometry, Some((0.0, TEST_CENTER_HZ)));
+    assert!(tap.init_failed);
+    assert_eq!(tap.geometry, Some((0.0, TEST_CENTER_HZ)));
 
     // Final review, C2 — the failure has to reach the user, not just
     // the log: the toggle stays ON with a dead activity strip behind
@@ -402,26 +460,16 @@ fn init_failure_latches_at_the_same_geometry() {
 /// but this self-check remains the general safety net.)
 #[test]
 fn tap_rebuilds_on_geometry_mismatch() {
-    let mut bank: Option<sdr_orbcomm::ChannelBank> = None;
-    let mut init_failed = false;
-    let mut geometry: Option<(f64, f64)> = None;
-    let mut events = Vec::new();
     let (tx, _rx) = mpsc::channel::<DspToUi>();
-    let iq = vec![Complex::default(); 16];
+    let mut tap = TapHarness::new(16);
 
     // First call builds successfully at the initial geometry.
-    super::orbcomm_decode_tap(
-        &mut bank,
-        &mut init_failed,
-        &mut geometry,
-        TEST_SOURCE_RATE_HZ,
-        TEST_CENTER_HZ,
-        &iq,
-        &mut events,
-        &tx,
+    tap.run(TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ, &tx);
+    assert!(
+        tap.bank.is_some(),
+        "first call builds at the initial geometry"
     );
-    assert!(bank.is_some(), "first call builds at the initial geometry");
-    assert_eq!(geometry, Some((TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ)));
+    assert_eq!(tap.geometry, Some((TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ)));
 
     // Geometry changed underneath the tap (e.g. a retune or scanner
     // hop) WITHOUT any explicit invalidation call — simulated here by
@@ -430,46 +478,28 @@ fn tap_rebuilds_on_geometry_mismatch() {
     // self-checking, `bank` would stay `Some` regardless of what
     // geometry is passed now; observing `None` here proves a fresh
     // construction attempt was made (and failed, at the absurd rate).
-    super::orbcomm_decode_tap(
-        &mut bank,
-        &mut init_failed,
-        &mut geometry,
-        0.0,
-        OTHER_CENTER_HZ,
-        &iq,
-        &mut events,
-        &tx,
-    );
+    tap.run(0.0, OTHER_CENTER_HZ, &tx);
     assert!(
-        bank.is_none(),
+        tap.bank.is_none(),
         "mismatched geometry must drop the stale bank and attempt a rebuild"
     );
     assert!(
-        init_failed,
+        tap.init_failed,
         "the rebuild attempt at the absurd rate must fail"
     );
-    assert_eq!(geometry, Some((0.0, OTHER_CENTER_HZ)));
+    assert_eq!(tap.geometry, Some((0.0, OTHER_CENTER_HZ)));
 
     // A THIRD call back at valid geometry must retry despite the
     // latch — proving the latch clears on ANY geometry change, not
     // just a successful rebuild (a failed attempt must be retriable
     // too, since the new geometry may well be valid).
-    super::orbcomm_decode_tap(
-        &mut bank,
-        &mut init_failed,
-        &mut geometry,
-        TEST_SOURCE_RATE_HZ,
-        TEST_CENTER_HZ,
-        &iq,
-        &mut events,
-        &tx,
-    );
+    tap.run(TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ, &tx);
     assert!(
-        bank.is_some(),
+        tap.bank.is_some(),
         "valid geometry after a failed attempt must retry and succeed"
     );
-    assert!(!init_failed);
-    assert_eq!(geometry, Some((TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ)));
+    assert!(!tap.init_failed);
+    assert_eq!(tap.geometry, Some((TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ)));
 }
 
 /// `true` if any event is an `Error` mentioning "orbcomm"

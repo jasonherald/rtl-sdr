@@ -35,6 +35,13 @@ use crate::state::AppState;
 /// Bytes rendered per hexdump row.
 const HEXDUMP_BYTES_PER_ROW: usize = 16;
 
+/// Hz per MHz — channel frequencies arrive in Hz and every row in this
+/// viewer renders them in MHz.
+const HZ_PER_MHZ: f64 = 1_000_000.0;
+/// Metres per kilometre — the ephemeris decoder reports altitude in
+/// metres and speed in m/s; the log line shows km and km/s.
+const METERS_PER_KM: f64 = 1_000.0;
+
 /// Default viewer window size. Wide enough for a full ephemeris log
 /// line at the monospace font size without wrapping.
 const ORBCOMM_VIEWER_WINDOW_WIDTH: i32 = 900;
@@ -74,7 +81,7 @@ pub fn format_packet_row(event: &OrbcommEvent) -> String {
 
 /// One-line rendering of a parsed [`OrbcommPacket`].
 fn format_packet_line(packet: &OrbcommPacket, channel_hz: f64) -> String {
-    let mhz = channel_hz / 1_000_000.0;
+    let mhz = channel_hz / HZ_PER_MHZ;
     match packet {
         OrbcommPacket::Ephemeris(eph) => format_ephemeris_line(eph),
         OrbcommPacket::Sync { code, sat_id } => {
@@ -100,8 +107,8 @@ fn format_ephemeris_line(eph: &Ephemeris) -> String {
         sat_label(eph.sat_id),
         format_lat(eph.lat_deg),
         format_lon(eph.lon_deg),
-        eph.alt_m / 1000.0,
-        eph.vel_ms / 1000.0,
+        eph.alt_m / METERS_PER_KM,
+        eph.vel_ms / METERS_PER_KM,
         format_utc_hms(eph.sat_time_unix),
     )
 }
@@ -170,7 +177,7 @@ fn format_hex_inline(bytes: &[u8]) -> String {
 /// Header line + [`format_hexdump`] block for a `MessageComplete`
 /// event.
 fn format_message_complete(channel_hz: f64, bytes: &[u8], partial: bool) -> String {
-    let mhz = channel_hz / 1_000_000.0;
+    let mhz = channel_hz / HZ_PER_MHZ;
     let marker = if partial { " [partial]" } else { "" };
     format!(
         "Message complete · {mhz:.4} MHz{marker}\n{}",
@@ -288,26 +295,12 @@ pub fn connect_orbcomm_action(app: &adw::Application, state: &Rc<AppState>) {
     app.set_accels_for_action("app.orbcomm-open", &["<Ctrl><Shift>o"]);
 }
 
-#[allow(clippy::too_many_lines)]
-fn build_orbcomm_viewer_window(state: &Rc<AppState>) -> adw::Window {
-    let window = adw::Window::builder()
-        .title("Orbcomm")
-        .default_width(ORBCOMM_VIEWER_WINDOW_WIDTH)
-        .default_height(ORBCOMM_VIEWER_WINDOW_HEIGHT)
-        .modal(false)
-        .build();
-    // Link to the GApplication so Wayland's app-id + icon resolve
-    // correctly. Same rationale as `acars_viewer`/`apt_viewer`: this
-    // window has no parent to inherit application-ness from.
-    if let Some(app) =
-        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok())
-    {
-        window.set_application(Some(&app));
-    }
-
+/// Header bar carrying the "Decode" enable switch. Returns both so the
+/// caller can keep the switch in [`ViewerHandles`] — the ack path
+/// (`apply_enabled_ack`) drives it, and it never sets itself
+/// optimistically (module docs).
+fn build_header_bar(state: &Rc<AppState>) -> (adw::HeaderBar, gtk4::Switch) {
     let header = adw::HeaderBar::new();
-
-    // ─── Enable switch ───
     let enable_switch = gtk4::Switch::builder()
         .valign(gtk4::Align::Center)
         .active(state.orbcomm_enabled.get())
@@ -322,8 +315,13 @@ fn build_orbcomm_viewer_window(state: &Rc<AppState>) -> adw::Window {
     enable_box.append(&enable_label);
     enable_box.append(&enable_switch);
     header.pack_start(&enable_box);
+    (header, enable_switch)
+}
 
-    // ─── Channel-activity strip ───
+/// Per-channel activity strip: one label per
+/// [`sdr_orbcomm::ORBCOMM_CHANNELS_HZ`] entry, in that order — the
+/// order [`refresh_channel_strip`] indexes by.
+fn build_channel_strip() -> (gtk4::Box, Vec<gtk4::Label>) {
     let strip = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
     strip.set_margin_start(12);
     strip.set_margin_end(12);
@@ -345,8 +343,13 @@ fn build_orbcomm_viewer_window(state: &Rc<AppState>) -> adw::Window {
             label
         })
         .collect();
+    (strip, channel_labels)
+}
 
-    // ─── Monospace scrolled log ───
+/// Monospace, non-wrapping log view inside its own scroller. The
+/// scroller is returned alongside because [`append_log_entry`]'s
+/// auto-follow drives its `GtkAdjustment` directly.
+fn build_log_view() -> (gtk4::TextView, gtk4::ScrolledWindow) {
     let log_view = gtk4::TextView::builder()
         .editable(false)
         .cursor_visible(false)
@@ -362,6 +365,60 @@ fn build_orbcomm_viewer_window(state: &Rc<AppState>) -> adw::Window {
         .vexpand(true)
         .hexpand(true)
         .build();
+    (log_view, scrolled_window)
+}
+
+/// Enable-switch dispatch + close-request teardown for a freshly built
+/// viewer window.
+fn wire_viewer_signals(
+    window: &adw::Window,
+    enable_switch: &gtk4::Switch,
+    handles: &Rc<ViewerHandles>,
+    state: &Rc<AppState>,
+) {
+    // ─── Enable switch → SetOrbcommEnabled ───
+    {
+        let state = Rc::clone(state);
+        let handles = Rc::clone(handles);
+        enable_switch.connect_active_notify(move |sw| {
+            if handles.suppress_switch_notify.get() {
+                return;
+            }
+            state.send_dsp(crate::messages::UiToDsp::SetOrbcommEnabled(sw.is_active()));
+        });
+    }
+
+    // Wire close-request to clear both `AppState` slots, mirroring
+    // `acars_viewer`.
+    {
+        let state = Rc::clone(state);
+        window.connect_close_request(move |_| {
+            *state.orbcomm_viewer_window.borrow_mut() = None;
+            *state.orbcomm_viewer_handles.borrow_mut() = None;
+            glib::Propagation::Proceed
+        });
+    }
+}
+
+fn build_orbcomm_viewer_window(state: &Rc<AppState>) -> adw::Window {
+    let window = adw::Window::builder()
+        .title("Orbcomm")
+        .default_width(ORBCOMM_VIEWER_WINDOW_WIDTH)
+        .default_height(ORBCOMM_VIEWER_WINDOW_HEIGHT)
+        .modal(false)
+        .build();
+    // Link to the GApplication so Wayland's app-id + icon resolve
+    // correctly. Same rationale as `acars_viewer`/`apt_viewer`: this
+    // window has no parent to inherit application-ness from.
+    if let Some(app) =
+        gtk4::gio::Application::default().and_then(|a| a.downcast::<gtk4::Application>().ok())
+    {
+        window.set_application(Some(&app));
+    }
+
+    let (header, enable_switch) = build_header_bar(state);
+    let (strip, channel_labels) = build_channel_strip();
+    let (log_view, scrolled_window) = build_log_view();
 
     let content = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     content.append(&header);
@@ -385,28 +442,7 @@ fn build_orbcomm_viewer_window(state: &Rc<AppState>) -> adw::Window {
     // rather than blanking until the next `OrbcommChannelStats` tick.
     refresh_channel_strip(&handles, &state.orbcomm_channel_stats.borrow());
 
-    // ─── Enable switch → SetOrbcommEnabled ───
-    {
-        let state = Rc::clone(state);
-        let handles = Rc::clone(&handles);
-        enable_switch.connect_active_notify(move |sw| {
-            if handles.suppress_switch_notify.get() {
-                return;
-            }
-            state.send_dsp(crate::messages::UiToDsp::SetOrbcommEnabled(sw.is_active()));
-        });
-    }
-
-    // Wire close-request to clear both `AppState` slots, mirroring
-    // `acars_viewer`.
-    {
-        let state = Rc::clone(state);
-        window.connect_close_request(move |_| {
-            *state.orbcomm_viewer_window.borrow_mut() = None;
-            *state.orbcomm_viewer_handles.borrow_mut() = None;
-            glib::Propagation::Proceed
-        });
-    }
+    wire_viewer_signals(&window, &enable_switch, &handles, state);
 
     window
 }
@@ -415,7 +451,7 @@ fn build_orbcomm_viewer_window(state: &Rc<AppState>) -> adw::Window {
 /// (fresh viewer open, first tick not landed), frequency + running
 /// ok/err counters once they do.
 fn channel_label_text(freq_hz: f64, stats: Option<&ChannelStats>) -> String {
-    let mhz = freq_hz / 1_000_000.0;
+    let mhz = freq_hz / HZ_PER_MHZ;
     match stats {
         Some(s) => format!(
             "{mhz:.4} MHz\n{} ok / {} err",

@@ -254,12 +254,25 @@ pub enum DspToUi {
     /// slice keeps the same variable-width convention as
     /// `AcarsChannelStats`. Issue #865.
     OrbcommChannelStats(Box<[sdr_orbcomm::ChannelStats]>),
-    /// Ack for `UiToDsp::SetOrbcommEnabled`. Construction can't
-    /// fail synchronously the way ACARS engage can (Orbcomm
-    /// doesn't force source geometry), so unlike
-    /// `AcarsEnabledChanged` this always succeeds — a bank-init
-    /// failure surfaces later via the tap's latch (mirrors the
-    /// LRPT pattern) rather than through this ack. Issue #865.
+    /// Ack for `UiToDsp::SetOrbcommEnabled`, carrying the state the
+    /// engine actually settled on — which is not always the state
+    /// the UI asked for. An enable is refused synchronously in two
+    /// cases, and both ack `false` after a `DspToUi::Error`
+    /// explaining why:
+    ///
+    /// - the scanner is running (the two are mutually exclusive —
+    ///   the scanner writes frontend decimation directly);
+    /// - forcing frontend decimation to 1 failed (`engage_orbcomm`
+    ///   rolls the ratio back before acking).
+    ///
+    /// Unlike `AcarsEnabledChanged` this is a plain `bool` rather
+    /// than a `Result`: the refusal reason is already a user-facing
+    /// `DspToUi::Error`, and the UI switch only needs the settled
+    /// state to follow. A *bank-init* failure is a third, later
+    /// failure mode that this ack never carries at all — it happens
+    /// on the first block after engage and surfaces through the
+    /// tap's own one-shot `DspToUi::Error` latch (mirrors the LRPT
+    /// pattern). Issue #865.
     OrbcommEnabledChanged(bool),
 }
 

@@ -87,7 +87,7 @@ reference repo's `literature/`).
 
 ## Architecture
 
-```
+```text
 wideband IQ (pre-VFO, processed_buf)
    └── orbcomm_decode_tap (sdr-core, sibling of acars_decode_tap)
          └── sdr_orbcomm::ChannelBank

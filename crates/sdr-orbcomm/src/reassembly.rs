@@ -13,8 +13,33 @@
 //!
 //! Orbcomm interleaves multi-packet messages on a channel only rarely, so
 //! this tracks exactly one in-flight sequence — not one per originating
-//! subscriber or channel. A fragment whose `total` doesn't match the
-//! in-flight sequence is treated as the start of a new sequence.
+//! subscriber or channel.
+//!
+//! # Sequence boundaries: strictly increasing `seq`
+//!
+//! The downlink is an in-order TDM broadcast: a satellite transmits a
+//! message's fragments in ascending sequence order, and the next message on
+//! that channel starts over at `seq 0`. The real captures show exactly that
+//! — the byte-1 values enumerated on [`msg_total_len`] come in runs whose
+//! low nibble counts up from zero, with the next same-`total` run restarting
+//! at zero rather than continuing.
+//!
+//! So a fragment joins the in-flight sequence only when its `seq` is
+//! **strictly greater** than every `seq` already collected (gaps are fine —
+//! a lost fragment simply never arrives). Anything else — an equal `seq`, a
+//! lower one, or a different `total` — is the boundary of a NEW sequence:
+//! the in-flight one is flushed as `partial` and the arriving fragment opens
+//! a fresh sequence. `seq == 0` restarting a sequence falls out of that rule
+//! rather than being special-cased, and so do duplicates.
+//!
+//! An earlier revision instead tolerated out-of-order arrival, keeping any
+//! fragment whose `total` matched. That was speculative — nothing in the
+//! captures or the reference decoder calls for it — and it actively
+//! corrupted messages: a stale fragment left behind by a lost sequence (say
+//! `seq 1` of a 3-fragment message) would sit in flight until the NEXT
+//! same-`total` sequence's `seq 0` and `seq 2` filled in around it, and the
+//! "completed" message would be a hybrid of two unrelated transmissions
+//! (`a_new_sequence_never_merges_with_a_stale_same_total_fragment`).
 
 use std::collections::BTreeMap;
 
@@ -86,13 +111,14 @@ struct InFlight {
     /// it. Every joining fragment must report the same total.
     total: u8,
     /// Fragments seen so far, keyed by their zero-based sequence number. A
-    /// `BTreeMap` keeps concatenation order free (sorted iteration) even
-    /// though fragments may arrive out of order. Only sequence numbers in
-    /// `0..total` are ever inserted (see [`Reassembler::push`]), so
-    /// [`Self::is_complete`] and [`Self::concat_payloads`] never need to
-    /// re-check the range themselves. A fragment re-sent for a sequence
-    /// number already present overwrites the earlier one — last write
-    /// wins, silently.
+    /// `BTreeMap` keeps concatenation order free (sorted iteration) and
+    /// makes the sequence's high-water mark a `keys().next_back()` away —
+    /// which is what the strictly-increasing boundary rule (module docs)
+    /// tests each arrival against. Only sequence numbers in `0..total` are
+    /// ever inserted (see [`Reassembler::push`]), so [`Self::is_complete`]
+    /// and [`Self::concat_payloads`] never need to re-check the range
+    /// themselves. A key is never overwritten: an arriving fragment whose
+    /// `seq` is already present opens a new sequence instead.
     fragments: BTreeMap<u8, [u8; MESSAGE_PAYLOAD_BYTES]>,
     /// Number of `push` calls (of any syntactically valid Message packet)
     /// since this sequence started, incremented on every push while it's
@@ -105,6 +131,15 @@ impl InFlight {
     /// Sequence numbers `0..total` are all present.
     fn is_complete(&self) -> bool {
         self.total > 0 && (0..self.total).all(|seq| self.fragments.contains_key(&seq))
+    }
+
+    /// Highest sequence number collected so far — the high-water mark an
+    /// arriving fragment must strictly exceed to join this sequence rather
+    /// than start a new one (module docs). `None` only for the momentarily
+    /// empty map inside [`Reassembler::push`]'s `get_or_insert_with`, which
+    /// treats it as "nothing to exceed".
+    fn highest_seq(&self) -> Option<u8> {
+        self.fragments.keys().next_back().copied()
     }
 
     /// Concatenate fragment payloads in ascending sequence order. Missing
@@ -212,13 +247,15 @@ impl Reassembler {
             }
         }
 
-        // A fragment reporting a different total than the (still-live)
-        // in-flight sequence restarts: flush the old sequence as partial.
-        if self
-            .inflight
-            .as_ref()
-            .is_some_and(|inflight| inflight.total != total)
-        {
+        // Sequence boundary (module docs): the arriving fragment joins the
+        // still-live in-flight sequence only when it reports the same total
+        // AND its seq strictly exceeds every seq collected so far. A
+        // different total, an equal seq or a lower one all mean a new
+        // sequence has started — flush the old one as partial and let the
+        // arriving fragment open a fresh one below.
+        if self.inflight.as_ref().is_some_and(|inflight| {
+            inflight.total != total || inflight.highest_seq().is_some_and(|hi| seq <= hi)
+        }) {
             self.flush_inflight(true, out);
         }
 
@@ -338,44 +375,122 @@ mod tests {
         assert_eq!(done.bytes, expected);
     }
 
+    /// `CodeRabbit` round 1 on PR #871, the defect the monotonic-sequence
+    /// boundary rule closes: a stale in-flight fragment left over from an
+    /// earlier same-`total` sequence must NOT merge with the fragments of
+    /// the next one. Before the rule, the leftover `seq 1` simply stayed
+    /// put while `seq 0` and `seq 2` of the *new* sequence filled in
+    /// around it, and the "completed" message was a hybrid of two
+    /// unrelated transmissions.
     #[test]
-    fn out_of_order_fragments_still_complete_in_sequence_order() {
+    fn a_new_sequence_never_merges_with_a_stale_same_total_fragment() {
         let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
-        let p1 = [0xAAu8; MESSAGE_PAYLOAD_BYTES];
-        let p2 = [0xBBu8; MESSAGE_PAYLOAD_BYTES];
-        let p3 = [0xCCu8; MESSAGE_PAYLOAD_BYTES];
+        let stale = [0x99u8; MESSAGE_PAYLOAD_BYTES];
+        let p0 = [0xA0u8; MESSAGE_PAYLOAD_BYTES];
+        let p1 = [0xA1u8; MESSAGE_PAYLOAD_BYTES];
+        let p2 = [0xA2u8; MESSAGE_PAYLOAD_BYTES];
 
-        assert_none(&mut r, &msg_fragment(2, 3, p3));
-        assert_none(&mut r, &msg_fragment(0, 3, p1));
-        let done = expect_one(&mut r, &msg_fragment(1, 3, p2), "completes");
+        // Left over from a sequence whose fragments 0 and 2 were never
+        // decoded: fragment 1 of a total-3 sequence, still in flight.
+        assert_none(&mut r, &msg_fragment(1, 3, stale));
+
+        // A NEW total-3 sequence starts. Its `seq 0` is not greater than
+        // the in-flight high-water mark of 1, so it opens a fresh
+        // sequence and flushes the leftover as partial — carrying only
+        // its own payload.
+        let flushed = expect_one(
+            &mut r,
+            &msg_fragment(0, 3, p0),
+            "the stale fragment flushes when the new sequence opens",
+        );
+        assert!(flushed.partial);
+        assert_eq!(flushed.bytes, stale.to_vec());
+
+        // The new sequence then completes from exactly its own three
+        // fragments — the stale payload must appear nowhere in it.
+        assert_none(&mut r, &msg_fragment(1, 3, p1));
+        let done = expect_one(&mut r, &msg_fragment(2, 3, p2), "new sequence completes");
         assert!(!done.partial);
         let mut expected = Vec::new();
+        expected.extend_from_slice(&p0);
         expected.extend_from_slice(&p1);
         expected.extend_from_slice(&p2);
-        expected.extend_from_slice(&p3);
+        assert_eq!(
+            done.bytes, expected,
+            "the completed message must not carry the stale fragment"
+        );
+    }
+
+    /// Gaps stay tolerated: a lost middle fragment leaves the sequence in
+    /// flight (to be stale-flushed later), it does not complete early.
+    /// Strictly increasing seq is the rule; contiguous seq is not.
+    #[test]
+    fn a_gap_leaves_the_sequence_in_flight() {
+        let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
+        let p0 = [0x10u8; MESSAGE_PAYLOAD_BYTES];
+        let p2 = [0x12u8; MESSAGE_PAYLOAD_BYTES];
+
+        assert_none(&mut r, &msg_fragment(0, 3, p0));
+        // Fragment 1 was lost; fragment 2 still joins (2 > 0) and the
+        // sequence stays incomplete rather than completing on two of three.
+        assert_none(&mut r, &msg_fragment(2, 3, p2));
+    }
+
+    /// A repeated sequence number is the same boundary signal as a
+    /// backwards one: the downlink is an in-order broadcast, so a `seq`
+    /// we have already seen can only belong to a new transmission.
+    #[test]
+    fn a_duplicate_seq_starts_a_new_sequence() {
+        let mut r = Reassembler::new(DEFAULT_MAX_AGE_PACKETS);
+        let first = [0x21u8; MESSAGE_PAYLOAD_BYTES];
+        let second = [0x22u8; MESSAGE_PAYLOAD_BYTES];
+        let tail = [0x23u8; MESSAGE_PAYLOAD_BYTES];
+
+        assert_none(&mut r, &msg_fragment(0, 2, first));
+        let flushed = expect_one(
+            &mut r,
+            &msg_fragment(0, 2, second),
+            "the duplicate seq restarts, flushing the first attempt",
+        );
+        assert!(flushed.partial);
+        assert_eq!(flushed.bytes, first.to_vec());
+
+        // The restarted sequence completes from `second` + its own tail.
+        let done = expect_one(&mut r, &msg_fragment(1, 2, tail), "restarted completes");
+        assert!(!done.partial);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&second);
+        expected.extend_from_slice(&tail);
         assert_eq!(done.bytes, expected);
     }
 
     #[test]
     fn missing_fragment_flushes_partial_once_stale() {
+        /// The largest total a nibble can express. Used so the sequence
+        /// can be aged with strictly increasing (hence non-restarting)
+        /// fragment numbers without ever completing.
+        const TOTAL: u8 = 15;
         let max_age = 3u32;
         let mut r = Reassembler::new(max_age);
-        let p1 = [0x11u8; MESSAGE_PAYLOAD_BYTES];
-        assert_none(&mut r, &msg_fragment(0, 3, p1));
-        // Fragments 1 and 2 never arrive. Age the sequence with same-seq repeats
-        // (total unchanged, so no restart), which just overwrite fragment 0
-        // in place — harmless since we only assert the *fact* of a flush
-        // and the surviving payload below.
-        for _ in 0..max_age {
-            assert_none(&mut r, &msg_fragment(0, 3, p1));
+        let payload = |seq: u8| [0x10 | seq; MESSAGE_PAYLOAD_BYTES];
+
+        // Fragments 0..=3 arrive; 4..15 never do.
+        for seq in 0..=3u8 {
+            assert_none(&mut r, &msg_fragment(seq, TOTAL, payload(seq)));
         }
+        // The next push takes the age past `max_age`, flushing the stalled
+        // sequence as partial before the arriving fragment opens its own.
         let flushed = expect_one(
             &mut r,
-            &msg_fragment(0, 3, p1),
+            &msg_fragment(4, TOTAL, payload(4)),
             "stale flush on the push that exceeds max_age",
         );
         assert!(flushed.partial);
-        assert_eq!(flushed.bytes, p1.to_vec());
+        let mut expected = Vec::new();
+        for seq in 0..=3u8 {
+            expected.extend_from_slice(&payload(seq));
+        }
+        assert_eq!(flushed.bytes, expected);
     }
 
     #[test]
