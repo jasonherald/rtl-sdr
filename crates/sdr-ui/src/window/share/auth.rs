@@ -257,6 +257,7 @@ fn wire_auth_require_toggle(
         current_key: Rc::clone(current_auth_key),
         revealed: Rc::clone(auth_key_revealed),
         reveal_button: panels.server.auth_key_reveal_button.downgrade(),
+        share_row: panels.server.share_row.downgrade(),
     };
     panels
         .server
@@ -287,6 +288,11 @@ struct AuthToggleDeps {
     current_key: Rc<RefCell<Option<Vec<u8>>>>,
     revealed: Rc<std::cell::Cell<bool>>,
     reveal_button: glib::WeakRef<gtk4::Button>,
+    /// Master share switch — gated insensitive alongside the
+    /// require-row for the duration of the async keyring load
+    /// (issue #845, `CodeRabbit` round 1 on PR #873) so the user
+    /// can't flip sharing on while `current_key` is still empty.
+    share_row: glib::WeakRef<adw::SwitchRow>,
 }
 
 fn on_auth_require_toggled(row: &adw::SwitchRow, deps: &AuthToggleDeps) {
@@ -299,6 +305,7 @@ fn on_auth_require_toggled(row: &adw::SwitchRow, deps: &AuthToggleDeps) {
         current_key: current_key_for_toggle,
         revealed: revealed_for_toggle,
         reveal_button: reveal_button_for_toggle,
+        share_row: _,
     } = deps;
     if auth_toggle_guard_for_handler.get() {
         // Re-entered from our own `set_active` revert
@@ -463,12 +470,29 @@ fn apply_auth_key_and_reveal(
 /// the switch reverts to off via the same reentry-guard trick the
 /// synchronous path uses, so the programmatic `set_active(false)`
 /// doesn't re-enter this handler.
+///
+/// Also gates the master Share switch insensitive for the same
+/// duration (issue #845, `CodeRabbit` round 1 on PR #873, CWE-306):
+/// without this, the user could flip sharing on while
+/// `current_auth_key` is still empty and "Require key" reads
+/// active, which would reach `Server::start` with `auth_key: None`
+/// — an unauthenticated server despite the UI claiming otherwise.
+/// `start_shared_server`'s `auth_key_ready_to_start` guard backstops
+/// this even if the gate here is ever bypassed.
 fn enable_auth_requirement_async(row: &adw::SwitchRow, deps: &AuthToggleDeps) {
     let row_weak = row.downgrade();
     let deps = deps.clone();
     row.set_sensitive(false);
+    if let Some(share_row) = deps.share_row.upgrade() {
+        share_row.set_sensitive(false);
+    }
     glib::spawn_future_local(async move {
         let join = gio::spawn_blocking(ensure_server_auth_key).await;
+        // Re-sensitize both rows regardless of outcome below — the
+        // pending window is over either way.
+        if let Some(share_row) = deps.share_row.upgrade() {
+            share_row.set_sensitive(true);
+        }
         let Some(row) = row_weak.upgrade() else {
             // Window torn down before the keyring round trip
             // finished — nothing left to update.

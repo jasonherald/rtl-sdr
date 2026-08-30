@@ -299,11 +299,29 @@ pub(super) fn connect_share_switch(
     // torn down before the round trip lands is a silent no-op; the
     // key row simply appears a beat later on slow keyrings, which
     // is acceptable and intended.
+    //
+    // Defense in depth #1 (#845, `CodeRabbit` round 1 on PR #873):
+    // while `current_auth_key` is still empty and "Require key" is
+    // active, `share_row` is held insensitive too. Without this, a
+    // fast click (or scripted input) on Share during the pending
+    // window would flip sharing on with `current_auth_key` still
+    // `None` — `start_shared_server`'s hard guard
+    // (`auth_key_ready_to_start`) backstops that even if this UI
+    // gate is ever bypassed, but gating here is what keeps the
+    // click from silently no-op'ing/reverting in the user's face.
     if panels.server.auth_require_row.is_active() {
         let current_auth_key_for_seed = Rc::clone(&current_auth_key);
         let key_row_weak = panels.server.auth_key_row.downgrade();
+        let share_row_weak_for_seed = panels.server.share_row.downgrade();
+        panels.server.share_row.set_sensitive(false);
         glib::spawn_future_local(async move {
             let join = gio::spawn_blocking(ensure_server_auth_key).await;
+            // Re-sensitize Share regardless of outcome below — the
+            // pending window is over either way.
+            let share_row = share_row_weak_for_seed.upgrade();
+            if let Some(share_row) = &share_row {
+                share_row.set_sensitive(true);
+            }
             let Some(key_row) = key_row_weak.upgrade() else {
                 // Window closed before the keyring round trip
                 // finished — nothing left to seed.
@@ -504,6 +522,37 @@ fn start_shared_server(
     // `Server::start` receives. Per `CodeRabbit` round 1
     // on PR #406.
     let pending_auth_key = current_key_for_share.borrow().clone();
+
+    // Defense in depth #2 (#845, `CodeRabbit` round 1 on PR #873):
+    // hard guard at the config-assembly boundary. The UI gating in
+    // `connect_share_switch` (site 1) and `enable_auth_requirement_async`
+    // (site 2) is meant to keep Share insensitive while a keyring
+    // load is pending, but this check is what actually makes a
+    // `Server::start` with `auth_key: None` while "Require key" is
+    // active IMPOSSIBLE, regardless of any future UI-ordering
+    // mistake — an unauthenticated server despite the toggle
+    // reading "on" is a CWE-306 missing-authentication bug, not
+    // just a UI glitch.
+    if !auth_key_ready_to_start(
+        widgets.auth_require_row.is_active(),
+        pending_auth_key.as_deref(),
+    ) {
+        tracing::warn!(
+            "rtl_tcp share-start blocked: auth required but the key is still loading from the keyring"
+        );
+        if let Some(overlay) = toast_overlay_weak.upgrade() {
+            overlay.add_toast(plain_toast(
+                "Auth key still loading — try again in a moment",
+            ));
+        }
+        reentry_guard.set(true);
+        if let Some(share) = share_row_weak.upgrade() {
+            share.set_active(false);
+        }
+        reentry_guard.set(false);
+        return;
+    }
+
     let config = build_server_config_from_panel(widgets, pending_auth_key);
     match Server::start(config) {
         Ok(server) => {
@@ -575,6 +624,22 @@ pub(super) const DIRECT_SAMPLING_Q_BRANCH: i32 = 2;
 /// keeping the UI honest about "we're not overriding this" rather
 /// than pinning a value the server may later tune.
 pub(super) const SERVER_BUFFER_CAPACITY_DEFAULT: usize = 0;
+
+/// Pure guard (issue #845, `CodeRabbit` round 1 on PR #873): is it
+/// safe to start the server with this `auth_required` / pending-key
+/// combination? `false` ONLY for "Require key" active with no key
+/// bytes yet — the one combination that must never reach
+/// `Server::start` (it would silently start an unauthenticated
+/// server, CWE-306). Auth off never needs a key, and auth on with
+/// bytes already loaded is the normal path.
+///
+/// Kept as a standalone pure function (rather than inlined at the
+/// call site) so it's unit-testable without a GTK harness — see
+/// `share/auth_guard_tests.rs`.
+#[must_use]
+pub(super) fn auth_key_ready_to_start(auth_required: bool, pending_key: Option<&[u8]>) -> bool {
+    !auth_required || pending_key.is_some()
+}
 
 /// Read the server panel widget values and build a `ServerConfig`
 /// off them. Takes the widget bundle by reference so the arg list
@@ -695,6 +760,9 @@ pub(super) fn set_controls_locked(panel: &ServerSwitchWidgets, locked: bool) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod server_panel_format_tests;
+
+#[cfg(test)]
+mod auth_guard_tests;
 
 /// Frequency / sample-rate / gain / DSP portion of the panel read.
 /// Split out per the 50-NLOC gate (#817).
