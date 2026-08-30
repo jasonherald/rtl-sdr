@@ -90,6 +90,12 @@ fn test_write_and_save() {
 
 #[test]
 fn test_auto_save() {
+    /// Upper bound for the debounced auto-save flush to land — generous
+    /// because coverage-instrumented CI runners are slow (#863).
+    const FLUSH_DEADLINE: Duration = Duration::from_secs(10);
+    /// Poll cadence while waiting for the flush.
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
     let path = temp_path("test_autosave.json");
     let _ = fs::remove_file(&path);
 
@@ -101,11 +107,39 @@ fn test_auto_save() {
         v["volume"] = json!(0.75);
     });
 
-    thread::sleep(Duration::from_millis(1500));
-
-    let content = fs::read_to_string(&path).unwrap();
-    let on_disk: Value = serde_json::from_str(&content).unwrap();
-    assert_eq!(on_disk["volume"], 0.75);
+    // The debounced auto-save worker flushes on its own schedule; a
+    // fixed sleep raced it under coverage instrumentation on loaded CI
+    // runners (#863). Poll until the flush lands, asserting only at
+    // the deadline. Reads racing the atomic temp+rename publish (#760)
+    // see either the old or the new complete file, so the parse guard
+    // below never observes torn JSON.
+    let deadline = std::time::Instant::now() + FLUSH_DEADLINE;
+    loop {
+        // Track what the poll last observed so a timeout names the
+        // actual failure stage (missing file vs bad JSON vs stale
+        // value) instead of a generic message.
+        let last_state = match fs::read_to_string(&path) {
+            Err(e) => format!("config file unreadable: {e}"),
+            Ok(content) => match serde_json::from_str::<Value>(&content) {
+                Err(e) => format!("config file not valid JSON yet: {e}"),
+                Ok(on_disk) if on_disk["volume"] == json!(0.75) => break,
+                Ok(on_disk) => format!("volume still {:?}", on_disk["volume"]),
+            },
+        };
+        let now = std::time::Instant::now();
+        assert!(
+            now < deadline,
+            "auto-save did not flush volume=0.75 within {FLUSH_DEADLINE:?}; last observed: {last_state}"
+        );
+        // Cap the final sleep at the remaining budget so the loop
+        // re-checks right at the deadline instead of overshooting it.
+        // A flush observed on that last check still passes: the
+        // deadline bounds how long we keep polling, not how fast the
+        // debounced worker must be — treating it as a strict upper
+        // bound would reintroduce the marginal-timing flake this test
+        // was rewritten to eliminate (#863).
+        thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
+    }
 
     mgr.disable_auto_save();
     let _ = fs::remove_file(&path);
