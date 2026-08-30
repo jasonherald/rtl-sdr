@@ -126,11 +126,19 @@ fn test_auto_save() {
                 Ok(on_disk) => format!("volume still {:?}", on_disk["volume"]),
             },
         };
+        let now = std::time::Instant::now();
         assert!(
-            std::time::Instant::now() < deadline,
+            now < deadline,
             "auto-save did not flush volume=0.75 within {FLUSH_DEADLINE:?}; last observed: {last_state}"
         );
-        thread::sleep(POLL_INTERVAL);
+        // Cap the final sleep at the remaining budget so the loop
+        // re-checks right at the deadline instead of overshooting it.
+        // A flush observed on that last check still passes: the
+        // deadline bounds how long we keep polling, not how fast the
+        // debounced worker must be — treating it as a strict upper
+        // bound would reintroduce the marginal-timing flake this test
+        // was rewritten to eliminate (#863).
+        thread::sleep(deadline.saturating_duration_since(now).min(POLL_INTERVAL));
     }
 
     mgr.disable_auto_save();
