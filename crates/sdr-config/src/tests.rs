@@ -109,15 +109,20 @@ fn test_auto_save() {
     // below never observes torn JSON.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(content) = fs::read_to_string(&path)
-            && let Ok(on_disk) = serde_json::from_str::<Value>(&content)
-            && on_disk["volume"] == json!(0.75)
-        {
-            break;
-        }
+        // Track what the poll last observed so a timeout names the
+        // actual failure stage (missing file vs bad JSON vs stale
+        // value) instead of a generic message.
+        let last_state = match fs::read_to_string(&path) {
+            Err(e) => format!("config file unreadable: {e}"),
+            Ok(content) => match serde_json::from_str::<Value>(&content) {
+                Err(e) => format!("config file not valid JSON yet: {e}"),
+                Ok(on_disk) if on_disk["volume"] == json!(0.75) => break,
+                Ok(on_disk) => format!("volume still {:?}", on_disk["volume"]),
+            },
+        };
         assert!(
             std::time::Instant::now() < deadline,
-            "auto-save did not flush volume=0.75 within 10 s"
+            "auto-save did not flush volume=0.75 within 10 s; last observed: {last_state}"
         );
         thread::sleep(Duration::from_millis(100));
     }
