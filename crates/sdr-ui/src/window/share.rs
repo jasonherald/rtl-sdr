@@ -15,7 +15,7 @@ pub(in crate::window) use status::{
 
 use super::{
     AdvertiseOptions, Advertiser, DEVICE_RTLSDR, InitialDeviceState, Rc, RefCell, SAMPLE_RATES,
-    Server, ServerConfig, SidebarPanels, TxtRecord, adw, glib, local_hostname, plain_toast,
+    Server, ServerConfig, SidebarPanels, TxtRecord, adw, gio, glib, local_hostname, plain_toast,
 };
 
 /// Owned handle for a running `rtl_tcp` server + optional mDNS
@@ -283,17 +283,44 @@ pub(super) fn connect_share_switch(
     let current_auth_key: Rc<RefCell<Option<Vec<u8>>>> = Rc::new(RefCell::new(None));
     let auth_key_revealed: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
 
-    // If auth was restored as ON from config, eagerly load the
-    // key from the keyring so the key row reflects real state
-    // before the user interacts with anything. The server isn't
-    // running yet (that requires the share_row flip), so no
-    // `set_auth_key` call here — just UI state.
+    // If auth was restored as ON from config, load the key from
+    // the keyring so the key row reflects real state before the
+    // user interacts with anything. The server isn't running yet
+    // (that requires the share_row flip), so no `set_auth_key`
+    // call here — just UI state.
+    //
+    // The load is a synchronous Secret Service D-Bus round trip
+    // (and potentially a WRITE, when the keyring is empty/corrupt)
+    // — running it inline here would block window construction on
+    // a locked or slow keyring (issue #845). Instead it's pushed
+    // onto a `gio::spawn_blocking` worker and applied back on the
+    // main context via `glib::spawn_future_local`, same pattern as
+    // `sstv_viewer.rs::export_png_async`. Weak refs so a window
+    // torn down before the round trip lands is a silent no-op; the
+    // key row simply appears a beat later on slow keyrings, which
+    // is acceptable and intended.
     if panels.server.auth_require_row.is_active() {
-        let key = ensure_server_auth_key();
-        *current_auth_key.borrow_mut() = Some(key);
-        panels.server.auth_key_row.set_visible(true);
-        // Leave subtitle as the masked placeholder (widget
-        // default) — user clicks Reveal to see the real value.
+        let current_auth_key_for_seed = Rc::clone(&current_auth_key);
+        let key_row_weak = panels.server.auth_key_row.downgrade();
+        glib::spawn_future_local(async move {
+            let join = gio::spawn_blocking(ensure_server_auth_key).await;
+            let Some(key_row) = key_row_weak.upgrade() else {
+                // Window closed before the keyring round trip
+                // finished — nothing left to seed.
+                return;
+            };
+            let key = match join {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::warn!("startup rtl_tcp auth-key keyring-load worker panicked: {e:?}");
+                    return;
+                }
+            };
+            *current_auth_key_for_seed.borrow_mut() = Some(key);
+            key_row.set_visible(true);
+            // Leave subtitle as the masked placeholder (widget
+            // default) — user clicks Reveal to see the real value.
+        });
     }
 
     // Clone `current_auth_key` for the share_row closure before
