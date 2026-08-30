@@ -1,6 +1,6 @@
 //! Orbcomm decode tap and the `SetOrbcomm*` command helper.
 
-use super::{DspState, DspToUi, mpsc};
+use super::{DspState, DspToUi, mpsc, rebuild_frontend, rebuild_vfo_echoing};
 
 /// Orbcomm channel-bank stats emission throttle. Same cadence as
 /// `crate::acars_airband_lock::ACARS_STATS_EMIT_INTERVAL_MS` — kept
@@ -26,11 +26,8 @@ pub(super) const ORBCOMM_INIT_ERROR_PREFIX: &str = "Orbcomm decoder could not st
 ///
 /// Unlike ACARS, Orbcomm has no airband-lock engage/disengage
 /// machinery gating every geometry-mutating command — a fixed set of
-/// call sites can't be enumerated and clear-guarded exhaustively.
-/// `controller/scanner.rs::handle_scanner_retune`, for one, writes
-/// `state.center_freq` and calls `frontend.set_decimation(...)`
-/// directly, bypassing `handle_tune` / `handle_set_decimation`
-/// entirely. So the tap self-checks instead: `geometry` tracks the
+/// call sites can't be enumerated and clear-guarded exhaustively. So
+/// the tap self-checks instead: `geometry` tracks the
 /// `(source_rate_hz, center_hz)` pair the current `bank` /
 /// `init_failed` state was last attempted at — success OR failure.
 /// On every call, if the caller's `(source_rate_hz, center_hz)` no
@@ -38,10 +35,15 @@ pub(super) const ORBCOMM_INIT_ERROR_PREFIX: &str = "Orbcomm decoder could not st
 /// clears the failure latch (a geometry change may make a
 /// previously-failing attempt succeed, or a previously-succeeding
 /// one now decode the wrong channels' NCO mix) before proceeding.
-/// This makes every current and future geometry-mutating call site
-/// safe by construction, with no per-site invalidation clear needed
-/// — the only clear that remains is `cleanup()`'s, which releases
-/// the bank on source stop rather than reacting to a geometry change.
+/// This is a safety net for ordinary retunes / rate changes while
+/// enabled (`handle_tune`, `handle_set_sample_rate`, etc. need no
+/// invalidation clear of their own) — it is NOT what keeps the
+/// scanner from corrupting the tap's geometry; that is
+/// `handle_set_orbcomm_enabled` / `handle_set_scanner_enabled`'s
+/// mutual-exclusion refusal below (CR round 3, smoke-test fix), since
+/// the scanner mutates frontend decimation directly and self-checking
+/// alone can't recover a span that decimation shrank below an Orbcomm
+/// channel's bandwidth.
 ///
 /// Lazy-init: once geometry is confirmed current, if `bank.is_none()`
 /// and `*init_failed == false`, builds the `ChannelBank` from
@@ -127,29 +129,150 @@ pub(super) fn orbcomm_decode_tap(
     }
 }
 
-/// Handler for `UiToDsp::SetOrbcommEnabled`. Sets the flag and
-/// clears the bank / init-failure latch / tracked geometry on BOTH
-/// enable and disable so the next tap call lazy-rebuilds against the
-/// live geometry. Always acks — unlike ACARS engage, Orbcomm doesn't
-/// force source geometry, so there is no synchronous failure mode
-/// here; a `ChannelBank::new` failure surfaces later via the tap's
-/// latch (mirrors the LRPT pattern).
+/// Handler for `UiToDsp::SetOrbcommEnabled`. Dispatches to
+/// [`engage_orbcomm`] / [`disengage_orbcomm`] — split the way
+/// `handle_set_acars_enabled` splits into `engage_acars` /
+/// `disengage_acars`, since engage now has a real (if narrow) failure
+/// surface: forcing frontend decimation to 1 can be refused or fail.
 ///
 /// Also the routing point [`super::cleanup`] uses to force the
 /// toggle off on source stop (issue #865, CR round 2) — `orbcomm_enabled`
 /// is the actual on/off state (unlike `acars_region`, a config
 /// preference that legitimately persists across a stop), so leaving
 /// it set across `cleanup()` would strand the UI toggle latched on
-/// with no live tap behind it.
+/// with no live tap behind it, and (CR round 3) would leave the
+/// frontend stuck at the forced decim=1 with nothing to restore it.
 pub(super) fn handle_set_orbcomm_enabled(
     state: &mut DspState,
     dsp_tx: &mpsc::Sender<DspToUi>,
     enable: bool,
 ) {
-    state.orbcomm_enabled = enable;
+    if enable {
+        engage_orbcomm(state, dsp_tx);
+    } else {
+        disengage_orbcomm(state, dsp_tx);
+    }
+}
+
+/// Engage half of [`handle_set_orbcomm_enabled`] (issue #865, CR
+/// round 3 — smoke-test fix). Mirrors the ACARS-engage subset that
+/// actually applies to Orbcomm: force frontend decimation to 1 while
+/// enabled, refuse while the scanner is running.
+///
+/// # Why decimation must be forced
+///
+/// `orbcomm_decode_tap` reads the post-frontend-decimation buffer at
+/// `frontend.effective_sample_rate()`. A narrow-mode decimation (NFM,
+/// WFM, ...) both shrinks the tapped span below any Orbcomm channel's
+/// bandwidth (surfaced as `"no orbcomm channel inside the source"`)
+/// and can land the effective rate on a poorly-conditioned /
+/// non-integer value `plan_resampling` can't plan (surfaced as a
+/// resampler tap-count init error). ACARS avoids both by forcing
+/// frontend decim=1 for the duration of its airband-lock engagement
+/// (`ACARS_FRONTEND_DECIM`, `apply_acars_geometry`); this mirrors
+/// just that piece — Orbcomm does NOT force source rate or center the
+/// way ACARS's airband lock does, only decimation.
+///
+/// # Why the scanner is refused
+///
+/// The scanner mutates frontend decimation directly
+/// (`handle_scanner_retune` / demod-mode hops), bypassing the forced
+/// decim=1 this function establishes. Rather than have the tap's
+/// geometry self-check silently fight the scanner block-to-block,
+/// engage is refused outright while the scanner is running — the
+/// user disables one before enabling the other, same UI-explainable
+/// contract as ACARS's own scanner gate. The symmetric refusal lives
+/// beside the ACARS check in
+/// `controller/scanner.rs::handle_set_scanner_enabled`.
+fn engage_orbcomm(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
+    // Idempotent: already engaged. Re-ack with current state — mirrors
+    // ACARS's `engage_refusal` idempotent-reack path.
+    if state.orbcomm_pre_decim.is_some() {
+        let _ = dsp_tx.send(DspToUi::OrbcommEnabledChanged(true));
+        return;
+    }
+
+    if state.scanner.is_enabled() {
+        tracing::warn!("Orbcomm engage rejected: scanner is running");
+        let _ = dsp_tx.send(DspToUi::Error(
+            "Orbcomm enable ignored: the scanner is running. Disable the scanner first."
+                .to_string(),
+        ));
+        let _ = dsp_tx.send(DspToUi::OrbcommEnabledChanged(false));
+        return;
+    }
+
+    let prior_decim = state.frontend.decim_ratio();
+    if let Err(e) = force_orbcomm_decim(state, dsp_tx, 1) {
+        tracing::warn!("Orbcomm engage: forcing frontend decim=1 failed: {e}");
+        let _ = dsp_tx.send(DspToUi::Error(format!("Orbcomm enable failed: {e}")));
+        let _ = dsp_tx.send(DspToUi::OrbcommEnabledChanged(false));
+        return;
+    }
+
+    state.orbcomm_pre_decim = Some(prior_decim);
+    state.orbcomm_enabled = true;
     state.orbcomm_bank = None;
     state.orbcomm_init_failed = false;
     state.orbcomm_geometry = None;
-    tracing::info!(enable, "Orbcomm enabled changed");
-    let _ = dsp_tx.send(DspToUi::OrbcommEnabledChanged(enable));
+    tracing::info!(
+        prior_decim,
+        "Orbcomm engaged: frontend decimation forced to 1"
+    );
+    let _ = dsp_tx.send(DspToUi::OrbcommEnabledChanged(true));
+}
+
+/// Disengage half of [`handle_set_orbcomm_enabled`] (issue #865, CR
+/// round 3). Restores the frontend decimation [`engage_orbcomm`]
+/// saved, then clears the bank/latch/geometry and acks. Idempotent: a
+/// disable with nothing engaged just re-acks `false`.
+///
+/// Called both from the `SetOrbcommEnabled(false)` dispatch and from
+/// `cleanup()` (source stop) — the restore is a pure `state.frontend`
+/// / `state.vfo` rebuild that never touches `state.source`, so it has
+/// no ordering dependency on whether the source is still open. ACARS
+/// runs its own equivalent (`apply_acars_geometry`) before
+/// `source.stop()` for a different reason (it retunes the LIVE
+/// source's rate/center), which doesn't apply here — Orbcomm only
+/// ever forces decimation.
+fn disengage_orbcomm(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
+    if let Some(prior_decim) = state.orbcomm_pre_decim.take()
+        && let Err(e) = force_orbcomm_decim(state, dsp_tx, prior_decim)
+    {
+        // Best-effort: the frontend may now sit at whatever decim the
+        // failed rebuild left it at (likely still 1) rather than the
+        // user's prior setting. Still force the logical state off
+        // below so the session can't get stuck with the toggle
+        // latched on — same "ack the intent even when the live
+        // rollback fails" precedent as ACARS's engage/disengage
+        // failure paths.
+        tracing::warn!("Orbcomm disengage: restoring decim={prior_decim} failed: {e}");
+        let _ = dsp_tx.send(DspToUi::Error(format!(
+            "Orbcomm disable: could not restore the prior decimation ({prior_decim}): {e}"
+        )));
+    }
+    state.orbcomm_enabled = false;
+    state.orbcomm_bank = None;
+    state.orbcomm_init_failed = false;
+    state.orbcomm_geometry = None;
+    tracing::info!("Orbcomm disengaged");
+    let _ = dsp_tx.send(DspToUi::OrbcommEnabledChanged(false));
+}
+
+/// Set the frontend's decimation ratio and rebuild the frontend + VFO
+/// to match — the same sequence `apply_acars_geometry` uses for its
+/// `target_frontend_decim` step, scoped to just decimation since
+/// Orbcomm doesn't touch source rate or center.
+fn force_orbcomm_decim(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    decim: u32,
+) -> Result<(), String> {
+    state
+        .frontend
+        .set_decimation(decim)
+        .map_err(|e| format!("frontend decim={decim}: {e}"))?;
+    rebuild_frontend(state)?;
+    rebuild_vfo_echoing(state, dsp_tx)?;
+    Ok(())
 }

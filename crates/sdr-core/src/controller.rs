@@ -644,12 +644,11 @@ struct DspState {
     /// UDP feeder. CR round 2 on PR #598.
     acars_last_user_network_addr: Option<String>,
     /// Live Orbcomm bank. Unlike `acars_bank`, this never has a
-    /// Start-path invalidation window to work around — Orbcomm
-    /// has no forced geometry, so `orbcomm_enabled` alone is the
-    /// "should the tap run" signal. `None` means "not yet built
-    /// at the current geometry" (lazy-init pending, torn down by
-    /// `cleanup()` on source stop, or dropped by the tap's own
-    /// self-check when `orbcomm_geometry` goes stale). Issue #865.
+    /// Start-path invalidation window to work around. `None` means
+    /// "not yet built at the current geometry" (lazy-init pending,
+    /// torn down by `cleanup()` on source stop, or dropped by the
+    /// tap's own self-check when `orbcomm_geometry` goes stale).
+    /// Issue #865.
     orbcomm_bank: Option<sdr_orbcomm::ChannelBank>,
     /// One-shot guard: a previous `ChannelBank::new` failed AT THE
     /// GEOMETRY RECORDED IN `orbcomm_geometry`. Mirrors
@@ -665,17 +664,39 @@ struct DspState {
     /// or failure. `None` before the first attempt (or after
     /// `cleanup()` / `SetOrbcommEnabled` resets it). `orbcomm_decode_tap`
     /// compares this against its live `(source_rate_hz, center_hz)`
-    /// arguments on every call and self-rebuilds on a mismatch, so no
-    /// individual geometry-mutating call site (tune, sample-rate,
-    /// decimation, the scanner's direct retune, ...) needs its own
-    /// invalidation clear. Issue #865, CR round 1.
+    /// arguments on every call and self-rebuilds on a mismatch — a
+    /// safety net for retunes and any other geometry drift that
+    /// happens while enabled (`handle_tune`, `handle_set_sample_rate`,
+    /// etc. need no invalidation clear of their own). Issue #865,
+    /// CR round 1.
     orbcomm_geometry: Option<(f64, f64)>,
+    /// Frontend decimation ratio saved when Orbcomm forced it to 1
+    /// (see `orbcomm_enabled`'s doc). `Some(ratio)` is the CANONICAL
+    /// "Orbcomm is engaged" signal — mirrors `acars_pre_lock` — and
+    /// is what a disable / `cleanup()` restores the frontend to.
+    /// `None` when not engaged. Issue #865, CR round 3 (smoke-test
+    /// fix).
+    orbcomm_pre_decim: Option<u32>,
     /// User-facing enable flag. Gates whether `process_iq_block`
     /// calls `orbcomm_decode_tap` at all. The actual on/off state
-    /// (unlike `acars_region`, a config preference) — `cleanup()`
-    /// force-clears this to `false` on every source stop, with an
-    /// `OrbcommEnabledChanged(false)` ack, so the UI toggle can't
-    /// stay latched on across a Stop. Issue #865, CR round 2.
+    /// (unlike `acars_region`, a config preference).
+    ///
+    /// Unlike ACARS, Orbcomm doesn't force source rate/center — but
+    /// it DOES force frontend decimation to 1 while enabled, the way
+    /// ACARS's engage path does (mirrored, not the full airband
+    /// lock): the tap reads the post-frontend-decimation buffer at
+    /// `frontend.effective_sample_rate()`, and a narrow-mode
+    /// decimation both shrinks the tapped span below any Orbcomm
+    /// channel's bandwidth and can produce a rate `plan_resampling`
+    /// can't plan. `handle_set_orbcomm_enabled`'s engage path saves
+    /// the prior decimation into `orbcomm_pre_decim` and forces 1;
+    /// disable / `cleanup()` restores it. Engage is refused while the
+    /// scanner is running (it mutates decimation directly), and the
+    /// scanner refuses to enable while this is `true` — symmetric
+    /// mutual exclusion, mirroring ACARS's own scanner guards.
+    /// `cleanup()` force-clears this to `false` on every source stop,
+    /// with an `OrbcommEnabledChanged(false)` ack, so the UI toggle
+    /// can't stay latched on across a Stop. Issue #865, CR rounds 2-3.
     orbcomm_enabled: bool,
     /// Last `DspToUi::OrbcommChannelStats` emission timestamp.
     /// `None` until the first emission (so the first eligible
@@ -807,6 +828,7 @@ impl DspState {
             orbcomm_bank: None,
             orbcomm_init_failed: false,
             orbcomm_geometry: None,
+            orbcomm_pre_decim: None,
             orbcomm_enabled: false,
             orbcomm_stats_emitted_at: None,
             orbcomm_events_buf: Vec::new(),

@@ -87,11 +87,20 @@ fn set_enabled_acks_and_clears_bank() {
 /// persists across a stop). `cleanup()` must force it off, tear down
 /// the bank/latch/geometry, and ack `OrbcommEnabledChanged(false)` so
 /// a UI toggle left on can't survive a Stop with no live tap behind it.
+///
+/// CR round 3 (smoke-test fix) extends this: engaging via the real
+/// handler also forces frontend decimation to 1, so `cleanup()` must
+/// restore it too — otherwise a Stop while Orbcomm is enabled would
+/// leave every OTHER mode (NFM, WFM, ...) stuck decoding at decim=1
+/// on the next Start.
 #[test]
 fn cleanup_forces_orbcomm_enabled_off_with_ack() {
     let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
     let mut state = DspState::new(dsp_tx.clone()).unwrap();
-    state.orbcomm_enabled = true;
+    let prior_decim = state.frontend.decim_ratio();
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, true);
+    assert!(state.orbcomm_enabled, "test setup: orbcomm must be engaged");
+    assert_eq!(state.frontend.decim_ratio(), 1, "test setup: decim forced");
     state.orbcomm_bank = Some(test_bank());
     state.orbcomm_geometry = Some((TEST_SOURCE_RATE_HZ, TEST_CENTER_HZ));
     let _ = drain(&dsp_rx);
@@ -102,12 +111,164 @@ fn cleanup_forces_orbcomm_enabled_off_with_ack() {
     assert!(state.orbcomm_bank.is_none(), "cleanup must drop the bank");
     assert!(!state.orbcomm_init_failed);
     assert!(state.orbcomm_geometry.is_none());
+    assert!(
+        state.orbcomm_pre_decim.is_none(),
+        "cleanup must clear the saved decimation"
+    );
+    assert_eq!(
+        state.frontend.decim_ratio(),
+        prior_decim,
+        "cleanup must restore the pre-engage decimation"
+    );
     let events = drain(&dsp_rx);
     assert!(
         events
             .iter()
             .any(|e| matches!(e, DspToUi::OrbcommEnabledChanged(false))),
         "expected OrbcommEnabledChanged(false) from cleanup, got {events:?}"
+    );
+}
+
+/// Issue #865, CR round 3 (smoke-test fix) — engaging Orbcomm must
+/// force frontend decimation to 1 (mirrors ACARS's
+/// `ACARS_FRONTEND_DECIM` engage forcing) and remember whatever
+/// decimation was active beforehand so disable can restore it.
+#[test]
+fn enable_forces_decim_1_and_saves_prior() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let prior_decim = state.frontend.decim_ratio();
+    assert_ne!(
+        prior_decim, 1,
+        "test assumes the default DspState decimation isn't already 1"
+    );
+    let _ = drain(&dsp_rx);
+
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, true);
+
+    assert_eq!(
+        state.frontend.decim_ratio(),
+        1,
+        "engage must force frontend decimation to 1"
+    );
+    assert_eq!(
+        state.orbcomm_pre_decim,
+        Some(prior_decim),
+        "engage must save the pre-engage decimation for disable to restore"
+    );
+    assert!(state.orbcomm_enabled);
+    let events = drain(&dsp_rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DspToUi::OrbcommEnabledChanged(true))),
+        "expected OrbcommEnabledChanged(true), got {events:?}"
+    );
+}
+
+/// Issue #865, CR round 3 — the counterpart of
+/// `enable_forces_decim_1_and_saves_prior`: disabling must restore
+/// the decimation engage saved, not leave the frontend pinned at 1.
+#[test]
+fn disable_restores_prior_decim() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let prior_decim = state.frontend.decim_ratio();
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, true);
+    assert_eq!(state.frontend.decim_ratio(), 1, "test setup: decim forced");
+    let _ = drain(&dsp_rx);
+
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, false);
+
+    assert_eq!(
+        state.frontend.decim_ratio(),
+        prior_decim,
+        "disable must restore the pre-engage decimation"
+    );
+    assert!(
+        state.orbcomm_pre_decim.is_none(),
+        "disable must clear the saved decimation"
+    );
+    assert!(!state.orbcomm_enabled);
+    let events = drain(&dsp_rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DspToUi::OrbcommEnabledChanged(false))),
+        "expected OrbcommEnabledChanged(false), got {events:?}"
+    );
+}
+
+/// Issue #865, CR round 3 — engage must be refused while the scanner
+/// is running: the scanner mutates frontend decimation directly
+/// (`handle_scanner_retune` / demod-mode hops), which would fight the
+/// decim=1 Orbcomm forces. Mirrors ACARS's own scanner-running
+/// engage refusal.
+#[test]
+fn enable_refused_while_scanner_enabled() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    handle_command(&mut state, &dsp_tx, UiToDsp::SetScannerEnabled(true));
+    assert!(
+        state.scanner.is_enabled(),
+        "test setup: scanner must be running"
+    );
+    let prior_decim = state.frontend.decim_ratio();
+    let _ = drain(&dsp_rx);
+
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, true);
+
+    assert!(
+        !state.orbcomm_enabled,
+        "engage must be refused while the scanner runs"
+    );
+    assert!(state.orbcomm_pre_decim.is_none());
+    assert_eq!(
+        state.frontend.decim_ratio(),
+        prior_decim,
+        "a refused engage must not touch the frontend"
+    );
+    let events = drain(&dsp_rx);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, DspToUi::OrbcommEnabledChanged(false))),
+        "expected OrbcommEnabledChanged(false), got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DspToUi::Error(msg) if msg.to_lowercase().contains("scanner")
+        )),
+        "expected a scanner-related refusal Error, got {events:?}"
+    );
+}
+
+/// Issue #865, CR round 3 — the symmetric refusal: scanner enable
+/// must be rejected while Orbcomm is engaged, mirroring the ACARS
+/// airband-lock check right beside it in
+/// `controller/scanner.rs::handle_set_scanner_enabled`.
+#[test]
+fn scanner_enable_refused_while_orbcomm_enabled() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    handle_set_orbcomm_enabled(&mut state, &dsp_tx, true);
+    assert!(state.orbcomm_enabled, "test setup: orbcomm must be engaged");
+    let _ = drain(&dsp_rx);
+
+    handle_command(&mut state, &dsp_tx, UiToDsp::SetScannerEnabled(true));
+
+    assert!(
+        !state.scanner.is_enabled(),
+        "scanner enable must be refused while Orbcomm is active"
+    );
+    let events = drain(&dsp_rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DspToUi::Error(msg) if msg.to_lowercase().contains("orbcomm")
+        )),
+        "expected an orbcomm-related refusal Error, got {events:?}"
     );
 }
 
@@ -232,11 +393,13 @@ fn init_failure_latches_at_the_same_geometry() {
 
 /// Issue #865, CR round 1 — the tap must self-check its tracked
 /// geometry against the live `(source_rate_hz, center_hz)` on every
-/// call and rebuild on a mismatch, so call sites that bypass
-/// `handle_tune` / `handle_set_sample_rate` / `handle_set_decimation`
-/// (the scanner's direct `state.center_freq` / decimation writes in
-/// `controller/scanner.rs`, for one) can't leave the bank silently
-/// decoding stale geometry.
+/// call and rebuild on a mismatch, so ordinary geometry-mutating call
+/// sites (`handle_tune`, `handle_set_sample_rate`, ...) don't need an
+/// invalidation clear of their own. (The scanner's own decimation
+/// writes are ruled out by mutual exclusion instead — see
+/// `enable_refused_while_scanner_enabled` /
+/// `scanner_enable_refused_while_orbcomm_enabled` below, CR round 3 —
+/// but this self-check remains the general safety net.)
 #[test]
 fn tap_rebuilds_on_geometry_mismatch() {
     let mut bank: Option<sdr_orbcomm::ChannelBank> = None;

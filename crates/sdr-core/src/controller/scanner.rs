@@ -299,6 +299,18 @@ pub(super) fn handle_set_scanner_enabled(
         ));
         return;
     }
+    // Symmetric to Orbcomm's own scanner-running refusal in
+    // `orbcomm::engage_orbcomm` — the scanner mutates frontend
+    // decimation directly (this handler, on demod-mode hops), which
+    // would fight the decim=1 Orbcomm forces while enabled. Issue
+    // #865, CR round 3 (smoke-test fix).
+    if enabled && state.orbcomm_enabled {
+        tracing::warn!("scanner enable rejected: Orbcomm decode is active");
+        let _ = dsp_tx.send(DspToUi::Error(
+            "Scanner enable ignored: Orbcomm decode is active. Disable Orbcomm first.".to_string(),
+        ));
+        return;
+    }
     if enabled && stop_any_recording(state, dsp_tx) {
         let _ = dsp_tx.send(DspToUi::ScannerMutexStopped(
             ScannerMutexReason::RecordingStoppedForScanner,
