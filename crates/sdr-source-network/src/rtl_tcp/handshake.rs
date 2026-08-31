@@ -82,19 +82,41 @@ pub(super) struct HandshakeOutcome {
     pub(super) codec: Codec,
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "connect flow is linear — TCP connect + RTLX handshake + \
-              auth pre-build + dongle_info_t + ServerExtension + state \
-              publish. Splitting would scatter the error-mapping glue \
-              that's the whole point of this function."
-)]
+/// One TCP connect + full handshake, orchestrated over one helper
+/// per stage — resolve/connect, hello emission, `dongle_info_t`,
+/// `ServerExtension` negotiation, and the connected-state publish.
+/// The former single-function form carried a `too_many_lines` allow;
+/// carved per the 50-NLOC gate (Codacy precedent from PR #880's
+/// server-side `spawn_client_workers` staging). Behavior unchanged:
+/// every stage propagates the same errors from the same points, and
+/// the publish ordering (tuner cache → `Connected` state → command
+/// sink) is preserved inside [`publish_connected`].
 pub(super) fn attempt_connect(
     host: &str,
     port: u16,
     shared: &Arc<SharedState>,
     config: &RtlTcpConfig,
 ) -> Result<HandshakeOutcome, SourceError> {
+    let stream = resolve_and_connect(host, port, shared, config)?;
+    let extension_enabled = send_client_hello_if_enabled(&stream, config)?;
+    let tuner = read_dongle_header(&stream)?;
+    let (codec, granted_role) = negotiate_extension(&stream, extension_enabled)?;
+    publish_connected(shared, &stream, config, tuner, codec, granted_role)?;
+    // `pending_stream` stays populated for the session as the lock-free
+    // cancellation handle (see its field doc).
+    Ok(HandshakeOutcome { stream, codec })
+}
+
+/// Resolve `host:port`, run the cancellable connect, publish the
+/// stop-cancellation handle, and install the socket options the
+/// session needs. Split out per the 50-NLOC gate (PR #880 Codacy
+/// precedent).
+fn resolve_and_connect(
+    host: &str,
+    port: u16,
+    shared: &Arc<SharedState>,
+    config: &RtlTcpConfig,
+) -> Result<TcpStream, SourceError> {
     // `(host, port).to_socket_addrs()` handles both IPv4 dotted
     // quads AND IPv6 literals like `::1` correctly — the naïve
     // `format!("{host}:{port}")` that we had before would build
@@ -145,6 +167,18 @@ pub(super) fn attempt_connect(
         tracing::warn!(%e, "SO_KEEPALIVE not applied (non-fatal)");
     }
 
+    Ok(stream)
+}
+
+/// Emit the extended-protocol `ClientHello` (+ eager-auth follow-up)
+/// when any config field carries non-default RTLX state. Returns
+/// whether the extension path was taken so the caller knows to read
+/// the `ServerExtension` block. Split out per the 50-NLOC gate
+/// (PR #880 Codacy precedent).
+fn send_client_hello_if_enabled(
+    stream: &TcpStream,
+    config: &RtlTcpConfig,
+) -> Result<bool, SourceError> {
     // Send the extended-protocol `ClientHello` if the caller
     // opted into either compression (#307) or takeover (#393) —
     // both are RTLX features that require the server to parse
@@ -246,7 +280,7 @@ pub(super) fn attempt_connect(
             // `CodeRabbit` round 1 on PR #405.
             version: sdr_server_rtltcp::extension::required_protocol_version(flags),
         };
-        if let Err(e) = (&stream).write_all(&hello.to_bytes()) {
+        if let Err(e) = (&mut &*stream).write_all(&hello.to_bytes()) {
             return Err(SourceError::Io(e));
         }
         // Auth follow-up (#394 eager path). Pre-built above so
@@ -254,15 +288,20 @@ pub(super) fn attempt_connect(
         // reads these bytes in the same receive-buffer position
         // without a round-trip to request them.
         if let Some(wire) = auth_payload {
-            if let Err(e) = (&stream).write_all(&wire) {
+            if let Err(e) = (&mut &*stream).write_all(&wire) {
                 return Err(SourceError::Io(e));
             }
         }
     }
+    Ok(extension_enabled)
+}
 
+/// Read + verify the legacy 12-byte `dongle_info_t` header. Split
+/// out per the 50-NLOC gate (PR #880 Codacy precedent).
+fn read_dongle_header(stream: &TcpStream) -> Result<TunerInfo, SourceError> {
     // Read and verify the 12-byte dongle_info_t header.
     let mut header_buf = [0u8; DONGLE_INFO_LEN];
-    read_exact_with_context(&stream, &mut header_buf)?;
+    read_exact_with_context(stream, &mut header_buf)?;
 
     let Some(info) = DongleInfo::from_bytes(&header_buf) else {
         return Err(SourceError::Protocol(
@@ -279,7 +318,17 @@ pub(super) fn attempt_connect(
     // `set_state(Connected)` call below, so the tuner is visible
     // only once the handshake has fully succeeded. Per CodeRabbit
     // round 5 on PR #399.
+    Ok(tuner)
+}
 
+/// Read the `ServerExtension` block (when a hello was sent) and
+/// route non-OK statuses to their dedicated error variants; the
+/// legacy path lands on `Codec::None` with no granted role. Split
+/// out per the 50-NLOC gate (PR #880 Codacy precedent).
+fn negotiate_extension(
+    stream: &TcpStream,
+    extension_enabled: bool,
+) -> Result<(Codec, Option<sdr_server_rtltcp::extension::Role>), SourceError> {
     // Read the server's `ServerExtension` block BEFORE publishing
     // `Connected` state — the codec is part of the state the UI
     // renders, and landing in `Connected { codec: None }` first and
@@ -300,7 +349,7 @@ pub(super) fn attempt_connect(
     // Per CodeRabbit round 1 on PR #408.
     let mut granted_role: Option<sdr_server_rtltcp::extension::Role> = None;
     let codec = if extension_enabled {
-        match read_server_extension(&stream) {
+        match read_server_extension(stream) {
             Ok(ext) => {
                 // A non-OK status means the server parsed our hello
                 // but rejected the session. Each flavor needs a
@@ -363,7 +412,21 @@ pub(super) fn attempt_connect(
     } else {
         Codec::None
     };
+    Ok((codec, granted_role))
+}
 
+/// Publish the handshake result: tuner cache first, then the
+/// `Connected` state transition, then the command-sink clone — the
+/// ordering contract documented on each block below. Split out per
+/// the 50-NLOC gate (PR #880 Codacy precedent).
+fn publish_connected(
+    shared: &Arc<SharedState>,
+    stream: &TcpStream,
+    config: &RtlTcpConfig,
+    tuner: TunerInfo,
+    codec: Codec,
+    granted_role: Option<sdr_server_rtltcp::extension::Role>,
+) -> Result<(), SourceError> {
     // Publish tuner metadata + Connected state together — both
     // reflect the same "handshake fully succeeded" point. Order
     // matters: tuner cache first, then state transition, so any
@@ -400,10 +463,7 @@ pub(super) fn attempt_connect(
     if let Ok(mut slot) = shared.command_sink.lock() {
         *slot = Some(sink);
     }
-    // `pending_stream` stays populated for the session as the lock-free
-    // cancellation handle (see its field doc).
-
-    Ok(HandshakeOutcome { stream, codec })
+    Ok(())
 }
 
 /// Run `TcpStream::connect_timeout` on a helper thread, polling a
@@ -423,30 +483,10 @@ pub(super) fn connect_cancellable(
     thread::Builder::new()
         .name("rtl_tcp-connect".into())
         .spawn(move || {
-            let mut last_err: Option<std::io::Error> = None;
-            let mut stream: Option<TcpStream> = None;
-            for addr in addrs {
-                match TcpStream::connect_timeout(&addr, timeout) {
-                    Ok(s) => {
-                        stream = Some(s);
-                        break;
-                    }
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            let result = match stream {
-                Some(s) => Ok(s),
-                None => Err(last_err.unwrap_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::AddrNotAvailable,
-                        "no socket addresses resolved",
-                    )
-                })),
-            };
             // `rx` may already have dropped if the manager shut down
             // during our blocking connect — that's fine, the helper
             // just exits with its result thrown away.
-            let _ = tx.send(result);
+            let _ = tx.send(connect_first_addr(addrs, timeout));
         })
         .map_err(SourceError::Io)?;
 
@@ -473,6 +513,29 @@ pub(super) fn connect_cancellable(
             }
         }
     }
+}
+
+/// Helper-thread body of [`connect_cancellable`]: try each resolved
+/// address in order (covers hostnames with multiple A/AAAA records),
+/// first successful connect wins. Split out per the 50-NLOC gate
+/// (PR #880 Codacy precedent).
+fn connect_first_addr(
+    addrs: Vec<SocketAddr>,
+    timeout: Duration,
+) -> Result<TcpStream, std::io::Error> {
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no socket addresses resolved",
+        )
+    }))
 }
 
 fn read_exact_with_context(stream: &TcpStream, buf: &mut [u8]) -> Result<(), SourceError> {

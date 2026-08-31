@@ -79,22 +79,7 @@ impl RtlTcpSource {
         // IF gain is per stage (upper 16 bits of the param, 1-based);
         // one slot collapsed every stage into the last write (#745).
         if cmd.op == CommandOp::SetIfGain {
-            let stage = (cmd.param >> IF_GAIN_STAGE_SHIFT_BITS) as usize;
-            if (1..=IF_GAIN_STAGES).contains(&stage) {
-                self.shared.last_if_gain[stage - 1].store(cmd.param, Ordering::Relaxed);
-                self.shared
-                    .if_gain_mask
-                    .fetch_or(1u32 << (stage - 1), Ordering::Relaxed);
-                let bit = u32::from((cmd.op as u8) - 1);
-                self.shared
-                    .replay_mask
-                    .fetch_or(1u32 << bit, Ordering::Relaxed);
-            } else {
-                tracing::debug!(
-                    stage,
-                    "SetIfGain stage out of range; not recorded for replay"
-                );
-            }
+            self.record_if_gain(cmd);
             return;
         }
         // `SetIfGain` returned above; its per-stage slots are not in
@@ -130,6 +115,30 @@ impl RtlTcpSource {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mask| {
                     Some((mask & sibling_clear) | own_bit)
                 });
+    }
+
+    /// Per-stage `SetIfGain` recording (the stage number rides the
+    /// param's upper 16 bits, 1-based); one shared slot would
+    /// collapse every stage into the last write (#745). Split out of
+    /// [`Self::record_command`] per the 50-NLOC gate (PR #880
+    /// Codacy precedent).
+    fn record_if_gain(&self, cmd: Command) {
+        let stage = (cmd.param >> IF_GAIN_STAGE_SHIFT_BITS) as usize;
+        if (1..=IF_GAIN_STAGES).contains(&stage) {
+            self.shared.last_if_gain[stage - 1].store(cmd.param, Ordering::Relaxed);
+            self.shared
+                .if_gain_mask
+                .fetch_or(1u32 << (stage - 1), Ordering::Relaxed);
+            let bit = u32::from((cmd.op as u8) - 1);
+            self.shared
+                .replay_mask
+                .fetch_or(1u32 << bit, Ordering::Relaxed);
+        } else {
+            tracing::debug!(
+                stage,
+                "SetIfGain stage out of range; not recorded for replay"
+            );
+        }
     }
 
     /// Convenience typed setters — each one round-trips through
@@ -425,40 +434,34 @@ impl Source for RtlTcpSource {
     ) {
         // Order mirrors `SharedState::new`'s initialization so a
         // future field addition here is forced through the same
-        // review as the atomics themselves.
-        self.shared
-            .last_center_freq_hz
-            .store(snapshot.last_center_freq_hz, Ordering::Relaxed);
-        self.shared
-            .last_sample_rate_hz
-            .store(snapshot.last_sample_rate_hz, Ordering::Relaxed);
-        self.shared
-            .last_gain_mode
-            .store(snapshot.last_gain_mode, Ordering::Relaxed);
-        self.shared
-            .last_tuner_gain
-            .store(snapshot.last_tuner_gain, Ordering::Relaxed);
-        self.shared
-            .last_ppm
-            .store(snapshot.last_ppm, Ordering::Relaxed);
-        self.shared
-            .last_agc_mode
-            .store(snapshot.last_agc_mode, Ordering::Relaxed);
-        self.shared
-            .last_direct_sampling
-            .store(snapshot.last_direct_sampling, Ordering::Relaxed);
-        self.shared
-            .last_offset_tuning
-            .store(snapshot.last_offset_tuning, Ordering::Relaxed);
-        self.shared
-            .last_bias_tee
-            .store(snapshot.last_bias_tee, Ordering::Relaxed);
-        self.shared
-            .last_gain_by_index
-            .store(snapshot.last_gain_by_index, Ordering::Relaxed);
-        self.shared
-            .last_testmode
-            .store(snapshot.last_testmode, Ordering::Relaxed);
+        // review as the atomics themselves. Data-driven pairs (per
+        // the 50-NLOC gate, PR #880 Codacy precedent) keep each
+        // slot next to its snapshot field so the two can't drift.
+        let slots = [
+            (
+                &self.shared.last_center_freq_hz,
+                snapshot.last_center_freq_hz,
+            ),
+            (
+                &self.shared.last_sample_rate_hz,
+                snapshot.last_sample_rate_hz,
+            ),
+            (&self.shared.last_gain_mode, snapshot.last_gain_mode),
+            (&self.shared.last_tuner_gain, snapshot.last_tuner_gain),
+            (&self.shared.last_ppm, snapshot.last_ppm),
+            (&self.shared.last_agc_mode, snapshot.last_agc_mode),
+            (
+                &self.shared.last_direct_sampling,
+                snapshot.last_direct_sampling,
+            ),
+            (&self.shared.last_offset_tuning, snapshot.last_offset_tuning),
+            (&self.shared.last_bias_tee, snapshot.last_bias_tee),
+            (&self.shared.last_gain_by_index, snapshot.last_gain_by_index),
+            (&self.shared.last_testmode, snapshot.last_testmode),
+        ];
+        for (slot, value) in slots {
+            slot.store(value, Ordering::Relaxed);
+        }
         for (slot, value) in self.shared.last_if_gain.iter().zip(snapshot.last_if_gain) {
             slot.store(value, Ordering::Relaxed);
         }

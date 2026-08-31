@@ -100,60 +100,25 @@ pub(super) fn run_data_pump(
     let mut consecutive_timeouts: u32 = 0;
     // Default Ok path: any break out of the loop (EOF, stall,
     // generic socket error) is a reconnect-worthy dropout, not
-    // a terminal failure. Only explicit `return Err(...)` below
-    // for LZ4 decode corruption escapes as terminal.
+    // a terminal failure. Only the `Terminal` tick below (LZ4
+    // decode corruption) escapes as terminal.
     let mut outcome: Result<(), SourceError> = Ok(());
     while !shared.shutdown.load(Ordering::Relaxed) {
-        match reader.read(&mut buf) {
-            Ok(0) => {
-                tracing::info!("rtl_tcp server closed connection");
-                break;
-            }
-            Ok(n) => {
-                consecutive_timeouts = 0;
+        match classify_pump_read(
+            reader.read(&mut buf),
+            codec,
+            &mut consecutive_timeouts,
+            tolerated_timeouts,
+        ) {
+            PumpTick::Received(n) => {
                 if let Ok(mut rx) = shared.rx_buf.lock() {
                     append_with_cap_to_shared(shared, &mut rx, &buf[..n]);
                 }
             }
-            Err(e)
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                // Read timeout — server may have silently gone away.
-                // Break out to the reconnect loop after a handful of
-                // consecutive timeouts rather than waiting for the kernel
-                // keepalive (which can take minutes). A single timeout
-                // can be a transient stall; repeated timeouts mean the
-                // peer is dead.
-                consecutive_timeouts = consecutive_timeouts.saturating_add(1);
-                if consecutive_timeouts >= tolerated_timeouts {
-                    tracing::info!(
-                        consecutive_timeouts,
-                        "rtl_tcp stream stalled, breaking out for reconnect"
-                    );
-                    break;
-                }
-            }
-            Err(e) if codec != Codec::None && e.kind() == std::io::ErrorKind::InvalidData => {
-                // LZ4 frame corruption mid-stream — either a codec
-                // mismatch we negotiated wrong (server lied about
-                // capability) or an on-the-wire bit flip under a
-                // transport that doesn't guarantee integrity. The
-                // stream state is unrecoverable: the next read
-                // would start mid-block, so every subsequent
-                // reconnect would hit the same corruption.
-                // Surface as `SourceError::Protocol` so the
-                // connection manager routes to terminal
-                // `ConnectionState::Failed` instead of spinning
-                // on the backoff schedule forever. Per CodeRabbit
-                // round 5 on PR #399.
-                outcome = Err(SourceError::Protocol(format!(
-                    "rtl_tcp {codec} decode failed mid-stream (unrecoverable): {e}"
-                )));
-                break;
-            }
-            Err(e) => {
-                tracing::info!(%e, "rtl_tcp socket read failed, will reconnect");
+            PumpTick::KeepWaiting => {}
+            PumpTick::Reconnect => break,
+            PumpTick::Terminal(e) => {
+                outcome = Err(e);
                 break;
             }
         }
@@ -161,6 +126,87 @@ pub(super) fn run_data_pump(
 
     end_session(shared);
     outcome
+}
+
+/// What one data-pump read means for the loop. Mirrors the server
+/// side's `classify_usb_read` shape (see
+/// `sdr-server-rtltcp::server::broadcast`). Split out of
+/// [`run_data_pump`] per the 50-NLOC gate (PR #880 Codacy
+/// precedent).
+enum PumpTick {
+    /// `n` fresh bytes to append to the receive buffer.
+    Received(usize),
+    /// Tolerated timeout — stay on this connection.
+    KeepWaiting,
+    /// Reconnect-worthy dropout (EOF, stall past the tolerance,
+    /// generic socket error) — break out to the backoff loop.
+    Reconnect,
+    /// Unrecoverable stream corruption — the manager routes this to
+    /// terminal `ConnectionState::Failed`.
+    Terminal(SourceError),
+}
+
+/// Classify one `Decoder::read` result. Split out of
+/// [`run_data_pump`] per the 50-NLOC gate (PR #880 Codacy
+/// precedent); the arms and their rationale are unchanged.
+fn classify_pump_read(
+    result: std::io::Result<usize>,
+    codec: Codec,
+    consecutive_timeouts: &mut u32,
+    tolerated_timeouts: u32,
+) -> PumpTick {
+    match result {
+        Ok(0) => {
+            tracing::info!("rtl_tcp server closed connection");
+            PumpTick::Reconnect
+        }
+        Ok(n) => {
+            *consecutive_timeouts = 0;
+            PumpTick::Received(n)
+        }
+        Err(e)
+            if e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::WouldBlock =>
+        {
+            // Read timeout — server may have silently gone away.
+            // Break out to the reconnect loop after a handful of
+            // consecutive timeouts rather than waiting for the kernel
+            // keepalive (which can take minutes). A single timeout
+            // can be a transient stall; repeated timeouts mean the
+            // peer is dead.
+            *consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+            if *consecutive_timeouts >= tolerated_timeouts {
+                tracing::info!(
+                    consecutive_timeouts = *consecutive_timeouts,
+                    "rtl_tcp stream stalled, breaking out for reconnect"
+                );
+                PumpTick::Reconnect
+            } else {
+                PumpTick::KeepWaiting
+            }
+        }
+        Err(e) if codec != Codec::None && e.kind() == std::io::ErrorKind::InvalidData => {
+            // LZ4 frame corruption mid-stream — either a codec
+            // mismatch we negotiated wrong (server lied about
+            // capability) or an on-the-wire bit flip under a
+            // transport that doesn't guarantee integrity. The
+            // stream state is unrecoverable: the next read
+            // would start mid-block, so every subsequent
+            // reconnect would hit the same corruption.
+            // Surface as `SourceError::Protocol` so the
+            // connection manager routes to terminal
+            // `ConnectionState::Failed` instead of spinning
+            // on the backoff schedule forever. Per CodeRabbit
+            // round 5 on PR #399.
+            PumpTick::Terminal(SourceError::Protocol(format!(
+                "rtl_tcp {codec} decode failed mid-stream (unrecoverable): {e}"
+            )))
+        }
+        Err(e) => {
+            tracing::info!(%e, "rtl_tcp socket read failed, will reconnect");
+            PumpTick::Reconnect
+        }
+    }
 }
 
 /// Tear down the per-session state when the data pump exits: drop the

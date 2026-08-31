@@ -67,50 +67,8 @@ pub(super) fn connection_manager(
                 // `run_data_pump` clears it at session end.
                 clear_pending_stream(&shared);
                 tracing::warn!(%e, host = %host, port, attempt, "rtl_tcp connect failed");
-                // Route each terminal error-kind to its
-                // dedicated `ConnectionState` variant so the UI
-                // can offer specific recovery actions (take-
-                // control, enter key, re-prompt) instead of a
-                // generic "Failed" with opaque reason string.
-                // Pre-#396 AuthRequired/AuthFailed folded into
-                // `Failed { reason: "protocol error: ..." }` and
-                // `ControllerBusy` auto-retried via
-                // `TemporarilyUnavailable`. Per #396, each gets
-                // its own terminal state.
-                match e {
-                    SourceError::ControllerBusy => {
-                        set_state(&shared, ConnectionState::ControllerBusy);
-                        return;
-                    }
-                    SourceError::AuthRequired => {
-                        set_state(&shared, ConnectionState::AuthRequired);
-                        return;
-                    }
-                    SourceError::AuthFailed => {
-                        set_state(&shared, ConnectionState::AuthFailed);
-                        return;
-                    }
-                    SourceError::Protocol(_) => {
-                        // Non-recoverable: server isn't speaking
-                        // rtl_tcp, or the extended handshake was
-                        // rejected for a reason we don't have a
-                        // dedicated state for (ListenerCapReached,
-                        // parse errors, future status codes).
-                        set_state(
-                            &shared,
-                            ConnectionState::Failed {
-                                reason: format!("{e}"),
-                            },
-                        );
-                        return;
-                    }
-                    // `TemporarilyUnavailable` (transient network
-                    // conditions the caller wants us to back off
-                    // and retry on — NOT role denials, which are
-                    // now their own variants above) and every
-                    // other `SourceError` variant fall through to
-                    // the backoff loop below.
-                    _ => {}
+                if route_terminal_connect_error(&shared, &e) {
+                    return;
                 }
             }
         }
@@ -142,6 +100,82 @@ pub(super) fn connection_manager(
     set_state(&shared, ConnectionState::Disconnected);
 }
 
+// Route each terminal error-kind to its
+// dedicated `ConnectionState` variant so the UI
+// can offer specific recovery actions (take-
+// control, enter key, re-prompt) instead of a
+// generic "Failed" with opaque reason string.
+// Pre-#396 AuthRequired/AuthFailed folded into
+// `Failed { reason: "protocol error: ..." }` and
+// `ControllerBusy` auto-retried via
+// `TemporarilyUnavailable`. Per #396, each gets
+// its own terminal state.
+/// `true` = the error is terminal and the manager thread must exit
+/// (the terminal `ConnectionState` has already been published);
+/// `false` = transient, fall through to the backoff loop. Split out
+/// of [`connection_manager`] per the 50-NLOC gate (PR #880 Codacy
+/// precedent).
+fn route_terminal_connect_error(shared: &Arc<SharedState>, e: &SourceError) -> bool {
+    match e {
+        SourceError::ControllerBusy => {
+            set_state(shared, ConnectionState::ControllerBusy);
+            true
+        }
+        SourceError::AuthRequired => {
+            set_state(shared, ConnectionState::AuthRequired);
+            true
+        }
+        SourceError::AuthFailed => {
+            set_state(shared, ConnectionState::AuthFailed);
+            true
+        }
+        SourceError::Protocol(_) => {
+            // Non-recoverable: server isn't speaking
+            // rtl_tcp, or the extended handshake was
+            // rejected for a reason we don't have a
+            // dedicated state for (ListenerCapReached,
+            // parse errors, future status codes).
+            set_state(
+                shared,
+                ConnectionState::Failed {
+                    reason: format!("{e}"),
+                },
+            );
+            true
+        }
+        // `TemporarilyUnavailable` (transient network
+        // conditions the caller wants us to back off
+        // and retry on — NOT role denials, which are
+        // now their own variants above) and every
+        // other `SourceError` variant fall through to
+        // the backoff loop below.
+        _ => false,
+    }
+}
+
+/// The sticky-op replay table: one `(op, last-value slot)` pair per
+/// single-slot stateful command, in opcode order. (`SetIfGain` is
+/// per-stage and spliced in by the caller.) Split out of
+/// [`replay_sticky_commands`] per the 50-NLOC gate (PR #880 Codacy
+/// precedent).
+fn sticky_op_table(shared: &SharedState) -> [(CommandOp, &std::sync::atomic::AtomicU32); 13] {
+    [
+        (CommandOp::SetCenterFreq, &shared.last_center_freq_hz),
+        (CommandOp::SetSampleRate, &shared.last_sample_rate_hz),
+        (CommandOp::SetGainMode, &shared.last_gain_mode),
+        (CommandOp::SetTunerGain, &shared.last_tuner_gain),
+        (CommandOp::SetFreqCorrection, &shared.last_ppm),
+        (CommandOp::SetTestMode, &shared.last_testmode),
+        (CommandOp::SetAgcMode, &shared.last_agc_mode),
+        (CommandOp::SetDirectSampling, &shared.last_direct_sampling),
+        (CommandOp::SetOffsetTuning, &shared.last_offset_tuning),
+        (CommandOp::SetRtlXtal, &shared.last_rtl_xtal),
+        (CommandOp::SetTunerXtal, &shared.last_tuner_xtal),
+        (CommandOp::SetGainByIndex, &shared.last_gain_by_index),
+        (CommandOp::SetBiasTee, &shared.last_bias_tee),
+    ]
+}
+
 fn replay_sticky_commands(shared: &Arc<SharedState>) {
     let Ok(mut sink) = shared.command_sink.lock() else {
         return;
@@ -160,21 +194,7 @@ fn replay_sticky_commands(shared: &Arc<SharedState>) {
     let if_gain_ops = (0..IF_GAIN_STAGES)
         .filter(|stage_idx| if_gain_mask & (1u32 << stage_idx) != 0)
         .map(|stage_idx| (CommandOp::SetIfGain, &shared.last_if_gain[stage_idx]));
-    let ops = [
-        (CommandOp::SetCenterFreq, &shared.last_center_freq_hz),
-        (CommandOp::SetSampleRate, &shared.last_sample_rate_hz),
-        (CommandOp::SetGainMode, &shared.last_gain_mode),
-        (CommandOp::SetTunerGain, &shared.last_tuner_gain),
-        (CommandOp::SetFreqCorrection, &shared.last_ppm),
-        (CommandOp::SetTestMode, &shared.last_testmode),
-        (CommandOp::SetAgcMode, &shared.last_agc_mode),
-        (CommandOp::SetDirectSampling, &shared.last_direct_sampling),
-        (CommandOp::SetOffsetTuning, &shared.last_offset_tuning),
-        (CommandOp::SetRtlXtal, &shared.last_rtl_xtal),
-        (CommandOp::SetTunerXtal, &shared.last_tuner_xtal),
-        (CommandOp::SetGainByIndex, &shared.last_gain_by_index),
-        (CommandOp::SetBiasTee, &shared.last_bias_tee),
-    ];
+    let ops = sticky_op_table(shared);
     // IF gain stages go where `SetIfGain` sits in opcode order — before
     // the first op with a higher opcode — one command per recorded
     // stage. Derived from the table so a reorder cannot silently move
