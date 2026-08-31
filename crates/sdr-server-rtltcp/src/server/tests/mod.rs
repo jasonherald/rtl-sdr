@@ -1,6 +1,42 @@
 use super::*;
 
 // ============================================================
+// Import-path adjustments for the #818 module split. Before the
+// split every name below reached the test files through the
+// `use super::*` glob against the monolithic `server.rs`; the
+// production items now live in the `accept` / `broadcast` /
+// `client` / `config` submodules, and the std / crate imports
+// that used to sit at the old root are re-imported here. These
+// `use` declarations are visible to the child test modules via
+// their own `use super::*` globs, so the individual test files
+// stay untouched.
+// ============================================================
+use std::io::Write;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::broadcaster::{ClientRegistry, ClientSlot};
+use crate::codec::{Codec, CodecMask};
+use crate::error::ServerError;
+use crate::extension::{
+    AUTH_KEY_HEADER_LEN, AUTH_REPLY_TIMEOUT, AuthKeyMessage, CLIENT_HELLO_LEN, ClientHello,
+    EXTENSION_MAGIC, Role,
+};
+
+use super::accept::handshake::{
+    HELLO_SNIFF_TIMEOUT, TCP_KEEPALIVE_IDLE_SECS, configure_client_socket, sniff_auth_key_message,
+    sniff_client_hello,
+};
+#[cfg(target_os = "linux")]
+use super::accept::handshake::{TCP_KEEPALIVE_INTERVAL_SECS, TCP_KEEPALIVE_RETRIES};
+use super::broadcast::{UsbReadOutcome, classify_usb_read};
+use super::client::{ChunkOutcome, tcp_writer, write_chunk_shedding_backlog};
+use super::config::validate_auth_key_length;
+
+// ============================================================
 // Test fixture constants (CodeRabbit round 4 on PR #402).
 // Extracted so each test's intent reads at a glance —
 // `42_001` on its own is noise, `TEST_CLIENT_A_PORT` plus a
