@@ -62,9 +62,11 @@ pub(in crate::window) enum AuthChangeOutcome {
     /// rebuild, when one was requested, succeeded too).
     Applied,
     /// The key change reached the server, but the requested mDNS
-    /// advertiser rebuild failed — the TXT record's
-    /// `auth_required` flag will be stale until the next server
-    /// start. Carries the error text for the caller's toast.
+    /// advertiser rebuild failed — the old record was already
+    /// unregistered (see `apply_auth_change` for why that ordering
+    /// is deliberate), so LAN advertising is OFF until the next
+    /// successful rebuild or server start. Carries the error text
+    /// for the caller's toast.
     AppliedAdvertiserFailed(String),
     /// Borrow contention on the slot (another handler is
     /// mid-mutation — rare, mid-click race). Caller reverts the
@@ -166,7 +168,16 @@ impl RunningServerHandle {
     /// unregister fires before we re-announce under the same
     /// instance name — mdns-sd allows back-to-back registers, but
     /// cleanly bracketed unregister/register avoids a window where
-    /// duplicate records briefly coexist on the LAN.
+    /// duplicate records briefly coexist on the LAN. Deliberately
+    /// NOT keep-old-until-success (`CodeRabbit` round 2 on
+    /// PR #879): holding the old registration alive while the new
+    /// one registers would have the old advertiser's TTL-0 goodbye
+    /// fire for the shared instance name AFTER the new record is
+    /// live, purging it from peer caches on the common success
+    /// path. The price is the failure path: a failed rebuild
+    /// leaves LAN advertising OFF (not stale) until the next
+    /// successful rebuild or server start — rare, surfaced via
+    /// [`AuthChangeOutcome::AppliedAdvertiserFailed`]'s toast.
     ///
     /// Returns a typed [`AuthChangeOutcome`]; toasts and switch
     /// reverts are the caller's job (see

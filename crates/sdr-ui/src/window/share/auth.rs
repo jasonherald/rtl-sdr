@@ -135,8 +135,11 @@ pub(super) fn wire_share_auth_controls(
 /// - Server is running and `set_auth_key(new)` returned `Ok`.
 ///   A failed advertiser rebuild after a successful key change
 ///   still counts as success (the server holds the new state) —
-///   it toasts, and the TXT record stays stale until the next
-///   server start.
+///   it toasts, and LAN advertising stays off until the next
+///   successful rebuild or server start (the old record is
+///   unregistered before the rebuild attempt; see
+///   `RunningServerHandle::apply_auth_change` for the ordering
+///   rationale).
 ///
 /// **Failure cases:**
 /// - The slot is busy (another handler is mid-mutation — rare,
@@ -192,8 +195,12 @@ fn auth_change_ui_response(outcome: AuthChangeOutcome) -> (bool, Option<String>)
         AuthChangeOutcome::NotRunning | AuthChangeOutcome::Applied => (true, None),
         AuthChangeOutcome::AppliedAdvertiserFailed(e) => (
             true,
+            // "advertising is now off", not "stale": the rebuild
+            // unregisters the old record before re-announcing, so
+            // a failed rebuild leaves no advertisement at all
+            // (`CodeRabbit` round 2 on PR #879).
             Some(format!(
-                "Couldn't refresh mDNS advertisement after auth toggle: {e}"
+                "Couldn't re-announce over mDNS after the auth change — LAN advertising is now off: {e}"
             )),
         ),
         AuthChangeOutcome::Busy => {
@@ -719,7 +726,9 @@ mod tests {
         assert!(ok);
         assert_eq!(
             toast.as_deref(),
-            Some("Couldn't refresh mDNS advertisement after auth toggle: mdns down")
+            Some(
+                "Couldn't re-announce over mDNS after the auth change — LAN advertising is now off: mdns down"
+            )
         );
     }
 
