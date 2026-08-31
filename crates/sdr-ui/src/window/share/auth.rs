@@ -160,32 +160,52 @@ pub(in crate::window) fn apply_live_auth_change(
     let rebuild_nickname = widgets
         .filter(|w| w.advertise_row.is_active())
         .map(|w| w.nickname_row.text());
-    match running.apply_auth_change(new_key, rebuild_nickname.as_deref()) {
-        AuthChangeOutcome::NotRunning | AuthChangeOutcome::Applied => true,
-        AuthChangeOutcome::AppliedAdvertiserFailed(e) => {
-            // Same pattern as the initial server-start advertise
-            // failure: the server keeps running with the new key;
-            // worst case, clients see stale auth metadata until
-            // the server is restarted.
-            if let Some(overlay) = toast_overlay.upgrade() {
-                overlay.add_toast(plain_toast(&format!(
-                    "Couldn't refresh mDNS advertisement after auth toggle: {e}"
-                )));
-            }
-            true
-        }
+    let (ok, toast) =
+        auth_change_ui_response(running.apply_auth_change(new_key, rebuild_nickname.as_deref()));
+    if let Some(message) = toast
+        && let Some(overlay) = toast_overlay.upgrade()
+    {
+        overlay.add_toast(plain_toast(&message));
+    }
+    ok
+}
+
+/// Pure mapping from a typed [`AuthChangeOutcome`] to the UI
+/// response: `(server_holds_new_state, toast_message)`. The bool
+/// follows [`apply_live_auth_change`]'s contract (`false` ⇒ the
+/// caller reverts the switch); the toast text, when present, is
+/// surfaced by the caller. An advertiser-rebuild failure after a
+/// successful key change still counts as success — the server
+/// keeps running with the new key (same pattern as the initial
+/// server-start advertise failure); worst case, clients see stale
+/// auth metadata in the TXT record until the next server start.
+///
+/// Kept as a standalone widget-free function (rather than inlined
+/// at the call site) so all five outcome branches are
+/// unit-testable without a GTK harness or a live server — same
+/// rationale as `share.rs::auth_key_ready_to_start`. Per the
+/// Codacy AI review on PR #879. The `tracing::warn!`s for the
+/// failure outcomes live here too so every mapping consequence is
+/// in one place.
+fn auth_change_ui_response(outcome: AuthChangeOutcome) -> (bool, Option<String>) {
+    match outcome {
+        AuthChangeOutcome::NotRunning | AuthChangeOutcome::Applied => (true, None),
+        AuthChangeOutcome::AppliedAdvertiserFailed(e) => (
+            true,
+            Some(format!(
+                "Couldn't refresh mDNS advertisement after auth toggle: {e}"
+            )),
+        ),
         AuthChangeOutcome::Busy => {
             tracing::warn!("auth change skipped — running-server cell busy");
-            false
+            (false, None)
         }
         AuthChangeOutcome::Failed(e) => {
             tracing::warn!(%e, "Server::set_auth_key failed on live auth change");
-            if let Some(overlay) = toast_overlay.upgrade() {
-                overlay.add_toast(plain_toast(&format!(
-                    "Couldn't update auth on the running server: {e}"
-                )));
-            }
-            false
+            (
+                false,
+                Some(format!("Couldn't update auth on the running server: {e}")),
+            )
         }
     }
 }
@@ -672,4 +692,53 @@ fn wire_auth_copy_button(
                 overlay.add_toast(plain_toast("Key copied to clipboard"));
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthChangeOutcome;
+    use super::auth_change_ui_response;
+
+    #[test]
+    fn not_running_and_applied_succeed_without_toast() {
+        assert_eq!(
+            auth_change_ui_response(AuthChangeOutcome::NotRunning),
+            (true, None)
+        );
+        assert_eq!(
+            auth_change_ui_response(AuthChangeOutcome::Applied),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn advertiser_failure_still_succeeds_but_toasts() {
+        let (ok, toast) = auth_change_ui_response(AuthChangeOutcome::AppliedAdvertiserFailed(
+            "mdns down".into(),
+        ));
+        assert!(ok);
+        assert_eq!(
+            toast.as_deref(),
+            Some("Couldn't refresh mDNS advertisement after auth toggle: mdns down")
+        );
+    }
+
+    #[test]
+    fn busy_fails_silently() {
+        assert_eq!(
+            auth_change_ui_response(AuthChangeOutcome::Busy),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn server_failure_fails_with_toast() {
+        let (ok, toast) =
+            auth_change_ui_response(AuthChangeOutcome::Failed("mutex poisoned".into()));
+        assert!(!ok);
+        assert_eq!(
+            toast.as_deref(),
+            Some("Couldn't update auth on the running server: mutex poisoned")
+        );
+    }
 }

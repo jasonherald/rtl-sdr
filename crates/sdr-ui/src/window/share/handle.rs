@@ -86,6 +86,15 @@ impl RunningServerHandle {
     /// in the slot. Caller flips the shared `server_running` flag
     /// AFTER this returns so the source-panel guard can't race
     /// against a mid-construction state.
+    ///
+    /// Uses an infallible `borrow_mut` deliberately: every other
+    /// slot access is a tight scope that never spans blocking work
+    /// or callback dispatch, so no borrow can be live when the
+    /// share-switch handler calls this. A `try_borrow_mut` with a
+    /// Busy outcome would force the start path to handle an
+    /// unreachable state whose only "recovery" is silently
+    /// dropping a just-started server — strictly worse than the
+    /// theoretical panic. Per `CodeRabbit` round 1 on PR #879.
     pub(in crate::window) fn install(
         &self,
         server: super::Server,
@@ -101,9 +110,18 @@ impl RunningServerHandle {
     /// is taken explicitly to reverse. `Server::drop` then signals
     /// shutdown and joins the accept thread. No-op on an empty slot.
     pub(in crate::window) fn shutdown(&self) {
-        if let Some(mut handle) = self.imp().slot.borrow_mut().take() {
-            drop(handle.advertiser.take());
-            drop(handle.server);
+        // Take the value in its own statement so the `RefMut`
+        // temporary drops HERE — before the blocking teardown
+        // below. Inside an `if let` scrutinee the borrow would
+        // stay live across `Advertiser::drop` (mDNS unregister)
+        // and `Server::drop` (accept-thread join), and any
+        // re-entry into a handle method during that window would
+        // hit a borrowed slot. Per `CodeRabbit` round 1 on
+        // PR #879.
+        let taken = self.imp().slot.borrow_mut().take();
+        if let Some(mut running) = taken {
+            drop(running.advertiser.take());
+            drop(running.server);
         }
     }
 
