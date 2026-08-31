@@ -8,6 +8,9 @@ mod auth;
 pub(in crate::window) use auth::ensure_server_auth_key;
 use auth::wire_share_auth_controls;
 
+mod handle;
+use handle::RunningServerHandle;
+
 mod status;
 pub(in crate::window) use status::{
     connect_server_status_polling, reset_activity_log, reset_clients_list, reset_status_rows,
@@ -50,7 +53,13 @@ pub(super) fn connect_server_panel(
     toast_overlay: &adw::ToastOverlay,
     server_running: Rc<std::cell::Cell<bool>>,
 ) {
-    let running: Rc<RefCell<Option<RunningServer>>> = Rc::new(RefCell::new(None));
+    // Typed single-owner handle for the running-server slot
+    // (issue #847). `glib::Object` is internally refcounted, so
+    // the wiring calls below clone the handle directly — same
+    // sharing semantics as the old `Rc<RefCell<...>>` cell, but
+    // every slot access now goes through a named operation on
+    // `RunningServerHandle` instead of a raw borrow.
+    let running = RunningServerHandle::new();
 
     // Share is now an activity on the left activity bar — always
     // reachable via the 📡 icon. The legacy hotplug-driven
@@ -64,12 +73,12 @@ pub(super) fn connect_server_panel(
     // authority on server lifecycle — on toggle we either start a
     // new `Server` (+ optional `Advertiser`) and store the handle,
     // or drop the handle so the accept thread tears down.
-    connect_share_switch(panels, toast_overlay, Rc::clone(&running), server_running);
+    connect_share_switch(panels, toast_overlay, running.clone(), server_running);
 
     // Poll `Server::stats()` on a timer, render the status rows,
     // and auto-stop the server if `has_stopped()` becomes true
     // (e.g. USB unplug or accept-thread failure).
-    connect_server_status_polling(panels, Rc::clone(&running));
+    connect_server_status_polling(panels, running);
 
     // Bandwidth advisory — toggled on the device-default sample
     // rate. Unlike the source panel's advisory (which also gates
@@ -246,7 +255,7 @@ impl ServerSwitchWidgetsWeak {
 pub(super) fn connect_share_switch(
     panels: &SidebarPanels,
     toast_overlay: &adw::ToastOverlay,
-    running: Rc<RefCell<Option<RunningServer>>>,
+    running: RunningServerHandle,
     server_running: Rc<std::cell::Cell<bool>>,
 ) {
     use std::cell::Cell;
@@ -269,9 +278,10 @@ pub(super) fn connect_share_switch(
     // Clone the `running` handle for the listener-cap live-apply
     // closure BEFORE the `share_row` active-notify handler
     // below consumes the outer `running` by move. Both closures
-    // share the same `RefCell`; neither holds a borrow past its
-    // own tick. Per #395.
-    let running_for_cap = Rc::clone(&running);
+    // share the same slot via the refcounted handle; every access
+    // is a single named operation, so no borrow outlives its own
+    // tick. Per #395 + #847.
+    let running_for_cap = running.clone();
     // Shared state for the auth-key display row. `current_key`
     // holds the active key bytes while the server is running
     // with auth enabled; `None` when auth is off. `key_revealed`
@@ -362,7 +372,7 @@ pub(super) fn connect_share_switch(
     // Clones for the auth-controls wiring below — taken before the
     // share_row closure consumes the outer handles by move.
     let widgets_weak_for_auth = widgets_weak.clone();
-    let running_for_auth = Rc::clone(&running);
+    let running_for_auth = running.clone();
     panels.server.share_row.connect_active_notify(move |row| {
         on_share_row_toggled(
             row,
@@ -397,7 +407,7 @@ fn on_share_row_toggled(
     widgets_weak: &ServerSwitchWidgetsWeak,
     toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
     current_key_for_share: &Rc<RefCell<Option<Vec<u8>>>>,
-    running: &Rc<RefCell<Option<RunningServer>>>,
+    running: &RunningServerHandle,
     server_running: &Rc<std::cell::Cell<bool>>,
     share_row_weak: &glib::WeakRef<adw::SwitchRow>,
 ) {
@@ -443,37 +453,23 @@ fn on_share_row_toggled(
 /// Listener-cap live-apply (issue #395): spin-row changes reach the
 /// running server without a restart. Split out per the 50-NLOC gate
 /// (#817).
-fn wire_listener_cap_live_apply(
-    panels: &SidebarPanels,
-    running_for_cap: Rc<RefCell<Option<RunningServer>>>,
-) {
+fn wire_listener_cap_live_apply(panels: &SidebarPanels, running_for_cap: RunningServerHandle) {
     // Listener-cap live-apply. Changes on the spin row take effect
     // on the next client accept without restarting the server. The
     // row also persists to sdr_config via a separate signal
     // attached inside `server_panel.rs`; this handler only cares
-    // about the running-server case. Per issue #395.
+    // about the running-server case — `set_listener_cap` skips
+    // silently when no server is running or another handler is
+    // mid-mutation on the slot (see its doc comment). Per issue
+    // #395.
     panels.server.listener_cap_row.connect_value_notify(move |row| {
-        let Ok(handle) = running_for_cap.try_borrow() else {
-            // Another handler is holding the `RunningServer` borrow
-            // (e.g. the share_row active-notify flipping server
-            // start/stop). Skip this tick — the spin row's new
-            // value is already persisted via the server_panel
-            // signal, and the next accept after start will pick
-            // it up through `build_server_config_from_panel`.
-            return;
-        };
-        let Some(handle) = handle.as_ref() else {
-            // Server not running — the spin row edit is already
-            // persisted; nothing to apply live.
-            return;
-        };
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             reason = "spin row bounded to [MIN_LISTENER_CAP, MAX_LISTENER_CAP] at the widget level"
         )]
         let cap = row.value() as usize;
-        handle.server.set_listener_cap(cap);
+        running_for_cap.set_listener_cap(cap);
     });
 }
 
@@ -482,20 +478,15 @@ fn wire_listener_cap_live_apply(
 /// and reset the panel rows. Split out per the 50-NLOC gate (#817).
 fn stop_shared_server(
     widgets: &ServerSwitchWidgets,
-    running: &Rc<RefCell<Option<RunningServer>>>,
+    running: &RunningServerHandle,
     server_running: &Rc<std::cell::Cell<bool>>,
 ) {
-    // Drop the handle → Server::drop signals shutdown and
-    // joins the accept thread; Advertiser::drop unregisters
-    // the mDNS record. Sequence matters (advertiser first
-    // so peers see the goodbye packet before the server
-    // stops) — field declaration order in `RunningServer`
-    // would drop `server` first, so take the advertiser
-    // explicitly first to reverse.
-    if let Some(mut handle) = running.borrow_mut().take() {
-        drop(handle.advertiser.take());
-        drop(handle.server);
-    }
+    // Take + tear down the running server: `Server::drop` signals
+    // shutdown and joins the accept thread; `Advertiser::drop`
+    // unregisters the mDNS record. The advertiser-first drop
+    // ordering (peers see the goodbye packet before the server
+    // stops) lives in `RunningServerHandle::shutdown`.
+    running.shutdown();
     // Clear the shared "server is live" flag ahead of the
     // widget-visibility changes so an immediate source-type
     // re-selection triggered by the user's next action sees
@@ -518,7 +509,7 @@ fn stop_shared_server(
 fn start_shared_server(
     widgets: &ServerSwitchWidgets,
     current_key_for_share: &Rc<RefCell<Option<Vec<u8>>>>,
-    running: &Rc<RefCell<Option<RunningServer>>>,
+    running: &RunningServerHandle,
     server_running: &Rc<std::cell::Cell<bool>>,
     toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
     reentry_guard: &Rc<std::cell::Cell<bool>>,
@@ -603,7 +594,7 @@ fn start_shared_server(
             widgets.status_row.set_visible(true);
             widgets.activity_log_row.set_visible(true);
             widgets.clients_row.set_visible(true);
-            *running.borrow_mut() = Some(RunningServer { server, advertiser });
+            running.install(server, advertiser);
             // Flip the shared "server is live" flag AFTER
             // the handle is stored so the source-panel
             // guard can't race against a mid-construction

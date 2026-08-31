@@ -8,7 +8,8 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
 use super::super::{Rc, RefCell, SidebarPanels, adw, gio, glib, plain_toast};
-use super::{RunningServer, ServerSwitchWidgets, ServerSwitchWidgetsWeak, build_advertiser};
+use super::handle::{AuthChangeOutcome, RunningServerHandle};
+use super::{ServerSwitchWidgets, ServerSwitchWidgetsWeak};
 
 /// Read the `rtl_tcp` server auth key from the OS keyring, if
 /// present. Returns `Some(bytes)` for a well-formed hex-encoded
@@ -81,7 +82,7 @@ pub(in crate::window) fn ensure_server_auth_key() -> Vec<u8> {
 pub(super) fn wire_share_auth_controls(
     panels: &SidebarPanels,
     widgets_weak: &ServerSwitchWidgetsWeak,
-    running: &Rc<RefCell<Option<RunningServer>>>,
+    running: &RunningServerHandle,
     current_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
     auth_key_revealed: &Rc<std::cell::Cell<bool>>,
     toast_overlay: &adw::ToastOverlay,
@@ -121,101 +122,70 @@ pub(super) fn wire_share_auth_controls(
 /// server actually holds the new state; `false` means the
 /// caller must revert the UI so it stays in sync.
 ///
+/// Thin adapter over [`RunningServerHandle::apply_auth_change`]
+/// (issue #847): this function decides whether an advertiser
+/// rebuild is wanted (widget refs available AND the user has
+/// advertising on) and maps the typed outcome onto toasts + the
+/// bool contract; the slot access, `set_auth_key` call, and the
+/// rebuild itself live in the handle.
+///
 /// **Success cases:**
-/// - No server is running (`running` cell contains `None`): no
-///   server-side change to apply; caller can proceed with UI.
-/// - Server is running and `set_auth_key(new)` returns `Ok`.
-///   The advertiser is then rebuilt via
-///   `refresh_advertiser_for_auth_change` so the TXT record
-///   reflects the new `auth_required` state.
+/// - No server is running: no server-side change to apply;
+///   caller can proceed with UI.
+/// - Server is running and `set_auth_key(new)` returned `Ok`.
+///   A failed advertiser rebuild after a successful key change
+///   still counts as success (the server holds the new state) —
+///   it toasts, and the TXT record stays stale until the next
+///   server start.
 ///
 /// **Failure cases:**
-/// - `try_borrow_mut` on the running-server cell fails (another
-///   handler holds a mutable borrow — rare, mid-click race).
-///   Caller reverts the switch; next click usually wins.
+/// - The slot is busy (another handler is mid-mutation — rare,
+///   mid-click race). Caller reverts the switch; next click
+///   usually wins.
 /// - `set_auth_key` returns `Err` (e.g., mutex poisoned). The
 ///   toast surfaces the error and the caller reverts UI state.
 ///
 /// Does NOT touch UI state — caller owns the UI mutation gate.
 /// Per `CodeRabbit` round 1 on PR #406.
 pub(in crate::window) fn apply_live_auth_change(
-    running: &Rc<RefCell<Option<RunningServer>>>,
+    running: &RunningServerHandle,
     new_key: Option<Vec<u8>>,
     widgets: Option<&ServerSwitchWidgets>,
     toast_overlay: &glib::WeakRef<adw::ToastOverlay>,
 ) -> bool {
-    let Ok(mut handle_cell) = running.try_borrow_mut() else {
-        tracing::warn!("auth change skipped — running-server cell busy");
-        return false;
-    };
-    let Some(handle) = handle_cell.as_mut() else {
-        // Server not running — UI-only change is always fine.
-        return true;
-    };
-    if let Err(e) = handle.server.set_auth_key(new_key) {
-        tracing::warn!(%e, "Server::set_auth_key failed on live auth change");
-        if let Some(overlay) = toast_overlay.upgrade() {
-            overlay.add_toast(plain_toast(&format!(
-                "Couldn't update auth on the running server: {e}"
-            )));
-        }
-        return false;
-    }
-    // mDNS TXT refresh. Only meaningful when we have widget refs
-    // (caller upgraded `widgets_weak` before the call).
-    if let Some(widgets) = widgets {
-        refresh_advertiser_for_auth_change(handle, widgets, toast_overlay);
-    }
-    true
-}
-
-/// Tear down and rebuild the running server's mDNS advertiser so
-/// its TXT record reflects the current `Server::auth_required()`
-/// state. Called after every successful live auth toggle so
-/// discovery clients see the new `auth_required=true|absent`
-/// flag without waiting for a server restart.
-///
-/// **No-op when:**
-/// - No server is running (`handle` is `None`).
-/// - The user has advertising turned off (`advertise_row`
-///   inactive). Honors the user's choice — we don't bring
-///   advertising back online just because auth flipped.
-///
-/// **Error path:** `build_advertiser` failures log + toast
-/// (same pattern as the initial server-start advertise failure).
-/// The server itself keeps running without a fresh TXT; worst
-/// case, clients see stale auth metadata until the server is
-/// restarted. Never panics, never leaves a half-registered
-/// advertiser in place. Per `CodeRabbit` round 1 on PR #406.
-pub(in crate::window) fn refresh_advertiser_for_auth_change(
-    handle: &mut RunningServer,
-    widgets: &ServerSwitchWidgets,
-    toast_overlay: &glib::WeakRef<adw::ToastOverlay>,
-) {
-    if !widgets.advertise_row.is_active() {
-        // User turned advertising off — don't sneak it back on.
-        return;
-    }
-    // Drop the old advertiser FIRST so its Drop-based unregister
-    // fires before we re-announce under the same instance name.
-    // mdns-sd allows back-to-back registers with the same name
-    // but cleanly bracketed unregister/register avoids a window
-    // where duplicate records briefly coexist on the LAN.
-    drop(handle.advertiser.take());
-    match build_advertiser(&handle.server, &widgets.nickname_row.text()) {
-        Ok(adv) => {
-            handle.advertiser = Some(adv);
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "mDNS advertiser rebuild after auth toggle failed; TXT auth_required will be stale until next start"
-            );
+    // Rebuild the mDNS advertiser only when we have widget refs
+    // (caller upgraded `widgets_weak` before the call) AND the
+    // user has advertising on — advertising turned off stays off;
+    // we don't sneak it back on just because auth flipped.
+    let rebuild_nickname = widgets
+        .filter(|w| w.advertise_row.is_active())
+        .map(|w| w.nickname_row.text());
+    match running.apply_auth_change(new_key, rebuild_nickname.as_deref()) {
+        AuthChangeOutcome::NotRunning | AuthChangeOutcome::Applied => true,
+        AuthChangeOutcome::AppliedAdvertiserFailed(e) => {
+            // Same pattern as the initial server-start advertise
+            // failure: the server keeps running with the new key;
+            // worst case, clients see stale auth metadata until
+            // the server is restarted.
             if let Some(overlay) = toast_overlay.upgrade() {
                 overlay.add_toast(plain_toast(&format!(
                     "Couldn't refresh mDNS advertisement after auth toggle: {e}"
                 )));
             }
+            true
+        }
+        AuthChangeOutcome::Busy => {
+            tracing::warn!("auth change skipped — running-server cell busy");
+            false
+        }
+        AuthChangeOutcome::Failed(e) => {
+            tracing::warn!(%e, "Server::set_auth_key failed on live auth change");
+            if let Some(overlay) = toast_overlay.upgrade() {
+                overlay.add_toast(plain_toast(&format!(
+                    "Couldn't update auth on the running server: {e}"
+                )));
+            }
+            false
         }
     }
 }
@@ -224,7 +194,7 @@ pub(in crate::window) fn refresh_advertiser_for_auth_change(
 /// Split out per the 50-NLOC gate (#817).
 fn wire_auth_require_toggle(
     panels: &SidebarPanels,
-    running: &Rc<RefCell<Option<RunningServer>>>,
+    running: &RunningServerHandle,
     current_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
     auth_key_revealed: &Rc<std::cell::Cell<bool>>,
     toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
@@ -252,7 +222,7 @@ fn wire_auth_require_toggle(
         reentry_guard: Rc::new(std::cell::Cell::new(false)),
         key_row: panels.server.auth_key_row.downgrade(),
         widgets_weak: widgets_weak.clone(),
-        running: Rc::clone(running),
+        running: running.clone(),
         toast_overlay: toast_overlay_weak.clone(),
         current_key: Rc::clone(current_auth_key),
         revealed: Rc::clone(auth_key_revealed),
@@ -283,7 +253,7 @@ struct AuthToggleDeps {
     reentry_guard: Rc<std::cell::Cell<bool>>,
     key_row: glib::WeakRef<adw::ActionRow>,
     widgets_weak: ServerSwitchWidgetsWeak,
-    running: Rc<RefCell<Option<RunningServer>>>,
+    running: RunningServerHandle,
     toast_overlay: glib::WeakRef<adw::ToastOverlay>,
     current_key: Rc<RefCell<Option<Vec<u8>>>>,
     revealed: Rc<std::cell::Cell<bool>>,
@@ -371,7 +341,7 @@ fn on_auth_require_toggled(row: &adw::SwitchRow, deps: &AuthToggleDeps) {
 /// 50-NLOC gate (#817).
 fn disable_auth_requirement(
     widgets: Option<&ServerSwitchWidgets>,
-    running_for_auth_toggle: &Rc<RefCell<Option<RunningServer>>>,
+    running_for_auth_toggle: &RunningServerHandle,
     toast_overlay_for_auth_toggle: &glib::WeakRef<adw::ToastOverlay>,
     current_key_for_toggle: &Rc<RefCell<Option<Vec<u8>>>>,
     revealed_for_toggle: &Rc<std::cell::Cell<bool>>,
@@ -416,7 +386,7 @@ fn disable_auth_requirement(
 )]
 fn apply_auth_key_and_reveal(
     widgets: Option<&ServerSwitchWidgets>,
-    running_for_auth_toggle: &Rc<RefCell<Option<RunningServer>>>,
+    running_for_auth_toggle: &RunningServerHandle,
     toast_overlay_for_auth_toggle: &glib::WeakRef<adw::ToastOverlay>,
     current_key_for_toggle: &Rc<RefCell<Option<Vec<u8>>>>,
     revealed_for_toggle: &Rc<std::cell::Cell<bool>>,
@@ -588,12 +558,12 @@ fn wire_auth_reveal_copy(
 /// Split out per the 50-NLOC gate (#817).
 fn wire_auth_regenerate(
     panels: &SidebarPanels,
-    running: &Rc<RefCell<Option<RunningServer>>>,
+    running: &RunningServerHandle,
     current_auth_key: &Rc<RefCell<Option<Vec<u8>>>>,
     auth_key_revealed: &Rc<std::cell::Cell<bool>>,
     toast_overlay_weak: &glib::WeakRef<adw::ToastOverlay>,
 ) {
-    let running_for_auth_regen = Rc::clone(running);
+    let running_for_auth_regen = running.clone();
     let toast_overlay_for_regen = toast_overlay_weak.clone();
     // Regenerate button — generates a fresh 32-byte key,
     // applies it to the live server, persists to keyring, and
