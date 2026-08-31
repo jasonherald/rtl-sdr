@@ -209,7 +209,7 @@ impl RunningServerHandle {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "mDNS advertiser rebuild after auth toggle failed; TXT auth_required will be stale until next start"
+                    "mDNS advertiser rebuild after auth toggle failed; LAN advertising is off until a later rebuild or server restart"
                 );
                 AuthChangeOutcome::AppliedAdvertiserFailed(e.to_string())
             }
