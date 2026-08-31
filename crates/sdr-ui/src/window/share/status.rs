@@ -6,8 +6,9 @@
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
-use super::super::{Duration, Instant, Rc, RefCell, SidebarPanels, adw, glib, sidebar};
-use super::{RunningServer, ServerSwitchWidgets};
+use super::super::{Duration, Instant, Rc, SidebarPanels, adw, glib, sidebar};
+use super::ServerSwitchWidgets;
+use super::handle::RunningServerHandle;
 use std::cell::Cell;
 
 /// Cadence for the server-stats poll that renders the "Server
@@ -116,7 +117,7 @@ impl ServerStatusWidgetsWeak {
 /// instead of a bogus megabit-scale number during the transient.
 pub(in crate::window) fn connect_server_status_polling(
     panels: &SidebarPanels,
-    running: Rc<RefCell<Option<RunningServer>>>,
+    running: RunningServerHandle,
 ) {
     let widgets_weak = ServerStatusWidgetsWeak::from_panel(&panels.server);
     let share_row_weak = panels.server.share_row.downgrade();
@@ -158,14 +159,10 @@ pub(in crate::window) fn connect_server_status_polling(
         let Some(widgets) = widgets_weak.upgrade() else {
             return glib::ControlFlow::Break;
         };
-        // Snapshot `Server::stats()` under the borrow. `stats()`
-        // internally locks a Mutex — the return is a Clone, so the
-        // borrow scope is tight.
-        let snapshot = running
-            .borrow()
-            .as_ref()
-            .map(|h| (h.server.stats(), h.server.has_stopped()));
-        let Some((stats, stopped)) = snapshot else {
+        // Snapshot `(Server::stats(), Server::has_stopped())` via
+        // the typed handle — the tight-borrow rationale lives on
+        // `RunningServerHandle::poll_stats` (issue #847).
+        let Some((stats, stopped)) = running.poll_stats() else {
             // No server running — nothing to render, keep ticking
             // (the share switch handler will spin us up again).
             return glib::ControlFlow::Continue;
