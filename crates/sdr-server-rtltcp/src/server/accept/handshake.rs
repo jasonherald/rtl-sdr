@@ -248,6 +248,45 @@ pub(in crate::server) const HELLO_SNIFF_TIMEOUT: Duration = Duration::from_milli
 pub(in crate::server) fn sniff_client_hello(
     mut stream: &TcpStream,
 ) -> std::io::Result<Option<ClientHello>> {
+    if !poll_peek_magic(stream)? {
+        return Ok(None);
+    }
+    // Magic matched — commit to consuming 8 bytes. A timeout or
+    // EOF here is no longer a safe fallback: we've verified the
+    // client started an extended hello and `read_exact` will
+    // have eaten whatever bytes arrived before the stall.
+    // Returning `Ok(None)` would let the legacy path start
+    // against a shifted command stream — exactly the desync
+    // `CodeRabbit` round 2 on PR #399 flagged. Treat every
+    // failure mode as a protocol error and drop the client.
+    stream.set_read_timeout(Some(HELLO_SNIFF_TIMEOUT))?;
+    let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
+    let read_result = stream.read_exact(&mut hello_buf);
+    stream.set_read_timeout(None)?;
+    read_result?;
+    ClientHello::from_bytes(&hello_buf)
+        .map(Some)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RTLX magic matched but ClientHello body failed to parse (unknown role or \
+             malformed field)",
+            )
+        })
+}
+
+/// Peek-poll phase of [`sniff_client_hello`]: wait up to
+/// [`HELLO_SNIFF_TIMEOUT`] for either the full 4-byte
+/// [`EXTENSION_MAGIC`] (→ `Ok(true)`, caller commits to the 8-byte
+/// hello read) or a definitive legacy signal (→ `Ok(false)`:
+/// zero-byte timeout, clean EOF, or an observed prefix that does
+/// not match the magic — nothing consumed in any of those, so the
+/// legacy command stream stays intact). A partial magic prefix that
+/// never completes is an `InvalidData` error, and transport errors
+/// propagate. Split out per the 50-NLOC gate (Codacy round on
+/// PR #880); the return-case rationale lives on the caller's doc
+/// comment.
+fn poll_peek_magic(stream: &TcpStream) -> std::io::Result<bool> {
     // Poll cadence for the peek retry loop. Small enough that a
     // fragmented `RTLX` hello whose trailing bytes land within a
     // few ms gets re-checked before the sniff deadline; large
@@ -269,29 +308,7 @@ pub(in crate::server) fn sniff_client_hello(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             stream.set_read_timeout(None)?;
-            if observed_any_prefix {
-                // Partial magic-prefix observed but full 4 bytes
-                // never arrived. Returning `Ok(None)` (legacy
-                // fallback) would shift the command reader by
-                // the 1–3 prefix bytes still queued in the
-                // receive buffer — parsing `R` / `RT` / `RTL`
-                // as opcodes corrupts the command stream. Surface
-                // as `InvalidData` (not `TimedOut`) to match the
-                // post-magic-match `read_exact` and body-parse
-                // failure paths below: both are protocol-desync
-                // errors from the host's perspective — the socket
-                // isn't "idle", it sent bytes that commit to the
-                // extended protocol and then stalled. Per
-                // `CodeRabbit` round 6 on PR #402.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "RTLX magic prefix observed but full 4-byte magic did not complete \
-                     within HELLO_SNIFF_TIMEOUT",
-                ));
-            }
-            // Zero bytes ever observed — idle legacy peer or
-            // port scanner. Nothing consumed, safe to fall back.
-            return Ok(None);
+            return peek_deadline_verdict(observed_any_prefix);
         }
         // Per-iteration read timeout capped by `PEEK_POLL_INTERVAL`
         // so we wake up to re-check the deadline if the kernel
@@ -305,7 +322,7 @@ pub(in crate::server) fn sniff_client_hello(
                 // fallback regardless of whether a prefix had
                 // been observed.
                 stream.set_read_timeout(None)?;
-                return Ok(None);
+                return Ok(false);
             }
             Ok(n) if n >= EXTENSION_MAGIC.len() => break,
             Ok(n) => {
@@ -318,7 +335,7 @@ pub(in crate::server) fn sniff_client_hello(
                     // with `R`. Bytes stay queued for
                     // `command_worker`.
                     stream.set_read_timeout(None)?;
-                    return Ok(None);
+                    return Ok(false);
                 }
                 // Prefix still a candidate `RTLX`. Brief yield
                 // so the kernel receive buffer can fill before
@@ -348,30 +365,37 @@ pub(in crate::server) fn sniff_client_hello(
         // command frame. Bytes stay queued for the command
         // reader.
         stream.set_read_timeout(None)?;
-        return Ok(None);
+        return Ok(false);
     }
-    // Magic matched — commit to consuming 8 bytes. A timeout or
-    // EOF here is no longer a safe fallback: we've verified the
-    // client started an extended hello and `read_exact` will
-    // have eaten whatever bytes arrived before the stall.
-    // Returning `Ok(None)` would let the legacy path start
-    // against a shifted command stream — exactly the desync
-    // `CodeRabbit` round 2 on PR #399 flagged. Treat every
-    // failure mode as a protocol error and drop the client.
-    stream.set_read_timeout(Some(HELLO_SNIFF_TIMEOUT))?;
-    let mut hello_buf = [0u8; CLIENT_HELLO_LEN];
-    let read_result = stream.read_exact(&mut hello_buf);
-    stream.set_read_timeout(None)?;
-    read_result?;
-    ClientHello::from_bytes(&hello_buf)
-        .map(Some)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "RTLX magic matched but ClientHello body failed to parse (unknown role or \
-             malformed field)",
-            )
-        })
+    // Full magic matched. The per-iteration read timeout is left
+    // installed — the caller immediately replaces it with the
+    // commit-read timeout, matching the pre-split control flow.
+    Ok(true)
+}
+
+/// Verdict when the sniff deadline expires. A partial magic-prefix
+/// observed but never completed is `InvalidData`: returning the
+/// legacy fallback would shift the command reader by the 1–3
+/// prefix bytes still queued in the receive buffer — parsing `R` /
+/// `RT` / `RTL` as opcodes corrupts the command stream. Surfaced
+/// as `InvalidData` (not `TimedOut`) to match the post-magic-match
+/// `read_exact` and body-parse failure paths: both are
+/// protocol-desync errors from the host's perspective — the socket
+/// isn't "idle", it sent bytes that commit to the extended
+/// protocol and then stalled. Per `CodeRabbit` round 6 on PR #402.
+/// Zero bytes ever observed — idle legacy peer or port scanner —
+/// is the safe legacy fallback (nothing consumed). Split out of
+/// [`poll_peek_magic`] per the 50-NLOC gate (Codacy round on
+/// PR #880).
+fn peek_deadline_verdict(observed_any_prefix: bool) -> std::io::Result<bool> {
+    if observed_any_prefix {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "RTLX magic prefix observed but full 4-byte magic did not complete \
+             within HELLO_SNIFF_TIMEOUT",
+        ));
+    }
+    Ok(false)
 }
 
 /// Read + parse an [`AuthKeyMessage`] from `stream` within an

@@ -247,87 +247,112 @@ pub(super) fn command_worker(
                 return;
             }
         }
-        let Some(cmd) = Command::from_bytes(&buf) else {
-            // Upstream silently drops unknown opcodes (switch has no default).
-            tracing::debug!(
-                op = buf[0],
-                client_id = slot.id,
-                "rtl_tcp unknown command opcode, dropping"
-            );
+        let Some(cmd) = parse_gated_command(buf, &slot) else {
             continue;
         };
-        // Role gate (#392). Listener clients may send commands —
-        // the protocol doesn't stop them — but the server drops
-        // them server-side without touching the device. No reply
-        // is sent (keeps the wire protocol identical for Control
-        // and Listen); the listener's UI simply observes that its
-        // tune / gain commands have no effect, which matches the
-        // "passive observer" contract they signed up for by
-        // requesting Role::Listen.
-        if slot.role == Role::Listen {
-            tracing::debug!(
-                client_id = slot.id,
-                op = ?cmd.op,
-                param = cmd.param,
-                "rtl_tcp listener client attempted command — dropped"
-            );
-            continue;
-        }
-        let Ok(mut dev) = device.lock() else {
-            // Same rationale as the broadcaster: a poisoned device
-            // mutex is unrecoverable, and silently dropping commands
-            // here would leave the client driving the UI with no
-            // visible effect on the server. Close this client.
-            tracing::error!(
-                client_id = slot.id,
-                "device mutex poisoned, command worker aborting and closing this client"
-            );
-            slot.mark_disconnected();
+        if !apply_command(&device, &slot, cmd) {
             return;
-        };
-        // A takeover may have displaced this controller while it
-        // waited for the device lock; its command must not land on
-        // the new controller's dongle state (#710).
-        if slot.is_disconnected() {
-            tracing::debug!(
-                client_id = slot.id,
-                "rtl_tcp command dropped — client displaced while waiting for the device"
-            );
-            return;
-        }
-        dispatch(&mut dev, cmd);
-        drop(dev);
-        if let Ok(mut s) = slot.stats.lock() {
-            let now = Instant::now();
-            s.record_command(cmd.op, now);
-            // Capture the commanded state alongside the
-            // last-command stamp. We record what the CLIENT
-            // requested (not what the device ultimately applied)
-            // because: (a) the dispatch layer already logs device
-            // failures at warn!, (b) if a SetCenterFreq request is
-            // rejected by the device, the client will re-request,
-            // and (c) showing the client's view helps debug
-            // client-side bugs ("why is GQRX stuck on 145 MHz?").
-            match cmd.op {
-                CommandOp::SetCenterFreq => s.current_freq_hz = Some(cmd.param),
-                CommandOp::SetSampleRate => s.current_sample_rate_hz = Some(cmd.param),
-                CommandOp::SetTunerGain => {
-                    #[allow(
-                        clippy::cast_possible_wrap,
-                        reason = "gain param is signed tenths-of-dB on the wire, u32 is a raw-bits transport"
-                    )]
-                    let gain = cmd.param as i32;
-                    s.current_gain_tenths_db = Some(gain);
-                }
-                CommandOp::SetGainMode => {
-                    // Upstream: 0 = auto, nonzero = manual. Store
-                    // the auto bool for the UI status-row renderer.
-                    s.current_gain_auto = Some(cmd.param == 0);
-                }
-                _ => {}
-            }
         }
     }
+}
+
+/// Parse one 5-byte command frame and apply the #392 role gate.
+/// `None` = skip this frame (unknown opcode, or a listener client
+/// attempting a command). Split out of [`command_worker`] per the
+/// 50-NLOC gate (Codacy round on PR #880).
+fn parse_gated_command(buf: [u8; COMMAND_LEN], slot: &Arc<ClientSlot>) -> Option<Command> {
+    let Some(cmd) = Command::from_bytes(&buf) else {
+        // Upstream silently drops unknown opcodes (switch has no default).
+        tracing::debug!(
+            op = buf[0],
+            client_id = slot.id,
+            "rtl_tcp unknown command opcode, dropping"
+        );
+        return None;
+    };
+    // Role gate (#392). Listener clients may send commands —
+    // the protocol doesn't stop them — but the server drops
+    // them server-side without touching the device. No reply
+    // is sent (keeps the wire protocol identical for Control
+    // and Listen); the listener's UI simply observes that its
+    // tune / gain commands have no effect, which matches the
+    // "passive observer" contract they signed up for by
+    // requesting Role::Listen.
+    if slot.role == Role::Listen {
+        tracing::debug!(
+            client_id = slot.id,
+            op = ?cmd.op,
+            param = cmd.param,
+            "rtl_tcp listener client attempted command — dropped"
+        );
+        return None;
+    }
+    Some(cmd)
+}
+
+/// Land one validated, role-gated command on the shared device and
+/// record it against the client's stats. Returns `false` when the
+/// command worker must exit (poisoned device mutex — the slot is
+/// marked disconnected here — or a takeover displaced this
+/// controller while it waited for the device lock). Split out of
+/// [`command_worker`] per the 50-NLOC gate (Codacy round on
+/// PR #880).
+fn apply_command(device: &Arc<Mutex<RtlSdrDevice>>, slot: &Arc<ClientSlot>, cmd: Command) -> bool {
+    let Ok(mut dev) = device.lock() else {
+        // Same rationale as the broadcaster: a poisoned device
+        // mutex is unrecoverable, and silently dropping commands
+        // here would leave the client driving the UI with no
+        // visible effect on the server. Close this client.
+        tracing::error!(
+            client_id = slot.id,
+            "device mutex poisoned, command worker aborting and closing this client"
+        );
+        slot.mark_disconnected();
+        return false;
+    };
+    // A takeover may have displaced this controller while it
+    // waited for the device lock; its command must not land on
+    // the new controller's dongle state (#710).
+    if slot.is_disconnected() {
+        tracing::debug!(
+            client_id = slot.id,
+            "rtl_tcp command dropped — client displaced while waiting for the device"
+        );
+        return false;
+    }
+    dispatch(&mut dev, cmd);
+    drop(dev);
+    if let Ok(mut s) = slot.stats.lock() {
+        let now = Instant::now();
+        s.record_command(cmd.op, now);
+        // Capture the commanded state alongside the
+        // last-command stamp. We record what the CLIENT
+        // requested (not what the device ultimately applied)
+        // because: (a) the dispatch layer already logs device
+        // failures at warn!, (b) if a SetCenterFreq request is
+        // rejected by the device, the client will re-request,
+        // and (c) showing the client's view helps debug
+        // client-side bugs ("why is GQRX stuck on 145 MHz?").
+        match cmd.op {
+            CommandOp::SetCenterFreq => s.current_freq_hz = Some(cmd.param),
+            CommandOp::SetSampleRate => s.current_sample_rate_hz = Some(cmd.param),
+            CommandOp::SetTunerGain => {
+                #[allow(
+                    clippy::cast_possible_wrap,
+                    reason = "gain param is signed tenths-of-dB on the wire, u32 is a raw-bits transport"
+                )]
+                let gain = cmd.param as i32;
+                s.current_gain_tenths_db = Some(gain);
+            }
+            CommandOp::SetGainMode => {
+                // Upstream: 0 = auto, nonzero = manual. Store
+                // the auto bool for the UI status-row renderer.
+                s.current_gain_auto = Some(cmd.param == 0);
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 enum ReadResult {

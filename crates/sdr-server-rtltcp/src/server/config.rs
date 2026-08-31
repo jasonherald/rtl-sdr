@@ -16,7 +16,7 @@ use librtlsdr_rs::RtlSdrDevice;
 use crate::broadcaster::ClientRegistry;
 use crate::error::ServerError;
 
-use super::accept::spawn_accept_thread;
+use super::accept::{ClientSetupDeps, spawn_accept_thread};
 use super::broadcast::spawn_broadcaster_thread;
 use super::{
     DEFAULT_BUFFER_CAPACITY, DEFAULT_CENTER_FREQ_HZ, DEFAULT_LISTENER_CAP, DEFAULT_SAMPLE_RATE_HZ,
@@ -270,39 +270,8 @@ impl Server {
         // round 2 on PR #405.
         validate_auth_key_length(config.auth_key.as_deref())?;
 
-        // Bind first — surface port-in-use before touching the USB device
-        // so we don't leave a dongle claimed after a failed bind.
-        let listener = TcpListener::bind(config.bind).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AddrInUse {
-                ServerError::PortInUse(config.bind.to_string())
-            } else {
-                ServerError::Io(e)
-            }
-        })?;
-        // `config.bind` may request port 0 (OS-assigned); in that case
-        // the actual port is only known after bind completes. Read it
-        // back from the socket so `bind_address()` returns the real
-        // port the UI/logs can show.
-        let actual_bind = listener.local_addr().map_err(ServerError::Io)?;
-
-        let device_count = librtlsdr_rs::get_device_count();
-        if device_count == 0 {
-            return Err(ServerError::NoDevice);
-        }
-        if config.device_index >= device_count {
-            return Err(ServerError::BadDeviceIndex {
-                requested: config.device_index,
-                available: device_count,
-            });
-        }
-
-        let mut device = RtlSdrDevice::open(config.device_index)?;
-        apply_initial_state(&mut device, &config.initial)?;
-
-        let tuner = TunerAdvertiseInfo {
-            name: format!("{:?}", device.tuner_type()),
-            gain_count: device.tuner_gains().len() as u32,
-        };
+        let (listener, actual_bind) = bind_listener(config.bind)?;
+        let (device, tuner) = open_configured_device(&config)?;
         tracing::info!(
             bind = %actual_bind,
             tuner = %tuner.name,
@@ -340,32 +309,17 @@ impl Server {
         let broadcaster_thread =
             spawn_broadcaster_thread(dev_mutex.clone(), registry.clone(), shutdown.clone())?;
 
-        let accept_thread = match spawn_accept_thread(
-            listener,
-            dev_mutex,
-            registry.clone(),
-            shutdown.clone(),
-            stopped.clone(),
-            per_client_depth,
-            config.compression,
-            listener_cap.clone(),
-            auth_key.clone(),
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                // Accept-thread spawn failed AFTER the broadcaster
-                // was already running. Signal global shutdown so
-                // the broadcaster exits its USB read loop, join
-                // it so its `Arc<Mutex<RtlSdrDevice>>` clone
-                // drops, THEN surface the error. Without this the
-                // broadcaster would keep reading USB against a
-                // dongle the caller expects to be released. Per
-                // CodeRabbit round 1 on PR #402.
-                shutdown.store(true, Ordering::SeqCst);
-                let _ = broadcaster_thread.join();
-                return Err(ServerError::Io(e));
-            }
+        let deps = ClientSetupDeps {
+            device: dev_mutex,
+            registry: registry.clone(),
+            shutdown: shutdown.clone(),
+            per_client_buffer_depth: per_client_depth,
+            compression: config.compression,
+            listener_cap: listener_cap.clone(),
+            auth_key: auth_key.clone(),
         };
+        let (accept_thread, broadcaster_thread) =
+            spawn_accept_with_rollback(listener, stopped.clone(), deps, broadcaster_thread)?;
 
         Ok(Server {
             shutdown,
@@ -631,6 +585,83 @@ pub(super) fn validate_auth_key_length(key: Option<&[u8]>) -> Result<(), ServerE
         }
     }
     Ok(())
+}
+
+/// Spawn the accept thread, rolling the broadcaster back if the
+/// spawn fails: the accept-thread spawn happens AFTER the
+/// broadcaster is already running, so on failure we signal global
+/// shutdown so the broadcaster exits its USB read loop, join it so
+/// its `Arc<Mutex<RtlSdrDevice>>` clone drops, THEN surface the
+/// error. Without this the broadcaster would keep reading USB
+/// against a dongle the caller expects to be released. Per
+/// `CodeRabbit` round 1 on PR #402. Returns both handles (accept,
+/// broadcaster) so ownership round-trips to [`Server::start`].
+/// Split out per the 50-NLOC gate (Codacy round on PR #880); the
+/// shutdown flag rides in `deps.shutdown`.
+fn spawn_accept_with_rollback(
+    listener: TcpListener,
+    stopped: Arc<AtomicBool>,
+    deps: ClientSetupDeps,
+    broadcaster_thread: JoinHandle<()>,
+) -> Result<(JoinHandle<()>, JoinHandle<()>), ServerError> {
+    let shutdown = deps.shutdown.clone();
+    match spawn_accept_thread(listener, stopped, deps) {
+        Ok(h) => Ok((h, broadcaster_thread)),
+        Err(e) => {
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = broadcaster_thread.join();
+            Err(ServerError::Io(e))
+        }
+    }
+}
+
+/// Bind the listener and read back the actual bound address. Bind
+/// happens first in [`Server::start`] — surface port-in-use before
+/// touching the USB device so we don't leave a dongle claimed after
+/// a failed bind. `bind` may request port 0 (OS-assigned); in that
+/// case the actual port is only known after bind completes, so it's
+/// read back from the socket and `bind_address()` returns the real
+/// port the UI/logs can show. Split out of [`Server::start`] per
+/// the 50-NLOC gate (Codacy round on PR #880).
+fn bind_listener(bind: SocketAddr) -> Result<(TcpListener, SocketAddr), ServerError> {
+    let listener = TcpListener::bind(bind).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            ServerError::PortInUse(bind.to_string())
+        } else {
+            ServerError::Io(e)
+        }
+    })?;
+    let actual_bind = listener.local_addr().map_err(ServerError::Io)?;
+    Ok((listener, actual_bind))
+}
+
+/// Open the configured RTL-SDR (device-count + index checks first,
+/// for typed errors instead of a raw open failure), apply the
+/// user's initial device state, and capture the tuner metadata the
+/// server advertises over mDNS. Split out of [`Server::start`] per
+/// the 50-NLOC gate (Codacy round on PR #880).
+fn open_configured_device(
+    config: &ServerConfig,
+) -> Result<(RtlSdrDevice, TunerAdvertiseInfo), ServerError> {
+    let device_count = librtlsdr_rs::get_device_count();
+    if device_count == 0 {
+        return Err(ServerError::NoDevice);
+    }
+    if config.device_index >= device_count {
+        return Err(ServerError::BadDeviceIndex {
+            requested: config.device_index,
+            available: device_count,
+        });
+    }
+
+    let mut device = RtlSdrDevice::open(config.device_index)?;
+    apply_initial_state(&mut device, &config.initial)?;
+
+    let tuner = TunerAdvertiseInfo {
+        name: format!("{:?}", device.tuner_type()),
+        gain_count: device.tuner_gains().len() as u32,
+    };
+    Ok((device, tuner))
 }
 
 /// Apply the user's initial settings to the freshly-opened device.
