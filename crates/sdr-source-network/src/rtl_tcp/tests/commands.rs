@@ -580,28 +580,14 @@ fn restore_sticky_snapshot_populates_every_shared_slot() {
     let mut src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
     src.rtl_tcp_restore_sticky_snapshot(&snapshot);
 
-    let s = &src.shared;
-    assert_eq!(s.last_center_freq_hz.load(Ordering::Relaxed), 1);
-    assert_eq!(s.last_sample_rate_hz.load(Ordering::Relaxed), 2);
-    assert_eq!(s.last_gain_mode.load(Ordering::Relaxed), 3);
-    assert_eq!(s.last_tuner_gain.load(Ordering::Relaxed), 4);
-    assert_eq!(s.last_ppm.load(Ordering::Relaxed), 5);
-    assert_eq!(s.last_agc_mode.load(Ordering::Relaxed), 6);
-    assert_eq!(s.last_direct_sampling.load(Ordering::Relaxed), 7);
-    assert_eq!(s.last_offset_tuning.load(Ordering::Relaxed), 8);
-    assert_eq!(s.last_bias_tee.load(Ordering::Relaxed), 9);
-    assert_eq!(s.last_gain_by_index.load(Ordering::Relaxed), 10);
-    assert_eq!(s.last_testmode.load(Ordering::Relaxed), 11);
-    for (i, slot) in s.last_if_gain.iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation, reason = "6 stages, tiny values")]
-        {
-            assert_eq!(slot.load(Ordering::Relaxed), 100 + i as u32);
-        }
-    }
-    assert_eq!(s.if_gain_mask.load(Ordering::Relaxed), 0b111);
-    assert_eq!(s.last_rtl_xtal.load(Ordering::Relaxed), 12);
-    assert_eq!(s.last_tuner_xtal.load(Ordering::Relaxed), 13);
-    // Restored LAST in the production code so a partial restore can't
-    // replay fresh zeros — value must land regardless.
-    assert_eq!(s.replay_mask.load(Ordering::Relaxed), 0b1010);
+    // Round-trip through the capture side rather than asserting each
+    // atomic by hand: `rtl_tcp_sticky_snapshot` reads every shared
+    // slot BY FIELD NAME, so a swapped pair in the restore table
+    // still surfaces as a struct mismatch here — and the struct
+    // equality covers replay_mask, the per-stage IF-gain array, the
+    // gain mask, and both xtals in one assert.
+    let captured = src
+        .rtl_tcp_sticky_snapshot()
+        .expect("rtl_tcp sources always produce a sticky snapshot");
+    assert_eq!(captured, snapshot);
 }
