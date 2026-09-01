@@ -28,7 +28,9 @@ const BW_HANDLE_THRESHOLD_PX: f64 = 8.0;
 const DEFAULT_BANDWIDTH_HZ: f64 = 12_500.0;
 
 /// Minimum bandwidth the user can set, in Hz.
-const MIN_BANDWIDTH_HZ: f64 = 500.0;
+// `pub(super)` (not private) so `interaction.rs`'s drag-math tests
+// can assert against the same clamp floor the production code uses.
+pub(super) const MIN_BANDWIDTH_HZ: f64 = 500.0;
 
 /// Maximum bandwidth the user can set, in Hz.
 const MAX_BANDWIDTH_HZ: f64 = 250_000.0;
