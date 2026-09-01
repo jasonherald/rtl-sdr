@@ -174,8 +174,16 @@ impl SpectrumHandle {
 
     /// Update the display dB range for the FFT plot, waterfall, and signal history.
     pub fn set_db_range(&self, min_db: f32, max_db: f32) {
-        if min_db >= max_db {
-            tracing::trace!(min_db, max_db, "set_db_range: ignoring inverted range");
+        // Non-finite bounds must be rejected explicitly: `NaN >= x`
+        // is false, so a NaN would sail past the inverted-range
+        // check and hand the renderers an invalid coordinate range.
+        // Per `CodeRabbit` round 1 on PR #883.
+        if !min_db.is_finite() || !max_db.is_finite() || min_db >= max_db {
+            tracing::trace!(
+                min_db,
+                max_db,
+                "set_db_range: ignoring non-finite or inverted range"
+            );
             return;
         }
         self.min_db.set(min_db);

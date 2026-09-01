@@ -643,13 +643,10 @@ impl LrptImageRenderer {
         n_lines: usize,
         apid: Option<u16>,
     ) -> Result<(), ViewerError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
-                op: "create_dir_all",
-                path: parent.to_path_buf(),
-                source: e,
-            })?;
-        }
+        // Shared with the standalone writers in `export.rs` so the
+        // error `op` identifiers stay defined in one place. Per
+        // `CodeRabbit` round 1 on PR #883.
+        super::export::ensure_parent_dir(path)?;
 
         let export_surface =
             cairo::ImageSurface::create(cairo::Format::ARgb32, IMAGE_WIDTH as i32, n_lines as i32)
@@ -676,12 +673,7 @@ impl LrptImageRenderer {
         })?;
         drop(cr);
 
-        let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
-            op: "file create",
-            path: path.to_path_buf(),
-            source: e,
-        })?;
-        export_surface.write_to_png(&mut file)?;
+        super::export::save_surface_png(&export_surface, path)?;
         tracing::info!(?path, ?apid, lines = n_lines, "LRPT image exported to PNG",);
         Ok(())
     }

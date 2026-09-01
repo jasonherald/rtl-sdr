@@ -619,3 +619,33 @@ pub fn open_lrpt_viewer_if_needed(
         glib::Propagation::Proceed
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{COMPOSITE_CATALOG, DropdownEntry, desired_dropdown_entries, entries_match};
+
+    #[test]
+    fn desired_entries_are_apids_in_order_then_full_catalog() {
+        let desired = desired_dropdown_entries(&[68, 65]);
+        assert_eq!(desired.len(), 2 + COMPOSITE_CATALOG.len());
+        assert!(matches!(desired[0], DropdownEntry::Apid(68)));
+        assert!(matches!(desired[1], DropdownEntry::Apid(65)));
+        for (entry, recipe) in desired[2..].iter().zip(COMPOSITE_CATALOG.iter()) {
+            assert!(matches!(entry, DropdownEntry::Composite(r) if r == recipe));
+        }
+    }
+
+    #[test]
+    fn entries_match_rejects_length_and_variant_mismatches() {
+        let a = desired_dropdown_entries(&[68]);
+        let b = desired_dropdown_entries(&[68]);
+        assert!(entries_match(&a, &b));
+        // Different APID set → mismatch.
+        let c = desired_dropdown_entries(&[68, 65]);
+        assert!(!entries_match(&a, &c));
+        // Same length, different variant in slot 0 → mismatch.
+        let mut d = b.clone();
+        d[0] = DropdownEntry::Composite(COMPOSITE_CATALOG[0]);
+        assert!(!entries_match(&a, &d));
+    }
+}

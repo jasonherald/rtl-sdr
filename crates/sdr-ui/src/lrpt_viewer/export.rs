@@ -62,7 +62,7 @@ fn validated_png_dims(
 
 /// Create `path`'s parent directory if needed. Split out of the
 /// PNG writers per the 50-NLOC gate (#819).
-fn ensure_parent_dir(path: &Path) -> Result<(), ViewerError> {
+pub(super) fn ensure_parent_dir(path: &Path) -> Result<(), ViewerError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
             op: "create_dir_all",
@@ -75,7 +75,10 @@ fn ensure_parent_dir(path: &Path) -> Result<(), ViewerError> {
 
 /// Create the output file and encode `surface` into it as PNG.
 /// Split out of the PNG writers per the 50-NLOC gate (#819).
-fn save_surface_png(surface: &cairo::ImageSurface, path: &Path) -> Result<(), ViewerError> {
+pub(super) fn save_surface_png(
+    surface: &cairo::ImageSurface,
+    path: &Path,
+) -> Result<(), ViewerError> {
     let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
         op: "file create",
         path: path.to_path_buf(),
@@ -262,6 +265,26 @@ pub enum ExportSnapshot {
     },
 }
 
+/// `YYYY-MM-DD-HHMMSS-uuuuuu` local timestamp, or `"unknown"` when
+/// glib can't resolve the local clock. Shared by both export-path
+/// builders below so the manual (per-APID) and composite filename
+/// conventions can't drift apart — they must keep sorting together
+/// in `~/sdr-recordings`. The microsecond suffix prevents
+/// same-second overwrite collisions (per `CodeRabbit` round 13 on
+/// PR #543; deduplicated per CR round 1 on PR #883).
+fn export_timestamp() -> String {
+    glib::DateTime::now_local()
+        .as_ref()
+        .ok()
+        .and_then(|dt| {
+            let stamp = dt.format("%Y-%m-%d-%H%M%S").ok()?;
+            // glib's `microsecond()` is 0..=999_999, zero-padded
+            // to 6 digits keeps lexical-sort matching wall-clock.
+            Some(format!("{stamp}-{usec:06}", usec = dt.microsecond()))
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Default path the Export PNG button writes to:
 /// `~/sdr-recordings/lrpt-{apid}-YYYY-MM-DD-HHMMSS-uuuuuu.png`.
 ///
@@ -271,16 +294,7 @@ pub enum ExportSnapshot {
 /// overwrote the first via `File::create`'s truncate semantics.
 /// Per `CodeRabbit` round 13 on PR #543.
 pub(super) fn default_export_path(apid: Option<u16>) -> PathBuf {
-    let timestamp = glib::DateTime::now_local()
-        .as_ref()
-        .ok()
-        .and_then(|dt| {
-            let stamp = dt.format("%Y-%m-%d-%H%M%S").ok()?;
-            // glib's `microsecond()` is 0..=999_999, zero-padded
-            // to 6 digits keeps lexical-sort matching wall-clock.
-            Some(format!("{stamp}-{usec:06}", usec = dt.microsecond()))
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    let timestamp = export_timestamp();
     let apid_part = apid.map_or_else(|| "unknown".to_string(), |a| format!("apid{a}"));
     glib::home_dir()
         .join("sdr-recordings")
@@ -297,14 +311,7 @@ pub(super) fn default_export_path(apid: Option<u16>) -> PathBuf {
 /// paths share a disk-layout convention. Per CR round 2 on PR
 /// #575.
 pub(super) fn composite_export_path(recipe_name: &str) -> PathBuf {
-    let timestamp = glib::DateTime::now_local()
-        .as_ref()
-        .ok()
-        .and_then(|dt| {
-            let stamp = dt.format("%Y-%m-%d-%H%M%S").ok()?;
-            Some(format!("{stamp}-{usec:06}", usec = dt.microsecond()))
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    let timestamp = export_timestamp();
     let slug = recipe_name.replace(' ', "-").replace(['/', '\\'], "_");
     glib::home_dir()
         .join("sdr-recordings")

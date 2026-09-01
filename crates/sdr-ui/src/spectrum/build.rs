@@ -67,7 +67,7 @@ fn new_spectrum_shared() -> Rc<SpectrumShared> {
         vfo_offset_callback: Rc::new(RefCell::new(None)),
         locked_click_callback: Rc::new(RefCell::new(None)),
         full_bandwidth: Rc::new(Cell::new(0.0)),
-        center_freq: Rc::new(Cell::new(100_000_000.0)), // default 100 MHz
+        center_freq: Rc::new(Cell::new(super::DEFAULT_CENTER_FREQ_HZ)),
         scanner_axis_lock: Rc::new(RefCell::new(None)),
     })
 }

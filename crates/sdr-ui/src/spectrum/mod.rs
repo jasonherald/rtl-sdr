@@ -61,6 +61,11 @@ const FFT_PANE_FRACTION: f64 = 0.30;
 const DEFAULT_MIN_DB: f32 = -70.0;
 /// Default maximum display level in dB.
 const DEFAULT_MAX_DB: f32 = 0.0;
+/// Center frequency seeded into the frequency axis before the
+/// first real tune arrives — 100 MHz, matching upstream
+/// `rtl_tcp.c`'s `frequency = 100000000` default. Named per the
+/// magic-number convention (`CodeRabbit` round 1 on PR #883).
+const DEFAULT_CENTER_FREQ_HZ: f64 = 100_000_000.0;
 
 /// Margin (px) between the floating "Reset VFO" overlay button
 /// and the top-right edge of the spectrum area. 8 px is a visual

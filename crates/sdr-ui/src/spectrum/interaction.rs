@@ -402,3 +402,63 @@ pub(super) fn attach_scroll_gesture(
         target.add_controller(scroll);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::vfo_overlay::{BwHandle, MIN_BANDWIDTH_HZ, VfoState};
+    use super::apply_bw_handle_drag;
+
+    fn vfo() -> VfoState {
+        VfoState {
+            bandwidth_hz: 10_000.0,
+            offset_hz: 0.0,
+            ..VfoState::default()
+        }
+    }
+
+    #[test]
+    fn left_handle_drag_keeps_right_edge_fixed() {
+        // Dragging the left edge inward by +1 kHz: bandwidth shrinks
+        // by the delta, and the center shifts by half of it so the
+        // right edge (offset + bw/2 = +5 kHz) stays put.
+        let mut v = vfo();
+        apply_bw_handle_drag(&mut v, BwHandle::Left, 1_000.0, 10_000.0, 0.0);
+        assert!((v.bandwidth_hz - 9_000.0).abs() < 1e-9);
+        assert!((v.offset_hz - 500.0).abs() < 1e-9);
+        assert!((v.offset_hz + v.bandwidth_hz / 2.0 - 5_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn right_handle_drag_keeps_left_edge_fixed() {
+        // Dragging the right edge outward by +1 kHz: bandwidth grows
+        // by the delta, center shifts by half, left edge stays at
+        // −5 kHz.
+        let mut v = vfo();
+        apply_bw_handle_drag(&mut v, BwHandle::Right, 1_000.0, 10_000.0, 0.0);
+        assert!((v.bandwidth_hz - 11_000.0).abs() < 1e-9);
+        assert!((v.offset_hz - 500.0).abs() < 1e-9);
+        assert!((v.offset_hz - v.bandwidth_hz / 2.0 + 5_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn over_shrink_clamps_to_minimum_bandwidth() {
+        // A shrink that lands below the floor (but above zero) is
+        // clamped to MIN_BANDWIDTH_HZ, and the offset is recomputed
+        // from the CLAMPED width so the right edge stays fixed.
+        let mut v = vfo();
+        apply_bw_handle_drag(&mut v, BwHandle::Left, 9_800.0, 10_000.0, 0.0);
+        assert!((v.bandwidth_hz - MIN_BANDWIDTH_HZ).abs() < 1e-9);
+        assert!((v.offset_hz - (5_000.0 - MIN_BANDWIDTH_HZ / 2.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn drag_to_zero_or_negative_bandwidth_is_a_no_op() {
+        // A delta that would take the width to exactly zero (or
+        // negative) fails the `new_bw > 0.0` guard — the drag tick is
+        // ignored and the VFO keeps its pre-drag geometry.
+        let mut v = vfo();
+        apply_bw_handle_drag(&mut v, BwHandle::Left, 10_000.0, 10_000.0, 0.0);
+        assert!((v.bandwidth_hz - 10_000.0).abs() < 1e-9);
+        assert!((v.offset_hz).abs() < 1e-9);
+    }
+}
