@@ -97,6 +97,12 @@ const CONNECT_SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 /// initial-allocation policy in one place so they can't drift.
 const RECV_CHUNK_BYTES: usize = 64 * 1024;
 
+/// Zero point of `rtl_tcp`'s 8-bit unsigned-offset I/Q samples; also
+/// the scale factor that maps byte 0..=255 onto f32 in [-1, 1). One
+/// named value for both the offset and the divisor so the two can't
+/// drift apart. Per `CodeRabbit` round 1 on PR #882.
+pub(in crate::rtl_tcp) const IQ_U8_ZERO_OFFSET: f32 = 127.5;
+
 /// Upper-16-bit field of a `SetIfGain` param is the 1-based IF stage;
 /// the lower 16 bits carry the gain (tenths of dB). Mirrors the server's
 /// `dispatch.rs` and upstream rtl_tcp.c.

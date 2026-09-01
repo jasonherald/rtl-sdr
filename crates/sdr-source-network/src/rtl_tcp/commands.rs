@@ -321,8 +321,8 @@ impl Source for RtlTcpSource {
             let re_u = rx[i * 2];
             let im_u = rx[i * 2 + 1];
             output[i] = Complex::new(
-                (f32::from(re_u) - 127.5) / 127.5,
-                (f32::from(im_u) - 127.5) / 127.5,
+                (f32::from(re_u) - super::IQ_U8_ZERO_OFFSET) / super::IQ_U8_ZERO_OFFSET,
+                (f32::from(im_u) - super::IQ_U8_ZERO_OFFSET) / super::IQ_U8_ZERO_OFFSET,
             );
         }
         rx.drain(..take_bytes);

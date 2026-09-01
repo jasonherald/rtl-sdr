@@ -504,3 +504,104 @@ fn replay_bits_set_independently_per_op() {
     // No other bits should be set.
     assert_eq!(mask.count_ones(), 1);
 }
+
+#[test]
+fn send_command_write_failure_clears_sink_and_keeps_replay_state() {
+    // Codacy AI review on PR #882: the write-failure teardown in
+    // `send_command` (shutdown + sink clear so the pump's read half
+    // breaks out and the manager reconnects) was uncovered. Force a
+    // deterministic write failure with a real localhost socket that
+    // we shut down BEFORE handing it to the source: Rust's TcpStream
+    // writes with MSG_NOSIGNAL, so the write comes back BrokenPipe
+    // instead of raising SIGPIPE.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (_server_side, _) = listener.accept().unwrap();
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+
+    let src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+    *src.shared.command_sink.lock().unwrap() = Some(client);
+
+    let result = src.send_command(Command {
+        op: CommandOp::SetCenterFreq,
+        param: 144_390_000,
+    });
+
+    // Write failure is NOT surfaced to the caller — the command is
+    // parked in replay state and the session tears down for the
+    // manager to reconnect.
+    assert!(result.is_ok(), "write failure must not error the caller");
+    assert!(
+        src.shared.command_sink.lock().unwrap().is_none(),
+        "failed sink must be cleared so the manager reconnects"
+    );
+    // The command recorded BEFORE the write survives for replay.
+    assert_eq!(
+        src.shared.last_center_freq_hz.load(Ordering::Relaxed),
+        144_390_000
+    );
+    let mask = src.shared.replay_mask.load(Ordering::Relaxed);
+    assert_eq!(mask & 0x1, 0x1, "SetCenterFreq replay bit must be set");
+}
+
+#[test]
+fn restore_sticky_snapshot_populates_every_shared_slot() {
+    // Codacy AI review on PR #882: `rtl_tcp_restore_sticky_snapshot`
+    // was uncovered. Distinct value per field so a swapped pair in
+    // the restore table can't cancel out.
+    use sdr_pipeline::source_manager::{RTL_TCP_IF_GAIN_STAGES, RtlTcpStickySnapshot};
+
+    let mut if_gain = [0u32; RTL_TCP_IF_GAIN_STAGES];
+    for (i, slot) in if_gain.iter_mut().enumerate() {
+        #[allow(clippy::cast_possible_truncation, reason = "6 stages, tiny values")]
+        {
+            *slot = 100 + i as u32;
+        }
+    }
+    let snapshot = RtlTcpStickySnapshot {
+        replay_mask: 0b1010,
+        last_center_freq_hz: 1,
+        last_sample_rate_hz: 2,
+        last_gain_mode: 3,
+        last_tuner_gain: 4,
+        last_ppm: 5,
+        last_agc_mode: 6,
+        last_direct_sampling: 7,
+        last_offset_tuning: 8,
+        last_bias_tee: 9,
+        last_gain_by_index: 10,
+        last_testmode: 11,
+        last_if_gain: if_gain,
+        if_gain_mask: 0b111,
+        last_rtl_xtal: 12,
+        last_tuner_xtal: 13,
+    };
+
+    let mut src = RtlTcpSource::new("127.0.0.1", UNUSED_TEST_PORT);
+    src.rtl_tcp_restore_sticky_snapshot(&snapshot);
+
+    let s = &src.shared;
+    assert_eq!(s.last_center_freq_hz.load(Ordering::Relaxed), 1);
+    assert_eq!(s.last_sample_rate_hz.load(Ordering::Relaxed), 2);
+    assert_eq!(s.last_gain_mode.load(Ordering::Relaxed), 3);
+    assert_eq!(s.last_tuner_gain.load(Ordering::Relaxed), 4);
+    assert_eq!(s.last_ppm.load(Ordering::Relaxed), 5);
+    assert_eq!(s.last_agc_mode.load(Ordering::Relaxed), 6);
+    assert_eq!(s.last_direct_sampling.load(Ordering::Relaxed), 7);
+    assert_eq!(s.last_offset_tuning.load(Ordering::Relaxed), 8);
+    assert_eq!(s.last_bias_tee.load(Ordering::Relaxed), 9);
+    assert_eq!(s.last_gain_by_index.load(Ordering::Relaxed), 10);
+    assert_eq!(s.last_testmode.load(Ordering::Relaxed), 11);
+    for (i, slot) in s.last_if_gain.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation, reason = "6 stages, tiny values")]
+        {
+            assert_eq!(slot.load(Ordering::Relaxed), 100 + i as u32);
+        }
+    }
+    assert_eq!(s.if_gain_mask.load(Ordering::Relaxed), 0b111);
+    assert_eq!(s.last_rtl_xtal.load(Ordering::Relaxed), 12);
+    assert_eq!(s.last_tuner_xtal.load(Ordering::Relaxed), 13);
+    // Restored LAST in the production code so a partial restore can't
+    // replay fresh zeros — value must land regardless.
+    assert_eq!(s.replay_mask.load(Ordering::Relaxed), 0b1010);
+}
