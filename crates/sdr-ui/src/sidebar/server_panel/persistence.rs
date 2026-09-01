@@ -39,135 +39,167 @@ use super::{
 /// this signal-handler block; `clone()` is fine here because the
 /// panel's widgets are all held strongly by the sidebar (= window)
 /// lifetime anyway, and the notify handlers only fire on user
-/// action — no leak risk from a long-running timer.
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear sequence of 10 persistence bindings — splitting would just fragment a straightforward contract"
-)]
+pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<ConfigManager>) {
+    // ---- Phase 1: restore ----
+    config.read(|v| {
+        restore_connection_rows(panel, v);
+        restore_device_default_rows(panel, v);
+        restore_sharing_policy_rows(panel, v);
+    });
+
+    // ---- Phase 2: subscribe ----
+    subscribe_connection_rows(panel, config);
+    subscribe_device_default_rows(panel, config);
+    subscribe_device_frontend_rows(panel, config);
+    subscribe_sharing_policy_rows(panel, config);
+}
+
+/// Phase-1 restore for the connection rows (nickname / port / bind /
+/// advertise). Split out of [`connect_server_panel_persistence`] per
+/// the 50-NLOC gate (#819, PR #880 Codacy precedent).
 #[allow(
     clippy::cast_precision_loss,
     reason = "persisted numeric fields (port / freq Hz / ppm) fit well below f64's 52-bit mantissa; the spin rows clamp to u16/u32 ranges at the widget level"
 )]
-pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<ConfigManager>) {
-    // ---- Phase 1: restore ----
-    config.read(|v| {
-        if let Some(nickname) = v
-            .get(KEY_SERVER_NICKNAME)
-            .and_then(serde_json::Value::as_str)
-        {
-            panel.nickname_row.set_text(nickname);
-        }
-        if let Some(port) = v.get(KEY_SERVER_PORT).and_then(serde_json::Value::as_u64) {
-            let clamped = (port as f64).clamp(MIN_SERVER_PORT, MAX_SERVER_PORT);
-            panel.port_row.set_value(clamped);
-        }
-        if let Some(bind_idx) = v
-            .get(KEY_SERVER_BIND_IDX)
-            .and_then(serde_json::Value::as_u64)
-        {
-            // Accept only the legal indices; anything else falls
-            // back to loopback (safest default — never silently
-            // widens exposure).
-            let idx = u32::try_from(bind_idx).unwrap_or(BIND_LOOPBACK_IDX);
-            let legal = if idx == BIND_ALL_INTERFACES_IDX {
-                BIND_ALL_INTERFACES_IDX
-            } else {
-                BIND_LOOPBACK_IDX
-            };
-            panel.bind_row.set_selected(legal);
-        }
-        if let Some(advertise) = v
-            .get(KEY_SERVER_ADVERTISE)
-            .and_then(serde_json::Value::as_bool)
-        {
-            panel.advertise_row.set_active(advertise);
-        }
-        if let Some(freq) = v
-            .get(KEY_SERVER_DEFAULT_FREQ_HZ)
-            .and_then(serde_json::Value::as_u64)
-        {
-            let clamped = (freq as f64).clamp(MIN_CENTER_FREQ_HZ, MAX_CENTER_FREQ_HZ);
-            panel.center_freq_row.set_value(clamped);
-        }
-        if let Some(idx) = v
-            .get(KEY_SERVER_DEFAULT_SR_IDX)
-            .and_then(serde_json::Value::as_u64)
-            && let Ok(idx_u32) = u32::try_from(idx)
-            && idx_u32 < SAMPLE_RATE_COUNT
-        {
-            // Strict bounds check on the stored index: anything
-            // past the StringList's last entry is discarded (not
-            // silently clamped) so a corrupt config leaves the
-            // widget on its build-time default instead of flipping
-            // to an arbitrary rate. Same policy as `bind_row`.
-            panel.sample_rate_row.set_selected(idx_u32);
-        }
-        if let Some(gain) = v
-            .get(KEY_SERVER_DEFAULT_GAIN_DB)
-            .and_then(serde_json::Value::as_f64)
-        {
-            let clamped = gain.clamp(MIN_SERVER_GAIN_DB, MAX_SERVER_GAIN_DB);
-            panel.gain_row.set_value(clamped);
-        }
-        if let Some(ppm) = v
-            .get(KEY_SERVER_DEFAULT_PPM)
-            .and_then(serde_json::Value::as_i64)
-        {
-            let clamped = (ppm as f64).clamp(MIN_SERVER_PPM, MAX_SERVER_PPM);
-            panel.ppm_row.set_value(clamped);
-        }
-        if let Some(bias_tee) = v
-            .get(KEY_SERVER_DEFAULT_BIAS_TEE)
-            .and_then(serde_json::Value::as_bool)
-        {
-            panel.bias_tee_row.set_active(bias_tee);
-        }
-        if let Some(ds) = v
-            .get(KEY_SERVER_DEFAULT_DIRECT_SAMPLING)
-            .and_then(serde_json::Value::as_bool)
-        {
-            panel.direct_sampling_row.set_active(ds);
-        }
-        if let Some(idx) = v
-            .get(KEY_SERVER_COMPRESSION_IDX)
-            .and_then(serde_json::Value::as_u64)
-            && let Ok(idx_u32) = u32::try_from(idx)
-            && idx_u32 < COMPRESSION_COUNT
-        {
-            // Strict bounds check: unknown stored indices fall
-            // back to the widget's build-time default (`Off`) so
-            // a corrupt config can't silently enable compression.
-            panel.compression_row.set_selected(idx_u32);
-        }
-        if let Some(cap) = v
-            .get(KEY_SERVER_LISTENER_CAP)
-            .and_then(serde_json::Value::as_u64)
-        {
-            // Clamp to the UI's advertised range on restore. An
-            // out-of-range stored value would have been saved by
-            // some other client talking to the same config file
-            // (e.g. `sdr-rtl-tcp --listener-cap 999`); the widget
-            // still needs to be a valid spin-row value so pin it
-            // into [MIN_LISTENER_CAP, MAX_LISTENER_CAP]. Per #395.
-            let clamped = (cap as f64).clamp(MIN_LISTENER_CAP, MAX_LISTENER_CAP);
-            panel.listener_cap_row.set_value(clamped);
-        }
-        if let Some(require) = v
-            .get(KEY_SERVER_REQUIRE_AUTH)
-            .and_then(serde_json::Value::as_bool)
-        {
-            // Restore the "Require key" toggle state. The key
-            // itself lives in the OS keyring; window.rs loads /
-            // creates it on toggle-on. Just restore the bool
-            // here so the widget reflects the user's last
-            // choice; window.rs's connect-active handler
-            // kicks off the keyring/server wiring if it was on.
-            // Per #395.
-            panel.auth_require_row.set_active(require);
-        }
-    });
+fn restore_connection_rows(panel: &ServerPanel, v: &serde_json::Value) {
+    if let Some(nickname) = v
+        .get(KEY_SERVER_NICKNAME)
+        .and_then(serde_json::Value::as_str)
+    {
+        panel.nickname_row.set_text(nickname);
+    }
+    if let Some(port) = v.get(KEY_SERVER_PORT).and_then(serde_json::Value::as_u64) {
+        let clamped = (port as f64).clamp(MIN_SERVER_PORT, MAX_SERVER_PORT);
+        panel.port_row.set_value(clamped);
+    }
+    if let Some(bind_idx) = v
+        .get(KEY_SERVER_BIND_IDX)
+        .and_then(serde_json::Value::as_u64)
+    {
+        // Accept only the legal indices; anything else falls
+        // back to loopback (safest default — never silently
+        // widens exposure).
+        let idx = u32::try_from(bind_idx).unwrap_or(BIND_LOOPBACK_IDX);
+        let legal = if idx == BIND_ALL_INTERFACES_IDX {
+            BIND_ALL_INTERFACES_IDX
+        } else {
+            BIND_LOOPBACK_IDX
+        };
+        panel.bind_row.set_selected(legal);
+    }
+    if let Some(advertise) = v
+        .get(KEY_SERVER_ADVERTISE)
+        .and_then(serde_json::Value::as_bool)
+    {
+        panel.advertise_row.set_active(advertise);
+    }
+}
 
-    // ---- Phase 2: subscribe ----
+/// Phase-1 restore for the device-defaults rows (freq / sample rate /
+/// gain / PPM / bias-T / direct sampling). Split out per the 50-NLOC
+/// gate (#819).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "persisted numeric fields (port / freq Hz / ppm) fit well below f64's 52-bit mantissa; the spin rows clamp to u16/u32 ranges at the widget level"
+)]
+fn restore_device_default_rows(panel: &ServerPanel, v: &serde_json::Value) {
+    if let Some(freq) = v
+        .get(KEY_SERVER_DEFAULT_FREQ_HZ)
+        .and_then(serde_json::Value::as_u64)
+    {
+        let clamped = (freq as f64).clamp(MIN_CENTER_FREQ_HZ, MAX_CENTER_FREQ_HZ);
+        panel.center_freq_row.set_value(clamped);
+    }
+    if let Some(idx) = v
+        .get(KEY_SERVER_DEFAULT_SR_IDX)
+        .and_then(serde_json::Value::as_u64)
+        && let Ok(idx_u32) = u32::try_from(idx)
+        && idx_u32 < SAMPLE_RATE_COUNT
+    {
+        // Strict bounds check on the stored index: anything
+        // past the StringList's last entry is discarded (not
+        // silently clamped) so a corrupt config leaves the
+        // widget on its build-time default instead of flipping
+        // to an arbitrary rate. Same policy as `bind_row`.
+        panel.sample_rate_row.set_selected(idx_u32);
+    }
+    if let Some(gain) = v
+        .get(KEY_SERVER_DEFAULT_GAIN_DB)
+        .and_then(serde_json::Value::as_f64)
+    {
+        let clamped = gain.clamp(MIN_SERVER_GAIN_DB, MAX_SERVER_GAIN_DB);
+        panel.gain_row.set_value(clamped);
+    }
+    if let Some(ppm) = v
+        .get(KEY_SERVER_DEFAULT_PPM)
+        .and_then(serde_json::Value::as_i64)
+    {
+        let clamped = (ppm as f64).clamp(MIN_SERVER_PPM, MAX_SERVER_PPM);
+        panel.ppm_row.set_value(clamped);
+    }
+    if let Some(bias_tee) = v
+        .get(KEY_SERVER_DEFAULT_BIAS_TEE)
+        .and_then(serde_json::Value::as_bool)
+    {
+        panel.bias_tee_row.set_active(bias_tee);
+    }
+    if let Some(ds) = v
+        .get(KEY_SERVER_DEFAULT_DIRECT_SAMPLING)
+        .and_then(serde_json::Value::as_bool)
+    {
+        panel.direct_sampling_row.set_active(ds);
+    }
+}
+
+/// Phase-1 restore for the sharing-policy rows (compression /
+/// listener cap / require-key). Split out per the 50-NLOC gate (#819).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "persisted numeric fields (port / freq Hz / ppm) fit well below f64's 52-bit mantissa; the spin rows clamp to u16/u32 ranges at the widget level"
+)]
+fn restore_sharing_policy_rows(panel: &ServerPanel, v: &serde_json::Value) {
+    if let Some(idx) = v
+        .get(KEY_SERVER_COMPRESSION_IDX)
+        .and_then(serde_json::Value::as_u64)
+        && let Ok(idx_u32) = u32::try_from(idx)
+        && idx_u32 < COMPRESSION_COUNT
+    {
+        // Strict bounds check: unknown stored indices fall
+        // back to the widget's build-time default (`Off`) so
+        // a corrupt config can't silently enable compression.
+        panel.compression_row.set_selected(idx_u32);
+    }
+    if let Some(cap) = v
+        .get(KEY_SERVER_LISTENER_CAP)
+        .and_then(serde_json::Value::as_u64)
+    {
+        // Clamp to the UI's advertised range on restore. An
+        // out-of-range stored value would have been saved by
+        // some other client talking to the same config file
+        // (e.g. `sdr-rtl-tcp --listener-cap 999`); the widget
+        // still needs to be a valid spin-row value so pin it
+        // into [MIN_LISTENER_CAP, MAX_LISTENER_CAP]. Per #395.
+        let clamped = (cap as f64).clamp(MIN_LISTENER_CAP, MAX_LISTENER_CAP);
+        panel.listener_cap_row.set_value(clamped);
+    }
+    if let Some(require) = v
+        .get(KEY_SERVER_REQUIRE_AUTH)
+        .and_then(serde_json::Value::as_bool)
+    {
+        // Restore the "Require key" toggle state. The key
+        // itself lives in the OS keyring; window.rs loads /
+        // creates it on toggle-on. Just restore the bool
+        // here so the widget reflects the user's last
+        // choice; window.rs's connect-active handler
+        // kicks off the keyring/server wiring if it was on.
+        // Per #395.
+        panel.auth_require_row.set_active(require);
+    }
+}
+
+/// Phase-2 subscribe for the connection rows. Split out per the
+/// 50-NLOC gate (#819).
+fn subscribe_connection_rows(panel: &ServerPanel, config: &Arc<ConfigManager>) {
     // Nickname: AdwEntryRow fires `connect_changed` on every edit.
     let cfg_nick = Arc::clone(config);
     panel.nickname_row.connect_changed(move |row| {
@@ -212,6 +244,11 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             v[KEY_SERVER_ADVERTISE] = serde_json::json!(row.is_active());
         });
     });
+}
+
+/// Phase-2 subscribe for the device-defaults rows. Split out per the
+/// 50-NLOC gate (#819).
+fn subscribe_device_default_rows(panel: &ServerPanel, config: &Arc<ConfigManager>) {
     // Center frequency spin row (device default).
     let cfg_freq = Arc::clone(config);
     panel.center_freq_row.connect_value_notify(move |row| {
@@ -256,6 +293,12 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             v[KEY_SERVER_DEFAULT_PPM] = serde_json::json!(ppm);
         });
     });
+}
+
+/// Phase-2 subscribe for the bias-T / direct-sampling frontend
+/// switches. Split out of the device-defaults subscriber per the
+/// 50-NLOC gate (#819).
+fn subscribe_device_frontend_rows(panel: &ServerPanel, config: &Arc<ConfigManager>) {
     // Bias-tee switch.
     let cfg_bt = Arc::clone(config);
     panel.bias_tee_row.connect_active_notify(move |row| {
@@ -270,6 +313,11 @@ pub fn connect_server_panel_persistence(panel: &ServerPanel, config: &Arc<Config
             v[KEY_SERVER_DEFAULT_DIRECT_SAMPLING] = serde_json::json!(row.is_active());
         });
     });
+}
+
+/// Phase-2 subscribe for the sharing-policy rows. Split out per the
+/// 50-NLOC gate (#819).
+fn subscribe_sharing_policy_rows(panel: &ServerPanel, config: &Arc<ConfigManager>) {
     // Compression codec combo. Same strict-gate policy as
     // `bind_row` / `sample_rate_row` — only persist in-range
     // indices so widget-model churn can't corrupt the stored value.

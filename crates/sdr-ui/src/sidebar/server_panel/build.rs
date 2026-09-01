@@ -148,7 +148,10 @@ struct DeviceDefaultsRows {
     direct_sampling_row: adw::SwitchRow,
 }
 
-fn build_device_defaults_rows() -> DeviceDefaultsRows {
+/// Center-frequency + sample-rate halves of the device-defaults
+/// expander. Split out of [`build_device_defaults_rows`] per the
+/// 50-NLOC gate (#819, PR #880 Codacy precedent).
+fn build_defaults_freq_rate_rows() -> (adw::SpinRow, adw::ComboRow) {
     let freq_adj = gtk4::Adjustment::new(
         DEFAULT_CENTER_FREQ_HZ,
         MIN_CENTER_FREQ_HZ,
@@ -184,6 +187,12 @@ fn build_device_defaults_rows() -> DeviceDefaultsRows {
         .model(&sample_rate_model)
         .selected(DEFAULT_SERVER_SAMPLE_RATE_INDEX)
         .build();
+
+    (center_freq_row, sample_rate_row)
+}
+
+fn build_device_defaults_rows() -> DeviceDefaultsRows {
+    let (center_freq_row, sample_rate_row) = build_defaults_freq_rate_rows();
 
     let gain_adj = gtk4::Adjustment::new(
         DEFAULT_SERVER_GAIN_DB,
@@ -234,22 +243,39 @@ fn build_device_defaults_rows() -> DeviceDefaultsRows {
     }
 }
 
-/// Build the server-panel widgets. Always visible — the Share
-/// activity icon in the left activity bar is the user's opt-in
-/// gesture, so the panel no longer hides itself based on hotplug
-/// state. When no dongle is plugged in the Start switch errors
-/// gracefully; the panel's presence under its dedicated icon is
-/// the right UX regardless of current dongle availability.
+/// Always-visible share-configuration rows (switch, nickname, port,
+/// bind, advertise, compression). Grouped per the
+/// [`DeviceDefaultsRows`] precedent so [`build_server_panel`] stays
+/// inside the 50-NLOC gate (#819, PR #880 Codacy precedent).
 #[allow(
-    clippy::too_many_lines,
-    reason = "widget-assembly function — splitting scatters one-time wire-up across many helpers with no readability win"
+    clippy::struct_field_names,
+    reason = "all fields are GTK *Row widgets — the shared suffix matches the rest of sidebar/ and reads clearly at call sites"
 )]
-pub fn build_server_panel() -> ServerPanel {
-    let widget = adw::PreferencesGroup::builder()
-        .title("Share over network")
-        .description("Expose this machine's RTL-SDR dongle to remote rtl_tcp clients")
-        .build();
+struct ShareConfigRows {
+    share_row: adw::SwitchRow,
+    nickname_row: adw::EntryRow,
+    port_row: adw::SpinRow,
+    bind_row: adw::ComboRow,
+    advertise_row: adw::SwitchRow,
+    compression_row: adw::ComboRow,
+}
 
+/// The #394/#395 auth-control widgets: master switch, key-display
+/// row, and its reveal / copy / regenerate suffix buttons. Grouped
+/// per the [`DeviceDefaultsRows`] precedent (50-NLOC gate, #819).
+#[allow(
+    clippy::struct_field_names,
+    reason = "the shared auth_ prefix mirrors the ServerPanel field names these map onto"
+)]
+struct AuthRows {
+    auth_require_row: adw::SwitchRow,
+    auth_key_row: adw::ActionRow,
+    auth_key_reveal_button: gtk4::Button,
+    auth_key_copy_button: gtk4::Button,
+    auth_key_regenerate_button: gtk4::Button,
+}
+
+fn build_share_config_rows() -> ShareConfigRows {
     let share_row = adw::SwitchRow::builder()
         .title("Share over network")
         .subtitle("Start the rtl_tcp server and advertise it on the LAN")
@@ -304,6 +330,18 @@ pub fn build_server_panel() -> ServerPanel {
         .selected(COMPRESSION_OFF_IDX)
         .build();
 
+    ShareConfigRows {
+        share_row,
+        nickname_row,
+        port_row,
+        bind_row,
+        advertise_row,
+        compression_row,
+    }
+}
+
+/// Listener-cap spin row (#395). Split out per the 50-NLOC gate (#819).
+fn build_listener_cap_row() -> adw::SpinRow {
     // Listener cap — per #395. Default pulled from the backend's
     // `DEFAULT_LISTENER_CAP` so a UI-backend drift would surface as
     // a test / build failure rather than a quiet divergence. The
@@ -325,7 +363,7 @@ pub fn build_server_panel() -> ServerPanel {
         LISTENER_CAP_PAGE,
         0.0,
     );
-    let listener_cap_row = adw::SpinRow::builder()
+    adw::SpinRow::builder()
         .title("Listener cap")
         .subtitle(
             "Max simultaneous Listen clients — 0 disables listeners, change applies on next client",
@@ -333,8 +371,10 @@ pub fn build_server_panel() -> ServerPanel {
         .adjustment(&listener_cap_adj)
         .numeric(true)
         .snap_to_ticks(true)
-        .build();
+        .build()
+}
 
+fn build_auth_rows() -> AuthRows {
     // Auth-key controls (#394/#395). Three widgets: master
     // "Require key" switch, a key-display row that only shows
     // when auth is on, and three suffix buttons for
@@ -394,97 +434,128 @@ pub fn build_server_panel() -> ServerPanel {
     auth_key_row.add_suffix(&auth_key_copy_button);
     auth_key_row.add_suffix(&auth_key_regenerate_button);
 
-    let device_defaults_row = adw::ExpanderRow::builder()
-        .title("Device defaults")
-        .subtitle("Applied when the server opens the dongle — clients override live")
-        .build();
-
-    let DeviceDefaultsRows {
-        center_freq_row,
-        sample_rate_row,
-        gain_row,
-        ppm_row,
-        bias_tee_row,
-        direct_sampling_row,
-    } = build_device_defaults_rows();
-
-    device_defaults_row.add_row(&center_freq_row);
-    device_defaults_row.add_row(&sample_rate_row);
-    device_defaults_row.add_row(&gain_row);
-    device_defaults_row.add_row(&ppm_row);
-    device_defaults_row.add_row(&bias_tee_row);
-    device_defaults_row.add_row(&direct_sampling_row);
-
-    let StatusRows {
-        expander: status_row,
-        client_row: status_client_row,
-        uptime_row: status_uptime_row,
-        data_rate_row: status_data_rate_row,
-        commanded_row: status_commanded_row,
-        stop_button: status_stop_button,
-    } = build_status_rows();
-
-    let (activity_log_row, activity_log_list) = build_activity_log_row();
-    let (clients_row, clients_list) = build_clients_row();
-
-    // Bandwidth advisory — hidden initially. Visibility is toggled
-    // on sample-rate changes via the wiring in window.rs, mirroring
-    // the source-panel path. Copy is intentionally identical to the
-    // source-panel version (shared consts) so users see the same
-    // warning wording no matter which side they're configuring.
-    let bandwidth_advisory_row = adw::ActionRow::builder()
-        .title(crate::sidebar::source_panel::HIGH_BANDWIDTH_ADVISORY_TITLE)
-        .subtitle(crate::sidebar::source_panel::HIGH_BANDWIDTH_ADVISORY_SUBTITLE)
-        .visible(false)
-        .build();
-    bandwidth_advisory_row.add_prefix(&gtk4::Image::from_icon_name("dialog-information-symbolic"));
-
-    widget.add(&share_row);
-    widget.add(&nickname_row);
-    widget.add(&port_row);
-    widget.add(&bind_row);
-    widget.add(&advertise_row);
-    widget.add(&compression_row);
-    widget.add(&listener_cap_row);
-    widget.add(&auth_require_row);
-    widget.add(&auth_key_row);
-    widget.add(&device_defaults_row);
-    widget.add(&status_row);
-    widget.add(&clients_row);
-    widget.add(&activity_log_row);
-    widget.add(&bandwidth_advisory_row);
-
-    ServerPanel {
-        widget,
-        share_row,
-        nickname_row,
-        port_row,
-        bind_row,
-        advertise_row,
-        compression_row,
-        listener_cap_row,
+    AuthRows {
         auth_require_row,
         auth_key_row,
         auth_key_reveal_button,
         auth_key_copy_button,
         auth_key_regenerate_button,
+    }
+}
+
+/// Build the server-panel widgets. Always visible — the Share
+/// activity icon in the left activity bar is the user's opt-in
+/// gesture, so the panel no longer hides itself based on hotplug
+/// state. When no dongle is plugged in the Start switch errors
+/// gracefully; the panel's presence under its dedicated icon is
+/// the right UX regardless of current dongle availability.
+pub fn build_server_panel() -> ServerPanel {
+    let widget = adw::PreferencesGroup::builder()
+        .title("Share over network")
+        .description("Expose this machine's RTL-SDR dongle to remote rtl_tcp clients")
+        .build();
+
+    let share = build_share_config_rows();
+    let auth = build_auth_rows();
+    let defaults = build_device_defaults_rows();
+    let device_defaults_row = build_defaults_expander(&defaults);
+    let status = build_status_rows();
+    let (activity_log_row, activity_log_list) = build_activity_log_row();
+    let (clients_row, clients_list) = build_clients_row();
+
+    // Field-by-field moves from the grouped builders straight into
+    // the flat `ServerPanel` handle `window.rs` consumes — no
+    // intermediate destructuring, so the function stays inside the
+    // 50-NLOC gate while the panel's public shape is unchanged.
+    let panel = ServerPanel {
+        widget,
+        share_row: share.share_row,
+        nickname_row: share.nickname_row,
+        port_row: share.port_row,
+        bind_row: share.bind_row,
+        advertise_row: share.advertise_row,
+        compression_row: share.compression_row,
+        listener_cap_row: build_listener_cap_row(),
+        auth_require_row: auth.auth_require_row,
+        auth_key_row: auth.auth_key_row,
+        auth_key_reveal_button: auth.auth_key_reveal_button,
+        auth_key_copy_button: auth.auth_key_copy_button,
+        auth_key_regenerate_button: auth.auth_key_regenerate_button,
         device_defaults_row,
-        center_freq_row,
-        sample_rate_row,
-        gain_row,
-        ppm_row,
-        bias_tee_row,
-        direct_sampling_row,
-        status_row,
-        status_client_row,
-        status_uptime_row,
-        status_data_rate_row,
-        status_commanded_row,
-        status_stop_button,
+        center_freq_row: defaults.center_freq_row,
+        sample_rate_row: defaults.sample_rate_row,
+        gain_row: defaults.gain_row,
+        ppm_row: defaults.ppm_row,
+        bias_tee_row: defaults.bias_tee_row,
+        direct_sampling_row: defaults.direct_sampling_row,
+        status_row: status.expander,
+        status_client_row: status.client_row,
+        status_uptime_row: status.uptime_row,
+        status_data_rate_row: status.data_rate_row,
+        status_commanded_row: status.commanded_row,
+        status_stop_button: status.stop_button,
         activity_log_row,
         activity_log_list,
         clients_row,
         clients_list,
-        bandwidth_advisory_row,
-    }
+        bandwidth_advisory_row: build_bandwidth_advisory_row(),
+    };
+    attach_server_rows(&panel);
+    panel
+}
+
+/// Pack every top-level row into the panel's `PreferencesGroup`, in
+/// display order. Runs after the [`ServerPanel`] literal is built so
+/// the add-sequence reads off the panel handle instead of fourteen
+/// positional parameters. Split out of [`build_server_panel`] per
+/// the 50-NLOC gate (#819, PR #880 Codacy precedent). Order is the
+/// user-visible row order.
+fn attach_server_rows(panel: &ServerPanel) {
+    let w = &panel.widget;
+    w.add(&panel.share_row);
+    w.add(&panel.nickname_row);
+    w.add(&panel.port_row);
+    w.add(&panel.bind_row);
+    w.add(&panel.advertise_row);
+    w.add(&panel.compression_row);
+    w.add(&panel.listener_cap_row);
+    w.add(&panel.auth_require_row);
+    w.add(&panel.auth_key_row);
+    w.add(&panel.device_defaults_row);
+    w.add(&panel.status_row);
+    w.add(&panel.clients_row);
+    w.add(&panel.activity_log_row);
+    w.add(&panel.bandwidth_advisory_row);
+}
+
+/// "Device defaults" expander with its six child rows attached.
+/// Split out of [`build_server_panel`] per the 50-NLOC gate (#819).
+fn build_defaults_expander(rows: &DeviceDefaultsRows) -> adw::ExpanderRow {
+    let expander = adw::ExpanderRow::builder()
+        .title("Device defaults")
+        .subtitle("Applied when the server opens the dongle — clients override live")
+        .build();
+    expander.add_row(&rows.center_freq_row);
+    expander.add_row(&rows.sample_rate_row);
+    expander.add_row(&rows.gain_row);
+    expander.add_row(&rows.ppm_row);
+    expander.add_row(&rows.bias_tee_row);
+    expander.add_row(&rows.direct_sampling_row);
+    expander
+}
+
+/// Bandwidth advisory — hidden initially. Visibility is toggled
+/// on sample-rate changes via the wiring in window.rs, mirroring
+/// the source-panel path. Copy is intentionally identical to the
+/// source-panel version (shared consts) so users see the same
+/// warning wording no matter which side they're configuring.
+/// Split out of [`build_server_panel`] per the 50-NLOC gate (#819).
+fn build_bandwidth_advisory_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(crate::sidebar::source_panel::HIGH_BANDWIDTH_ADVISORY_TITLE)
+        .subtitle(crate::sidebar::source_panel::HIGH_BANDWIDTH_ADVISORY_SUBTITLE)
+        .visible(false)
+        .build();
+    row.add_prefix(&gtk4::Image::from_icon_name("dialog-information-symbolic"));
+    row
 }
