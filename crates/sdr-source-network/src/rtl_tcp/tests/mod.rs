@@ -1,4 +1,28 @@
 use super::*;
+
+// ============================================================
+// Import-path adjustments for the #818 module split. Before the
+// split every name below reached the test files through the
+// `use super::*` glob against the monolithic `rtl_tcp.rs`; the
+// production items now live in the `commands` / `handshake` /
+// `manager` / `pump` submodules, and the std / crate imports
+// that used to sit at the old root are re-imported here. These
+// `use` declarations are visible to the child test modules via
+// their own `use super::*` globs, so the individual test files
+// stay untouched.
+// ============================================================
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+
+use sdr_pipeline::source_manager::Source;
+use sdr_server_rtltcp::codec::CodecMask;
+use sdr_server_rtltcp::extension::{EXTENSION_MAGIC, ServerExtension, Status};
+use sdr_server_rtltcp::protocol::{Command, CommandOp, DONGLE_INFO_LEN};
+use sdr_types::Complex;
+
+use super::handshake::connect_cancellable;
+use super::manager::backoff_delay;
+use super::pump::{append_with_cap_inner, append_with_cap_to_shared, end_session};
 // Tests build `ServerExtension` / `ClientHello` values with
 // explicit `version: PROTOCOL_VERSION`. Lib code itself
 // picks versions via `required_protocol_version` and no
