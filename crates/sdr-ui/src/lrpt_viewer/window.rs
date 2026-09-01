@@ -1,0 +1,576 @@
+//! Window chrome + action wiring for the LRPT viewer (issue
+//! #819): the non-modal viewer window with its channel/composite
+//! dropdown, Pause and Export PNG header buttons, the
+//! `app.lrpt-open` action (`Ctrl+Shift+L`), and the
+//! open-if-needed flow shared with the auto-record path. Split
+//! out of `lrpt_viewer.rs` per the file-size pass.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use gtk4::prelude::*;
+use gtk4::{gio, glib};
+use libadwaita as adw;
+use libadwaita::prelude::*;
+
+use sdr_lrpt::image::IMAGE_WIDTH;
+use sdr_radio::lrpt_image::LrptImage;
+
+use super::composite::{COMPOSITE_CATALOG, CompositeRecipe};
+use super::export::{
+    ExportSnapshot, composite_export_path, default_export_path, write_greyscale_png, write_rgb_png,
+};
+use super::view::LrptImageView;
+use super::{DROPDOWN_REFRESH_INTERVAL_MS, VIEWER_WINDOW_HEIGHT, VIEWER_WINDOW_WIDTH};
+use crate::messages::UiToDsp;
+use crate::viewer::{plain_toast, show_toast_in};
+
+// ─── Non-modal viewer window ───────────────────────────────────────────
+
+/// One row in the dropdown — either a single APID, or a
+/// composite recipe. Pulled out as a tagged enum (rather than
+/// the previous parallel `Vec<u16>`) so the
+/// `connect_selected_notify` handler can dispatch straight off
+/// the index without index-arithmetic against a "where do
+/// composites start" boundary that drifted any time the APID
+/// list changed. Per #547.
+#[derive(Clone, Copy, Debug)]
+enum DropdownEntry {
+    Apid(u16),
+    Composite(CompositeRecipe),
+}
+
+/// Build the dynamic channel-picker dropdown for the viewer
+/// header. APIDs aren't known at open time, so the dropdown
+/// starts dimmed-but-visible and a 1 Hz `glib` timer rebuilds
+/// its model whenever new APIDs appear in `view`. A parallel
+/// `Vec<DropdownEntry>` lets us decode the dropdown's numeric
+/// `selected` index back into either an APID or a composite
+/// recipe without parsing the display string.
+///
+/// The model is laid out as: per-APID entries first (sorted),
+/// then every recipe in [`COMPOSITE_CATALOG`] in catalog order.
+/// Composite rows are listed unconditionally even when the
+/// underlying APIDs aren't all present yet — picking one in
+/// that state shows a black canvas with a debug log, and the
+/// dropdown's drain tick re-issues `set_composite` on every
+/// poll so the image populates the moment the missing channel
+/// arrives. Per #547.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the refresh tick is one logical block — building the desired \
+              entries list, detecting changes, optionally rebuilding the \
+              composite cache, then syncing the dropdown's selected index. \
+              Splitting it would force the borrow-scoping comments and the \
+              re-entrance-safety invariants out of the body that depends on \
+              them"
+)]
+fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
+    // Seed with the static composite catalog so users can pick
+    // a composite from the moment the viewer opens — no waiting
+    // for the first 1 Hz refresh tick. APIDs prepend to this
+    // list as they're decoded (the tick rebuilds the model
+    // sorted-APIDs-first, then composites). Per CR round 6 on
+    // PR #575: previously the dropdown started empty + dimmed
+    // until the tick fired, which made the new composite rows
+    // invisible for up to a second every viewer open.
+    let seed_entries: Vec<DropdownEntry> = COMPOSITE_CATALOG
+        .iter()
+        .copied()
+        .map(DropdownEntry::Composite)
+        .collect();
+    let seed_labels: Vec<String> = seed_entries
+        .iter()
+        .map(|e| match e {
+            DropdownEntry::Apid(apid) => format!("APID {apid}"),
+            DropdownEntry::Composite(recipe) => format!("Composite — {}", recipe.name),
+        })
+        .collect();
+    let seed_label_refs: Vec<&str> = seed_labels.iter().map(String::as_str).collect();
+    let model = gtk4::StringList::new(&seed_label_refs);
+    let dropdown = gtk4::DropDown::builder()
+        .model(&model)
+        .tooltip_text("Which AVHRR channel (APID) or composite to display")
+        // Seeded with composites — user can pick before any
+        // APID arrives. Per CR round 6 on PR #575.
+        .sensitive(true)
+        .build();
+    dropdown.update_property(&[gtk4::accessible::Property::Label("LRPT channel selector")]);
+    // GTK4 `DropDown` defaults `selected` to `0` for a
+    // non-empty model, which would silently activate composite
+    // #0 the moment the dropdown is built (the
+    // `selected_notify` handler can't distinguish "user picked"
+    // from "GTK auto-selected at construction"). Pin it to
+    // `INVALID_LIST_POSITION` so the renderer's auto-select
+    // path (`push_line` on first APID line received) drives
+    // the initial selection instead — matching the pre-CR-6
+    // behavior where opening the viewer didn't activate
+    // anything until data flowed. Per CR round 6 on PR #575.
+    dropdown.set_selected(gtk4::INVALID_LIST_POSITION);
+    let dropdown_entries: Rc<RefCell<Vec<DropdownEntry>>> = Rc::new(RefCell::new(seed_entries));
+
+    // Selection → renderer. Per-APID picks route to
+    // `set_active_apid` and clear any active composite so the
+    // single-channel canvas paints; composite picks call
+    // `set_composite`, which builds the cached ARGB32 surface
+    // from the named source APIDs. Per #547.
+    {
+        let view = view.clone();
+        let dropdown_entries = Rc::clone(&dropdown_entries);
+        dropdown.connect_selected_notify(move |dd| {
+            let idx = dd.selected() as usize;
+            let entries = dropdown_entries.borrow();
+            let Some(&entry) = entries.get(idx) else {
+                return;
+            };
+            // Drop the borrow before any view mutation that
+            // might re-enter the dropdown handler (e.g. via
+            // a future `set_selected` call inside the view).
+            drop(entries);
+            match entry {
+                DropdownEntry::Apid(apid) => {
+                    view.clear_composite();
+                    let _ = view.set_active_apid(apid);
+                }
+                DropdownEntry::Composite(recipe) => {
+                    let _ = view.set_composite(recipe);
+                }
+            }
+        });
+    }
+
+    // Refresh tick — runs at 1 Hz (channel discovery is rare;
+    // a faster cadence would burn CPU on idle string compares).
+    // Register the source on the view so `LrptImageView::shutdown`
+    // can cancel it when the window closes; otherwise the closure's
+    // `view.clone()` would keep the view + ~51 MB-per-channel
+    // surfaces alive forever.
+    //
+    // The tick has three jobs:
+    //   1. Rebuild the entries list when the APID set changes
+    //      (composite rows are always appended; per-APID rows
+    //      are sorted).
+    //   2. Re-sync the dropdown's `selected` to whichever APID
+    //      the renderer thinks is active (or the first APID if
+    //      the renderer has no selection yet).
+    //   3. When composite mode is active, re-issue
+    //      `view.set_composite(recipe)` so newly-decoded lines
+    //      from the source APIDs land in the cached composite
+    //      surface. The user sees lines accrue at the same
+    //      cadence the dropdown refreshes (~1 Hz). Per #547.
+    //
+    // **Borrow scoping:** GTK4's `gtk4::DropDown::set_selected`
+    // emits `notify::selected` SYNCHRONOUSLY inside the setter,
+    // which means the `connect_selected_notify` handler above
+    // re-enters this same `dropdown_entries` `RefCell` to look
+    // up the entry for the new index. If we held a `borrow_mut()`
+    // across `set_selected(...)`, that re-entrance would panic
+    // with "already borrowed". Per `CodeRabbit` round 3 on PR
+    // #543. The borrows below are kept tight: an immutable
+    // `borrow()` for the equality compare, a fresh
+    // `borrow_mut()` for the `clone_from`, and zero borrows
+    // held during the `set_selected` calls.
+    let view_for_tick = view.clone();
+    let dropdown_clone = dropdown.clone();
+    let refresh_id = glib::timeout_add_local(
+        std::time::Duration::from_millis(u64::from(DROPDOWN_REFRESH_INTERVAL_MS)),
+        move || {
+            let mut current_apids = view_for_tick.known_apids();
+            current_apids.sort_unstable();
+
+            // Build the desired full entries list: per-APID
+            // entries first (sorted), then catalog composites.
+            let mut desired: Vec<DropdownEntry> = current_apids
+                .iter()
+                .copied()
+                .map(DropdownEntry::Apid)
+                .collect();
+            desired.extend(
+                COMPOSITE_CATALOG
+                    .iter()
+                    .copied()
+                    .map(DropdownEntry::Composite),
+            );
+
+            let entries_unchanged = {
+                let cur = dropdown_entries.borrow();
+                cur.len() == desired.len()
+                    && cur.iter().zip(desired.iter()).all(|(a, b)| match (a, b) {
+                        (DropdownEntry::Apid(x), DropdownEntry::Apid(y)) => x == y,
+                        (DropdownEntry::Composite(x), DropdownEntry::Composite(y)) => x == y,
+                        _ => false,
+                    })
+            };
+
+            // Rebuild the composite cache when composite mode is
+            // active so newly-decoded lines accrue in near-real-
+            // time. Skip the rebuild while the user has the viewer
+            // paused — `set_composite` always queues a redraw, and
+            // the pause contract says the canvas should freeze
+            // until Resume is clicked. The next non-paused tick
+            // catches up. Per #547 + CR round 1 on PR #575.
+            //
+            // Also skip when the source channels' min height
+            // hasn't advanced since the last build (e.g. LOS
+            // reached, decoder stalled, only a non-limiting
+            // channel grew). The composite truncates to
+            // `min(r, g, b)`, so a non-limiting channel growing
+            // produces byte-identical output — rebuilding then is
+            // pure waste (~3 memcpys + per-pixel interleave +
+            // queued redraw, every tick, forever). Per CR round 3
+            // on PR #575.
+            if let Some(recipe) = view_for_tick.active_composite()
+                && !view_for_tick.is_paused()
+            {
+                let current = view_for_tick.current_composite_min_height(recipe);
+                let cached = view_for_tick.cached_composite_min_height();
+                if current != cached {
+                    let _ = view_for_tick.set_composite(recipe);
+                }
+            }
+
+            // If the entries match AND the dropdown's selected
+            // entry still aligns with the renderer's active
+            // channel, there's nothing else to do this tick.
+            let active_apid = view_for_tick.active_apid();
+            let active_composite = view_for_tick.active_composite();
+            #[allow(clippy::cast_possible_truncation)]
+            let selected_entry = {
+                let entries = dropdown_entries.borrow();
+                entries.get(dropdown_clone.selected() as usize).copied()
+            };
+            let selected_aligned = match (selected_entry, active_composite, active_apid) {
+                (Some(DropdownEntry::Composite(s)), Some(a), _) => s == a,
+                (Some(DropdownEntry::Apid(s)), None, Some(a)) => s == a,
+                _ => false,
+            };
+            if entries_unchanged && selected_aligned {
+                return glib::ControlFlow::Continue;
+            }
+
+            if !entries_unchanged {
+                model.splice(0, model.n_items(), &[]);
+                for entry in &desired {
+                    match entry {
+                        DropdownEntry::Apid(apid) => model.append(&format!("APID {apid}")),
+                        DropdownEntry::Composite(recipe) => {
+                            model.append(&format!("Composite — {}", recipe.name));
+                        }
+                    }
+                }
+                dropdown_entries.borrow_mut().clone_from(&desired);
+            }
+            // Always sensitive — composite catalog entries are
+            // present even before any APID arrives. Picking one
+            // pre-decode logs and falls through to the
+            // background-painted canvas; the next refresh tick
+            // rebuilds once data shows up. Per #547.
+            dropdown_clone.set_sensitive(!desired.is_empty());
+
+            // Sync the selected index to the renderer's active
+            // state. Composite mode wins over per-APID active.
+            if let Some(recipe) = active_composite {
+                if let Some(pos) = desired.iter().position(|e| match e {
+                    DropdownEntry::Composite(r) => *r == recipe,
+                    DropdownEntry::Apid(_) => false,
+                }) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    dropdown_clone.set_selected(pos as u32);
+                }
+            } else if let Some(active) = active_apid {
+                if let Some(pos) = desired.iter().position(|e| match e {
+                    DropdownEntry::Apid(a) => *a == active,
+                    DropdownEntry::Composite(_) => false,
+                }) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    dropdown_clone.set_selected(pos as u32);
+                }
+            } else if !current_apids.is_empty() {
+                // No previous selection — pick the first APID
+                // (sorted) so the user sees something the moment
+                // data arrives. The `selected_notify` handler above
+                // will route the choice into the renderer.
+                dropdown_clone.set_selected(0);
+            }
+            glib::ControlFlow::Continue
+        },
+    );
+    view.register_source(refresh_id);
+
+    dropdown
+}
+
+/// Build the Pause / Resume toggle for the viewer header.
+/// Pull-out so [`open_lrpt_viewer_window`] stays under the
+/// 100-line clippy threshold.
+fn build_pause_button(view: &LrptImageView) -> gtk4::ToggleButton {
+    let btn = gtk4::ToggleButton::builder()
+        .icon_name("media-playback-pause-symbolic")
+        .tooltip_text("Pause / resume the live image update")
+        .build();
+    btn.update_property(&[gtk4::accessible::Property::Label(
+        "Pause or resume live image update",
+    )]);
+    let view = view.clone();
+    btn.connect_toggled(move |b| {
+        view.set_paused(b.is_active());
+    });
+    btn
+}
+
+/// Open the LRPT viewer in a non-modal transient window. The
+/// window holds a header bar with a channel dropdown,
+/// Pause / Resume, and Export PNG, plus the drawing-area
+/// canvas underneath.
+///
+/// Non-modal so the user can keep tuning, recording, or
+/// otherwise interacting with the main radio window while the
+/// LRPT image builds up alongside.
+pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
+    parent: &W,
+    title: &str,
+    image: LrptImage,
+) -> (LrptImageView, adw::Window) {
+    let view = LrptImageView::new(image);
+
+    let window = adw::Window::builder()
+        .title(title)
+        .default_width(VIEWER_WINDOW_WIDTH)
+        .default_height(VIEWER_WINDOW_HEIGHT)
+        .transient_for(parent)
+        .modal(false)
+        .build();
+    // Inherit the parent's GApplication so Wayland's
+    // `xdg_toplevel_set_app_id` carries `com.sdr.rs` and the
+    // WM can resolve our icon. See apt_viewer.rs for the full
+    // rationale.
+    window.set_application(parent.application().as_ref());
+
+    let header = adw::HeaderBar::new();
+
+    let channel_dropdown = build_channel_dropdown(&view);
+    header.pack_start(&channel_dropdown);
+
+    let pause_btn = build_pause_button(&view);
+    header.pack_start(&pause_btn);
+
+    // ── Export PNG ────────────────────────────────────────
+    let export_btn = gtk4::Button::builder()
+        .icon_name("document-save-symbolic")
+        // Wording covers both per-APID and composite exports — the
+        // button writes whatever the dropdown has selected
+        // (per-channel greyscale OR a false-colour composite). Per
+        // CR round 3 on PR #575.
+        .tooltip_text("Export the current LRPT image to PNG")
+        .build();
+    export_btn.update_property(&[gtk4::accessible::Property::Label(
+        "Export current LRPT image to PNG",
+    )]);
+    let export_view = view.clone();
+    let window_for_export = window.downgrade();
+    export_btn.connect_clicked(move |_| {
+        let Some(window_now) = window_for_export.upgrade() else {
+            return;
+        };
+        // Snapshot the viewer's current state on the GTK main
+        // thread (drains pending rows + clones either the per-
+        // channel Vec<u8> or the three composite source channels
+        // under a brief mutex hold), then off-main-thread does
+        // the heavy PNG encoding + filesystem I/O via
+        // `gio::spawn_blocking`. Same pattern the LOS
+        // `SaveLrptPass` handler uses; before this round, the
+        // manual Export PNG button froze the GTK main loop on
+        // any large channel because Cairo PNG encoding is
+        // O(width × n_lines) and not negligible at the
+        // ≤8192-line cap. Per `CodeRabbit` round 10 on PR #543.
+        //
+        // Composite-mode aware: `snapshot_for_export` returns an
+        // [`ExportSnapshot::Composite`] when the user has a
+        // composite recipe active so the manual Export PNG matches
+        // what's on screen. Per CR round 2 on PR #575 — before
+        // this, exporting while a composite was displayed wrote
+        // out the last greyscale APID's surface instead of the
+        // composite the user was looking at.
+        let Some(snapshot) = export_view.snapshot_for_export() else {
+            // Either nothing is selected, or the active channel /
+            // composite has no decoded rows yet. Surface as a
+            // clear toast rather than an opaque "no active
+            // channel" error.
+            show_toast_in(
+                &window_now,
+                adw::Toast::builder()
+                    .title("No LRPT image data to export yet")
+                    .build(),
+            );
+            return;
+        };
+        // Filename is derived AFTER the snapshot so the resolved
+        // APID (or composite recipe slug) lands in it. See
+        // `default_export_path` / `composite_export_path` for the
+        // disk-layout convention.
+        let path = match &snapshot {
+            ExportSnapshot::Channel { apid, .. } => default_export_path(Some(*apid)),
+            ExportSnapshot::Composite { recipe, .. } => composite_export_path(recipe.name),
+        };
+        let window_weak = window_now.downgrade();
+        glib::spawn_future_local(async move {
+            let path_for_msg = path.clone();
+            let result = gio::spawn_blocking(move || match snapshot {
+                ExportSnapshot::Channel { buffer, .. } => {
+                    write_greyscale_png(&path, &buffer.pixels, IMAGE_WIDTH, buffer.lines)
+                }
+                ExportSnapshot::Composite { snapshot, .. } => {
+                    let rgb = sdr_lrpt::image::assemble_rgb_composite(
+                        &snapshot.r_pixels,
+                        &snapshot.g_pixels,
+                        &snapshot.b_pixels,
+                        snapshot.height,
+                    );
+                    write_rgb_png(&path, &rgb, IMAGE_WIDTH, snapshot.height)
+                }
+            })
+            .await;
+            let toast = match result {
+                Ok(Ok(())) => plain_toast(&format!("Saved {}", path_for_msg.display())),
+                Ok(Err(e)) => plain_toast(&format!("PNG export failed: {e}")),
+                Err(e) => {
+                    // Worker thread panicked. `Box<dyn Any>`
+                    // doesn't implement Display — log via Debug,
+                    // surface a generic message.
+                    tracing::warn!("manual LRPT export worker panicked: {e:?}");
+                    adw::Toast::builder()
+                        .title("PNG export worker panicked")
+                        .build()
+                }
+            };
+            if let Some(window) = window_weak.upgrade() {
+                show_toast_in(&window, toast);
+            }
+        });
+    });
+    header.pack_end(&export_btn);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(view.drawing_area()));
+
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&toolbar));
+
+    window.set_content(Some(&toast_overlay));
+    window.present();
+
+    (view, window)
+}
+
+// ─── Live viewer action ────────────────────────────────────────────────
+
+/// Wire the `app.lrpt-open` action onto `app`. Activating it
+/// (via the app menu, the `Ctrl+Shift+L` accelerator, or future
+/// activity-bar entry) opens a non-modal LRPT viewer window
+/// and informs the DSP controller about the shared image
+/// handle so the LRPT decoder tap starts pushing scan lines
+/// into it. Closing the window clears the `AppState` slot
+/// (the GTK widget tree drops with the window) but leaves the
+/// DSP-side decoder + shared image attached so an in-flight
+/// auto-record pass keeps capturing — see the close-request
+/// comment in [`open_lrpt_viewer_if_needed`] and the
+/// module-level docs above for the lifecycle rationale.
+pub fn connect_lrpt_action(
+    app: &adw::Application,
+    parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,
+    state: &Rc<crate::state::AppState>,
+) {
+    let action = gio::SimpleAction::new("lrpt-open", None);
+    let parent_provider = Rc::clone(parent_provider);
+    let state_for_action = Rc::clone(state);
+    action.connect_activate(move |_, _| {
+        open_lrpt_viewer_if_needed(&parent_provider, &state_for_action);
+    });
+    app.add_action(&action);
+    app.set_accels_for_action("app.lrpt-open", &["<Ctrl><Shift>l"]);
+}
+
+/// Open the LRPT viewer window if it isn't already open.
+/// Registers the new view in `state.lrpt_viewer`, hands the
+/// shared image to the DSP thread, and wires `close-request`
+/// to cancel the view's `glib` timers + drop the `AppState` slot.
+/// The DSP capture (decoder + shared image) intentionally
+/// outlives the window — see the close-request body for why.
+///
+/// Pulled out of [`connect_lrpt_action`] so the auto-record
+/// path (Task 7.5) can fire the same open flow at AOS without
+/// going through the GIO action system. Mirrors the APT
+/// viewer's [`crate::apt_viewer::open_apt_viewer_if_needed`].
+pub fn open_lrpt_viewer_if_needed(
+    parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,
+    state: &Rc<crate::state::AppState>,
+) {
+    if state.lrpt_viewer.borrow().is_some() {
+        // Defensive re-attach: if a future code path ever
+        // detaches the DSP-side image (today nothing sends
+        // `ClearLrptImage`, but a future refactor might), the
+        // existing-viewer fast-path would silently leave the
+        // tap muted. Re-sending `SetLrptImage` is idempotent
+        // — the controller's handler no longer drops the
+        // decoder on attach (round 11 paired change), so
+        // mid-pass decoder state survives the round-trip. Per
+        // `CodeRabbit` round 11 on PR #543.
+        state.send_dsp(UiToDsp::SetLrptImage(state.lrpt_image.clone()));
+        // Raise the existing window so `Ctrl+Shift+L` actually
+        // surfaces a buried / minimised viewer instead of being
+        // a silent no-op. Weak-ref upgrade fails closed: if the
+        // window is gone but the AppState slot wasn't cleared
+        // yet (close-request race), we just skip — the slot
+        // will clear momentarily anyway. Per `CodeRabbit`
+        // round 13 on PR #543.
+        if let Some(window) = state
+            .lrpt_viewer_window
+            .borrow()
+            .as_ref()
+            .and_then(glib::WeakRef::upgrade)
+        {
+            window.present();
+        }
+        return;
+    }
+    let Some(parent) = parent_provider() else {
+        tracing::warn!("lrpt-open invoked with no main window available");
+        return;
+    };
+    let image = state.lrpt_image.clone();
+    let (view, window) = open_lrpt_viewer_window(&parent, "Meteor-M LRPT", image.clone());
+    *state.lrpt_viewer.borrow_mut() = Some(view);
+    *state.lrpt_viewer_window.borrow_mut() = Some(window.downgrade());
+    state.send_dsp(UiToDsp::SetLrptImage(image));
+
+    let state_for_close = Rc::clone(state);
+    window.connect_close_request(move |_| {
+        // Cancel the view's drain + dropdown-refresh timeouts
+        // BEFORE we drop the AppState slot; otherwise their
+        // closures' `Rc<view>` clones keep the view + ~51 MB-
+        // per-channel surfaces alive until the application
+        // exits. Per `CodeRabbit` round 1 on PR #543.
+        if let Some(view) = state_for_close.lrpt_viewer.borrow().as_ref() {
+            view.shutdown();
+        }
+        *state_for_close.lrpt_viewer.borrow_mut() = None;
+        *state_for_close.lrpt_viewer_window.borrow_mut() = None;
+        // Deliberately NOT sending `UiToDsp::ClearLrptImage`
+        // here — the DSP-side decoder + shared image stay
+        // attached so the DSP keeps decoding into the shared
+        // image regardless of viewer presence. Closing the
+        // viewer mid-pass used to drop all subsequent rows
+        // and break the LOS `SaveLrptPass` save (the recorder
+        // would post "no image saved" even though decoding
+        // was still feasible). Now the recorder reads the
+        // shared image directly at LOS, so viewer close is
+        // purely a UI teardown. The decoder remains gated by
+        // `current_mode == Lrpt` and the source-stop cleanup
+        // path, so closing the viewer in manual LRPT mode
+        // doesn't burn CPU forever — switching demod or
+        // stopping the source still tears it down. Per
+        // `CodeRabbit` round 7 on PR #543.
+        glib::Propagation::Proceed
+    });
+}
