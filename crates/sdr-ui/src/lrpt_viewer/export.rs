@@ -15,6 +15,76 @@ use crate::viewer::ViewerError;
 
 // ─── Standalone PNG writer ─────────────────────────────────────────────
 
+/// Shared up-front validation for the standalone PNG writers:
+/// dimensions must fit Cairo's `i32` API, the zero-size guard
+/// runs BEFORE buffer-shape validation (so a zero dimension
+/// reports the dedicated `ZeroSized` discriminant instead of
+/// masking as `InvalidBuffer` — per CR on PR #550), and the byte
+/// buffer must be exactly `width * height * bytes_per_pixel`
+/// long. `mul_dim` / `kind` / `suffix` thread through so every
+/// error message stays byte-identical to the pre-split writers.
+/// Split out of [`write_greyscale_png`] / [`write_rgb_png`] per
+/// the 50-NLOC gate (#819, PR #880 Codacy precedent).
+fn validated_png_dims(
+    buf_len: usize,
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+    mul_dim: &'static str,
+    kind: &str,
+    suffix: &str,
+) -> Result<(i32, i32), ViewerError> {
+    let width_i32 = i32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "width",
+        value: width,
+    })?;
+    let height_i32 = i32::try_from(height).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "height",
+        value: height,
+    })?;
+    if width == 0 || height == 0 {
+        return Err(ViewerError::ZeroSized);
+    }
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(bytes_per_pixel))
+        .ok_or(ViewerError::DimensionTooLarge {
+            dim: mul_dim,
+            value: usize::MAX,
+        })?;
+    if buf_len != expected {
+        return Err(ViewerError::InvalidBuffer(format!(
+            "{kind} PNG pixel buffer length {buf_len} doesn't match width*height{suffix} ({width}*{height}{suffix} = {expected})",
+        )));
+    }
+    Ok((width_i32, height_i32))
+}
+
+/// Create `path`'s parent directory if needed. Split out of the
+/// PNG writers per the 50-NLOC gate (#819).
+fn ensure_parent_dir(path: &Path) -> Result<(), ViewerError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
+            op: "create_dir_all",
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    Ok(())
+}
+
+/// Create the output file and encode `surface` into it as PNG.
+/// Split out of the PNG writers per the 50-NLOC gate (#819).
+fn save_surface_png(surface: &cairo::ImageSurface, path: &Path) -> Result<(), ViewerError> {
+    let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
+        op: "file create",
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    surface.write_to_png(&mut file)?;
+    Ok(())
+}
+
 /// Write a tightly-sized PNG of greyscale `pixels` (one byte per
 /// pixel, row-major, length `width * height`) to `path`.
 ///
@@ -52,44 +122,16 @@ pub fn write_greyscale_png(
     // `#[allow(cast_possible_wrap)]` would have hidden the
     // wrap, not prevented it. Per `CodeRabbit` round 9 on PR
     // #543.
-    let width_i32 = i32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "width",
-        value: width,
-    })?;
-    let height_i32 = i32::try_from(height).map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "height",
-        value: height,
-    })?;
-    // Zero-size guard runs BEFORE buffer-shape validation so a
-    // call like `write_greyscale_png(path, &[1], 0, 1)` reports
-    // the dedicated `ZeroSized` discriminant rather than masking
-    // it as a generic `InvalidBuffer`. Callers (and the user-
-    // facing toast) match on these distinctly. Per CR on PR #550.
-    if width == 0 || height == 0 {
-        return Err(ViewerError::ZeroSized);
-    }
-    let expected = width
-        .checked_mul(height)
-        .ok_or(ViewerError::DimensionTooLarge {
-            dim: "width × height",
-            value: usize::MAX,
-        })?;
-    if pixels.len() != expected {
-        return Err(ViewerError::InvalidBuffer(format!(
-            "greyscale PNG pixel buffer length {} doesn't match width*height ({}*{} = {})",
-            pixels.len(),
-            width,
-            height,
-            expected,
-        )));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
-            op: "create_dir_all",
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-    }
+    let (width_i32, height_i32) = validated_png_dims(
+        pixels.len(),
+        width,
+        height,
+        1,
+        "width × height",
+        "greyscale",
+        "",
+    )?;
+    ensure_parent_dir(path)?;
 
     let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width_i32, height_i32)
         .map_err(|e| ViewerError::Cairo {
@@ -112,13 +154,7 @@ pub fn write_greyscale_png(
             }
         }
     }
-    let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
-        op: "file create",
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    surface.write_to_png(&mut file)?;
-    Ok(())
+    save_surface_png(&surface, path)
 }
 
 /// Write a tightly-sized PNG of interleaved RGB `pixels` (3 bytes
@@ -153,45 +189,16 @@ pub fn write_rgb_png(
     // defensive try_from keeps `write_rgb_png` honest as a `pub`
     // library function — same rationale as the greyscale
     // writer's round-9 fix on PR #543.
-    let width_i32 = i32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "width",
-        value: width,
-    })?;
-    let height_i32 = i32::try_from(height).map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "height",
-        value: height,
-    })?;
-    // Zero-size guard runs BEFORE buffer-shape validation so a
-    // call with zero dimensions reports `ZeroSized` rather than
-    // masking it as a generic `InvalidBuffer` length-mismatch —
-    // same ordering as `write_greyscale_png` (per CR on PR
-    // #550).
-    if width == 0 || height == 0 {
-        return Err(ViewerError::ZeroSized);
-    }
-    let expected = width
-        .checked_mul(height)
-        .and_then(|n| n.checked_mul(3))
-        .ok_or(ViewerError::DimensionTooLarge {
-            dim: "width × height × 3",
-            value: usize::MAX,
-        })?;
-    if pixels.len() != expected {
-        return Err(ViewerError::InvalidBuffer(format!(
-            "RGB PNG pixel buffer length {} doesn't match width*height*3 ({}*{}*3 = {})",
-            pixels.len(),
-            width,
-            height,
-            expected,
-        )));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| ViewerError::Io {
-            op: "create_dir_all",
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-    }
+    let (width_i32, height_i32) = validated_png_dims(
+        pixels.len(),
+        width,
+        height,
+        3,
+        "width × height × 3",
+        "RGB",
+        "*3",
+    )?;
+    ensure_parent_dir(path)?;
 
     let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width_i32, height_i32)
         .map_err(|e| ViewerError::Cairo {
@@ -218,13 +225,7 @@ pub fn write_rgb_png(
             }
         }
     }
-    let mut file = std::fs::File::create(path).map_err(|e| ViewerError::Io {
-        op: "file create",
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    surface.write_to_png(&mut file)?;
-    Ok(())
+    save_surface_png(&surface, path)
 }
 
 /// Tagged snapshot returned by [`LrptImageView::snapshot_for_export`]

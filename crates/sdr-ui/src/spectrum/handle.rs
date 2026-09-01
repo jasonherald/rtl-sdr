@@ -125,42 +125,7 @@ impl SpectrumHandle {
         if let Some(s) = self.fft_state.borrow_mut().as_mut() {
             let mode = self.averaging_mode.get();
             let mut avg = self.avg_buffer.borrow_mut();
-
-            // Seed the averaging buffer from the first frame, or re-seed if
-            // the FFT size changed. This avoids mode-specific init values
-            // (e.g., MinHold needs high init, PeakHold needs low init) and
-            // prevents one-frame artifacts after mode switches.
-            if avg.len() != data.len() {
-                *avg = data.to_vec();
-            }
-
-            match mode {
-                AveragingMode::None => {
-                    s.current_data.resize(data.len(), 0.0);
-                    s.current_data.copy_from_slice(data);
-                }
-                AveragingMode::PeakHold => {
-                    for (i, &d) in data.iter().enumerate() {
-                        avg[i] = avg[i].max(d);
-                    }
-                    s.current_data.resize(avg.len(), 0.0);
-                    s.current_data.copy_from_slice(&avg);
-                }
-                AveragingMode::RunningAvg => {
-                    for (i, &d) in data.iter().enumerate() {
-                        avg[i] = AVERAGING_ALPHA.mul_add(d, (1.0 - AVERAGING_ALPHA) * avg[i]);
-                    }
-                    s.current_data.resize(avg.len(), 0.0);
-                    s.current_data.copy_from_slice(&avg);
-                }
-                AveragingMode::MinHold => {
-                    for (i, &d) in data.iter().enumerate() {
-                        avg[i] = avg[i].min(d);
-                    }
-                    s.current_data.resize(avg.len(), 0.0);
-                    s.current_data.copy_from_slice(&avg);
-                }
-            }
+            apply_averaging(mode, data, &mut avg, &mut s.current_data);
 
             // NOTE: no display-side fftshift here. The DSP pipeline
             // (`crates/sdr-pipeline/src/iq_frontend.rs::compute_fft`)
@@ -542,5 +507,52 @@ impl SpectrumHandle {
     /// Per issue #563.
     pub fn connect_locked_click_to_tune<F: Fn(f64) + 'static>(&self, f: F) {
         *self.locked_click_callback.borrow_mut() = Some(Box::new(f));
+    }
+}
+
+/// Apply the selected [`AveragingMode`] to an incoming FFT frame,
+/// updating the running `avg` buffer and writing the display data
+/// into `current_data`. The averaging buffer is seeded from the
+/// first frame (or re-seeded when the FFT size changes) — this
+/// avoids mode-specific init values (e.g., `MinHold` needs high
+/// init, `PeakHold` needs low init) and prevents one-frame
+/// artifacts after mode switches. Split out of
+/// [`SpectrumHandle::push_fft_data`] per the 50-NLOC gate (#819,
+/// PR #880 Codacy precedent).
+fn apply_averaging(
+    mode: AveragingMode,
+    data: &[f32],
+    avg: &mut Vec<f32>,
+    current_data: &mut Vec<f32>,
+) {
+    if avg.len() != data.len() {
+        *avg = data.to_vec();
+    }
+    match mode {
+        AveragingMode::None => {
+            current_data.resize(data.len(), 0.0);
+            current_data.copy_from_slice(data);
+        }
+        AveragingMode::PeakHold => {
+            for (i, &d) in data.iter().enumerate() {
+                avg[i] = avg[i].max(d);
+            }
+            current_data.resize(avg.len(), 0.0);
+            current_data.copy_from_slice(avg);
+        }
+        AveragingMode::RunningAvg => {
+            for (i, &d) in data.iter().enumerate() {
+                avg[i] = AVERAGING_ALPHA.mul_add(d, (1.0 - AVERAGING_ALPHA) * avg[i]);
+            }
+            current_data.resize(avg.len(), 0.0);
+            current_data.copy_from_slice(avg);
+        }
+        AveragingMode::MinHold => {
+            for (i, &d) in data.iter().enumerate() {
+                avg[i] = avg[i].min(d);
+            }
+            current_data.resize(avg.len(), 0.0);
+            current_data.copy_from_slice(avg);
+        }
     }
 }

@@ -316,30 +316,9 @@ impl LrptImageRenderer {
             // no matter how many times we retry.
             return PushOutcome::Capped;
         }
-        let stride = match usize::try_from(entry.surface.stride()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("LRPT renderer: invalid surface stride: {e}");
-                return PushOutcome::TransientFailure;
-            }
-        };
-        let row_offset = entry.n_lines * stride;
-        let mut data = match entry.surface.data() {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("LRPT renderer: surface data lock failed: {e}");
-                return PushOutcome::TransientFailure;
-            }
-        };
-        for (i, &g) in pixels.iter().enumerate() {
-            let pixel_offset = row_offset + i * BYTES_PER_PIXEL;
-            data[pixel_offset] = g;
-            data[pixel_offset + 1] = g;
-            data[pixel_offset + 2] = g;
-            data[pixel_offset + 3] = 0xFF;
+        if let Some(failure) = write_greyscale_row(entry, pixels) {
+            return failure;
         }
-        // `data` guard drops here, flushing the surface for cairo.
-        drop(data);
         entry.n_lines += 1;
         // First-ever push for any channel — auto-select it so
         // the user sees something the moment data starts
@@ -706,6 +685,41 @@ impl LrptImageRenderer {
         tracing::info!(?path, ?apid, lines = n_lines, "LRPT image exported to PNG",);
         Ok(())
     }
+}
+
+/// Write one greyscale scan line into `entry`'s ARGB32 surface at
+/// its current `n_lines` row. Returns `Some(TransientFailure)` on
+/// a stride-conversion or surface-data-lock failure (the caller
+/// leaves the row in the source for the next poll to retry) and
+/// `None` on success — the caller advances `n_lines`. Split out
+/// of [`LrptImageRenderer::push_line`] per the 50-NLOC gate
+/// (#819, PR #880 Codacy precedent).
+fn write_greyscale_row(entry: &mut ChannelSurface, pixels: &[u8]) -> Option<PushOutcome> {
+    let stride = match usize::try_from(entry.surface.stride()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("LRPT renderer: invalid surface stride: {e}");
+            return Some(PushOutcome::TransientFailure);
+        }
+    };
+    let row_offset = entry.n_lines * stride;
+    let mut data = match entry.surface.data() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("LRPT renderer: surface data lock failed: {e}");
+            return Some(PushOutcome::TransientFailure);
+        }
+    };
+    for (i, &g) in pixels.iter().enumerate() {
+        let pixel_offset = row_offset + i * BYTES_PER_PIXEL;
+        data[pixel_offset] = g;
+        data[pixel_offset + 1] = g;
+        data[pixel_offset + 2] = g;
+        data[pixel_offset + 3] = 0xFF;
+    }
+    // `data` guard drops here, flushing the surface for cairo.
+    drop(data);
+    None
 }
 
 /// Paint `surface` (an `IMAGE_WIDTH × n_lines` Cairo image

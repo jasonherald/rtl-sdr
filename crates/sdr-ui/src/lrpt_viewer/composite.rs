@@ -114,6 +114,76 @@ pub const COMPOSITE_CATALOG: &[CompositeRecipe] = &[
     },
 ];
 
+/// Shared dimension / buffer-shape validation for the composite
+/// surface builders: `width` / `height` must fit Cairo's `i32`
+/// API, and the byte buffer must be exactly
+/// `width * height * bytes_per_pixel` long. Returns the
+/// `(width, height)` pair as `i32` for the surface constructors.
+/// `mul_dim` / `kind` thread through so the error text stays
+/// byte-identical to the pre-split messages. Split out of
+/// [`build_argb32_from_rgb`] / [`build_argb32_surface_from_bgra`]
+/// per the 50-NLOC gate (#819, PR #880 Codacy precedent).
+fn validated_composite_dims(
+    buf_len: usize,
+    width: usize,
+    height: usize,
+    bytes_per_pixel: usize,
+    mul_dim: &'static str,
+    kind: &str,
+) -> Result<(i32, i32), ViewerError> {
+    let width_i32 = i32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "composite width",
+        value: width,
+    })?;
+    let height_i32 = i32::try_from(height).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "composite height",
+        value: height,
+    })?;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(bytes_per_pixel))
+        .ok_or(ViewerError::DimensionTooLarge {
+            dim: mul_dim,
+            value: usize::MAX,
+        })?;
+    if buf_len != expected {
+        return Err(ViewerError::InvalidBuffer(format!(
+            "composite {kind} buffer length {buf_len} doesn't match width*height*{bytes_per_pixel} ({width} * {height} * {bytes_per_pixel} = {expected})",
+        )));
+    }
+    Ok((width_i32, height_i32))
+}
+
+/// Cairo's required ARGB32 stride for `width`, paired with our
+/// packed `width * 4` stride, both as `i32`. The caller compares
+/// them to decide whether the worker's tightly-packed BGRA buffer
+/// can be handed to `create_for_data` verbatim or needs a padded
+/// re-pack. Split out of [`build_argb32_surface_from_bgra`] per
+/// the 50-NLOC gate (#819).
+fn argb32_stride_pair(width: usize) -> Result<(i32, i32), ViewerError> {
+    let cairo_width = u32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "composite width",
+        value: width,
+    })?;
+    let stride = cairo::Format::ARgb32
+        .stride_for_width(cairo_width)
+        .map_err(|e| ViewerError::Cairo {
+            op: "composite ARGB32 stride",
+            source: e,
+        })?;
+    let packed_stride = i32::try_from(width.checked_mul(BYTES_PER_PIXEL).ok_or(
+        ViewerError::DimensionTooLarge {
+            dim: "composite width × 4",
+            value: usize::MAX,
+        },
+    )?)
+    .map_err(|_| ViewerError::DimensionTooLarge {
+        dim: "composite packed stride",
+        value: width * BYTES_PER_PIXEL,
+    })?;
+    Ok((stride, packed_stride))
+}
+
 /// Build a Cairo `ARgb32` surface from an interleaved RGB byte
 /// buffer (3 bytes per pixel, row-major). Cairo's native ARGB32
 /// on little-endian hosts is laid out as B, G, R, A in memory;
@@ -139,27 +209,14 @@ pub(super) fn build_argb32_from_rgb(
     width: usize,
     height: usize,
 ) -> Result<cairo::ImageSurface, ViewerError> {
-    let width_i32 = i32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "composite width",
-        value: width,
-    })?;
-    let height_i32 = i32::try_from(height).map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "composite height",
-        value: height,
-    })?;
-    let expected = width
-        .checked_mul(height)
-        .and_then(|n| n.checked_mul(3))
-        .ok_or(ViewerError::DimensionTooLarge {
-            dim: "composite width × height × 3",
-            value: usize::MAX,
-        })?;
-    if rgb.len() != expected {
-        return Err(ViewerError::InvalidBuffer(format!(
-            "composite RGB buffer length {} doesn't match width*height*3 ({width} * {height} * 3 = {expected})",
-            rgb.len(),
-        )));
-    }
+    let (width_i32, height_i32) = validated_composite_dims(
+        rgb.len(),
+        width,
+        height,
+        3,
+        "composite width × height × 3",
+        "RGB",
+    )?;
     let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width_i32, height_i32)
         .map_err(|e| ViewerError::Cairo {
             op: "composite ARGB32 surface",
@@ -262,47 +319,15 @@ pub(super) fn build_argb32_surface_from_bgra(
     width: usize,
     height: usize,
 ) -> Result<cairo::ImageSurface, ViewerError> {
-    let width_i32 = i32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "composite width",
-        value: width,
-    })?;
-    let height_i32 = i32::try_from(height).map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "composite height",
-        value: height,
-    })?;
-    let expected = width
-        .checked_mul(height)
-        .and_then(|n| n.checked_mul(BYTES_PER_PIXEL))
-        .ok_or(ViewerError::DimensionTooLarge {
-            dim: "composite width × height × 4",
-            value: usize::MAX,
-        })?;
-    if bgra.len() != expected {
-        return Err(ViewerError::InvalidBuffer(format!(
-            "composite BGRA buffer length {} doesn't match width*height*4 ({width} * {height} * 4 = {expected})",
-            bgra.len(),
-        )));
-    }
-    let cairo_width = u32::try_from(width).map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "composite width",
-        value: width,
-    })?;
-    let stride = cairo::Format::ARgb32
-        .stride_for_width(cairo_width)
-        .map_err(|e| ViewerError::Cairo {
-            op: "composite ARGB32 stride",
-            source: e,
-        })?;
-    let packed_stride = i32::try_from(width.checked_mul(BYTES_PER_PIXEL).ok_or(
-        ViewerError::DimensionTooLarge {
-            dim: "composite width × 4",
-            value: usize::MAX,
-        },
-    )?)
-    .map_err(|_| ViewerError::DimensionTooLarge {
-        dim: "composite packed stride",
-        value: width * BYTES_PER_PIXEL,
-    })?;
+    let (width_i32, height_i32) = validated_composite_dims(
+        bgra.len(),
+        width,
+        height,
+        BYTES_PER_PIXEL,
+        "composite width × height × 4",
+        "BGRA",
+    )?;
+    let (stride, packed_stride) = argb32_stride_pair(width)?;
     // Common case (ARGB32 at any reasonable width): Cairo's
     // stride matches our packed layout — hand the buffer over
     // verbatim. Otherwise re-pack with the padding Cairo wants.

@@ -56,15 +56,6 @@ enum DropdownEntry {
 /// dropdown's drain tick re-issues `set_composite` on every
 /// poll so the image populates the moment the missing channel
 /// arrives. Per #547.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the refresh tick is one logical block — building the desired \
-              entries list, detecting changes, optionally rebuilding the \
-              composite cache, then syncing the dropdown's selected index. \
-              Splitting it would force the borrow-scoping comments and the \
-              re-entrance-safety invariants out of the body that depends on \
-              them"
-)]
 fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
     // Seed with the static composite catalog so users can pick
     // a composite from the moment the viewer opens — no waiting
@@ -79,13 +70,7 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
         .copied()
         .map(DropdownEntry::Composite)
         .collect();
-    let seed_labels: Vec<String> = seed_entries
-        .iter()
-        .map(|e| match e {
-            DropdownEntry::Apid(apid) => format!("APID {apid}"),
-            DropdownEntry::Composite(recipe) => format!("Composite — {}", recipe.name),
-        })
-        .collect();
+    let seed_labels: Vec<String> = seed_entries.iter().map(|e| entry_label(*e)).collect();
     let seed_label_refs: Vec<&str> = seed_labels.iter().map(String::as_str).collect();
     let model = gtk4::StringList::new(&seed_label_refs);
     let dropdown = gtk4::DropDown::builder()
@@ -144,160 +129,204 @@ fn build_channel_dropdown(view: &LrptImageView) -> gtk4::DropDown {
     // Register the source on the view so `LrptImageView::shutdown`
     // can cancel it when the window closes; otherwise the closure's
     // `view.clone()` would keep the view + ~51 MB-per-channel
-    // surfaces alive forever.
-    //
-    // The tick has three jobs:
-    //   1. Rebuild the entries list when the APID set changes
-    //      (composite rows are always appended; per-APID rows
-    //      are sorted).
-    //   2. Re-sync the dropdown's `selected` to whichever APID
-    //      the renderer thinks is active (or the first APID if
-    //      the renderer has no selection yet).
-    //   3. When composite mode is active, re-issue
-    //      `view.set_composite(recipe)` so newly-decoded lines
-    //      from the source APIDs land in the cached composite
-    //      surface. The user sees lines accrue at the same
-    //      cadence the dropdown refreshes (~1 Hz). Per #547.
-    //
-    // **Borrow scoping:** GTK4's `gtk4::DropDown::set_selected`
-    // emits `notify::selected` SYNCHRONOUSLY inside the setter,
-    // which means the `connect_selected_notify` handler above
-    // re-enters this same `dropdown_entries` `RefCell` to look
-    // up the entry for the new index. If we held a `borrow_mut()`
-    // across `set_selected(...)`, that re-entrance would panic
-    // with "already borrowed". Per `CodeRabbit` round 3 on PR
-    // #543. The borrows below are kept tight: an immutable
-    // `borrow()` for the equality compare, a fresh
-    // `borrow_mut()` for the `clone_from`, and zero borrows
-    // held during the `set_selected` calls.
+    // surfaces alive forever. The tick's three jobs and its
+    // RefCell borrow-scoping invariants are documented on
+    // [`dropdown_refresh_tick`] (split out per the 50-NLOC gate,
+    // #819).
     let view_for_tick = view.clone();
     let dropdown_clone = dropdown.clone();
     let refresh_id = glib::timeout_add_local(
         std::time::Duration::from_millis(u64::from(DROPDOWN_REFRESH_INTERVAL_MS)),
-        move || {
-            let mut current_apids = view_for_tick.known_apids();
-            current_apids.sort_unstable();
-
-            // Build the desired full entries list: per-APID
-            // entries first (sorted), then catalog composites.
-            let mut desired: Vec<DropdownEntry> = current_apids
-                .iter()
-                .copied()
-                .map(DropdownEntry::Apid)
-                .collect();
-            desired.extend(
-                COMPOSITE_CATALOG
-                    .iter()
-                    .copied()
-                    .map(DropdownEntry::Composite),
-            );
-
-            let entries_unchanged = {
-                let cur = dropdown_entries.borrow();
-                cur.len() == desired.len()
-                    && cur.iter().zip(desired.iter()).all(|(a, b)| match (a, b) {
-                        (DropdownEntry::Apid(x), DropdownEntry::Apid(y)) => x == y,
-                        (DropdownEntry::Composite(x), DropdownEntry::Composite(y)) => x == y,
-                        _ => false,
-                    })
-            };
-
-            // Rebuild the composite cache when composite mode is
-            // active so newly-decoded lines accrue in near-real-
-            // time. Skip the rebuild while the user has the viewer
-            // paused — `set_composite` always queues a redraw, and
-            // the pause contract says the canvas should freeze
-            // until Resume is clicked. The next non-paused tick
-            // catches up. Per #547 + CR round 1 on PR #575.
-            //
-            // Also skip when the source channels' min height
-            // hasn't advanced since the last build (e.g. LOS
-            // reached, decoder stalled, only a non-limiting
-            // channel grew). The composite truncates to
-            // `min(r, g, b)`, so a non-limiting channel growing
-            // produces byte-identical output — rebuilding then is
-            // pure waste (~3 memcpys + per-pixel interleave +
-            // queued redraw, every tick, forever). Per CR round 3
-            // on PR #575.
-            if let Some(recipe) = view_for_tick.active_composite()
-                && !view_for_tick.is_paused()
-            {
-                let current = view_for_tick.current_composite_min_height(recipe);
-                let cached = view_for_tick.cached_composite_min_height();
-                if current != cached {
-                    let _ = view_for_tick.set_composite(recipe);
-                }
-            }
-
-            // If the entries match AND the dropdown's selected
-            // entry still aligns with the renderer's active
-            // channel, there's nothing else to do this tick.
-            let active_apid = view_for_tick.active_apid();
-            let active_composite = view_for_tick.active_composite();
-            #[allow(clippy::cast_possible_truncation)]
-            let selected_entry = {
-                let entries = dropdown_entries.borrow();
-                entries.get(dropdown_clone.selected() as usize).copied()
-            };
-            let selected_aligned = match (selected_entry, active_composite, active_apid) {
-                (Some(DropdownEntry::Composite(s)), Some(a), _) => s == a,
-                (Some(DropdownEntry::Apid(s)), None, Some(a)) => s == a,
-                _ => false,
-            };
-            if entries_unchanged && selected_aligned {
-                return glib::ControlFlow::Continue;
-            }
-
-            if !entries_unchanged {
-                model.splice(0, model.n_items(), &[]);
-                for entry in &desired {
-                    match entry {
-                        DropdownEntry::Apid(apid) => model.append(&format!("APID {apid}")),
-                        DropdownEntry::Composite(recipe) => {
-                            model.append(&format!("Composite — {}", recipe.name));
-                        }
-                    }
-                }
-                dropdown_entries.borrow_mut().clone_from(&desired);
-            }
-            // Always sensitive — composite catalog entries are
-            // present even before any APID arrives. Picking one
-            // pre-decode logs and falls through to the
-            // background-painted canvas; the next refresh tick
-            // rebuilds once data shows up. Per #547.
-            dropdown_clone.set_sensitive(!desired.is_empty());
-
-            // Sync the selected index to the renderer's active
-            // state. Composite mode wins over per-APID active.
-            if let Some(recipe) = active_composite {
-                if let Some(pos) = desired.iter().position(|e| match e {
-                    DropdownEntry::Composite(r) => *r == recipe,
-                    DropdownEntry::Apid(_) => false,
-                }) {
-                    #[allow(clippy::cast_possible_truncation)]
-                    dropdown_clone.set_selected(pos as u32);
-                }
-            } else if let Some(active) = active_apid {
-                if let Some(pos) = desired.iter().position(|e| match e {
-                    DropdownEntry::Apid(a) => *a == active,
-                    DropdownEntry::Composite(_) => false,
-                }) {
-                    #[allow(clippy::cast_possible_truncation)]
-                    dropdown_clone.set_selected(pos as u32);
-                }
-            } else if !current_apids.is_empty() {
-                // No previous selection — pick the first APID
-                // (sorted) so the user sees something the moment
-                // data arrives. The `selected_notify` handler above
-                // will route the choice into the renderer.
-                dropdown_clone.set_selected(0);
-            }
-            glib::ControlFlow::Continue
-        },
+        move || dropdown_refresh_tick(&view_for_tick, &dropdown_clone, &model, &dropdown_entries),
     );
     view.register_source(refresh_id);
 
     dropdown
+}
+
+/// Display label for one dropdown entry. Shared between the seed
+/// list and the refresh tick's model rebuild so the two can't
+/// drift. Split out per the 50-NLOC gate (#819).
+fn entry_label(entry: DropdownEntry) -> String {
+    match entry {
+        DropdownEntry::Apid(apid) => format!("APID {apid}"),
+        DropdownEntry::Composite(recipe) => format!("Composite — {}", recipe.name),
+    }
+}
+
+/// One firing of the dropdown's 1 Hz refresh tick. The tick has
+/// three jobs (per #547):
+///   1. Rebuild the entries list when the APID set changes
+///      (composite rows are always appended; per-APID rows
+///      are sorted).
+///   2. Re-sync the dropdown's `selected` to whichever APID
+///      the renderer thinks is active (or the first APID if
+///      the renderer has no selection yet).
+///   3. When composite mode is active, re-issue
+///      `view.set_composite(recipe)` so newly-decoded lines
+///      from the source APIDs land in the cached composite
+///      surface at the same ~1 Hz cadence.
+///
+/// **Borrow scoping:** GTK4's `gtk4::DropDown::set_selected`
+/// emits `notify::selected` SYNCHRONOUSLY inside the setter,
+/// which means the `connect_selected_notify` handler re-enters
+/// the same `dropdown_entries` `RefCell` to look up the entry for
+/// the new index. If any helper held a `borrow_mut()` across
+/// `set_selected(...)`, that re-entrance would panic with
+/// "already borrowed". Per `CodeRabbit` round 3 on PR #543. The
+/// borrows are kept tight: an immutable `borrow()` for the
+/// equality compare, a fresh `borrow_mut()` for the
+/// `clone_from`, and zero borrows held during the
+/// `set_selected` calls (in [`sync_dropdown_selection`]).
+/// Split out of the tick closure per the 50-NLOC gate (#819).
+fn dropdown_refresh_tick(
+    view: &LrptImageView,
+    dropdown: &gtk4::DropDown,
+    model: &gtk4::StringList,
+    dropdown_entries: &Rc<RefCell<Vec<DropdownEntry>>>,
+) -> glib::ControlFlow {
+    let mut current_apids = view.known_apids();
+    current_apids.sort_unstable();
+    let desired = desired_dropdown_entries(&current_apids);
+
+    let entries_unchanged = {
+        let cur = dropdown_entries.borrow();
+        entries_match(&cur, &desired)
+    };
+
+    maybe_rebuild_composite(view);
+
+    // If the entries match AND the dropdown's selected entry
+    // still aligns with the renderer's active channel, there's
+    // nothing else to do this tick.
+    let active_apid = view.active_apid();
+    let active_composite = view.active_composite();
+    #[allow(clippy::cast_possible_truncation)]
+    let selected_entry = {
+        let entries = dropdown_entries.borrow();
+        entries.get(dropdown.selected() as usize).copied()
+    };
+    let selected_aligned = match (selected_entry, active_composite, active_apid) {
+        (Some(DropdownEntry::Composite(s)), Some(a), _) => s == a,
+        (Some(DropdownEntry::Apid(s)), None, Some(a)) => s == a,
+        _ => false,
+    };
+    if entries_unchanged && selected_aligned {
+        return glib::ControlFlow::Continue;
+    }
+
+    if !entries_unchanged {
+        model.splice(0, model.n_items(), &[]);
+        for entry in &desired {
+            model.append(&entry_label(*entry));
+        }
+        dropdown_entries.borrow_mut().clone_from(&desired);
+    }
+    // Always sensitive — composite catalog entries are present
+    // even before any APID arrives. Picking one pre-decode logs
+    // and falls through to the background-painted canvas; the
+    // next refresh tick rebuilds once data shows up. Per #547.
+    dropdown.set_sensitive(!desired.is_empty());
+
+    sync_dropdown_selection(
+        dropdown,
+        &desired,
+        active_composite,
+        active_apid,
+        &current_apids,
+    );
+    glib::ControlFlow::Continue
+}
+
+/// Element-wise equality between the dropdown's current entries
+/// and the tick's freshly-built desired list. Split out of
+/// [`dropdown_refresh_tick`] per the 50-NLOC gate (#819).
+fn entries_match(cur: &[DropdownEntry], desired: &[DropdownEntry]) -> bool {
+    cur.len() == desired.len()
+        && cur.iter().zip(desired.iter()).all(|(a, b)| match (a, b) {
+            (DropdownEntry::Apid(x), DropdownEntry::Apid(y)) => x == y,
+            (DropdownEntry::Composite(x), DropdownEntry::Composite(y)) => x == y,
+            _ => false,
+        })
+}
+
+/// The desired full entries list for the dropdown model: per-APID
+/// entries first (sorted by the caller), then every catalog
+/// composite in catalog order. Split out of
+/// [`dropdown_refresh_tick`] per the 50-NLOC gate (#819).
+fn desired_dropdown_entries(current_apids: &[u16]) -> Vec<DropdownEntry> {
+    let mut desired: Vec<DropdownEntry> = current_apids
+        .iter()
+        .copied()
+        .map(DropdownEntry::Apid)
+        .collect();
+    desired.extend(
+        COMPOSITE_CATALOG
+            .iter()
+            .copied()
+            .map(DropdownEntry::Composite),
+    );
+    desired
+}
+
+/// Composite-cache rebuild gate for the refresh tick. Rebuild
+/// when composite mode is active so newly-decoded lines accrue in
+/// near-real-time — but skip while the viewer is paused
+/// (`set_composite` always queues a redraw, and the pause
+/// contract says the canvas freezes until Resume; the next
+/// non-paused tick catches up — per #547 + CR round 1 on PR
+/// #575), and skip when the source channels' min height hasn't
+/// advanced since the last build (LOS reached, decoder stalled,
+/// only a non-limiting channel grew — the composite truncates to
+/// `min(r, g, b)`, so rebuilding then is pure waste; per CR
+/// round 3 on PR #575). Split out per the 50-NLOC gate (#819).
+fn maybe_rebuild_composite(view: &LrptImageView) {
+    if let Some(recipe) = view.active_composite()
+        && !view.is_paused()
+    {
+        let current = view.current_composite_min_height(recipe);
+        let cached = view.cached_composite_min_height();
+        if current != cached {
+            let _ = view.set_composite(recipe);
+        }
+    }
+}
+
+/// Sync the dropdown's selected index to the renderer's active
+/// state. Composite mode wins over per-APID active; with no
+/// active selection at all, the first (sorted) APID is picked so
+/// the user sees something the moment data arrives — the
+/// `selected_notify` handler routes that choice into the
+/// renderer. No `dropdown_entries` borrow is held here (the
+/// `set_selected` calls re-enter the selection handler
+/// synchronously — see [`dropdown_refresh_tick`]'s borrow-scoping
+/// note). Split out per the 50-NLOC gate (#819).
+fn sync_dropdown_selection(
+    dropdown: &gtk4::DropDown,
+    desired: &[DropdownEntry],
+    active_composite: Option<CompositeRecipe>,
+    active_apid: Option<u16>,
+    current_apids: &[u16],
+) {
+    if let Some(recipe) = active_composite {
+        if let Some(pos) = desired.iter().position(|e| match e {
+            DropdownEntry::Composite(r) => *r == recipe,
+            DropdownEntry::Apid(_) => false,
+        }) {
+            #[allow(clippy::cast_possible_truncation)]
+            dropdown.set_selected(pos as u32);
+        }
+    } else if let Some(active) = active_apid {
+        if let Some(pos) = desired.iter().position(|e| match e {
+            DropdownEntry::Apid(a) => *a == active,
+            DropdownEntry::Composite(_) => false,
+        }) {
+            #[allow(clippy::cast_possible_truncation)]
+            dropdown.set_selected(pos as u32);
+        }
+    } else if !current_apids.is_empty() {
+        dropdown.set_selected(0);
+    }
 }
 
 /// Build the Pause / Resume toggle for the viewer header.
@@ -354,7 +383,43 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
     let pause_btn = build_pause_button(&view);
     header.pack_start(&pause_btn);
 
-    // ── Export PNG ────────────────────────────────────────
+    let export_btn = build_export_button(&view, &window);
+    header.pack_end(&export_btn);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(view.drawing_area()));
+
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&toolbar));
+
+    window.set_content(Some(&toast_overlay));
+    window.present();
+
+    (view, window)
+}
+
+// ─── Live viewer action ────────────────────────────────────────────────
+
+/// Build the Export PNG header button. Snapshots the viewer's
+/// current state on the GTK main thread (drains pending rows +
+/// clones either the per-channel `Vec<u8>` or the three composite
+/// source channels under a brief mutex hold), then hands the
+/// heavy PNG encoding + filesystem I/O to
+/// [`spawn_export_worker`]'s `gio::spawn_blocking` — same pattern
+/// as the LOS `SaveLrptPass` handler; before this, the manual
+/// Export PNG button froze the GTK main loop on any large channel
+/// (Cairo PNG encoding is O(width × `n_lines`), not negligible at
+/// the ≤8192-line cap; per `CodeRabbit` round 10 on PR #543).
+///
+/// Composite-mode aware: `snapshot_for_export` returns an
+/// [`ExportSnapshot::Composite`] when the user has a composite
+/// recipe active so the manual Export PNG matches what's on
+/// screen (per CR round 2 on PR #575 — before that, exporting
+/// while a composite was displayed wrote out the last greyscale
+/// APID's surface instead). Split out of
+/// [`open_lrpt_viewer_window`] per the 50-NLOC gate (#819).
+fn build_export_button(view: &LrptImageView, window: &adw::Window) -> gtk4::Button {
     let export_btn = gtk4::Button::builder()
         .icon_name("document-save-symbolic")
         // Wording covers both per-APID and composite exports — the
@@ -372,25 +437,6 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
         let Some(window_now) = window_for_export.upgrade() else {
             return;
         };
-        // Snapshot the viewer's current state on the GTK main
-        // thread (drains pending rows + clones either the per-
-        // channel Vec<u8> or the three composite source channels
-        // under a brief mutex hold), then off-main-thread does
-        // the heavy PNG encoding + filesystem I/O via
-        // `gio::spawn_blocking`. Same pattern the LOS
-        // `SaveLrptPass` handler uses; before this round, the
-        // manual Export PNG button froze the GTK main loop on
-        // any large channel because Cairo PNG encoding is
-        // O(width × n_lines) and not negligible at the
-        // ≤8192-line cap. Per `CodeRabbit` round 10 on PR #543.
-        //
-        // Composite-mode aware: `snapshot_for_export` returns an
-        // [`ExportSnapshot::Composite`] when the user has a
-        // composite recipe active so the manual Export PNG matches
-        // what's on screen. Per CR round 2 on PR #575 — before
-        // this, exporting while a composite was displayed wrote
-        // out the last greyscale APID's surface instead of the
-        // composite the user was looking at.
         let Some(snapshot) = export_view.snapshot_for_export() else {
             // Either nothing is selected, or the active channel /
             // composite has no decoded rows yet. Surface as a
@@ -412,58 +458,57 @@ pub fn open_lrpt_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
             ExportSnapshot::Channel { apid, .. } => default_export_path(Some(*apid)),
             ExportSnapshot::Composite { recipe, .. } => composite_export_path(recipe.name),
         };
-        let window_weak = window_now.downgrade();
-        glib::spawn_future_local(async move {
-            let path_for_msg = path.clone();
-            let result = gio::spawn_blocking(move || match snapshot {
-                ExportSnapshot::Channel { buffer, .. } => {
-                    write_greyscale_png(&path, &buffer.pixels, IMAGE_WIDTH, buffer.lines)
-                }
-                ExportSnapshot::Composite { snapshot, .. } => {
-                    let rgb = sdr_lrpt::image::assemble_rgb_composite(
-                        &snapshot.r_pixels,
-                        &snapshot.g_pixels,
-                        &snapshot.b_pixels,
-                        snapshot.height,
-                    );
-                    write_rgb_png(&path, &rgb, IMAGE_WIDTH, snapshot.height)
-                }
-            })
-            .await;
-            let toast = match result {
-                Ok(Ok(())) => plain_toast(&format!("Saved {}", path_for_msg.display())),
-                Ok(Err(e)) => plain_toast(&format!("PNG export failed: {e}")),
-                Err(e) => {
-                    // Worker thread panicked. `Box<dyn Any>`
-                    // doesn't implement Display — log via Debug,
-                    // surface a generic message.
-                    tracing::warn!("manual LRPT export worker panicked: {e:?}");
-                    adw::Toast::builder()
-                        .title("PNG export worker panicked")
-                        .build()
-                }
-            };
-            if let Some(window) = window_weak.upgrade() {
-                show_toast_in(&window, toast);
-            }
-        });
+        spawn_export_worker(snapshot, path, window_now.downgrade());
     });
-    header.pack_end(&export_btn);
-
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(view.drawing_area()));
-
-    let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_child(Some(&toolbar));
-
-    window.set_content(Some(&toast_overlay));
-    window.present();
-
-    (view, window)
+    export_btn
 }
 
-// ─── Live viewer action ────────────────────────────────────────────────
+/// Off-main-thread half of the Export PNG button: write the
+/// snapshot to `path` inside `gio::spawn_blocking` (per-channel
+/// greyscale via [`write_greyscale_png`]; composite via
+/// `assemble_rgb_composite` + [`write_rgb_png`]) and toast the
+/// outcome back into the viewer window. Split out per the 50-NLOC
+/// gate (#819).
+fn spawn_export_worker(
+    snapshot: ExportSnapshot,
+    path: std::path::PathBuf,
+    window_weak: glib::WeakRef<adw::Window>,
+) {
+    glib::spawn_future_local(async move {
+        let path_for_msg = path.clone();
+        let result = gio::spawn_blocking(move || match snapshot {
+            ExportSnapshot::Channel { buffer, .. } => {
+                write_greyscale_png(&path, &buffer.pixels, IMAGE_WIDTH, buffer.lines)
+            }
+            ExportSnapshot::Composite { snapshot, .. } => {
+                let rgb = sdr_lrpt::image::assemble_rgb_composite(
+                    &snapshot.r_pixels,
+                    &snapshot.g_pixels,
+                    &snapshot.b_pixels,
+                    snapshot.height,
+                );
+                write_rgb_png(&path, &rgb, IMAGE_WIDTH, snapshot.height)
+            }
+        })
+        .await;
+        let toast = match result {
+            Ok(Ok(())) => plain_toast(&format!("Saved {}", path_for_msg.display())),
+            Ok(Err(e)) => plain_toast(&format!("PNG export failed: {e}")),
+            Err(e) => {
+                // Worker thread panicked. `Box<dyn Any>`
+                // doesn't implement Display — log via Debug,
+                // surface a generic message.
+                tracing::warn!("manual LRPT export worker panicked: {e:?}");
+                adw::Toast::builder()
+                    .title("PNG export worker panicked")
+                    .build()
+            }
+        };
+        if let Some(window) = window_weak.upgrade() {
+            show_toast_in(&window, toast);
+        }
+    });
+}
 
 /// Wire the `app.lrpt-open` action onto `app`. Activating it
 /// (via the app menu, the `Ctrl+Shift+L` accelerator, or future

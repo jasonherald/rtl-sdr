@@ -247,48 +247,14 @@ impl LrptImageView {
             // Cairo surface via `create_for_data`. Cheap (no
             // memcpy in the common stride case) — the heavy
             // per-pixel pack already ran on the worker.
-            let surface_result = match bytes_result {
-                Ok(bgra) => build_argb32_surface_from_bgra(bgra, IMAGE_WIDTH, target_height),
-                Err(panic) => {
-                    tracing::warn!(?recipe, "composite worker panicked: {panic:?}");
-                    let mut r = renderer.borrow_mut();
-                    if r.composite_gen() == captured_gen {
-                        r.mark_composite_pending(recipe);
-                    }
-                    return;
-                }
-            };
-            match surface_result {
-                Ok(surface) => {
-                    let installed = renderer.borrow_mut().install_composite_cache(
-                        recipe,
-                        captured_gen,
-                        target_height,
-                        surface,
-                    );
-                    if installed {
-                        drawing_area.queue_draw();
-                    } else {
-                        tracing::debug!(
-                            ?recipe,
-                            captured_gen,
-                            "stale composite worker — selection changed mid-flight, dropping built surface",
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(?recipe, error = %e, "composite ARGB32 surface build failed");
-                    // Reset the in-flight target so the next
-                    // 1 Hz tick retries — only if the user
-                    // hasn't moved on. Gate on generation match
-                    // to avoid clobbering a newer build that
-                    // started while ours was running.
-                    let mut r = renderer.borrow_mut();
-                    if r.composite_gen() == captured_gen {
-                        r.mark_composite_pending(recipe);
-                    }
-                }
-            }
+            finish_composite_build(
+                &renderer,
+                &drawing_area,
+                recipe,
+                captured_gen,
+                target_height,
+                bytes_result,
+            );
         });
         true
     }
@@ -359,80 +325,81 @@ impl LrptImageView {
         // its surface-data lock — neither operation is fast
         // enough to hold the assembler mutex across, since that
         // would stall the DSP-thread writer behind it. Per
-        // `CodeRabbit` round 12 on PR #543.
-        struct PendingChannel {
-            apid: u16,
-            already: usize,
-            /// Flat tail of the channel's pixel buffer — every
-            /// row from `already` to `min(channel.lines,
-            /// available_lines)` packed contiguously, ready for
-            /// `chunks_exact(IMAGE_WIDTH)` in phase 2. One heap
-            /// alloc per APID per drain instead of one per row;
-            /// matters on viewer reopen mid-pass when there can
-            /// be thousands of unseen rows for a single APID
-            /// and the per-row alloc would churn the allocator
-            /// at 4 Hz under the shared-image mutex. Per
-            /// `CodeRabbit` round 17 on PR #543.
-            pixels: Vec<u8>,
+        // `CodeRabbit` round 12 on PR #543. (Each phase is its
+        // own helper per the 50-NLOC gate, #819.)
+        let pending = self.collect_pending_channels();
+        let visible_dirty = self.push_pending_channels(pending);
+        if visible_dirty && !self.paused.get() {
+            self.drawing_area.queue_draw();
         }
+    }
 
-        // Phase 1 — under shared-image lock.
-        let pending: Vec<PendingChannel> = {
-            let last_seen = self.last_seen_lines.borrow();
-            let mut acc: Vec<PendingChannel> = Vec::new();
-            self.image.with_assembler(|a| {
-                for (&apid, channel) in a.channels() {
-                    let already = last_seen.get(&apid).copied().unwrap_or(0);
-                    if channel.lines <= already {
-                        continue;
-                    }
-                    // Defensive — see lrpt_decoder::harvest_new_lines
-                    // for the parallel guard. Structurally
-                    // unreachable; the warn protects against
-                    // a future refactor of the assembler buffer
-                    // that drops the "pixels grows by full-line
-                    // increments" invariant.
-                    let available_lines = channel.pixels.len() / IMAGE_WIDTH;
-                    if available_lines < channel.lines {
-                        tracing::warn!(
-                            "LRPT view: channel {apid} pixel buffer shorter than expected; truncating at line {available_lines} (claimed lines = {})",
-                            channel.lines,
-                        );
-                    }
-                    let end_line = channel.lines.min(available_lines);
-                    if end_line <= already {
-                        continue;
-                    }
-                    let start = already * IMAGE_WIDTH;
-                    let end = end_line * IMAGE_WIDTH;
-                    acc.push(PendingChannel {
-                        apid,
-                        already,
-                        pixels: channel.pixels[start..end].to_vec(),
-                    });
+    /// Phase 1 of [`Self::drain_new_lines`] — under the shared-
+    /// image lock: walk the assembler and copy each channel's
+    /// unseen rows into an owned [`PendingChannel`]. Split out
+    /// per the 50-NLOC gate (#819).
+    fn collect_pending_channels(&self) -> Vec<PendingChannel> {
+        let last_seen = self.last_seen_lines.borrow();
+        let mut acc: Vec<PendingChannel> = Vec::new();
+        self.image.with_assembler(|a| {
+            for (&apid, channel) in a.channels() {
+                let already = last_seen.get(&apid).copied().unwrap_or(0);
+                if channel.lines <= already {
+                    continue;
                 }
-            });
-            acc
-        };
+                // Defensive — see lrpt_decoder::harvest_new_lines
+                // for the parallel guard. Structurally
+                // unreachable; the warn protects against
+                // a future refactor of the assembler buffer
+                // that drops the "pixels grows by full-line
+                // increments" invariant.
+                let available_lines = channel.pixels.len() / IMAGE_WIDTH;
+                if available_lines < channel.lines {
+                    tracing::warn!(
+                        "LRPT view: channel {apid} pixel buffer shorter than expected; truncating at line {available_lines} (claimed lines = {})",
+                        channel.lines,
+                    );
+                }
+                let end_line = channel.lines.min(available_lines);
+                if end_line <= already {
+                    continue;
+                }
+                let start = already * IMAGE_WIDTH;
+                let end = end_line * IMAGE_WIDTH;
+                acc.push(PendingChannel {
+                    apid,
+                    already,
+                    pixels: channel.pixels[start..end].to_vec(),
+                });
+            }
+        });
+        acc
+    }
 
-        // Phase 2 — outside the shared-image lock.
-        //
-        // Only the renderer's currently-active APID is painted
-        // by `LrptImageRenderer::render`, so the redraw should
-        // fire ONLY when that channel got a row this tick.
-        // Hidden APIDs that just gained rows are off-screen —
-        // their data lands in the per-channel surface but isn't
-        // visible until the user picks them in the dropdown,
-        // and the dropdown's own selected_notify handler will
-        // queue a redraw when that happens. Per `CodeRabbit`
-        // round 16 on PR #543.
-        //
-        // The auto-select transition (active was None, first
-        // ever push promotes it to Some(apid)) is covered by
-        // the per-channel comparison below: after `push_line`
-        // the renderer's `active_apid()` matches `p.apid`, so
-        // the same `painted_any && active == Some(p.apid)` gate
-        // catches the auto-select case naturally.
+    /// Phase 2 of [`Self::drain_new_lines`] — outside the shared-
+    /// image lock: hand each pending channel's rows to the
+    /// renderer and advance the per-APID watermark. Returns
+    /// whether the currently-visible channel gained a row (the
+    /// caller's queue-redraw gate). Split out per the 50-NLOC
+    /// gate (#819).
+    ///
+    /// Only the renderer's currently-active APID is painted
+    /// by `LrptImageRenderer::render`, so the redraw should
+    /// fire ONLY when that channel got a row this tick.
+    /// Hidden APIDs that just gained rows are off-screen —
+    /// their data lands in the per-channel surface but isn't
+    /// visible until the user picks them in the dropdown,
+    /// and the dropdown's own `selected_notify` handler will
+    /// queue a redraw when that happens. Per `CodeRabbit`
+    /// round 16 on PR #543.
+    ///
+    /// The auto-select transition (active was None, first
+    /// ever push promotes it to Some(apid)) is covered by
+    /// the per-channel comparison below: after `push_line`
+    /// the renderer's `active_apid()` matches `p.apid`, so
+    /// the same `painted_any && active == Some(p.apid)` gate
+    /// catches the auto-select case naturally.
+    fn push_pending_channels(&self, pending: Vec<PendingChannel>) -> bool {
         let mut visible_dirty = false;
         let mut last_seen = self.last_seen_lines.borrow_mut();
         let mut renderer = self.renderer.borrow_mut();
@@ -477,12 +444,7 @@ impl LrptImageView {
                 visible_dirty = true;
             }
         }
-        drop(renderer);
-        drop(last_seen);
-
-        if visible_dirty && !self.paused.get() {
-            self.drawing_area.queue_draw();
-        }
+        visible_dirty
     }
 
     /// Clear all buffered lines and reset the watermark map,
@@ -627,5 +589,90 @@ impl LrptImageView {
         }
         let (apid, buffer) = self.snapshot_active_channel()?;
         Some(ExportSnapshot::Channel { apid, buffer })
+    }
+}
+
+/// One channel's unseen rows, copied out of the shared assembler
+/// under its lock by [`LrptImageView::collect_pending_channels`]
+/// and consumed lock-free by
+/// [`LrptImageView::push_pending_channels`]. Hoisted from a
+/// function-local struct when `drain_new_lines` was split per the
+/// 50-NLOC gate (#819).
+struct PendingChannel {
+    apid: u16,
+    already: usize,
+    /// Flat tail of the channel's pixel buffer — every
+    /// row from `already` to `min(channel.lines,
+    /// available_lines)` packed contiguously, ready for
+    /// `chunks_exact(IMAGE_WIDTH)` in phase 2. One heap
+    /// alloc per APID per drain instead of one per row;
+    /// matters on viewer reopen mid-pass when there can
+    /// be thousands of unseen rows for a single APID
+    /// and the per-row alloc would churn the allocator
+    /// at 4 Hz under the shared-image mutex. Per
+    /// `CodeRabbit` round 17 on PR #543.
+    pixels: Vec<u8>,
+}
+
+/// Post-await half of [`LrptImageView::set_composite`]: wrap the
+/// worker's BGRA bytes in a Cairo surface on the main thread and
+/// install it as the composite cache — or, on worker panic /
+/// surface-build failure, reset the in-flight build target so the
+/// next 1 Hz tick retries. Every failure path gates on the
+/// generation match so it can't clobber a newer build that
+/// started while this one was running. Split out per the 50-NLOC
+/// gate (#819, PR #880 Codacy precedent).
+fn finish_composite_build(
+    renderer: &Rc<RefCell<LrptImageRenderer>>,
+    drawing_area: &gtk4::DrawingArea,
+    recipe: CompositeRecipe,
+    captured_gen: u64,
+    target_height: usize,
+    bytes_result: Result<Vec<u8>, Box<dyn std::any::Any + Send>>,
+) {
+    // Main thread: wrap the worker's BGRA bytes in a Cairo
+    // surface via `create_for_data`. Cheap (no memcpy in the
+    // common stride case) — the heavy per-pixel pack already ran
+    // on the worker.
+    let surface_result = match bytes_result {
+        Ok(bgra) => build_argb32_surface_from_bgra(bgra, IMAGE_WIDTH, target_height),
+        Err(panic) => {
+            tracing::warn!(?recipe, "composite worker panicked: {panic:?}");
+            let mut r = renderer.borrow_mut();
+            if r.composite_gen() == captured_gen {
+                r.mark_composite_pending(recipe);
+            }
+            return;
+        }
+    };
+    match surface_result {
+        Ok(surface) => {
+            let installed = renderer.borrow_mut().install_composite_cache(
+                recipe,
+                captured_gen,
+                target_height,
+                surface,
+            );
+            if installed {
+                drawing_area.queue_draw();
+            } else {
+                tracing::debug!(
+                    ?recipe,
+                    captured_gen,
+                    "stale composite worker — selection changed mid-flight, dropping built surface",
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(?recipe, error = %e, "composite ARGB32 surface build failed");
+            // Reset the in-flight target so the next 1 Hz tick
+            // retries — only if the user hasn't moved on. Gate on
+            // generation match to avoid clobbering a newer build
+            // that started while ours was running.
+            let mut r = renderer.borrow_mut();
+            if r.composite_gen() == captured_gen {
+                r.mark_composite_pending(recipe);
+            }
+        }
     }
 }
