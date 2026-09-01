@@ -1,6 +1,16 @@
 use super::*;
 use std::time::Duration;
 
+// Import-path adjustments for the #819 module split: `Arc` and
+// `ConfigManager` reached this file through the old root's use
+// block via the `use super::*` glob; the root no longer imports
+// them (its config-facing helpers moved to the `favorites` /
+// `persistence` submodules), so the test module imports them
+// directly. Same pattern as PR #880's `server/tests/mod.rs`.
+use std::sync::Arc;
+
+use sdr_config::ConfigManager;
+
 /// Fixed Unix timestamp used in the favorites round-trip test
 /// to pin the `last_seen_unix` field. Value is arbitrary (from
 /// November 2023) but deliberately chosen to be well past any
