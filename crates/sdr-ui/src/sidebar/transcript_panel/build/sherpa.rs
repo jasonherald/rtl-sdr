@@ -49,11 +49,19 @@ pub(super) fn build_sherpa_rows(
     model_row: &adw::ComboRow,
     saved_model_idx: u32,
 ) -> SherpaRows {
+    // Attachment order == call order (each helper `group.add`s its
+    // own rows), so the helpers run in the original display order:
+    // VAD → Auto Break toggle → timing sliders → display mode. The
+    // first carve draft called `build_auto_break_sliders` ahead of
+    // the struct literal, attaching the sliders ABOVE the toggle
+    // that controls them (`CodeRabbit` round 1 on PR #886).
+    let vad_threshold_row = build_vad_threshold_row(group, config);
+    let auto_break_row = build_auto_break_toggle(group, config);
     let (auto_break_min_open_row, auto_break_tail_row, auto_break_min_segment_row) =
         build_auto_break_sliders(group, config);
     let rows = SherpaRows {
-        vad_threshold_row: build_vad_threshold_row(group, config),
-        auto_break_row: build_auto_break_toggle(group, config),
+        vad_threshold_row,
+        auto_break_row,
         auto_break_min_open_row,
         auto_break_tail_row,
         auto_break_min_segment_row,

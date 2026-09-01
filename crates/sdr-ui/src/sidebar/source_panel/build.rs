@@ -133,19 +133,26 @@ fn build_tuner_gain_rows() -> (adw::SpinRow, adw::ComboRow, adw::SpinRow) {
     (gain_row, agc_row, ppm_row)
 }
 
+/// The eight RTL-SDR rows, named so a re-ordered return or
+/// destructure can't silently swap same-typed rows — the former
+/// eight-element tuple carried three `SpinRow`s and two
+/// `ComboRow`s that would still compile shuffled (`CodeRabbit`
+/// round 1 on PR #886).
+struct RtlSdrRows {
+    sample_rate: adw::ComboRow,
+    gain: adw::SpinRow,
+    agc: adw::ComboRow,
+    ppm: adw::SpinRow,
+    bias_tee: adw::SwitchRow,
+    converter_offset: adw::SpinRow,
+    direct_sampling: adw::ComboRow,
+    offset_tuning: adw::SwitchRow,
+}
+
 /// Build RTL-SDR-specific rows: sample rate, gain, AGC, PPM
 /// correction, bias tee, upconverter offset, direct sampling,
 /// offset tuning.
-fn build_rtlsdr_rows() -> (
-    adw::ComboRow,
-    adw::SpinRow,
-    adw::ComboRow,
-    adw::SpinRow,
-    adw::SwitchRow,
-    adw::SpinRow,
-    adw::ComboRow,
-    adw::SwitchRow,
-) {
+fn build_rtlsdr_rows() -> RtlSdrRows {
     let sample_rate_model = gtk4::StringList::new(RTL_SAMPLE_RATE_LABELS);
     let sample_rate_row = adw::ComboRow::builder()
         .title("Sample Rate")
@@ -158,23 +165,23 @@ fn build_rtlsdr_rows() -> (
     let (bias_tee_row, converter_offset_row, direct_sampling_row, offset_tuning_row) =
         build_rtl_frontend_rows();
 
-    (
-        sample_rate_row,
-        gain_row,
-        agc_row,
-        ppm_row,
-        bias_tee_row,
-        converter_offset_row,
-        direct_sampling_row,
-        offset_tuning_row,
-    )
+    RtlSdrRows {
+        sample_rate: sample_rate_row,
+        gain: gain_row,
+        agc: agc_row,
+        ppm: ppm_row,
+        bias_tee: bias_tee_row,
+        converter_offset: converter_offset_row,
+        direct_sampling: direct_sampling_row,
+        offset_tuning: offset_tuning_row,
+    }
 }
 
 /// Build network-specific rows: hostname, port, protocol.
 fn build_network_rows() -> (adw::EntryRow, adw::SpinRow, adw::ComboRow) {
     let hostname_row = adw::EntryRow::builder()
         .title("Hostname")
-        .text("localhost")
+        .text(super::DEFAULT_NETWORK_HOSTNAME)
         .build();
 
     let port_adj =
@@ -268,8 +275,7 @@ struct UsbTunerRows {
 }
 
 fn build_usb_tuner_rows() -> UsbTunerRows {
-    let (sample_rate, gain, agc, ppm, bias_tee, converter_offset, direct_sampling, offset_tuning) =
-        build_rtlsdr_rows();
+    let rtl = build_rtlsdr_rows();
     // Airspy unit selector. Starts with only the "first available"
     // entry; the wiring swaps in enumerated serials when the
     // controller answers `RefreshAirspyDevices`. Per #848 phase 5.
@@ -280,15 +286,15 @@ fn build_usb_tuner_rows() -> UsbTunerRows {
         .model(&airspy_device_model)
         .build();
     UsbTunerRows {
-        sample_rate,
-        gain,
-        agc,
-        ppm,
-        bias_tee,
-        converter_offset,
+        sample_rate: rtl.sample_rate,
+        gain: rtl.gain,
+        agc: rtl.agc,
+        ppm: rtl.ppm,
+        bias_tee: rtl.bias_tee,
+        converter_offset: rtl.converter_offset,
         airspy_device,
-        direct_sampling,
-        offset_tuning,
+        direct_sampling: rtl.direct_sampling,
+        offset_tuning: rtl.offset_tuning,
     }
 }
 

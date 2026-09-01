@@ -333,13 +333,17 @@ pub fn save_source_iq_inversion(config: &Arc<ConfigManager>, enabled: bool) {
 }
 
 /// Load the persisted raw-Network hostname. Defaults to
-/// `"localhost"` (matches the widget's initial value).
+/// [`super::DEFAULT_NETWORK_HOSTNAME`] — the same constant the
+/// widget's initial value uses, so the two can't drift.
 #[must_use]
 pub fn load_source_network_hostname(config: &Arc<ConfigManager>) -> String {
     config.read(|v| {
         v.get(KEY_SOURCE_NETWORK_HOSTNAME)
             .and_then(serde_json::Value::as_str)
-            .map_or_else(|| "localhost".to_string(), ToString::to_string)
+            .map_or_else(
+                || super::DEFAULT_NETWORK_HOSTNAME.to_string(),
+                ToString::to_string,
+            )
     })
 }
 
@@ -349,15 +353,16 @@ pub fn save_source_network_hostname(config: &Arc<ConfigManager>, hostname: &str)
     });
 }
 
-/// Load the persisted raw-Network port. Defaults to `1234`
-/// (matches `DEFAULT_PORT`).
+/// Load the persisted raw-Network port. Defaults to
+/// [`super::DEFAULT_PORT_U16`] — the wire form `DEFAULT_PORT`
+/// itself derives from, so widget and fallback can't drift.
 #[must_use]
 pub fn load_source_network_port(config: &Arc<ConfigManager>) -> u16 {
     config.read(|v| {
         v.get(KEY_SOURCE_NETWORK_PORT)
             .and_then(serde_json::Value::as_u64)
             .and_then(|n| u16::try_from(n).ok())
-            .unwrap_or(1234)
+            .unwrap_or(super::DEFAULT_PORT_U16)
     })
 }
 

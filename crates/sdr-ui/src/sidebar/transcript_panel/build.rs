@@ -253,45 +253,14 @@ fn build_audio_enhancement_row(
             .selected(saved_idx)
             .build();
         group.add(&row);
-
-        let config_enhancement = Arc::clone(config);
-        row.connect_selected_notify(move |r| {
-            // Map combo index → AudioEnhancement → stable config
-            // string. Only persist if the index matches one of
-            // the three known-valid values. GTK `ComboRow` emits
-            // `selected-notify` with transient out-of-range
-            // indices during intermediate widget state changes
-            // (e.g. during model repopulation), and the lenient
-            // "fall through to VoiceBand" pattern the ACTIVE
-            // dispatch path uses is dangerous here — it would
-            // silently overwrite a user's Broadband or Off
-            // workaround with the default on a spurious signal.
-            // Runtime dispatch (window.rs BackendConfig build) can
-            // still be lenient because it reads the current value
-            // once at session start; this persistence handler is
-            // the one that cares about transient signals.
-            let Some(value) = (match r.selected() {
-                AUDIO_ENHANCEMENT_VOICE_BAND_IDX => {
-                    Some(sdr_transcription::denoise::AudioEnhancement::VoiceBand)
-                }
-                AUDIO_ENHANCEMENT_BROADBAND_IDX => {
-                    Some(sdr_transcription::denoise::AudioEnhancement::Broadband)
-                }
-                AUDIO_ENHANCEMENT_OFF_IDX => {
-                    Some(sdr_transcription::denoise::AudioEnhancement::Off)
-                }
-                _ => None,
-            }) else {
-                return;
-            };
-            config_enhancement.write(|v| {
-                v[KEY_AUDIO_ENHANCEMENT] = serde_json::json!(value.as_config_str());
-            });
-        });
-
         row
     };
 
+    // Persistence subscription lives ONLY in the extracted helper —
+    // the carve briefly left an inline copy of the same closure
+    // here too, double-connecting the handler so every selection
+    // change wrote the config twice (`CodeRabbit` round 1 on
+    // PR #886).
     wire_audio_enhancement_persistence(&audio_enhancement_row, config);
     audio_enhancement_row
 }

@@ -429,8 +429,19 @@ const GAIN_STEP_DB: f64 = 0.1;
 /// Gain page increment in dB.
 const GAIN_PAGE_DB: f64 = 1.0;
 
-/// Default network port.
-const DEFAULT_PORT: f64 = 1234.0;
+/// Default raw-Network port, wire form. Single source of truth —
+/// the `f64` [`DEFAULT_PORT`] the `gtk4::Adjustment` consumes and
+/// the persistence loader's fallback both derive from it, so the
+/// widget default and the persisted fallback can't drift
+/// (`CodeRabbit` round 1 on PR #886).
+const DEFAULT_PORT_U16: u16 = 1234;
+/// Default network port ([`DEFAULT_PORT_U16`] in the `f64` form
+/// `gtk4::Adjustment` requires).
+const DEFAULT_PORT: f64 = DEFAULT_PORT_U16 as f64;
+/// Default raw-Network hostname, shared by the widget's initial
+/// value and the persistence fallback (`CodeRabbit` round 1 on
+/// PR #886).
+const DEFAULT_NETWORK_HOSTNAME: &str = "localhost";
 /// Minimum port number.
 const MIN_PORT: f64 = 1.0;
 /// Maximum port number.
