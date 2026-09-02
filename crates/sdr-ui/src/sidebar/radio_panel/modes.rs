@@ -19,13 +19,43 @@ use super::{
     VOICE_SQUELCH_SYLLABIC_IDX,
 };
 
+/// Pure visibility policy for a demod mode — which mode-specific
+/// control clusters the Radio panel shows. Extracted from
+/// [`RadioPanel::apply_demod_visibility`] so the policy (including
+/// the CTCSS hide-implies-force-clear rule that fixed a real
+/// "no audio with no visible control" bug) is unit-testable without
+/// a GTK harness; the widget application below stays a thin
+/// consumer. Per the Codacy AI review on PR #887.
+pub(super) struct DemodVisibility {
+    /// De-emphasis group/row + FM IF NR: any FM mode.
+    pub(super) fm_controls: bool,
+    /// Stereo decode: WFM broadcast only.
+    pub(super) stereo: bool,
+    /// CTCSS cluster: NFM only. When `false` the combo is also
+    /// force-cleared to "Off" by the applier — hiding an armed
+    /// detector would gate the speaker with no visible control.
+    pub(super) ctcss: bool,
+}
+
+impl DemodVisibility {
+    pub(super) fn for_mode(mode: sdr_types::DemodMode) -> Self {
+        let is_fm = matches!(mode, sdr_types::DemodMode::Wfm | sdr_types::DemodMode::Nfm);
+        Self {
+            fm_controls: is_fm,
+            stereo: mode == sdr_types::DemodMode::Wfm,
+            ctcss: mode == sdr_types::DemodMode::Nfm,
+        }
+    }
+}
+
 impl RadioPanel {
     /// Update mode-specific control visibility for the given demod mode.
     ///
     /// Centralizes FM/WFM visibility policy so startup and mode-switch
     /// handlers stay in sync.
     pub fn apply_demod_visibility(&self, mode: sdr_types::DemodMode) {
-        let is_fm = matches!(mode, sdr_types::DemodMode::Wfm | sdr_types::DemodMode::Nfm);
+        let policy = DemodVisibility::for_mode(mode);
+        let is_fm = policy.fm_controls;
         // De-emphasis group: hide the whole section on AM / SSB /
         // CW. The per-row `deemphasis_row.set_visible(...)` is
         // retained as a belt for screen readers (the row stays
@@ -34,14 +64,13 @@ impl RadioPanel {
         self.deemphasis_group.set_visible(is_fm);
         self.deemphasis_row.set_visible(is_fm);
         self.fm_if_nr_row.set_visible(is_fm);
-        self.stereo_row
-            .set_visible(mode == sdr_types::DemodMode::Wfm);
+        self.stereo_row.set_visible(policy.stereo);
         // CTCSS is an NFM-only feature — WFM / AM / SSB / CW
         // either don't carry sub-audible tones or don't use them
         // as a squelch keying mechanism in practice. Hide the
         // whole group; individual `set_visible` kept for the
         // same defensive reason as de-emphasis.
-        let ctcss_allowed = mode == sdr_types::DemodMode::Nfm;
+        let ctcss_allowed = policy.ctcss;
         self.ctcss_group.set_visible(ctcss_allowed);
         self.ctcss_row.set_visible(ctcss_allowed);
         self.ctcss_threshold_row.set_visible(ctcss_allowed);

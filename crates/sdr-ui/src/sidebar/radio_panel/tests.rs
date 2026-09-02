@@ -199,3 +199,35 @@ fn format_exactly_at_cap_still_shown_as_number() {
     let formatted = DistanceDisplay::Value(MAX_MEANINGFUL_DISTANCE_M).format();
     assert!(formatted.ends_with(" km"));
 }
+
+#[test]
+fn demod_visibility_policy_per_mode() {
+    use sdr_types::DemodMode;
+
+    use super::modes::DemodVisibility;
+
+    // NFM: everything on — FM controls, CTCSS; stereo is WFM-only.
+    let nfm = DemodVisibility::for_mode(DemodMode::Nfm);
+    assert!(nfm.fm_controls && nfm.ctcss && !nfm.stereo);
+
+    // WFM: FM controls + stereo, but CTCSS hidden AND force-cleared
+    // (leaving it armed on WFM was the historical "no audio with no
+    // visible control" bug the modes.rs comment documents).
+    let wfm = DemodVisibility::for_mode(DemodMode::Wfm);
+    assert!(wfm.fm_controls && wfm.stereo && !wfm.ctcss);
+
+    // AM / SSB / CW: no FM-specific controls at all.
+    for mode in [
+        DemodMode::Am,
+        DemodMode::Usb,
+        DemodMode::Lsb,
+        DemodMode::Cw,
+        DemodMode::Raw,
+    ] {
+        let v = DemodVisibility::for_mode(mode);
+        assert!(
+            !v.fm_controls && !v.stereo && !v.ctcss,
+            "{mode:?} must hide all FM-specific controls"
+        );
+    }
+}

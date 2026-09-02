@@ -23,7 +23,7 @@ use super::{
 };
 
 mod section_distance;
-use section_distance::{assemble_page, build_distance_section};
+use section_distance::{DistanceSection, assemble_page, build_distance_section};
 
 /// Build the radio / demodulator configuration panel.
 ///
@@ -50,54 +50,80 @@ pub fn build_radio_panel() -> RadioPanel {
     let voice = build_voice_squelch_rows();
     let distance = build_distance_section();
 
-    let (bandwidth_group, squelch_group, filters_group, deemphasis_group, ctcss_group) =
-        assemble_radio_page(
-            &bandwidth_row,
-            &squelch,
-            &voice,
-            &filters,
-            &deemphasis_row,
-            &ctcss,
-        );
-
-    let page = assemble_page(
-        &bandwidth_group,
-        &squelch_group,
-        &filters_group,
-        &deemphasis_group,
-        &ctcss_group,
-        &distance,
-    );
-
+    let sections = RadioSections {
+        bandwidth_row,
+        bandwidth_reset_button,
+        squelch,
+        deemphasis_row,
+        filters,
+        ctcss,
+        voice,
+        distance,
+    };
     // All rows connected to DSP pipeline via window.rs
+    assemble_panel(sections)
+}
+
+/// Everything the per-section builders produced, bundled so
+/// [`assemble_panel`] can flatten it into [`RadioPanel`] without an
+/// over-limit parameter list. Split out of [`build_radio_panel`] per
+/// the 50-NLOC gate (Codacy round 1 on PR #887 — its Lizard counts
+/// a few lines stricter than the local run, so the panel-literal
+/// flattening lives in its own function).
+struct RadioSections {
+    bandwidth_row: adw::SpinRow,
+    bandwidth_reset_button: gtk4::Button,
+    squelch: SquelchRows,
+    deemphasis_row: adw::ComboRow,
+    filters: FilterRows,
+    ctcss: CtcssRows,
+    voice: VoiceSquelchRows,
+    distance: DistanceSection,
+}
+
+/// Assemble the page from the built sections and flatten every row
+/// into the [`RadioPanel`] struct. Field-by-field moves — the
+/// user-visible group/row order is fixed by `assemble_radio_page` /
+/// `assemble_page`, not by this literal. Split out per the 50-NLOC
+/// gate (Codacy round 1 on PR #887).
+fn assemble_panel(s: RadioSections) -> RadioPanel {
+    let (page, deemphasis_group, ctcss_group) = assemble_radio_page(
+        &s.bandwidth_row,
+        &s.squelch,
+        &s.voice,
+        &s.filters,
+        &s.deemphasis_row,
+        &s.ctcss,
+        &s.distance,
+    );
 
     RadioPanel {
         widget: page,
         deemphasis_group,
         ctcss_group,
-        bandwidth_row,
-        bandwidth_reset_button,
-        squelch_enabled_row: squelch.squelch_enabled_row,
-        squelch_level_row: squelch.squelch_level_row,
-        auto_squelch_row: squelch.auto_squelch_row,
-        deemphasis_row,
-        noise_blanker_row: filters.noise_blanker_row,
-        nb_level_row: filters.nb_level_row,
-        fm_if_nr_row: filters.fm_if_nr_row,
-        stereo_row: filters.stereo_row,
-        notch_enabled_row: filters.notch_enabled_row,
-        notch_freq_row: filters.notch_freq_row,
-        ctcss_row: ctcss.ctcss_row,
-        ctcss_threshold_row: ctcss.ctcss_threshold_row,
-        ctcss_status_row: ctcss.ctcss_status_row,
-        voice_squelch_row: voice.voice_squelch_row,
-        voice_squelch_threshold_row: voice.voice_squelch_threshold_row,
-        voice_squelch_status_row: voice.voice_squelch_status_row,
-        erp_row: distance.erp_row,
-        calibration_row: distance.calibration_row,
-        distance_row: distance.distance_row,
-        distance_last_signal_db: distance.last_signal_db,
-        distance_last_frequency_hz: distance.last_frequency_hz,
+        bandwidth_row: s.bandwidth_row,
+        bandwidth_reset_button: s.bandwidth_reset_button,
+        squelch_enabled_row: s.squelch.squelch_enabled_row,
+        squelch_level_row: s.squelch.squelch_level_row,
+        auto_squelch_row: s.squelch.auto_squelch_row,
+        deemphasis_row: s.deemphasis_row,
+        noise_blanker_row: s.filters.noise_blanker_row,
+        nb_level_row: s.filters.nb_level_row,
+        fm_if_nr_row: s.filters.fm_if_nr_row,
+        stereo_row: s.filters.stereo_row,
+        notch_enabled_row: s.filters.notch_enabled_row,
+        notch_freq_row: s.filters.notch_freq_row,
+        ctcss_row: s.ctcss.ctcss_row,
+        ctcss_threshold_row: s.ctcss.ctcss_threshold_row,
+        ctcss_status_row: s.ctcss.ctcss_status_row,
+        voice_squelch_row: s.voice.voice_squelch_row,
+        voice_squelch_threshold_row: s.voice.voice_squelch_threshold_row,
+        voice_squelch_status_row: s.voice.voice_squelch_status_row,
+        erp_row: s.distance.erp_row,
+        calibration_row: s.distance.calibration_row,
+        distance_row: s.distance.distance_row,
+        distance_last_signal_db: s.distance.last_signal_db,
+        distance_last_frequency_hz: s.distance.last_frequency_hz,
     }
 }
 
@@ -267,9 +293,6 @@ fn build_filter_rows() -> FilterRows {
     }
 }
 
-/// CTCSS combo / threshold / status rows (with the UI-vs-DSP
-/// default-threshold debug assert). Split out per the 50-NLOC
-/// gate (#819).
 /// Notch enable + frequency rows. Split out of
 /// [`build_filter_rows`] per the 50-NLOC gate (#819).
 fn build_notch_rows() -> (adw::SwitchRow, adw::SpinRow) {
@@ -311,6 +334,11 @@ struct CtcssRows {
     ctcss_status_row: adw::ActionRow,
 }
 
+/// CTCSS combo / threshold / status rows (with the UI-vs-DSP
+/// default-threshold debug assert). Split out per the 50-NLOC
+/// gate (#819). (Doc restored to its function — the carve had
+/// left it stranded on `build_notch_rows`; Codacy round 1 on
+/// PR #887.)
 fn build_ctcss_rows() -> CtcssRows {
     // --- CTCSS tone squelch ---
     // Build the combo model with "Off" followed by the 51 CTCSS
@@ -457,10 +485,9 @@ fn assemble_radio_page(
     filters: &FilterRows,
     deemphasis_row: &adw::ComboRow,
     ctcss: &CtcssRows,
+    distance: &DistanceSection,
 ) -> (
-    adw::PreferencesGroup,
-    adw::PreferencesGroup,
-    adw::PreferencesGroup,
+    adw::PreferencesPage,
     adw::PreferencesGroup,
     adw::PreferencesGroup,
 ) {
@@ -499,13 +526,22 @@ fn assemble_radio_page(
     ctcss_group.add(&ctcss.ctcss_threshold_row);
     ctcss_group.add(&ctcss.ctcss_status_row);
 
-    (
-        bandwidth_group,
-        squelch_group,
-        filters_group,
-        deemphasis_group,
-        ctcss_group,
-    )
+    // Page packing (and the map-refresh wiring) lives in
+    // `assemble_page`; only the two groups `apply_demod_visibility`
+    // toggles at runtime travel back to the caller — folding the
+    // page call in here (Codacy round 1 on PR #887) keeps
+    // `build_radio_panel` under the 50-NLOC gate on Codacy's
+    // stricter Lizard count.
+    let page = assemble_page(
+        &bandwidth_group,
+        &squelch_group,
+        &filters_group,
+        &deemphasis_group,
+        &ctcss_group,
+        distance,
+    );
+
+    (page, deemphasis_group, ctcss_group)
 }
 
 /// Squelch group packing — squelch rows first, then the voice-
