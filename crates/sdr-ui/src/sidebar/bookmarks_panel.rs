@@ -31,8 +31,8 @@ use libadwaita::prelude::*;
 const SEARCH_LIST_GAP_PX: i32 = 12;
 
 use super::navigation_panel::{
-    ActiveBookmark, Bookmark, BookmarksMutatedCallback, NavigationCallback, SaveCallback,
-    load_bookmarks, rebuild_bookmark_list,
+    ActiveBookmark, Bookmark, BookmarkListCtx, BookmarksMutatedCallback, NavigationCallback,
+    SaveCallback, load_bookmarks, rebuild_bookmark_list,
 };
 
 /// Widget handles + shared state exposed from the bookmarks flyout.
@@ -144,18 +144,28 @@ impl BookmarksPanel {
         self.rebuild_inner(name_entry, true);
     }
 
+    /// Assemble the shared [`BookmarkListCtx`] handle bundle from
+    /// this panel's fields + the navigation panel's shared name
+    /// entry (#819 — replaces the former ten-argument
+    /// `rebuild_bookmark_list` signature).
+    fn list_ctx(&self, name_entry: &adw::EntryRow) -> BookmarkListCtx {
+        BookmarkListCtx {
+            bookmarks: std::rc::Rc::clone(&self.bookmarks),
+            on_navigate: std::rc::Rc::clone(&self.on_navigate),
+            active: std::rc::Rc::clone(&self.active_bookmark),
+            name_entry: name_entry.clone(),
+            on_save: std::rc::Rc::clone(&self.on_save),
+            filter_text: std::rc::Rc::clone(&self.filter_text),
+            manual_expanded: std::rc::Rc::clone(&self.manual_expanded),
+            on_mutated: std::rc::Rc::clone(&self.on_mutated),
+        }
+    }
+
     fn rebuild_inner(&self, name_entry: &adw::EntryRow, notify_mutated: bool) {
         super::navigation_panel::rebuild_bookmark_list(
             &self.bookmark_list,
             &self.bookmark_scroll,
-            &self.bookmarks,
-            &self.on_navigate,
-            &self.active_bookmark,
-            name_entry,
-            &self.on_save,
-            &self.filter_text,
-            &self.manual_expanded,
-            &self.on_mutated,
+            &self.list_ctx(name_entry),
         );
         if notify_mutated && let Some(cb) = self.on_mutated.borrow().as_ref() {
             cb();
@@ -176,7 +186,15 @@ impl BookmarksPanel {
 /// belongs to `NavigationPanel` because the Add button is packed
 /// with it; this panel just holds a reference.
 #[must_use]
-pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
+/// The flyout's static widget scaffolding — group, search entry,
+/// list box, scroll container. Split out of
+/// [`build_bookmarks_panel`] per the 50-NLOC gate (#819).
+fn build_list_scaffolding() -> (
+    adw::PreferencesGroup,
+    gtk4::SearchEntry,
+    gtk4::ListBox,
+    gtk4::ScrolledWindow,
+) {
     let widget = adw::PreferencesGroup::builder()
         .title("Bookmarks")
         .description("Saved stations")
@@ -208,6 +226,38 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         .build();
     widget.add(&bookmark_scroll);
 
+    (widget, search_entry, bookmark_list, bookmark_scroll)
+}
+
+/// Search-changed → update needle + rebuild, plus the initial
+/// seed rebuild. We rebuild the list instead of using
+/// `ListBox::set_filter_func` because the categorized view uses
+/// nested `AdwExpanderRow` widgets: the outer `ListBox` filter
+/// function only sees expanders, not the child rows inside them,
+/// so it cannot drive child visibility. Rebuilding on keystroke
+/// is cheap (dozens of rows in practice) and keeps the filter +
+/// grouping logic in one place. Split out of
+/// [`build_bookmarks_panel`] per the 50-NLOC gate (#819).
+fn wire_search_and_seed(
+    search_entry: &gtk4::SearchEntry,
+    bookmark_list: &gtk4::ListBox,
+    bookmark_scroll: &gtk4::ScrolledWindow,
+    ctx: BookmarkListCtx,
+) {
+    // Seed the list with the restored bookmarks.
+    rebuild_bookmark_list(bookmark_list, bookmark_scroll, &ctx);
+
+    let list_for_entry = bookmark_list.clone();
+    let scroll_for_entry = bookmark_scroll.clone();
+    search_entry.connect_search_changed(move |entry| {
+        *ctx.filter_text.borrow_mut() = entry.text().to_lowercase();
+        rebuild_bookmark_list(&list_for_entry, &scroll_for_entry, &ctx);
+    });
+}
+
+pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
+    let (widget, search_entry, bookmark_list, bookmark_scroll) = build_list_scaffolding();
+
     let bookmarks = std::rc::Rc::new(std::cell::RefCell::new(load_bookmarks()));
     let on_navigate: std::rc::Rc<std::cell::RefCell<Option<NavigationCallback>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -219,53 +269,18 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
     >::new()));
     let on_mutated: BookmarksMutatedCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
 
-    // Search-changed → update needle + rebuild. We rebuild the
-    // list instead of using `ListBox::set_filter_func` because
-    // the categorized view uses nested `AdwExpanderRow` widgets:
-    // the outer `ListBox` filter function only sees expanders,
-    // not the child rows inside them, so it cannot drive child
-    // visibility. Rebuilding on keystroke is cheap (dozens of
-    // rows in practice) and keeps the filter + grouping logic
-    // in one place.
-    let filter_for_entry = std::rc::Rc::clone(&filter_text);
-    let list_for_entry = bookmark_list.clone();
-    let scroll_for_entry = bookmark_scroll.clone();
-    let bookmarks_for_entry = std::rc::Rc::clone(&bookmarks);
-    let on_navigate_for_entry = std::rc::Rc::clone(&on_navigate);
-    let active_for_entry = std::rc::Rc::clone(&active_bookmark);
-    let on_save_for_entry = std::rc::Rc::clone(&on_save);
-    let manual_expanded_for_entry = std::rc::Rc::clone(&manual_expanded);
-    let on_mutated_for_entry = std::rc::Rc::clone(&on_mutated);
-    let name_entry_for_entry = name_entry.clone();
-    search_entry.connect_search_changed(move |entry| {
-        *filter_for_entry.borrow_mut() = entry.text().to_lowercase();
-        rebuild_bookmark_list(
-            &list_for_entry,
-            &scroll_for_entry,
-            &bookmarks_for_entry,
-            &on_navigate_for_entry,
-            &active_for_entry,
-            &name_entry_for_entry,
-            &on_save_for_entry,
-            &filter_for_entry,
-            &manual_expanded_for_entry,
-            &on_mutated_for_entry,
-        );
+    wire_search_and_seed(&search_entry, &bookmark_list, &bookmark_scroll, {
+        BookmarkListCtx {
+            bookmarks: std::rc::Rc::clone(&bookmarks),
+            on_navigate: std::rc::Rc::clone(&on_navigate),
+            active: std::rc::Rc::clone(&active_bookmark),
+            name_entry: name_entry.clone(),
+            on_save: std::rc::Rc::clone(&on_save),
+            filter_text: std::rc::Rc::clone(&filter_text),
+            manual_expanded: std::rc::Rc::clone(&manual_expanded),
+            on_mutated: std::rc::Rc::clone(&on_mutated),
+        }
     });
-
-    // Seed the list with the restored bookmarks.
-    rebuild_bookmark_list(
-        &bookmark_list,
-        &bookmark_scroll,
-        &bookmarks,
-        &on_navigate,
-        &active_bookmark,
-        name_entry,
-        &on_save,
-        &filter_text,
-        &manual_expanded,
-        &on_mutated,
-    );
 
     BookmarksPanel {
         widget,

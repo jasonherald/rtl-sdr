@@ -4,9 +4,6 @@
 //! wires the build-time distance-refresh signals. Split out of
 //! `radio_panel.rs` per the file-size pass (issue #819).
 
-use std::cell::Cell;
-use std::rc::Rc;
-
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_dsp::tone_detect::{CTCSS_DEFAULT_THRESHOLD, CTCSS_TONES_HZ};
@@ -14,19 +11,19 @@ use sdr_dsp::voice_squelch::{
     VOICE_SQUELCH_SNR_DEFAULT_THRESHOLD_DB, VOICE_SQUELCH_SYLLABIC_DEFAULT_THRESHOLD,
 };
 
-use super::distance::refresh_distance_display_standalone;
 use super::{
-    BANDWIDTH_PAGE_HZ, BANDWIDTH_STEP_HZ, CALIBRATION_PAGE_DB, CALIBRATION_STEP_DB,
-    CTCSS_THRESHOLD_PAGE, CTCSS_THRESHOLD_STEP, DEEMPHASIS_MODEL_LEN, DEFAULT_BANDWIDTH_HZ,
-    DEFAULT_CALIBRATION_DB, DEFAULT_CTCSS_THRESHOLD, DEFAULT_ERP_WATTS, DEFAULT_NB_LEVEL,
-    DEFAULT_NOTCH_FREQ_HZ, DEFAULT_SQUELCH_DB, ERP_PAGE_WATTS, ERP_STEP_WATTS, MAX_BANDWIDTH_HZ,
-    MAX_CALIBRATION_DB, MAX_CTCSS_THRESHOLD, MAX_ERP_WATTS, MAX_NB_LEVEL, MAX_NOTCH_FREQ_HZ,
-    MAX_SQUELCH_DB, MIN_BANDWIDTH_HZ, MIN_CALIBRATION_DB, MIN_CTCSS_THRESHOLD, MIN_ERP_WATTS,
-    MIN_NB_LEVEL, MIN_NOTCH_FREQ_HZ, MIN_SQUELCH_DB, NB_LEVEL_PAGE, NB_LEVEL_STEP,
-    NOTCH_FREQ_PAGE_HZ, NOTCH_FREQ_STEP_HZ, RadioPanel, SNR_THRESHOLD_DB_MAX, SNR_THRESHOLD_DB_MIN,
-    SQUELCH_PAGE_DB, SQUELCH_STEP_DB, SYLLABIC_THRESHOLD_MAX, SYLLABIC_THRESHOLD_MIN,
-    SYLLABIC_THRESHOLD_PAGE, SYLLABIC_THRESHOLD_STEP, VOICE_SQUELCH_MODE_LABELS,
+    BANDWIDTH_PAGE_HZ, BANDWIDTH_STEP_HZ, CTCSS_THRESHOLD_PAGE, CTCSS_THRESHOLD_STEP,
+    DEEMPHASIS_MODEL_LEN, DEFAULT_BANDWIDTH_HZ, DEFAULT_CTCSS_THRESHOLD, DEFAULT_NB_LEVEL,
+    DEFAULT_NOTCH_FREQ_HZ, DEFAULT_SQUELCH_DB, MAX_BANDWIDTH_HZ, MAX_CTCSS_THRESHOLD, MAX_NB_LEVEL,
+    MAX_NOTCH_FREQ_HZ, MAX_SQUELCH_DB, MIN_BANDWIDTH_HZ, MIN_CTCSS_THRESHOLD, MIN_NB_LEVEL,
+    MIN_NOTCH_FREQ_HZ, MIN_SQUELCH_DB, NB_LEVEL_PAGE, NB_LEVEL_STEP, NOTCH_FREQ_PAGE_HZ,
+    NOTCH_FREQ_STEP_HZ, RadioPanel, SNR_THRESHOLD_DB_MAX, SNR_THRESHOLD_DB_MIN, SQUELCH_PAGE_DB,
+    SQUELCH_STEP_DB, SYLLABIC_THRESHOLD_MAX, SYLLABIC_THRESHOLD_MIN, SYLLABIC_THRESHOLD_PAGE,
+    SYLLABIC_THRESHOLD_STEP, VOICE_SQUELCH_MODE_LABELS,
 };
+
+mod section_distance;
+use section_distance::{assemble_page, build_distance_section};
 
 /// Build the radio / demodulator configuration panel.
 ///
@@ -39,8 +36,74 @@ use super::{
 /// once sections were populated, so we pin "expanded by default"
 /// into "always visible" and give the user scroll instead of
 /// collapse as the focus affordance.
-#[allow(clippy::too_many_lines)]
 pub fn build_radio_panel() -> RadioPanel {
+    // Row construction happens per section below; the page/group
+    // ASSEMBLY (and therefore the user-visible row order) is
+    // unchanged from the pre-split monolith — groups are packed in
+    // `assemble_radio_page` / `assemble_page` in the original
+    // sequence.
+    let (bandwidth_row, bandwidth_reset_button) = build_bandwidth_rows();
+    let squelch = build_squelch_rows();
+    let deemphasis_row = build_deemphasis_row();
+    let filters = build_filter_rows();
+    let ctcss = build_ctcss_rows();
+    let voice = build_voice_squelch_rows();
+    let distance = build_distance_section();
+
+    let (bandwidth_group, squelch_group, filters_group, deemphasis_group, ctcss_group) =
+        assemble_radio_page(
+            &bandwidth_row,
+            &squelch,
+            &voice,
+            &filters,
+            &deemphasis_row,
+            &ctcss,
+        );
+
+    let page = assemble_page(
+        &bandwidth_group,
+        &squelch_group,
+        &filters_group,
+        &deemphasis_group,
+        &ctcss_group,
+        &distance,
+    );
+
+    // All rows connected to DSP pipeline via window.rs
+
+    RadioPanel {
+        widget: page,
+        deemphasis_group,
+        ctcss_group,
+        bandwidth_row,
+        bandwidth_reset_button,
+        squelch_enabled_row: squelch.squelch_enabled_row,
+        squelch_level_row: squelch.squelch_level_row,
+        auto_squelch_row: squelch.auto_squelch_row,
+        deemphasis_row,
+        noise_blanker_row: filters.noise_blanker_row,
+        nb_level_row: filters.nb_level_row,
+        fm_if_nr_row: filters.fm_if_nr_row,
+        stereo_row: filters.stereo_row,
+        notch_enabled_row: filters.notch_enabled_row,
+        notch_freq_row: filters.notch_freq_row,
+        ctcss_row: ctcss.ctcss_row,
+        ctcss_threshold_row: ctcss.ctcss_threshold_row,
+        ctcss_status_row: ctcss.ctcss_status_row,
+        voice_squelch_row: voice.voice_squelch_row,
+        voice_squelch_threshold_row: voice.voice_squelch_threshold_row,
+        voice_squelch_status_row: voice.voice_squelch_status_row,
+        erp_row: distance.erp_row,
+        calibration_row: distance.calibration_row,
+        distance_row: distance.distance_row,
+        distance_last_signal_db: distance.last_signal_db,
+        distance_last_frequency_hz: distance.last_frequency_hz,
+    }
+}
+
+/// Bandwidth spin row + its reset-to-mode-default suffix button.
+/// Split out of [`build_radio_panel`] per the 50-NLOC gate (#819).
+fn build_bandwidth_rows() -> (adw::SpinRow, gtk4::Button) {
     // --- Bandwidth ---
     let bandwidth_adj = gtk4::Adjustment::new(
         DEFAULT_BANDWIDTH_HZ,
@@ -76,6 +139,26 @@ pub fn build_radio_panel() -> RadioPanel {
     )]);
     bandwidth_row.add_suffix(&bandwidth_reset_button);
 
+    (bandwidth_row, bandwidth_reset_button)
+}
+
+/// The Squelch section's three rows, named per the bundle
+/// convention (#819).
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names deliberately mirror the RadioPanel fields they \
+              feed so the orchestrator's struct literal moves them 1:1 \
+              (same call as PR #886's SharedRows)"
+)]
+struct SquelchRows {
+    squelch_enabled_row: adw::SwitchRow,
+    squelch_level_row: adw::SpinRow,
+    auto_squelch_row: adw::SwitchRow,
+}
+
+/// Squelch enable / level / auto-squelch rows. Split out per the
+/// 50-NLOC gate (#819).
+fn build_squelch_rows() -> SquelchRows {
     // --- Squelch ---
     let squelch_enabled_row = adw::SwitchRow::builder().title("Squelch").build();
 
@@ -100,15 +183,46 @@ pub fn build_radio_panel() -> RadioPanel {
         .subtitle("Track noise floor automatically")
         .build();
 
+    SquelchRows {
+        squelch_enabled_row,
+        squelch_level_row,
+        auto_squelch_row,
+    }
+}
+
+/// De-emphasis selector row. Split out per the 50-NLOC gate (#819).
+fn build_deemphasis_row() -> adw::ComboRow {
     // --- De-emphasis ---
     let deemphasis_model =
         gtk4::StringList::new(&["None", "50 \u{00b5}s (EU)", "75 \u{00b5}s (US)"]);
     debug_assert_eq!(deemphasis_model.n_items(), DEEMPHASIS_MODEL_LEN);
-    let deemphasis_row = adw::ComboRow::builder()
+    adw::ComboRow::builder()
         .title("De-emphasis")
         .model(&deemphasis_model)
-        .build();
+        .build()
+}
 
+/// The six Filters-group rows, named so the orchestrator moves
+/// them by field instead of positionally. Split out per the
+/// 50-NLOC gate (#819).
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names deliberately mirror the RadioPanel fields they \
+              feed so the orchestrator's struct literal moves them 1:1 \
+              (same call as PR #886's SharedRows)"
+)]
+struct FilterRows {
+    noise_blanker_row: adw::SwitchRow,
+    nb_level_row: adw::SpinRow,
+    fm_if_nr_row: adw::SwitchRow,
+    stereo_row: adw::SwitchRow,
+    notch_enabled_row: adw::SwitchRow,
+    notch_freq_row: adw::SpinRow,
+}
+
+/// Noise blanker / FM IF NR / stereo / notch rows. Split out per
+/// the 50-NLOC gate (#819).
+fn build_filter_rows() -> FilterRows {
     // --- Noise Blanker ---
     let noise_blanker_row = adw::SwitchRow::builder().title("Noise Blanker").build();
 
@@ -141,6 +255,24 @@ pub fn build_radio_panel() -> RadioPanel {
         .visible(false) // Only shown in WFM mode
         .build();
 
+    let (notch_enabled_row, notch_freq_row) = build_notch_rows();
+
+    FilterRows {
+        noise_blanker_row,
+        nb_level_row,
+        fm_if_nr_row,
+        stereo_row,
+        notch_enabled_row,
+        notch_freq_row,
+    }
+}
+
+/// CTCSS combo / threshold / status rows (with the UI-vs-DSP
+/// default-threshold debug assert). Split out per the 50-NLOC
+/// gate (#819).
+/// Notch enable + frequency rows. Split out of
+/// [`build_filter_rows`] per the 50-NLOC gate (#819).
+fn build_notch_rows() -> (adw::SwitchRow, adw::SpinRow) {
     // --- Notch Filter ---
     let notch_enabled_row = adw::SwitchRow::builder()
         .title("Notch Filter")
@@ -162,6 +294,24 @@ pub fn build_radio_panel() -> RadioPanel {
         .digits(0)
         .build();
 
+    (notch_enabled_row, notch_freq_row)
+}
+
+/// The CTCSS section's three rows, named per the bundle
+/// convention (#819).
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names deliberately mirror the RadioPanel fields they \
+              feed so the orchestrator's struct literal moves them 1:1 \
+              (same call as PR #886's SharedRows)"
+)]
+struct CtcssRows {
+    ctcss_row: adw::ComboRow,
+    ctcss_threshold_row: adw::SpinRow,
+    ctcss_status_row: adw::ActionRow,
+}
+
+fn build_ctcss_rows() -> CtcssRows {
     // --- CTCSS tone squelch ---
     // Build the combo model with "Off" followed by the 51 CTCSS
     // tones. Each tone is labelled to one decimal place (matching
@@ -210,6 +360,31 @@ pub fn build_radio_panel() -> RadioPanel {
         .visible(false)
         .build();
 
+    CtcssRows {
+        ctcss_row,
+        ctcss_threshold_row,
+        ctcss_status_row,
+    }
+}
+
+/// Voice-squelch combo / threshold / status rows (with the
+/// DSP-default range debug asserts). Split out per the 50-NLOC
+/// gate (#819).
+/// The voice-squelch section's three rows, named per the bundle
+/// convention (#819).
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names deliberately mirror the RadioPanel fields they \
+              feed so the orchestrator's struct literal moves them 1:1 \
+              (same call as PR #886's SharedRows)"
+)]
+struct VoiceSquelchRows {
+    voice_squelch_row: adw::ComboRow,
+    voice_squelch_threshold_row: adw::SpinRow,
+    voice_squelch_status_row: adw::ActionRow,
+}
+
+fn build_voice_squelch_rows() -> VoiceSquelchRows {
     // --- Voice squelch ---
     // Three-entry combo: Off / Syllabic / SNR ratio. Threshold
     // spin row + status row start hidden (Off is the default);
@@ -268,6 +443,27 @@ pub fn build_radio_panel() -> RadioPanel {
         "SNR default threshold outside UI range"
     );
 
+    VoiceSquelchRows {
+        voice_squelch_row,
+        voice_squelch_threshold_row,
+        voice_squelch_status_row,
+    }
+}
+
+fn assemble_radio_page(
+    bandwidth_row: &adw::SpinRow,
+    squelch: &SquelchRows,
+    voice: &VoiceSquelchRows,
+    filters: &FilterRows,
+    deemphasis_row: &adw::ComboRow,
+    ctcss: &CtcssRows,
+) -> (
+    adw::PreferencesGroup,
+    adw::PreferencesGroup,
+    adw::PreferencesGroup,
+    adw::PreferencesGroup,
+    adw::PreferencesGroup,
+) {
     // --- Sectioned preferences page ---
     //
     // Individual row-level `.visible(false)` flags set at
@@ -285,182 +481,67 @@ pub fn build_radio_panel() -> RadioPanel {
         .title("Bandwidth")
         .description("Filter width around the tuned frequency")
         .build();
-    bandwidth_group.add(&bandwidth_row);
+    bandwidth_group.add(bandwidth_row);
 
-    let squelch_group = adw::PreferencesGroup::builder()
-        .title("Squelch")
-        .description("Mute audio when the signal is too weak")
-        .build();
-    squelch_group.add(&squelch_enabled_row);
-    squelch_group.add(&squelch_level_row);
-    squelch_group.add(&auto_squelch_row);
-    squelch_group.add(&voice_squelch_row);
-    squelch_group.add(&voice_squelch_threshold_row);
-    squelch_group.add(&voice_squelch_status_row);
-
-    let filters_group = adw::PreferencesGroup::builder()
-        .title("Filters")
-        .description("Clean up interference and noise")
-        .build();
-    filters_group.add(&noise_blanker_row);
-    filters_group.add(&nb_level_row);
-    filters_group.add(&fm_if_nr_row);
-    filters_group.add(&stereo_row);
-    filters_group.add(&notch_enabled_row);
-    filters_group.add(&notch_freq_row);
-
+    let squelch_group = assemble_squelch_group(squelch, voice);
+    let filters_group = assemble_filters_group(filters);
     let deemphasis_group = adw::PreferencesGroup::builder()
         .title("De-emphasis")
         .description("Restore high-frequency audio on FM")
         .build();
-    deemphasis_group.add(&deemphasis_row);
+    deemphasis_group.add(deemphasis_row);
 
     let ctcss_group = adw::PreferencesGroup::builder()
         .title("CTCSS")
         .description("Open audio only when a matching tone is present")
         .build();
-    ctcss_group.add(&ctcss_row);
-    ctcss_group.add(&ctcss_threshold_row);
-    ctcss_group.add(&ctcss_status_row);
+    ctcss_group.add(&ctcss.ctcss_row);
+    ctcss_group.add(&ctcss.ctcss_threshold_row);
+    ctcss_group.add(&ctcss.ctcss_status_row);
 
-    // --- Distance Estimator (FSPL, ticket #164) ---
-    let erp_adj = gtk4::Adjustment::new(
-        DEFAULT_ERP_WATTS,
-        MIN_ERP_WATTS,
-        MAX_ERP_WATTS,
-        ERP_STEP_WATTS,
-        ERP_PAGE_WATTS,
-        0.0,
-    );
-    let erp_row = adw::SpinRow::builder()
-        .title("Transmitter Power")
-        .subtitle("Effective radiated power, in watts (handheld ~5, mobile ~25-50)")
-        .adjustment(&erp_adj)
-        .digits(3)
-        .build();
-
-    let cal_adj = gtk4::Adjustment::new(
-        DEFAULT_CALIBRATION_DB,
-        MIN_CALIBRATION_DB,
-        MAX_CALIBRATION_DB,
-        CALIBRATION_STEP_DB,
-        CALIBRATION_PAGE_DB,
-        0.0,
-    );
-    let calibration_row = adw::SpinRow::builder()
-        .title("Receiver Calibration")
-        .subtitle("dB offset applied to raw level before computing path loss")
-        .adjustment(&cal_adj)
-        .digits(1)
-        .build();
-
-    let distance_row = adw::ActionRow::builder()
-        .title("Estimated Distance")
-        .subtitle("—")
-        .selectable(false)
-        .activatable(false)
-        .build();
-
-    let distance_group = adw::PreferencesGroup::builder()
-        .title("Distance Estimator")
-        .description(
-            "Rough line-of-sight (FSPL) estimate — read as an upper bound, not precision ranging",
-        )
-        .build();
-    distance_group.add(&erp_row);
-    distance_group.add(&calibration_row);
-    distance_group.add(&distance_row);
-
-    // Internal state shared across the panel clone surface — see
-    // the field docs on `RadioPanel` for why this is `Rc<Cell>`
-    // rather than plain `Cell`.
-    let distance_last_signal_db: Rc<Cell<Option<f32>>> = Rc::new(Cell::new(None));
-    let distance_last_frequency_hz: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
-
-    // Wire ERP and calibration spin-row changes to trigger a
-    // distance refresh using the cached signal/frequency. Config
-    // persistence and any DSP plumbing that cares about these
-    // values is wired separately in `window.rs` on the same
-    // signal — both handlers run on value change.
-    {
-        let last_signal = Rc::clone(&distance_last_signal_db);
-        let last_freq = Rc::clone(&distance_last_frequency_hz);
-        let erp_row_for_signal = erp_row.clone();
-        let cal_row_for_signal = calibration_row.clone();
-        let distance_row_for_signal = distance_row.clone();
-        let refresh = move || {
-            refresh_distance_display_standalone(
-                &erp_row_for_signal,
-                &cal_row_for_signal,
-                &distance_row_for_signal,
-                last_signal.get(),
-                last_freq.get(),
-            );
-        };
-        let refresh_for_erp = refresh.clone();
-        erp_row.connect_value_notify(move |_| refresh_for_erp());
-        calibration_row.connect_value_notify(move |_| refresh());
-    }
-
-    let page = adw::PreferencesPage::new();
-    page.add(&bandwidth_group);
-    page.add(&squelch_group);
-    page.add(&filters_group);
-    page.add(&deemphasis_group);
-    page.add(&ctcss_group);
-    page.add(&distance_group);
-
-    // When the Radio tab becomes visible (user switches to it
-    // via the activity bar), render the distance estimate with
-    // whatever cached inputs are current. The DSP-driven
-    // `update_distance_*` methods skip the render step while the
-    // panel is unmapped — without this handler the user would see
-    // a stale subtitle until the next SignalLevel message arrived.
-    {
-        let erp_for_map = erp_row.clone();
-        let cal_for_map = calibration_row.clone();
-        let dist_for_map = distance_row.clone();
-        let last_signal_for_map = Rc::clone(&distance_last_signal_db);
-        let last_freq_for_map = Rc::clone(&distance_last_frequency_hz);
-        page.connect_map(move |_| {
-            refresh_distance_display_standalone(
-                &erp_for_map,
-                &cal_for_map,
-                &dist_for_map,
-                last_signal_for_map.get(),
-                last_freq_for_map.get(),
-            );
-        });
-    }
-
-    // All rows connected to DSP pipeline via window.rs
-
-    RadioPanel {
-        widget: page,
+    (
+        bandwidth_group,
+        squelch_group,
+        filters_group,
         deemphasis_group,
         ctcss_group,
-        bandwidth_row,
-        bandwidth_reset_button,
-        squelch_enabled_row,
-        squelch_level_row,
-        auto_squelch_row,
-        deemphasis_row,
-        noise_blanker_row,
-        nb_level_row,
-        fm_if_nr_row,
-        stereo_row,
-        notch_enabled_row,
-        notch_freq_row,
-        ctcss_row,
-        ctcss_threshold_row,
-        ctcss_status_row,
-        voice_squelch_row,
-        voice_squelch_threshold_row,
-        voice_squelch_status_row,
-        erp_row,
-        calibration_row,
-        distance_row,
-        distance_last_signal_db,
-        distance_last_frequency_hz,
-    }
+    )
+}
+
+/// Squelch group packing — squelch rows first, then the voice-
+/// squelch trio, in the pre-split order. Split out per the
+/// 50-NLOC gate (#819).
+fn assemble_squelch_group(
+    squelch: &SquelchRows,
+    voice: &VoiceSquelchRows,
+) -> adw::PreferencesGroup {
+    let squelch_group = adw::PreferencesGroup::builder()
+        .title("Squelch")
+        .description("Mute audio when the signal is too weak")
+        .build();
+    squelch_group.add(&squelch.squelch_enabled_row);
+    squelch_group.add(&squelch.squelch_level_row);
+    squelch_group.add(&squelch.auto_squelch_row);
+    squelch_group.add(&voice.voice_squelch_row);
+    squelch_group.add(&voice.voice_squelch_threshold_row);
+    squelch_group.add(&voice.voice_squelch_status_row);
+
+    squelch_group
+}
+
+/// Filters group packing, pre-split row order. Split out per the
+/// 50-NLOC gate (#819).
+fn assemble_filters_group(filters: &FilterRows) -> adw::PreferencesGroup {
+    let filters_group = adw::PreferencesGroup::builder()
+        .title("Filters")
+        .description("Clean up interference and noise")
+        .build();
+    filters_group.add(&filters.noise_blanker_row);
+    filters_group.add(&filters.nb_level_row);
+    filters_group.add(&filters.fm_if_nr_row);
+    filters_group.add(&filters.stereo_row);
+    filters_group.add(&filters.notch_enabled_row);
+    filters_group.add(&filters.notch_freq_row);
+
+    filters_group
 }

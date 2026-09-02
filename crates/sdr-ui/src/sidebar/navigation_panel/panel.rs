@@ -7,7 +7,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use sdr_types::DemodMode;
 
-use super::list::rebuild_bookmark_list;
+use super::list::{BookmarkListCtx, rebuild_bookmark_list};
 use super::{ActiveBookmark, Bookmark, NavigationPanel};
 
 // ---------------------------------------------------------------------------
@@ -164,16 +164,20 @@ pub fn connect_preset_to_bookmarks(
     navigation: &NavigationPanel,
     bookmarks: &crate::sidebar::BookmarksPanel,
 ) {
-    let on_nav = std::rc::Rc::clone(&bookmarks.on_navigate);
-    let active = std::rc::Rc::clone(&bookmarks.active_bookmark);
-    let bm_rc = std::rc::Rc::clone(&bookmarks.bookmarks);
-    let on_save = std::rc::Rc::clone(&bookmarks.on_save);
-    let filter_text = std::rc::Rc::clone(&bookmarks.filter_text);
-    let manual_expanded = std::rc::Rc::clone(&bookmarks.manual_expanded);
-    let on_mutated = std::rc::Rc::clone(&bookmarks.on_mutated);
+    // One shared context for the closure — the same handle bundle
+    // the flyout's own rebuild paths use (#819).
+    let ctx = BookmarkListCtx {
+        bookmarks: std::rc::Rc::clone(&bookmarks.bookmarks),
+        on_navigate: std::rc::Rc::clone(&bookmarks.on_navigate),
+        active: std::rc::Rc::clone(&bookmarks.active_bookmark),
+        name_entry: navigation.name_entry.clone(),
+        on_save: std::rc::Rc::clone(&bookmarks.on_save),
+        filter_text: std::rc::Rc::clone(&bookmarks.filter_text),
+        manual_expanded: std::rc::Rc::clone(&bookmarks.manual_expanded),
+        on_mutated: std::rc::Rc::clone(&bookmarks.on_mutated),
+    };
     let list_weak = bookmarks.bookmark_list.downgrade();
     let scroll_weak = bookmarks.bookmark_scroll.downgrade();
-    let name_entry = navigation.name_entry.clone();
 
     navigation.preset_row.connect_selected_notify(move |row| {
         let idx = row.selected() as usize;
@@ -188,33 +192,22 @@ pub fn connect_preset_to_bookmarks(
         // on `on_nav` being Some would leave stale highlight /
         // name-entry state visible in the rare window between
         // panel construction and callback registration.
-        *active.borrow_mut() = ActiveBookmark::default();
-        name_entry.set_text("");
+        *ctx.active.borrow_mut() = ActiveBookmark::default();
+        ctx.name_entry.set_text("");
         let bm = Bookmark::new(
             preset.name,
             preset.frequency,
             preset.demod_mode,
             preset.bandwidth,
         );
-        if let Some(cb) = on_nav.borrow().as_ref() {
+        if let Some(cb) = ctx.on_navigate.borrow().as_ref() {
             cb(&bm);
         }
         // Rebuild to remove stale highlight
         if let Some(lb) = list_weak.upgrade()
             && let Some(sc) = scroll_weak.upgrade()
         {
-            rebuild_bookmark_list(
-                &lb,
-                &sc,
-                &bm_rc,
-                &on_nav,
-                &active,
-                &name_entry,
-                &on_save,
-                &filter_text,
-                &manual_expanded,
-                &on_mutated,
-            );
+            rebuild_bookmark_list(&lb, &sc, &ctx);
         }
     });
 }

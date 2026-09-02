@@ -68,7 +68,7 @@ pub use bookmarks::{
     Bookmark, TuningProfile, demod_mode_to_string, format_frequency, load_bookmarks,
     parse_demod_mode, save_bookmarks,
 };
-pub use list::rebuild_bookmark_list;
+pub use list::{BookmarkListCtx, rebuild_bookmark_list};
 pub use panel::{build_navigation_panel, connect_preset_to_bookmarks};
 pub use scan_projection::{
     project_and_push_scanner_channels, project_scanner_channels, scanner_channel_envelope,

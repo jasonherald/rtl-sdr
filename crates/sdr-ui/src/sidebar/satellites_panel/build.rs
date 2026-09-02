@@ -21,13 +21,54 @@ use super::{
 /// (avoids spurious save-on-restore feedback during window
 /// construction).
 #[must_use]
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear panel layout — ground-station group, TLE group, recording group (now with two switches per #533), and passes group are easier to follow as one block than artificially split into helpers"
-)]
 pub fn build_satellites_panel() -> SatellitesPanel {
     let page = adw::PreferencesPage::new();
 
+    // Attachment order == call order (each builder adds its group
+    // to the page): Ground Station → TLE Data → Notifications →
+    // Recording → Upcoming Passes → Heard via Orbcomm — the same
+    // top-to-bottom order the pre-split monolithic builder used.
+    let (lat_row, lon_row, alt_row, zip_row, zip_status_row) = build_station_group(&page);
+    let (last_refresh_row, refresh_button, refresh_spinner) = build_tle_group(&page);
+    let notify_lead_row = build_notify_group(&page);
+    let recording = build_recording_group(&page);
+    let (passes_group, passes_status_row) = build_passes_group(&page);
+    let heard_group = build_heard_group(&page);
+
+    SatellitesPanel {
+        widget: page,
+        lat_row,
+        lon_row,
+        alt_row,
+        zip_row,
+        zip_status_row,
+        last_refresh_row,
+        refresh_button,
+        refresh_spinner,
+        notify_lead_row,
+        auto_record_switch: recording.auto_record_switch,
+        auto_record_audio_switch: recording.auto_record_audio_switch,
+        auto_record_composites_switch: recording.auto_record_composites_switch,
+        auto_record_quality_row: recording.auto_record_quality_row,
+        doppler_switch: recording.doppler_switch,
+        passes_group,
+        passes_status_row,
+        heard_group,
+    }
+}
+
+/// Ground-station group — lat / lon / alt spin rows plus the ZIP
+/// shortcut and its status row. Split out of
+/// [`build_satellites_panel`] per the 50-NLOC gate (#819).
+fn build_station_group(
+    page: &adw::PreferencesPage,
+) -> (
+    adw::SpinRow,
+    adw::SpinRow,
+    adw::SpinRow,
+    adw::EntryRow,
+    adw::ActionRow,
+) {
     // ─── Ground station ────────────────────────────────────────
     let station_group = adw::PreferencesGroup::builder()
         .title("Ground Station")
@@ -89,6 +130,12 @@ pub fn build_satellites_panel() -> SatellitesPanel {
 
     page.add(&station_group);
 
+    (lat_row, lon_row, alt_row, zip_row, zip_status_row)
+}
+
+/// TLE group — last-refreshed row with the refresh button +
+/// spinner suffix. Split out per the 50-NLOC gate (#819).
+fn build_tle_group(page: &adw::PreferencesPage) -> (adw::ActionRow, gtk4::Button, gtk4::Spinner) {
     // ─── TLE Data ──────────────────────────────────────────────
     let tle_group = adw::PreferencesGroup::builder()
         .title("TLE Data")
@@ -120,6 +167,12 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     tle_group.add(&last_refresh_row);
     page.add(&tle_group);
 
+    (last_refresh_row, refresh_button, refresh_spinner)
+}
+
+/// Notifications group — the pre-pass lead-time spin row. Split
+/// out per the 50-NLOC gate (#819).
+fn build_notify_group(page: &adw::PreferencesPage) -> adw::SpinRow {
     // ─── Notifications ─────────────────────────────────────────
     let notify_group = adw::PreferencesGroup::builder()
         .title("Notifications")
@@ -143,6 +196,24 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     notify_group.add(&notify_lead_row);
     page.add(&notify_group);
 
+    notify_lead_row
+}
+
+/// The Recording group's five behavior toggles, named so the
+/// orchestrator's struct literal can move them by field instead of
+/// positionally. Split out per the 50-NLOC gate (#819).
+struct RecordingRows {
+    auto_record_switch: adw::SwitchRow,
+    auto_record_audio_switch: adw::SwitchRow,
+    auto_record_composites_switch: adw::SwitchRow,
+    auto_record_quality_row: adw::ComboRow,
+    doppler_switch: adw::SwitchRow,
+}
+
+/// Recording group — auto-record master switch, quality tier (with
+/// its sensitivity sync), audio + composites toggles, Doppler
+/// tracking. Split out per the 50-NLOC gate (#819).
+fn build_recording_group(page: &adw::PreferencesPage) -> RecordingRows {
     // ─── Recording ─────────────────────────────────────────────
     let recording_group = adw::PreferencesGroup::builder()
         .title("Recording")
@@ -156,39 +227,7 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         .build();
     recording_group.add(&auto_record_switch);
 
-    // Quality threshold combo row — gates which passes are
-    // worth auto-recording. The `AdwComboRow.string_list` indices
-    // match `AutoRecordQuality::ALL` order; if the order ever
-    // changes the persisted u32 indices in the user's config will
-    // silently drift, so don't reorder. Per #511.
-    let quality_strings = gtk4::StringList::new(
-        &AutoRecordQuality::ALL
-            .iter()
-            .map(|q| q.display_label())
-            .collect::<Vec<_>>(),
-    );
-    let auto_record_quality_row = adw::ComboRow::builder()
-        .title("Quality threshold")
-        .subtitle("Only passes with peak elevation at or above the selected tier auto-record.")
-        .model(&quality_strings)
-        .selected(AutoRecordQuality::DEFAULT.to_index())
-        // Combo is only useful when auto-record is on; sensitivity
-        // tracks the switch state below.
-        .sensitive(false)
-        .build();
-    recording_group.add(&auto_record_quality_row);
-
-    // Sync the combo's sensitivity to the auto-record switch.
-    {
-        let combo_clone = auto_record_quality_row.clone();
-        auto_record_switch.connect_active_notify(move |row| {
-            combo_clone.set_sensitive(row.is_active());
-        });
-        // Initial sync — the switch builder above defaulted to
-        // `false`, so this just keeps the two in lockstep if a
-        // future builder change flips the default.
-        auto_record_quality_row.set_sensitive(auto_record_switch.is_active());
-    }
+    let auto_record_quality_row = build_quality_row(&recording_group, &auto_record_switch);
 
     // Pairs with auto-record. Only takes effect when both this
     // and `auto_record_switch` are on; sampled exclusively at
@@ -248,6 +287,63 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     recording_group.add(&doppler_switch);
     page.add(&recording_group);
 
+    RecordingRows {
+        auto_record_switch,
+        auto_record_audio_switch,
+        auto_record_composites_switch,
+        auto_record_quality_row,
+        doppler_switch,
+    }
+}
+
+/// Quality-threshold combo for the Recording group, added to the
+/// group and kept sensitivity-synced to the auto-record switch.
+/// Split out of [`build_recording_group`] per the 50-NLOC gate
+/// (#819).
+fn build_quality_row(
+    recording_group: &adw::PreferencesGroup,
+    auto_record_switch: &adw::SwitchRow,
+) -> adw::ComboRow {
+    // Quality threshold combo row — gates which passes are
+    // worth auto-recording. The `AdwComboRow.string_list` indices
+    // match `AutoRecordQuality::ALL` order; if the order ever
+    // changes the persisted u32 indices in the user's config will
+    // silently drift, so don't reorder. Per #511.
+    let quality_strings = gtk4::StringList::new(
+        &AutoRecordQuality::ALL
+            .iter()
+            .map(|q| q.display_label())
+            .collect::<Vec<_>>(),
+    );
+    let auto_record_quality_row = adw::ComboRow::builder()
+        .title("Quality threshold")
+        .subtitle("Only passes with peak elevation at or above the selected tier auto-record.")
+        .model(&quality_strings)
+        .selected(AutoRecordQuality::DEFAULT.to_index())
+        // Combo is only useful when auto-record is on; sensitivity
+        // tracks the switch state below.
+        .sensitive(false)
+        .build();
+    recording_group.add(&auto_record_quality_row);
+
+    // Sync the combo's sensitivity to the auto-record switch.
+    {
+        let combo_clone = auto_record_quality_row.clone();
+        auto_record_switch.connect_active_notify(move |row| {
+            combo_clone.set_sensitive(row.is_active());
+        });
+        // Initial sync — the switch builder above defaulted to
+        // `false`, so this just keeps the two in lockstep if a
+        // future builder change flips the default.
+        auto_record_quality_row.set_sensitive(auto_record_switch.is_active());
+    }
+
+    auto_record_quality_row
+}
+
+/// Upcoming-passes group with its empty-state row. Split out per
+/// the 50-NLOC gate (#819).
+fn build_passes_group(page: &adw::PreferencesPage) -> (adw::PreferencesGroup, adw::ActionRow) {
     // ─── Upcoming Passes ──────────────────────────────────────
     let passes_group = adw::PreferencesGroup::builder()
         .title("Upcoming Passes")
@@ -264,6 +360,12 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     passes_group.add(&passes_status_row);
     page.add(&passes_group);
 
+    (passes_group, passes_status_row)
+}
+
+/// Heard-via-Orbcomm group (issue #865, Task 12) — built hidden.
+/// Split out per the 50-NLOC gate (#819).
+fn build_heard_group(page: &adw::PreferencesPage) -> adw::PreferencesGroup {
     // ─── Heard via Orbcomm (issue #865, Task 12) ───────────────
     // Built hidden — nothing has been heard yet at construction
     // time. `window/satellites/heard.rs` reveals it once the
@@ -276,24 +378,5 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         .build();
     page.add(&heard_group);
 
-    SatellitesPanel {
-        widget: page,
-        lat_row,
-        lon_row,
-        alt_row,
-        zip_row,
-        zip_status_row,
-        last_refresh_row,
-        refresh_button,
-        refresh_spinner,
-        notify_lead_row,
-        auto_record_switch,
-        auto_record_audio_switch,
-        auto_record_composites_switch,
-        auto_record_quality_row,
-        doppler_switch,
-        passes_group,
-        passes_status_row,
-        heard_group,
-    }
+    heard_group
 }
