@@ -1,4 +1,11 @@
 use super::*;
+// Import-surface adjustments for the #819 module split (PR #880
+// pattern): items the old monolithic root held directly now live
+// in submodules.
+use super::bookmarks::string_to_demod_mode;
+use super::list::bookmark_matches_filter;
+use super::panel::BAND_PRESETS;
+use sdr_types::DemodMode;
 
 #[test]
 fn format_frequency_mhz() {

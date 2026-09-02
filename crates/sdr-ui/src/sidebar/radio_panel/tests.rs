@@ -1,4 +1,8 @@
-use super::{DistanceDisplay, MAX_MEANINGFUL_DISTANCE_M};
+// Import-surface adjustment for the #819 module split (PR #880
+// pattern): `DistanceDisplay` now lives in the `distance`
+// submodule; the consts stay at the panel root.
+use super::MAX_MEANINGFUL_DISTANCE_M;
+use super::distance::DistanceDisplay;
 
 /// Compile-time validation that bandwidth constants are consistent.
 const _: () = {
