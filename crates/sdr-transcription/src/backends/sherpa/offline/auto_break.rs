@@ -333,7 +333,6 @@ pub(super) struct SessionIoAutoBreakParams {
 /// I/O thread — drives an `AutoBreakMachine` from the audio channel and
 /// forwards flushed segments to `decode_tx` (resampled + denoised
 /// before the send so the decoder thread stays zero-prep).
-#[allow(clippy::too_many_lines)]
 pub(super) fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
     let SessionIoAutoBreakParams {
         cancel,
@@ -365,91 +364,189 @@ pub(super) fn session_io_loop_auto_break(params: SessionIoAutoBreakParams) {
             return;
         }
 
-        let timeout = match pending_flush_deadline {
-            Some(deadline) => deadline
-                .checked_duration_since(std::time::Instant::now())
-                .unwrap_or_else(|| std::time::Duration::from_millis(0)),
-            None => AUDIO_RECV_TIMEOUT,
-        };
+        let timeout = recv_deadline_timeout(pending_flush_deadline);
 
-        match audio_rx.recv_timeout(timeout) {
-            Ok(crate::backend::TranscriptionInput::Samples(samples)) => {
-                machine.on_samples(&samples);
-                // Max-segment safety check: see pre-refactor comment
-                // above — resume in Recording, not Idle, so a long
-                // transmission is split rather than truncated.
-                if !matches!(machine.state(), AutoBreakState::Idle)
-                    && machine.buffer_duration_ms() >= AUTO_BREAK_MAX_SEGMENT_MS
-                {
-                    tracing::warn!(
-                        ms = machine.buffer_duration_ms(),
-                        cap = AUTO_BREAK_MAX_SEGMENT_MS,
-                        "Auto Break buffer exceeded max segment cap — forcing flush (check squelch configuration)"
-                    );
-                    let stereo_buf = machine.take_buffer();
-                    machine.reset_after_force_flush(AutoBreakState::Recording);
-                    if dispatch_auto_break_segment(
-                        &stereo_buf,
-                        noise_gate_ratio,
-                        audio_enhancement,
-                        &decode_tx,
-                    )
-                    .is_err()
-                    {
-                        return;
-                    }
-                    pending_flush_deadline = None;
-                }
-            }
-            Ok(crate::backend::TranscriptionInput::SquelchOpened) => {
-                machine.on_squelch_opened();
-                pending_flush_deadline = None;
-            }
-            Ok(crate::backend::TranscriptionInput::SquelchClosed) => {
-                machine.on_squelch_closed();
-                pending_flush_deadline = Some(std::time::Instant::now() + tail_duration);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(deadline) = pending_flush_deadline
-                    && std::time::Instant::now() >= deadline
-                {
-                    match machine.on_tail_timeout() {
-                        Some(FlushDecision::Decode) => {
-                            let stereo_buf = machine.take_buffer();
-                            if dispatch_auto_break_segment(
-                                &stereo_buf,
-                                noise_gate_ratio,
-                                audio_enhancement,
-                                &decode_tx,
-                            )
-                            .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Some(FlushDecision::DiscardPhantom) => {
-                            tracing::debug!("Auto Break: discarded phantom open");
-                        }
-                        Some(FlushDecision::DiscardShort) => {
-                            tracing::debug!("Auto Break: discarded sub-min segment");
-                        }
-                        None => {}
-                    }
-                    pending_flush_deadline = None;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::info!("sherpa Auto Break I/O thread ended (channel disconnected)");
-                drain_auto_break_on_exit(
-                    &mut machine,
-                    noise_gate_ratio,
-                    audio_enhancement,
-                    &decode_tx,
-                );
-                return;
-            }
+        let event = audio_rx.recv_timeout(timeout);
+        if handle_channel_event(
+            event,
+            &mut machine,
+            tail_duration,
+            noise_gate_ratio,
+            audio_enhancement,
+            &decode_tx,
+            &mut pending_flush_deadline,
+        )
+        .is_break()
+        {
+            return;
         }
     }
+}
+
+/// The `recv_timeout` budget for the next loop tick: time left
+/// until the pending tail-flush deadline, or the standard audio
+/// poll interval when no flush is pending. Split out of
+/// [`session_io_loop_auto_break`] per the 50-NLOC gate (#820).
+fn recv_deadline_timeout(
+    pending_flush_deadline: Option<std::time::Instant>,
+) -> std::time::Duration {
+    match pending_flush_deadline {
+        Some(deadline) => deadline
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or_else(|| std::time::Duration::from_millis(0)),
+        None => AUDIO_RECV_TIMEOUT,
+    }
+}
+
+/// One channel event (or timeout) of the Auto Break session loop:
+/// samples feed the machine (with the max-segment cap), squelch
+/// edges drive the state transitions and the tail-timer deadline,
+/// a timeout past the deadline flushes, and a disconnect drains and
+/// ends the session. `Break` = session over (drain already run
+/// where the pre-carve inline arms ran it; a decoder hang-up
+/// mid-dispatch breaks without draining, exactly as before). Split
+/// out of [`session_io_loop_auto_break`] per the 50-NLOC gate
+/// (#820; the loop was a pre-existing over-gate function moved by
+/// the split — its `too_many_lines` allow is retired with the
+/// carve).
+fn handle_channel_event(
+    event: Result<TranscriptionInput, mpsc::RecvTimeoutError>,
+    machine: &mut AutoBreakMachine,
+    tail_duration: std::time::Duration,
+    noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
+    decode_tx: &mpsc::Sender<DecodeRequest>,
+    pending_flush_deadline: &mut Option<std::time::Instant>,
+) -> std::ops::ControlFlow<()> {
+    match event {
+        Ok(TranscriptionInput::Samples(samples)) => handle_samples_arm(
+            machine,
+            &samples,
+            noise_gate_ratio,
+            audio_enhancement,
+            decode_tx,
+            pending_flush_deadline,
+        ),
+        Ok(TranscriptionInput::SquelchOpened) => {
+            machine.on_squelch_opened();
+            *pending_flush_deadline = None;
+            std::ops::ControlFlow::Continue(())
+        }
+        Ok(TranscriptionInput::SquelchClosed) => {
+            machine.on_squelch_closed();
+            *pending_flush_deadline = Some(std::time::Instant::now() + tail_duration);
+            std::ops::ControlFlow::Continue(())
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => handle_recv_timeout(
+            machine,
+            noise_gate_ratio,
+            audio_enhancement,
+            decode_tx,
+            pending_flush_deadline,
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::info!("sherpa Auto Break I/O thread ended (channel disconnected)");
+            drain_auto_break_on_exit(machine, noise_gate_ratio, audio_enhancement, decode_tx);
+            std::ops::ControlFlow::Break(())
+        }
+    }
+}
+
+/// `Samples` arm of the Auto Break session loop: feed the machine,
+/// then apply the max-segment safety cap — resume in `Recording`,
+/// not `Idle`, so a long transmission is split rather than
+/// truncated (see [`AutoBreakMachine::reset_after_force_flush`]).
+/// Clears `pending_flush_deadline` after a forced flush, exactly as
+/// the pre-carve inline arm did. `Break` = the decoder hung up.
+/// Split out of [`session_io_loop_auto_break`] per the 50-NLOC gate
+/// (#820; the loop was a pre-existing over-gate function moved by
+/// the split — its `too_many_lines` allow is retired with the
+/// carve).
+fn handle_samples_arm(
+    machine: &mut AutoBreakMachine,
+    samples: &[f32],
+    noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
+    decode_tx: &mpsc::Sender<DecodeRequest>,
+    pending_flush_deadline: &mut Option<std::time::Instant>,
+) -> std::ops::ControlFlow<()> {
+    machine.on_samples(samples);
+    if !matches!(machine.state(), AutoBreakState::Idle)
+        && machine.buffer_duration_ms() >= AUTO_BREAK_MAX_SEGMENT_MS
+    {
+        tracing::warn!(
+            ms = machine.buffer_duration_ms(),
+            cap = AUTO_BREAK_MAX_SEGMENT_MS,
+            "Auto Break buffer exceeded max segment cap — forcing flush (check squelch configuration)"
+        );
+        let stereo_buf = machine.take_buffer();
+        machine.reset_after_force_flush(AutoBreakState::Recording);
+        if dispatch_auto_break_segment(&stereo_buf, noise_gate_ratio, audio_enhancement, decode_tx)
+            .is_err()
+        {
+            return std::ops::ControlFlow::Break(());
+        }
+        *pending_flush_deadline = None;
+    }
+    std::ops::ControlFlow::Continue(())
+}
+
+/// `Timeout` arm of [`handle_channel_event`]: when the tail-flush
+/// deadline has passed, run the flush decision and clear the
+/// deadline — byte-equivalent to the pre-carve inline arm. `Break`
+/// = the decoder hung up. Split out per the 50-NLOC gate (#820).
+fn handle_recv_timeout(
+    machine: &mut AutoBreakMachine,
+    noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
+    decode_tx: &mpsc::Sender<DecodeRequest>,
+    pending_flush_deadline: &mut Option<std::time::Instant>,
+) -> std::ops::ControlFlow<()> {
+    if let Some(deadline) = *pending_flush_deadline
+        && std::time::Instant::now() >= deadline
+    {
+        if handle_tail_expiry(machine, noise_gate_ratio, audio_enhancement, decode_tx).is_break() {
+            return std::ops::ControlFlow::Break(());
+        }
+        *pending_flush_deadline = None;
+    }
+    std::ops::ControlFlow::Continue(())
+}
+
+/// Tail-timer expiry: ask the machine for its flush decision and
+/// dispatch or discard accordingly. The caller clears the deadline
+/// afterwards regardless of decision (matching the pre-carve inline
+/// arm). `Break` = the decoder hung up. Split out per the 50-NLOC
+/// gate (#820).
+fn handle_tail_expiry(
+    machine: &mut AutoBreakMachine,
+    noise_gate_ratio: f32,
+    audio_enhancement: denoise::AudioEnhancement,
+    decode_tx: &mpsc::Sender<DecodeRequest>,
+) -> std::ops::ControlFlow<()> {
+    match machine.on_tail_timeout() {
+        Some(FlushDecision::Decode) => {
+            let stereo_buf = machine.take_buffer();
+            if dispatch_auto_break_segment(
+                &stereo_buf,
+                noise_gate_ratio,
+                audio_enhancement,
+                decode_tx,
+            )
+            .is_err()
+            {
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        Some(FlushDecision::DiscardPhantom) => {
+            tracing::debug!("Auto Break: discarded phantom open");
+        }
+        Some(FlushDecision::DiscardShort) => {
+            tracing::debug!("Auto Break: discarded sub-min segment");
+        }
+        None => {}
+    }
+    std::ops::ControlFlow::Continue(())
 }
 
 /// Resample + denoise a completed Auto Break segment and hand it to
