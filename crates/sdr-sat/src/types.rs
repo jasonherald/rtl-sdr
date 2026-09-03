@@ -30,12 +30,6 @@ pub const SSTV_VHF_2M_BAND_HZ: (u64, u64) = (144_000_000, 148_000_000);
 /// 437.550 MHz within this range.
 pub const SSTV_UHF_70CM_BAND_HZ: (u64, u64) = (430_000_000, 440_000_000);
 
-/// Imaging protocol the receiver should use for a given catalog
-/// satellite. Drives the auto-record dispatch in
-/// `sidebar::satellites_recorder` so APT vs LRPT vs SSTV each get
-/// their own decoder + viewer without the recorder itself caring
-/// about protocol details.
-///
 /// LRPT modulation variant used by a Meteor-M satellite. Per #662,
 /// the original METEOR-M N2 (NORAD 40069, decommissioned) used
 /// standard QPSK; current generation METEOR-M2 satellites
@@ -67,6 +61,12 @@ pub enum LrptModulation {
     Oqpsk,
 }
 
+/// Imaging protocol the receiver should use for a given catalog
+/// satellite. Drives the auto-record dispatch in
+/// `sidebar::satellites_recorder` so APT vs LRPT vs SSTV each get
+/// their own decoder + viewer without the recorder itself caring
+/// about protocol details.
+///
 /// `None` on a [`KnownSatellite::imaging_protocol`] means "in the
 /// catalog for pass-prediction display purposes, but auto-record
 /// is not yet wired for this satellite's protocol." The recorder's
