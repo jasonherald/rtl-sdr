@@ -361,18 +361,30 @@ fn max_segment_cap_during_holdoff_keeps_pending_close_edge() {
     // must NOT discard the already-observed close edge (resume in
     // `Recording` + cleared deadline left the machine buffering dead
     // air and dispatching a silence segment every cap interval).
+    // Boundary parameters, named so the HoldingOff geometry stays
+    // legible (CR round 2 on PR #891): the transmission closes with
+    // CAP_HEADROOM_MS of room left under the cap, then TAIL_MS of
+    // gap-free post-close audio crosses it inside the tail window
+    // (TAIL_MS > CAP_HEADROOM_MS is what makes the cap trip while
+    // HoldingOff). The deadline models a pending tail flush well in
+    // the future; the gate ratio is the harness's pass-through value.
+    const CAP_HEADROOM_MS: u32 = 200;
+    const TAIL_MS: u32 = 400;
+    const PENDING_TAIL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+    const NOISE_GATE_PASSTHROUGH: f32 = 1.0;
+
     let mut machine = default_machine();
     let (decode_tx, decode_rx) = mpsc::channel();
-    let mut deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+    let mut deadline = Some(std::time::Instant::now() + PENDING_TAIL_DEADLINE);
 
     machine.on_squelch_opened();
-    machine.on_samples(&samples_for_ms(AUTO_BREAK_MAX_SEGMENT_MS - 200));
+    machine.on_samples(&samples_for_ms(AUTO_BREAK_MAX_SEGMENT_MS - CAP_HEADROOM_MS));
     machine.on_squelch_closed();
 
     let flow = handle_samples_arm(
         &mut machine,
-        &samples_for_ms(400),
-        1.0,
+        &samples_for_ms(TAIL_MS),
+        NOISE_GATE_PASSTHROUGH,
         denoise::AudioEnhancement::Off,
         &decode_tx,
         &mut deadline,
