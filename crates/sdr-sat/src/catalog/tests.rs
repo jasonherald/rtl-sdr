@@ -85,7 +85,8 @@ fn meteor_m2_4_is_present_and_lrpt() {
     // unrelated classified satellite at 70° inclination). The
     // real M2-4 is in Celestrak's weather group at 98.7°
     // sun-sync, COSPAR 2024-039A, and is actively transmitting
-    // LRPT on 137.900 MHz with the same APID set as M2-3. The
+    // LRPT on 137.900 MHz in standard mode (APIDs 64/65/68,
+    // unlike M2-3's 64/65/66 set — see the catalog pins). The
     // catalog ships it as `Some(Lrpt)` so the auto-record flow
     // fires on its passes.
     let m2_4 = KNOWN_SATELLITES

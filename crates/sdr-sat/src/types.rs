@@ -125,7 +125,7 @@ pub struct KnownSatellite {
     /// Display name, matches the Celestrak TLE name field exactly.
     pub name: &'static str,
     /// NORAD catalog number — the canonical satellite identifier.
-    /// [`TleCache`] looks up TLEs by this id directly.
+    /// [`crate::TleCache`] looks up TLEs by this id directly.
     pub norad_id: u32,
     /// Downlink centre frequency, Hz. Targets the satellite's primary
     /// imaging signal — APT (137.x MHz) for NOAA, LRPT (137.x MHz) for
