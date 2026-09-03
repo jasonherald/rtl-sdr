@@ -1,5 +1,15 @@
 use super::*;
-use chrono::TimeZone;
+// Import-surface adjustments for the #819 module split: the old
+// monolithic root's `use` block provided these through the glob;
+// the moved persistence helpers are reached through their new
+// submodule (PR #880 pattern).
+use std::sync::Arc;
+
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
+use sdr_config::ConfigManager;
+use sdr_sat::Pass;
+
+use super::persistence::{read_bool_or, read_f64_or};
 
 #[test]
 fn defaults_lie_inside_spinrow_bounds() {
