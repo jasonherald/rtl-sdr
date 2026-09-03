@@ -27,7 +27,9 @@ const SESSION_MONO_BUFFER_CAPACITY: usize = 16_000;
 /// `OfflineRecognizer::decode` calls for each segment the I/O thread
 /// forwards.
 ///
-/// (`pub(super)`: dispatched from the root `run_session`.)\n/// Silero is built on the I/O thread (not the host thread) because
+/// (`pub(super)`: dispatched from the root `run_session`.)
+///
+/// Silero is built on the I/O thread (not the host thread) because
 /// `SherpaSileroVad` is `!Send`, so owning it per-thread is simpler
 /// than smuggling an `&mut` across the thread boundary. The ~50 ms
 /// construction cost per session start is imperceptible next to the
@@ -51,9 +53,15 @@ pub(super) fn run_session_vad(recognizer: &OfflineRecognizer, params: SessionPar
     // decoder via `decode_tx`.
     let cancel_io = Arc::clone(&cancel);
     let event_tx_io = event_tx.clone();
-    let io_thread = std::thread::Builder::new()
-        .name("sherpa-session-io".into())
-        .spawn(move || {
+    // Worker spawn + host-thread decoder service + join live in the
+    // shared `run_with_session_io_worker` (Codacy clone detection on
+    // PR #891); only the loop body differs per flavor.
+    super::decode::run_with_session_io_worker(
+        recognizer,
+        &decode_rx,
+        &event_tx,
+        &cancel,
+        move || {
             session_io_loop_vad(SessionIoVadParams {
                 cancel: cancel_io,
                 audio_rx,
@@ -63,29 +71,9 @@ pub(super) fn run_session_vad(recognizer: &OfflineRecognizer, params: SessionPar
                 vad_threshold,
                 audio_enhancement,
             });
-        });
-    let io_thread = match io_thread {
-        Ok(handle) => handle,
-        Err(e) => {
-            let msg = format!("failed to spawn sherpa session I/O thread: {e}");
-            tracing::error!(%msg);
-            let _ = event_tx.send(TranscriptionEvent::Error(msg));
-            return;
-        }
-    };
-
-    // Host thread: drain decode_rx and run `recognizer.decode` for each.
-    // Returns when the I/O thread drops `decode_tx` (audio channel
-    // disconnected or user cancelled).
-    decoder_service_loop(recognizer, &decode_rx, &event_tx, &cancel);
-
-    // The I/O thread is exiting or has exited. Join to avoid leaving a
-    // detached worker behind; log on join failure but don't propagate
-    // further since the session is ending anyway.
-    if let Err(e) = io_thread.join() {
-        tracing::warn!("sherpa session I/O thread panicked during join: {e:?}");
-    }
-    tracing::info!("sherpa offline session ended");
+        },
+        "sherpa offline session ended",
+    );
 }
 
 /// Parameters for the VAD-mode session I/O thread.

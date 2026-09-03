@@ -164,3 +164,45 @@ fn decode_segment(
         let _ = event_tx.send(TranscriptionEvent::Text { timestamp, text });
     }
 }
+
+/// Spawn the `sherpa-session-io` worker, run the shared decoder
+/// service on the host thread, then join the worker. The two
+/// session flavors (VAD / Auto Break) differ only in the loop the
+/// worker runs — passed as `io_body` — and the end-of-session log
+/// line; the spawn-failure surfacing and join/log plumbing were
+/// previously duplicated verbatim in both (Codacy clone detection
+/// on PR #891).
+///
+/// A spawn failure is surfaced once via `TranscriptionEvent::Error`
+/// and the session ends; a worker panic at join time is logged but
+/// not propagated, since the session is ending anyway.
+pub(super) fn run_with_session_io_worker(
+    recognizer: &OfflineRecognizer,
+    decode_rx: &mpsc::Receiver<DecodeRequest>,
+    event_tx: &mpsc::Sender<TranscriptionEvent>,
+    cancel: &Arc<AtomicBool>,
+    io_body: impl FnOnce() + Send + 'static,
+    end_log: &'static str,
+) {
+    let io_thread = std::thread::Builder::new()
+        .name("sherpa-session-io".into())
+        .spawn(io_body);
+    let io_thread = match io_thread {
+        Ok(handle) => handle,
+        Err(e) => {
+            let msg = format!("failed to spawn sherpa session I/O thread: {e}");
+            tracing::error!(%msg);
+            let _ = event_tx.send(TranscriptionEvent::Error(msg));
+            return;
+        }
+    };
+
+    decoder_service_loop(recognizer, decode_rx, event_tx, cancel);
+
+    // The I/O thread is exiting or has exited. Join to avoid leaving
+    // a detached worker behind.
+    if let Err(e) = io_thread.join() {
+        tracing::warn!("sherpa session I/O thread panicked during join: {e:?}");
+    }
+    tracing::info!("{}", end_log);
+}

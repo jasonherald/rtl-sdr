@@ -287,9 +287,15 @@ pub(super) fn run_session_auto_break(recognizer: &OfflineRecognizer, params: Ses
 
     let cancel_io = Arc::clone(&cancel);
     let event_tx_io = event_tx.clone();
-    let io_thread = std::thread::Builder::new()
-        .name("sherpa-session-io".into())
-        .spawn(move || {
+    // Shared spawn/decoder/join plumbing — see
+    // `decode::run_with_session_io_worker` (Codacy clone detection
+    // on PR #891).
+    super::decode::run_with_session_io_worker(
+        recognizer,
+        &decode_rx,
+        &event_tx,
+        &cancel,
+        move || {
             session_io_loop_auto_break(SessionIoAutoBreakParams {
                 cancel: cancel_io,
                 audio_rx,
@@ -299,23 +305,9 @@ pub(super) fn run_session_auto_break(recognizer: &OfflineRecognizer, params: Ses
                 auto_break_thresholds,
                 audio_enhancement,
             });
-        });
-    let io_thread = match io_thread {
-        Ok(handle) => handle,
-        Err(e) => {
-            let msg = format!("failed to spawn sherpa session I/O thread: {e}");
-            tracing::error!(%msg);
-            let _ = event_tx.send(TranscriptionEvent::Error(msg));
-            return;
-        }
-    };
-
-    decoder_service_loop(recognizer, &decode_rx, &event_tx, &cancel);
-
-    if let Err(e) = io_thread.join() {
-        tracing::warn!("sherpa session I/O thread panicked during join: {e:?}");
-    }
-    tracing::info!("sherpa Auto Break session ended");
+        },
+        "sherpa Auto Break session ended",
+    );
 }
 
 /// Parameters for the Auto-Break-mode session I/O thread.
@@ -462,7 +454,7 @@ fn handle_channel_event(
 /// (#820; the loop was a pre-existing over-gate function moved by
 /// the split — its `too_many_lines` allow is retired with the
 /// carve).
-fn handle_samples_arm(
+pub(super) fn handle_samples_arm(
     machine: &mut AutoBreakMachine,
     samples: &[f32],
     noise_gate_ratio: f32,
@@ -480,13 +472,29 @@ fn handle_samples_arm(
             "Auto Break buffer exceeded max segment cap — forcing flush (check squelch configuration)"
         );
         let stereo_buf = machine.take_buffer();
-        machine.reset_after_force_flush(AutoBreakState::Recording);
+        // Resume in the state we were in: `Recording` splits a long
+        // open transmission (split-not-truncate, as before), while
+        // `HoldingOff` keeps the already-observed close edge so the
+        // pending tail flush still finalizes the transmission.
+        // Hard-coding `Recording` here lost that edge — the machine
+        // stayed `Recording` with the squelch closed, buffering dead
+        // air and dispatching a silence segment every cap interval
+        // (`CodeRabbit` round 1 on PR #891; pre-existing, moved
+        // verbatim by the split).
+        let resume_state = machine.state();
+        machine.reset_after_force_flush(resume_state);
         if dispatch_auto_break_segment(&stereo_buf, noise_gate_ratio, audio_enhancement, decode_tx)
             .is_err()
         {
             return std::ops::ControlFlow::Break(());
         }
-        *pending_flush_deadline = None;
+        // The tail deadline only exists in `HoldingOff` — keep it
+        // there so `on_tail_timeout` still runs for this
+        // transmission; clear it on the `Recording` split path as
+        // before.
+        if matches!(resume_state, AutoBreakState::Recording) {
+            *pending_flush_deadline = None;
+        }
     }
     std::ops::ControlFlow::Continue(())
 }
