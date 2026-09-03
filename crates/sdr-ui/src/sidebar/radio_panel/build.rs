@@ -395,9 +395,6 @@ fn build_ctcss_rows() -> CtcssRows {
     }
 }
 
-/// Voice-squelch combo / threshold / status rows (with the
-/// DSP-default range debug asserts). Split out per the 50-NLOC
-/// gate (#819).
 /// The voice-squelch section's three rows, named per the bundle
 /// convention (#819).
 #[allow(
@@ -412,6 +409,11 @@ struct VoiceSquelchRows {
     voice_squelch_status_row: adw::ActionRow,
 }
 
+/// Voice-squelch combo / threshold / status rows (with the
+/// DSP-default range debug asserts). Split out per the 50-NLOC
+/// gate (#819). (Doc restored to its function — the carve had
+/// stranded it on the bundle struct; `CodeRabbit` round 1 on
+/// PR #887.)
 fn build_voice_squelch_rows() -> VoiceSquelchRows {
     // --- Voice squelch ---
     // Three-entry combo: Off / Syllabic / SNR ratio. Threshold

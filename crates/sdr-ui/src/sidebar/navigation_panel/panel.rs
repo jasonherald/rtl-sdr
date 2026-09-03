@@ -165,17 +165,9 @@ pub fn connect_preset_to_bookmarks(
     bookmarks: &crate::sidebar::BookmarksPanel,
 ) {
     // One shared context for the closure — the same handle bundle
-    // the flyout's own rebuild paths use (#819).
-    let ctx = BookmarkListCtx {
-        bookmarks: std::rc::Rc::clone(&bookmarks.bookmarks),
-        on_navigate: std::rc::Rc::clone(&bookmarks.on_navigate),
-        active: std::rc::Rc::clone(&bookmarks.active_bookmark),
-        name_entry: navigation.name_entry.clone(),
-        on_save: std::rc::Rc::clone(&bookmarks.on_save),
-        filter_text: std::rc::Rc::clone(&bookmarks.filter_text),
-        manual_expanded: std::rc::Rc::clone(&bookmarks.manual_expanded),
-        on_mutated: std::rc::Rc::clone(&bookmarks.on_mutated),
-    };
+    // the flyout's own rebuild paths use, derived through the
+    // canonical constructor (#819; CR round 1 on PR #887).
+    let ctx = BookmarkListCtx::from_panel(bookmarks, &navigation.name_entry);
     let list_weak = bookmarks.bookmark_list.downgrade();
     let scroll_weak = bookmarks.bookmark_scroll.downgrade();
 

@@ -53,6 +53,12 @@ const NB_LEVEL_PAGE: f64 = 1.0;
 pub(crate) const VOICE_SQUELCH_OFF_IDX: u32 = 0;
 pub(crate) const VOICE_SQUELCH_SYLLABIC_IDX: u32 = 1;
 pub(crate) const VOICE_SQUELCH_SNR_IDX: u32 = 2;
+
+/// CTCSS combo index for "Off" — indices `1..=51` map to
+/// [`sdr_dsp::tone_detect::CTCSS_TONES_HZ`] entries (see
+/// `modes.rs::ctcss_mode_from_index`). Named alongside the
+/// voice-squelch indices per `CodeRabbit` round 1 on PR #887.
+pub(crate) const CTCSS_OFF_IDX: u32 = 0;
 /// User-visible combo labels. Order matches the `*_IDX` constants.
 const VOICE_SQUELCH_MODE_LABELS: &[&str] = &["Off", "Syllabic", "SNR ratio"];
 

@@ -28,7 +28,7 @@ pub fn build_satellites_panel() -> SatellitesPanel {
     // to the page): Ground Station → TLE Data → Notifications →
     // Recording → Upcoming Passes → Heard via Orbcomm — the same
     // top-to-bottom order the pre-split monolithic builder used.
-    let (lat_row, lon_row, alt_row, zip_row, zip_status_row) = build_station_group(&page);
+    let station = build_station_group(&page);
     let (last_refresh_row, refresh_button, refresh_spinner) = build_tle_group(&page);
     let notify_lead_row = build_notify_group(&page);
     let recording = build_recording_group(&page);
@@ -37,11 +37,11 @@ pub fn build_satellites_panel() -> SatellitesPanel {
 
     SatellitesPanel {
         widget: page,
-        lat_row,
-        lon_row,
-        alt_row,
-        zip_row,
-        zip_status_row,
+        lat_row: station.lat_row,
+        lon_row: station.lon_row,
+        alt_row: station.alt_row,
+        zip_row: station.zip_row,
+        zip_status_row: station.zip_status_row,
         last_refresh_row,
         refresh_button,
         refresh_spinner,
@@ -60,15 +60,27 @@ pub fn build_satellites_panel() -> SatellitesPanel {
 /// Ground-station group — lat / lon / alt spin rows plus the ZIP
 /// shortcut and its status row. Split out of
 /// [`build_satellites_panel`] per the 50-NLOC gate (#819).
-fn build_station_group(
-    page: &adw::PreferencesPage,
-) -> (
-    adw::SpinRow,
-    adw::SpinRow,
-    adw::SpinRow,
-    adw::EntryRow,
-    adw::ActionRow,
-) {
+/// The Ground Station group's five rows, named because latitude /
+/// longitude / altitude share the `SpinRow` type — a reordered
+/// positional return would swap them silently, and these values
+/// feed pass prediction, so the failure would be wrong pass times
+/// rather than a compile error (`CodeRabbit` round 1 on PR #887;
+/// same shape as [`RecordingRows`]).
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names deliberately mirror the SatellitesPanel fields they \
+              feed so the orchestrator's struct literal moves them 1:1 \
+              (same call as RecordingRows and PR #886's SharedRows)"
+)]
+struct StationRows {
+    lat_row: adw::SpinRow,
+    lon_row: adw::SpinRow,
+    alt_row: adw::SpinRow,
+    zip_row: adw::EntryRow,
+    zip_status_row: adw::ActionRow,
+}
+
+fn build_station_group(page: &adw::PreferencesPage) -> StationRows {
     // ─── Ground station ────────────────────────────────────────
     let station_group = adw::PreferencesGroup::builder()
         .title("Ground Station")
@@ -130,7 +142,13 @@ fn build_station_group(
 
     page.add(&station_group);
 
-    (lat_row, lon_row, alt_row, zip_row, zip_status_row)
+    StationRows {
+        lat_row,
+        lon_row,
+        alt_row,
+        zip_row,
+        zip_status_row,
+    }
 }
 
 /// TLE group — last-refreshed row with the refresh button +

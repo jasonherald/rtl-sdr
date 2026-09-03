@@ -149,16 +149,9 @@ impl BookmarksPanel {
     /// entry (#819 — replaces the former ten-argument
     /// `rebuild_bookmark_list` signature).
     fn list_ctx(&self, name_entry: &adw::EntryRow) -> BookmarkListCtx {
-        BookmarkListCtx {
-            bookmarks: std::rc::Rc::clone(&self.bookmarks),
-            on_navigate: std::rc::Rc::clone(&self.on_navigate),
-            active: std::rc::Rc::clone(&self.active_bookmark),
-            name_entry: name_entry.clone(),
-            on_save: std::rc::Rc::clone(&self.on_save),
-            filter_text: std::rc::Rc::clone(&self.filter_text),
-            manual_expanded: std::rc::Rc::clone(&self.manual_expanded),
-            on_mutated: std::rc::Rc::clone(&self.on_mutated),
-        }
+        // One-line delegation — `from_panel` is the single source
+        // of truth for the handle bundle (CR round 1 on PR #887).
+        BookmarkListCtx::from_panel(self, name_entry)
     }
 
     fn rebuild_inner(&self, name_entry: &adw::EntryRow, notify_mutated: bool) {
@@ -269,20 +262,11 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
     >::new()));
     let on_mutated: BookmarksMutatedCallback = std::rc::Rc::new(std::cell::RefCell::new(None));
 
-    wire_search_and_seed(&search_entry, &bookmark_list, &bookmark_scroll, {
-        BookmarkListCtx {
-            bookmarks: std::rc::Rc::clone(&bookmarks),
-            on_navigate: std::rc::Rc::clone(&on_navigate),
-            active: std::rc::Rc::clone(&active_bookmark),
-            name_entry: name_entry.clone(),
-            on_save: std::rc::Rc::clone(&on_save),
-            filter_text: std::rc::Rc::clone(&filter_text),
-            manual_expanded: std::rc::Rc::clone(&manual_expanded),
-            on_mutated: std::rc::Rc::clone(&on_mutated),
-        }
-    });
-
-    BookmarksPanel {
+    // Assemble the panel FIRST so the seed/search context can be
+    // derived from it via `BookmarkListCtx::from_panel` — the one
+    // canonical field mapping every rebuild path shares
+    // (`CodeRabbit` round 1 on PR #887).
+    let panel = BookmarksPanel {
         widget,
         bookmark_list,
         bookmark_scroll,
@@ -293,5 +277,12 @@ pub fn build_bookmarks_panel(name_entry: &adw::EntryRow) -> BookmarksPanel {
         filter_text,
         manual_expanded,
         on_mutated,
-    }
+    };
+    wire_search_and_seed(
+        &search_entry,
+        &panel.bookmark_list,
+        &panel.bookmark_scroll,
+        BookmarkListCtx::from_panel(&panel, name_entry),
+    );
+    panel
 }

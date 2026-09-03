@@ -88,7 +88,7 @@ impl RadioPanel {
         // on actual value change, so this is a no-op when CTCSS
         // was already Off.
         if !ctcss_allowed {
-            self.ctcss_row.set_selected(0);
+            self.ctcss_row.set_selected(super::CTCSS_OFF_IDX);
         }
 
         // Voice squelch is also NFM-oriented. Syllabic is
@@ -192,7 +192,7 @@ impl RadioPanel {
     /// and the `DspToUi::CtcssSustainedChanged` edge handler
     /// (with the actual bool from the message).
     pub fn set_ctcss_sustained(&self, sustained: bool) {
-        let text = if self.ctcss_row.selected() == 0 {
+        let text = if self.ctcss_row.selected() == super::CTCSS_OFF_IDX {
             "Off"
         } else if sustained {
             "Tone detected — gate open"

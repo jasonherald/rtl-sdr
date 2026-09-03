@@ -32,6 +32,7 @@ const UNCATEGORIZED_LABEL: &str = "Uncategorized";
 /// closures capture a clone, and the recursive rebuild threads
 /// the same context back through.
 #[derive(Clone)]
+
 pub struct BookmarkListCtx {
     /// The backing bookmark store.
     pub bookmarks: std::rc::Rc<std::cell::RefCell<Vec<Bookmark>>>,
@@ -51,6 +52,27 @@ pub struct BookmarkListCtx {
     pub manual_expanded: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     /// Scanner re-projection callback fired on list mutations.
     pub on_mutated: BookmarksMutatedCallback,
+}
+
+impl BookmarkListCtx {
+    /// Single source of truth for the handle bundle — every rebuild
+    /// path derives its context from the flyout panel, so all paths
+    /// provably share the same cells. Replaces three hand-copied
+    /// field mappings where one divergent `Rc::clone` would have
+    /// silently forked state (`CodeRabbit` round 1 on PR #887).
+    #[must_use]
+    pub fn from_panel(panel: &crate::sidebar::BookmarksPanel, name_entry: &adw::EntryRow) -> Self {
+        Self {
+            bookmarks: std::rc::Rc::clone(&panel.bookmarks),
+            on_navigate: std::rc::Rc::clone(&panel.on_navigate),
+            active: std::rc::Rc::clone(&panel.active_bookmark),
+            name_entry: name_entry.clone(),
+            on_save: std::rc::Rc::clone(&panel.on_save),
+            filter_text: std::rc::Rc::clone(&panel.filter_text),
+            manual_expanded: std::rc::Rc::clone(&panel.manual_expanded),
+            on_mutated: std::rc::Rc::clone(&panel.on_mutated),
+        }
+    }
 }
 
 /// Does the bookmark's name, subtitle, or category contain the

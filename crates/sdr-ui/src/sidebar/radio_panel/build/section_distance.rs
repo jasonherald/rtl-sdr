@@ -93,16 +93,11 @@ fn build_distance_rows() -> (adw::SpinRow, adw::SpinRow, adw::ActionRow) {
         .activatable(false)
         .build();
 
-    let distance_group = adw::PreferencesGroup::builder()
-        .title("Distance Estimator")
-        .description(
-            "Rough line-of-sight (FSPL) estimate — read as an upper bound, not precision ranging",
-        )
-        .build();
-    distance_group.add(&erp_row);
-    distance_group.add(&calibration_row);
-    distance_group.add(&distance_row);
-
+    // The retained group is built (and the rows parented) in
+    // `build_distance_group` — an earlier carve draft ALSO built a
+    // throwaway group here, wastefully parenting the rows into a
+    // widget that was immediately dropped (`CodeRabbit` round 1 on
+    // PR #887).
     (erp_row, calibration_row, distance_row)
 }
 
