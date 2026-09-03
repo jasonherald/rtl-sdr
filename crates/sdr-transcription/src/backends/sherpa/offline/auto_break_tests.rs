@@ -352,3 +352,55 @@ fn max_segment_safety_flush_resumes_recording_not_idle() {
     machine.on_samples(&samples_for_ms(1_000));
     assert_eq!(machine.buffer_duration_ms(), 1_000);
 }
+
+#[test]
+fn max_segment_cap_during_holdoff_keeps_pending_close_edge() {
+    // CodeRabbit round 1 on PR #891: a transmission that closes just
+    // under the cap keeps receiving gap-free samples during the tail
+    // window; when the cap trips in `HoldingOff`, the forced flush
+    // must NOT discard the already-observed close edge (resume in
+    // `Recording` + cleared deadline left the machine buffering dead
+    // air and dispatching a silence segment every cap interval).
+    // Boundary parameters, named so the HoldingOff geometry stays
+    // legible (CR round 2 on PR #891): the transmission closes with
+    // CAP_HEADROOM_MS of room left under the cap, then TAIL_MS of
+    // gap-free post-close audio crosses it inside the tail window
+    // (TAIL_MS > CAP_HEADROOM_MS is what makes the cap trip while
+    // HoldingOff). The deadline models a pending tail flush well in
+    // the future; the gate ratio is the harness's pass-through value.
+    const CAP_HEADROOM_MS: u32 = 200;
+    const TAIL_MS: u32 = 400;
+    const PENDING_TAIL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+    const NOISE_GATE_PASSTHROUGH: f32 = 1.0;
+
+    let mut machine = default_machine();
+    let (decode_tx, decode_rx) = mpsc::channel();
+    let mut deadline = Some(std::time::Instant::now() + PENDING_TAIL_DEADLINE);
+
+    machine.on_squelch_opened();
+    machine.on_samples(&samples_for_ms(AUTO_BREAK_MAX_SEGMENT_MS - CAP_HEADROOM_MS));
+    machine.on_squelch_closed();
+
+    let flow = handle_samples_arm(
+        &mut machine,
+        &samples_for_ms(TAIL_MS),
+        NOISE_GATE_PASSTHROUGH,
+        denoise::AudioEnhancement::Off,
+        &decode_tx,
+        &mut deadline,
+    );
+    assert!(matches!(flow, std::ops::ControlFlow::Continue(())));
+    // The oversized buffer was force-flushed to the decoder…
+    assert!(decode_rx.try_recv().is_ok(), "cap flush must dispatch");
+    // …but the close edge survives: still HoldingOff with the tail
+    // deadline intact, so `on_tail_timeout` finalizes the
+    // transmission instead of the machine sticking in `Recording`.
+    assert!(
+        matches!(machine.state(), AutoBreakState::HoldingOff),
+        "cap during HoldingOff must resume in HoldingOff"
+    );
+    assert!(
+        deadline.is_some(),
+        "tail deadline must survive a cap flush in HoldingOff"
+    );
+}
