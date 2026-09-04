@@ -159,19 +159,25 @@ fn lrpt_modulation_pinned_for_active_meteor_satellites() {
     );
 }
 
-/// Differential precoding is part of the downlink profile (#730):
-/// the current Meteor-M2 birds use plain concatenated coding, so
-/// the live decoder must not run the differential pre-decoder.
+/// Differential precoding is part of the downlink profile (#730,
+/// corrected #892): the current Meteor-M2 birds transmit
+/// differentially-precoded OQPSK, so the live decoder MUST run the
+/// differential pre-decoder. The prior version of this test pinned
+/// the opposite (`!lrpt_differential`) as fact — that assumption
+/// was never validated against a live signal and was the root cause
+/// of every silent M2-4 pass: the station's first successful decode
+/// (2026-09-04, #892) produced AVHRR imagery only with differential
+/// precoding enabled; plain OQPSK yielded zero CADUs.
 #[test]
-fn meteor_downlinks_are_not_differentially_precoded() {
+fn meteor_downlinks_are_differentially_precoded() {
     for norad_id in [METEOR_M2_3_NORAD_ID, METEOR_M2_4_NORAD_ID] {
         let sat = KNOWN_SATELLITES
             .iter()
             .find(|s| s.norad_id == norad_id)
             .expect("Meteor in KNOWN_SATELLITES");
         assert!(
-            !sat.lrpt_differential,
-            "{}: no differential precoding",
+            sat.lrpt_differential,
+            "{}: Meteor-M2 LRPT is differentially precoded (#892)",
             sat.name
         );
     }

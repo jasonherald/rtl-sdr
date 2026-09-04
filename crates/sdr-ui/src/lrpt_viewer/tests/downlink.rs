@@ -1,7 +1,8 @@
 use super::*;
 
 /// The AOS wiring's catalog → profile mapping: current Meteors
-/// are plain OQPSK; an uncatalogued id falls back to plain QPSK.
+/// are differentially-precoded OQPSK (#892); an uncatalogued id
+/// falls back to plain QPSK.
 #[test]
 fn lrpt_downlink_for_maps_the_catalog_profile() {
     use sdr_dsp::lrpt::LrptMode;
@@ -10,7 +11,7 @@ fn lrpt_downlink_for_maps_the_catalog_profile() {
     for norad_id in [sdr_sat::METEOR_M2_3_NORAD_ID, sdr_sat::METEOR_M2_4_NORAD_ID] {
         assert_eq!(
             lrpt_downlink_for(norad_id),
-            LrptDownlink::new(LrptMode::Oqpsk, false)
+            LrptDownlink::new(LrptMode::Oqpsk, true)
         );
     }
     assert_eq!(
@@ -30,7 +31,7 @@ fn lrpt_pass_start_sends_profile_then_clear() {
     let [first, second] = lrpt_pass_start_commands(sdr_sat::METEOR_M2_4_NORAD_ID, &image);
     assert!(matches!(
         first,
-        UiToDsp::SetLrptDownlink(profile) if profile == LrptDownlink::new(LrptMode::Oqpsk, false)
+        UiToDsp::SetLrptDownlink(profile) if profile == LrptDownlink::new(LrptMode::Oqpsk, true)
     ));
     assert!(matches!(second, UiToDsp::ClearLrptImageContents(_)));
 }
