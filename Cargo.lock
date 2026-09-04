@@ -3207,6 +3207,7 @@ dependencies = [
  "image",
  "proptest",
  "sdr-dsp",
+ "sdr-sat",
  "sdr-types",
  "thiserror 2.0.20",
  "tracing",

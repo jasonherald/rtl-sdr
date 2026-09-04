@@ -222,9 +222,13 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // M2-3 back to standard mode. Per #645.
         expected_lrpt_apids: Some(METEOR_M2_3_EXPECTED_LRPT_APIDS),
         // Current-generation METEOR-M2 satellites broadcast
-        // Offset QPSK at 72 ksym/s. Per #662.
+        // differentially-precoded Offset QPSK at 72 ksym/s. Per
+        // #662; differential requirement confirmed empirically on
+        // M2-4 (#892) and inferred here for M2-3 (identical downlink
+        // format) — flip back if an M2-3 live pass ever proves it
+        // decodes without differential.
         lrpt_modulation: Some(LrptModulation::Oqpsk),
-        lrpt_differential: false,
+        lrpt_differential: true,
     },
     KnownSatellite {
         // METEOR-M2 4 launched in 2024 and is actively transmitting
@@ -252,9 +256,15 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // passes — currently the easier first-decode target than
         // M2-3 for exactly that reason. Per #645.
         expected_lrpt_apids: Some(METEOR_M2_4_EXPECTED_LRPT_APIDS),
-        // Same OQPSK modulation as M2-3. Per #662.
+        // Same differentially-precoded OQPSK downlink as M2-3. The
+        // differential requirement was confirmed empirically here:
+        // the station's first successful M2-4 decode (2026-09-04,
+        // #892) produced real AVHRR imagery ONLY with differential
+        // precoding — plain OQPSK yielded zero CADUs. The former
+        // `lrpt_differential: false` is why every live M2-4 pass
+        // silently decoded nothing. Per #662 + #892.
         lrpt_modulation: Some(LrptModulation::Oqpsk),
-        lrpt_differential: false,
+        lrpt_differential: true,
     },
     // ISS SSTV — epic #472. Currently 437.550 MHz UHF (ARISS Series
     // 31+, April 2026 onward, see #638); the catalog tracks the live
