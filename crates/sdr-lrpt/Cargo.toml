@@ -23,6 +23,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [dev-dependencies]
 proptest = "1"
 criterion.workspace = true
+# Real-capture regression test drives the demod/FEC chain from the
+# live METEOR-M2 catalog entry (see tests/meteor_m2_real_capture.rs).
+sdr-sat.workspace = true
 
 [lints]
 workspace = true

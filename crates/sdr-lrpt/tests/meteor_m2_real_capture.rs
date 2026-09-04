@@ -49,13 +49,19 @@ fn meteor_m2_catalog_profile_decodes_a_real_pass() {
         )
     });
 
-    let (stats, lines) = decode_fixture(&path);
+    // Drive the chain from the live catalog entry — NOT hard-coded
+    // — so this test guards the catalog→pipeline wiring end to end:
+    // if `lrpt_differential` is ever reverted in the catalog, the
+    // built chain reverts with it and this decode fails. Per
+    // `CodeRabbit` round 2 on PR #894.
+    let (mode, differential) = catalog_profile(sdr_sat::METEOR_M2_4_NORAD_ID);
+    let (stats, lines) = decode_fixture(&path, mode, differential);
 
     assert!(
         stats.cadus_decoded > 0,
-        "OQPSK+differential decoded zero CADUs from {path} \
-         (rotation_locks={}, cadus_failed={}) — the METEOR-M2 \
-         catalog profile no longer decodes a known-good pass (#892)",
+        "the catalog's METEOR-M2 4 profile ({mode:?}, differential={differential}) \
+         decoded zero CADUs from {path} (rotation_locks={}, cadus_failed={}) — \
+         the catalog no longer maps to a chain that decodes a known-good pass (#892)",
         stats.rotation_locks,
         stats.cadus_failed,
     );
@@ -66,44 +72,69 @@ fn meteor_m2_catalog_profile_decodes_a_real_pass() {
     );
 }
 
-/// Stream the fixture through the exact profile the corrected
-/// catalog yields for METEOR-M2 3 / M2-4 — OQPSK modulation with
-/// differential precoding ON — and return the FEC stats plus the
-/// total assembled image lines. If a future edit flips the
-/// catalog's `lrpt_differential` back off, the analogous unit test
-/// in `sdr-sat` fails first; this is the end-to-end backstop
-/// proving the profile actually decodes a real signal.
-fn decode_fixture(path: &str) -> (sdr_lrpt::fec::FecStats, usize) {
-    let mut demod = LrptDemod::new_with_mode(LrptMode::Oqpsk).expect("OQPSK demod constructs");
-    let mut pipeline = LrptPipeline::new_with_differential(true);
+/// Resolve a `KnownSatellite`'s LRPT profile into the concrete
+/// demod + FEC settings, mirroring the live wiring's
+/// `lrpt_downlink_for`. Panics if the id isn't an LRPT entry — the
+/// caller passes a Meteor NORAD id.
+fn catalog_profile(norad_id: u32) -> (LrptMode, bool) {
+    let sat = sdr_sat::KNOWN_SATELLITES
+        .iter()
+        .find(|s| s.norad_id == norad_id)
+        .unwrap_or_else(|| panic!("NORAD {norad_id} not in KNOWN_SATELLITES"));
+    let mode = match sat.lrpt_modulation {
+        Some(sdr_sat::LrptModulation::Oqpsk) => LrptMode::Oqpsk,
+        Some(sdr_sat::LrptModulation::Qpsk) => LrptMode::Qpsk,
+        None => panic!("NORAD {norad_id} has no LRPT modulation in the catalog"),
+    };
+    (mode, sat.lrpt_differential)
+}
+
+/// Stream the fixture through the given demod mode + differential
+/// setting (resolved from the catalog by the caller) and return the
+/// FEC stats plus total assembled image lines.
+fn decode_fixture(
+    path: &str,
+    mode: LrptMode,
+    differential: bool,
+) -> (sdr_lrpt::fec::FecStats, usize) {
+    let mut demod = LrptDemod::new_with_mode(mode).expect("catalog demod mode constructs");
+    let mut pipeline = LrptPipeline::new_with_differential(differential);
 
     let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("cannot open {path}: {e}"));
     let mut reader = BufReader::new(file);
-    let mut byte_buf = vec![0u8; CHUNK_SAMPLES * IQ_SAMPLE_BYTES];
+    // Allocate the buffer AS `[Complex]` so it's guaranteed aligned,
+    // then read raw bytes into its byte-view — reading into a
+    // `Vec<u8>` and casting to `[Complex]` relies on the allocator
+    // happening to return 4-byte-aligned memory, which `cast_slice`
+    // would panic on if it ever didn't (Codacy round 1 on PR #894).
+    let mut buf = vec![Complex::default(); CHUNK_SAMPLES];
+    let chunk_bytes = CHUNK_SAMPLES * IQ_SAMPLE_BYTES;
 
     loop {
-        let mut filled = 0;
-        // Fill a whole-sample-aligned chunk.
-        while filled < byte_buf.len() {
-            match reader.read(&mut byte_buf[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) => panic!("read error on {path}: {e}"),
+        // Fill the chunk's byte-view in a scope so the mutable
+        // borrow ends before we read the samples back out.
+        let filled = {
+            let byte_view: &mut [u8] = bytemuck::cast_slice_mut(&mut buf);
+            let mut filled = 0;
+            while filled < byte_view.len() {
+                match reader.read(&mut byte_view[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => panic!("read error on {path}: {e}"),
+                }
             }
-        }
-        let aligned = (filled / IQ_SAMPLE_BYTES) * IQ_SAMPLE_BYTES;
-        if aligned == 0 {
+            filled
+        };
+        let whole_samples = filled / IQ_SAMPLE_BYTES;
+        if whole_samples == 0 {
             break;
         }
-        // Interleaved f32 (re, im) == `[Complex]` bit-for-bit; cast
-        // in place, no per-sample copy (same as `sdr-lrpt-replay`).
-        let samples: &[Complex] = bytemuck::cast_slice(&byte_buf[..aligned]);
-        for &sample in samples {
+        for &sample in &buf[..whole_samples] {
             if let Some(soft) = demod.process(sample) {
                 pipeline.push_symbol(soft);
             }
         }
-        if filled < byte_buf.len() {
+        if filled < chunk_bytes {
             break; // short read == EOF
         }
     }
