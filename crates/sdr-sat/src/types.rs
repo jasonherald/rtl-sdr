@@ -194,11 +194,13 @@ pub struct KnownSatellite {
     pub lrpt_modulation: Option<LrptModulation>,
     /// Whether this satellite's LRPT downlink is differentially
     /// precoded (the FEC chain runs dbdexter's `diff_decode` on the
-    /// soft symbols before Viterbi). The legacy METEOR-M N2 used
-    /// differential precoding; the current METEOR-M2 3 / M2-4 use
-    /// plain concatenated coding. Part of the downlink profile so
-    /// the live decoder and the replay CLI build the same chain
-    /// (#730). Meaningless (`false`) for non-LRPT entries.
+    /// soft symbols before Viterbi). The current METEOR-M2 3 / M2-4
+    /// downlinks ARE differentially precoded — confirmed empirically
+    /// on the first successful M2-4 decode, where plain OQPSK
+    /// yielded zero CADUs and only the differential chain produced
+    /// imagery (#892). Part of the downlink profile so the live
+    /// decoder and the replay CLI build the same chain (#730,
+    /// corrected #892). Meaningless (`false`) for non-LRPT entries.
     pub lrpt_differential: bool,
 }
 

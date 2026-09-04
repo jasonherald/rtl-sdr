@@ -49,16 +49,35 @@ fn meteor_m2_catalog_profile_decodes_a_real_pass() {
         )
     });
 
-    // The exact profile the corrected catalog yields for METEOR-M2
-    // 3 / M2-4: OQPSK modulation, differential precoding ON. If a
-    // future edit flips the catalog's `lrpt_differential` back off,
-    // the analogous unit test in `sdr-sat` fails first; this test
-    // is the end-to-end backstop proving the profile actually
-    // decodes a real signal.
+    let (stats, lines) = decode_fixture(&path);
+
+    assert!(
+        stats.cadus_decoded > 0,
+        "OQPSK+differential decoded zero CADUs from {path} \
+         (rotation_locks={}, cadus_failed={}) — the METEOR-M2 \
+         catalog profile no longer decodes a known-good pass (#892)",
+        stats.rotation_locks,
+        stats.cadus_failed,
+    );
+    assert!(
+        lines > 0,
+        "decoded {} CADUs but assembled zero image lines from {path}",
+        stats.cadus_decoded,
+    );
+}
+
+/// Stream the fixture through the exact profile the corrected
+/// catalog yields for METEOR-M2 3 / M2-4 — OQPSK modulation with
+/// differential precoding ON — and return the FEC stats plus the
+/// total assembled image lines. If a future edit flips the
+/// catalog's `lrpt_differential` back off, the analogous unit test
+/// in `sdr-sat` fails first; this is the end-to-end backstop
+/// proving the profile actually decodes a real signal.
+fn decode_fixture(path: &str) -> (sdr_lrpt::fec::FecStats, usize) {
     let mut demod = LrptDemod::new_with_mode(LrptMode::Oqpsk).expect("OQPSK demod constructs");
     let mut pipeline = LrptPipeline::new_with_differential(true);
 
-    let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("cannot open {path}: {e}"));
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("cannot open {path}: {e}"));
     let mut reader = BufReader::new(file);
     let mut byte_buf = vec![0u8; CHUNK_SAMPLES * IQ_SAMPLE_BYTES];
 
@@ -89,24 +108,10 @@ fn meteor_m2_catalog_profile_decodes_a_real_pass() {
         }
     }
 
-    let stats = pipeline.fec_stats();
-    let lines: usize = pipeline
+    let lines = pipeline
         .assembler()
         .channels()
         .map(|(_, ch)| ch.lines)
         .sum();
-
-    assert!(
-        stats.cadus_decoded > 0,
-        "OQPSK+differential decoded zero CADUs from {path} \
-         (rotation_locks={}, cadus_failed={}) — the METEOR-M2 \
-         catalog profile no longer decodes a known-good pass (#892)",
-        stats.rotation_locks,
-        stats.cadus_failed,
-    );
-    assert!(
-        lines > 0,
-        "decoded {} CADUs but assembled zero image lines from {path}",
-        stats.cadus_decoded,
-    );
+    (pipeline.fec_stats(), lines)
 }
