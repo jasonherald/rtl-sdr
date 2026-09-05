@@ -454,6 +454,16 @@ pub struct AppState {
     /// Pure UI-side classification — the decoder emits no per-type
     /// counts.
     pub orbcomm_tally: RefCell<crate::orbcomm_tally::OrbcommTally>,
+    /// Learned `sat_id → name` table (epic #865 identification):
+    /// spacecraft names inferred from ephemeris/TLE correlation and
+    /// persisted under a JSON object key, mirroring the
+    /// watched-satellites precedent. Populated by later wiring
+    /// (Task 5/7); empty at construction.
+    pub orbcomm_sat_names: RefCell<std::collections::HashMap<u8, String>>,
+    /// Parsed Orbcomm TLE candidates (name + propagatable
+    /// `Satellite`) loaded from the shared TLE cache. Populated by
+    /// later wiring (Task 5/7); empty at construction.
+    pub orbcomm_tles: RefCell<Vec<(String, sdr_sat::Satellite)>>,
     /// Stash for the **full batch** of `RecorderAction`s a
     /// recorder tick yielded when ACARS was engaged. The
     /// recorder tick site detects a `StartAutoRecord` in the
@@ -567,6 +577,8 @@ impl AppState {
             orbcomm_panel_handles: RefCell::new(None),
             orbcomm_heard: RefCell::new(crate::sidebar::satellites_heard::HeardSatellites::new()),
             orbcomm_tally: RefCell::new(crate::orbcomm_tally::OrbcommTally::default()),
+            orbcomm_sat_names: RefCell::new(std::collections::HashMap::new()),
+            orbcomm_tles: RefCell::new(Vec::new()),
             pending_aos_actions: RefCell::new(None),
             recorder_action_interpreter: RefCell::new(None),
         })

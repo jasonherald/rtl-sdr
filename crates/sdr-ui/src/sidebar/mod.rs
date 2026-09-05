@@ -12,6 +12,7 @@ pub mod display_panel;
 pub mod general_panel;
 pub mod navigation_panel;
 pub mod orbcomm_panel;
+pub mod orbcomm_persistence;
 pub mod radio_panel;
 pub mod satellites_heard;
 pub mod satellites_notify;
@@ -33,6 +34,9 @@ pub use display_panel::{DisplayPanel, build_display_panel};
 pub use general_panel::{GeneralPanel, build_general_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
 pub use orbcomm_panel::{OrbcommPanel, build_orbcomm_panel};
+pub use orbcomm_persistence::{
+    load_orbcomm_sat_names, orbcomm_tles_from_cache, save_orbcomm_sat_names,
+};
 pub use radio_panel::{RadioPanel, build_radio_panel};
 pub use satellites_panel::{SatellitesPanel, build_satellites_panel};
 pub use scanner_panel::{ScannerPanel, build_scanner_panel};
