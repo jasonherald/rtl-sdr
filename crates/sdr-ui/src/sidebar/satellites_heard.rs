@@ -39,13 +39,29 @@ pub struct HeardRow {
     /// Last-known `(lat_deg, lon_deg, alt_m)`, or `None` if only
     /// Sync beacons (no position) have been heard so far.
     pub position: Option<(f64, f64, f64)>,
+    /// Last-known ECEF speed magnitude (3D) in m/s from an Ephemeris
+    /// packet, mirroring `sdr_orbcomm::packet::Ephemeris::vel_ms`, or
+    /// `None` if none has decoded yet. Preserved across subsequent
+    /// Sync-only beacons, same as `position`.
+    pub vel_ms: Option<f64>,
+    /// Last-known satellite-reported clock, as a Unix timestamp, from
+    /// an Ephemeris packet, or `None` if none has decoded yet.
+    /// Preserved across subsequent Sync-only beacons, same as
+    /// `position`.
+    pub sat_time_unix: Option<i64>,
+    /// Total identity-bearing packets (Sync + Ephemeris) heard from
+    /// this `sat_id` this session.
+    pub packet_count: u64,
 }
 
 /// Per-satellite tracking state. Not `pub` — callers only see the
 /// [`HeardRow`] projection through [`HeardSatellites::rows`].
 struct Entry {
     position: Option<(f64, f64, f64)>,
+    vel_ms: Option<f64>,
+    sat_time_unix: Option<i64>,
     last_heard: Instant,
+    packet_count: u64,
 }
 
 /// Session-scoped "heard via Orbcomm" tracker, keyed by `sat_id`.
@@ -65,14 +81,22 @@ impl HeardSatellites {
         Self::default()
     }
 
-    /// Record a packet heard from `sat_id` at `now`. `position` is
-    /// `Some((lat_deg, lon_deg, alt_m))` for an Ephemeris packet,
-    /// `None` for a Sync beacon (which carries no position) — a
-    /// `None` record always keeps whatever position was already
-    /// known while still refreshing the last-heard time, so a
-    /// satellite doesn't lose its last fix just because the next
-    /// packet happened to be a Sync beacon.
-    pub fn record(&mut self, sat_id: u8, position: Option<(f64, f64, f64)>, now: Instant) {
+    /// Record a packet heard from `sat_id` at `now`. `position`,
+    /// `vel_ms`, and `sat_time_unix` are `Some` for an Ephemeris
+    /// packet (which carries a fix, ground-track velocity, and the
+    /// satellite's own clock) and `None` for a Sync beacon (which
+    /// carries none of the three) — a `None` field always keeps
+    /// whatever value was already known while still refreshing the
+    /// last-heard time, so a satellite doesn't lose its last fix just
+    /// because the next packet happened to be a Sync beacon.
+    pub fn record(
+        &mut self,
+        sat_id: u8,
+        position: Option<(f64, f64, f64)>,
+        vel_ms: Option<f64>,
+        sat_time_unix: Option<i64>,
+        now: Instant,
+    ) {
         // Opportunistic prune on every write, so a long session
         // doesn't carry expired entries forward between rebuilds.
         // `rows` also filters by age, so this is a memory-bound
@@ -83,12 +107,22 @@ impl HeardSatellites {
 
         let entry = self.entries.entry(sat_id).or_insert(Entry {
             position: None,
+            vel_ms: None,
+            sat_time_unix: None,
             last_heard: now,
+            packet_count: 0,
         });
         if position.is_some() {
             entry.position = position;
         }
+        if vel_ms.is_some() {
+            entry.vel_ms = vel_ms;
+        }
+        if sat_time_unix.is_some() {
+            entry.sat_time_unix = sat_time_unix;
+        }
         entry.last_heard = now;
+        entry.packet_count = entry.packet_count.saturating_add(1);
     }
 
     /// Snapshot the currently-heard (not yet expired) satellites,
@@ -111,6 +145,9 @@ impl HeardSatellites {
                 label: sdr_orbcomm::sat_names::sat_label(sat_id),
                 age_secs: now.saturating_duration_since(entry.last_heard).as_secs(),
                 position: entry.position,
+                vel_ms: entry.vel_ms,
+                sat_time_unix: entry.sat_time_unix,
+                packet_count: entry.packet_count,
             })
             .collect()
     }

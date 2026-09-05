@@ -6,7 +6,7 @@ use super::*;
 fn record_and_rows_round_trip() {
     let mut model = HeardSatellites::new();
     let now = Instant::now();
-    model.record(0x2C, Some((51.2, 7.4, 715_000.0)), now);
+    model.record(0x2C, Some((51.2, 7.4, 715_000.0)), None, None, now);
 
     let rows = model.rows(now);
 
@@ -20,7 +20,7 @@ fn record_and_rows_round_trip() {
 fn sync_after_ephemeris_keeps_position_and_refreshes_age() {
     let mut model = HeardSatellites::new();
     let t0 = Instant::now();
-    model.record(0x2C, Some((51.2, 7.4, 715_000.0)), t0);
+    model.record(0x2C, Some((51.2, 7.4, 715_000.0)), None, None, t0);
 
     // Before the Sync lands, age tracks the Ephemeris timestamp.
     let t_mid = t0 + Duration::from_secs(5);
@@ -30,7 +30,7 @@ fn sync_after_ephemeris_keeps_position_and_refreshes_age() {
 
     // A Sync beacon (no position) lands 10 s after the Ephemeris.
     let t_sync = t0 + Duration::from_secs(10);
-    model.record(0x2C, None, t_sync);
+    model.record(0x2C, None, None, None, t_sync);
 
     // 2 s after the Sync: age must reflect the Sync (not the
     // original Ephemeris), and the position must be unchanged.
@@ -45,7 +45,7 @@ fn sync_after_ephemeris_keeps_position_and_refreshes_age() {
 fn expiry_drops_old_entries() {
     let mut model = HeardSatellites::new();
     let t0 = Instant::now();
-    model.record(0x05, None, t0);
+    model.record(0x05, None, None, None, t0);
 
     let just_inside = t0 + Duration::from_secs(HEARD_EXPIRY_SECS - 1);
     assert_eq!(model.rows(just_inside).len(), 1);
@@ -61,9 +61,9 @@ fn expiry_drops_old_entries() {
 fn rows_sorted_most_recently_heard_first() {
     let mut model = HeardSatellites::new();
     let t0 = Instant::now();
-    model.record(0x01, None, t0);
+    model.record(0x01, None, None, None, t0);
     let t1 = t0 + Duration::from_secs(30);
-    model.record(0x02, None, t1);
+    model.record(0x02, None, None, None, t1);
 
     let rows = model.rows(t1);
 
@@ -76,8 +76,8 @@ fn rows_sorted_most_recently_heard_first() {
 fn two_satellites_tracked_independently() {
     let mut model = HeardSatellites::new();
     let now = Instant::now();
-    model.record(0x01, Some((10.0, 20.0, 700_000.0)), now);
-    model.record(0x02, Some((-5.0, -30.0, 720_000.0)), now);
+    model.record(0x01, Some((10.0, 20.0, 700_000.0)), None, None, now);
+    model.record(0x02, Some((-5.0, -30.0, 720_000.0)), None, None, now);
 
     let rows = model.rows(now);
 
@@ -92,4 +92,75 @@ fn two_satellites_tracked_independently() {
         .expect("sat 0x02 row present");
     assert_eq!(sat_01.position, Some((10.0, 20.0, 700_000.0)));
     assert_eq!(sat_02.position, Some((-5.0, -30.0, 720_000.0)));
+}
+
+#[test]
+fn ephemeris_record_retains_velocity_and_sat_time() {
+    let now = Instant::now();
+    let mut heard = HeardSatellites::new();
+    heard.record(
+        0x2C,
+        Some((51.2, 7.4, 715_000.0)),
+        Some(7450.0),
+        Some(1_600_000_000),
+        now,
+    );
+    let rows = heard.rows(now);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].vel_ms, Some(7450.0));
+    assert_eq!(rows[0].sat_time_unix, Some(1_600_000_000));
+}
+
+#[test]
+fn sync_only_record_leaves_velocity_and_time_none() {
+    let now = Instant::now();
+    let mut heard = HeardSatellites::new();
+    heard.record(0x2C, None, None, None, now);
+    let rows = heard.rows(now);
+    assert_eq!(rows[0].vel_ms, None);
+    assert_eq!(rows[0].sat_time_unix, None);
+    assert_eq!(rows[0].position, None);
+}
+
+#[test]
+fn record_increments_packet_count() {
+    let mut heard = HeardSatellites::new();
+    let now = Instant::now();
+    heard.record(
+        0x2C,
+        Some((1.0, 2.0, 700_000.0)),
+        Some(7400.0),
+        Some(111),
+        now,
+    );
+    heard.record(0x2C, None, None, None, now);
+    heard.record(
+        0x2C,
+        Some((1.1, 2.1, 700_100.0)),
+        Some(7401.0),
+        Some(112),
+        now,
+    );
+
+    let rows = heard.rows(now);
+
+    assert_eq!(rows[0].packet_count, 3);
+}
+
+#[test]
+fn sync_after_ephemeris_preserves_last_velocity_and_time() {
+    let now = Instant::now();
+    let mut heard = HeardSatellites::new();
+    heard.record(
+        0x2C,
+        Some((1.0, 2.0, 700_000.0)),
+        Some(7400.0),
+        Some(111),
+        now,
+    );
+    heard.record(0x2C, None, None, None, now); // Sync beacon after a fix
+    let rows = heard.rows(now);
+    assert_eq!(rows[0].vel_ms, Some(7400.0));
+    assert_eq!(rows[0].sat_time_unix, Some(111));
+    assert_eq!(rows[0].position, Some((1.0, 2.0, 700_000.0)));
 }

@@ -5,7 +5,6 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
 mod doppler;
-mod heard;
 mod passes;
 use passes::{DisplayedPass, build_recompute, wire_tle_refresh_button, wire_zip_lookup};
 mod saves;
@@ -331,8 +330,6 @@ pub(super) fn connect_satellites_panel(
     wire_tle_refresh_button(panel, cache.as_ref(), config, &panel_weak, &recompute);
 
     wire_zip_lookup(panel, &panel_weak);
-
-    heard::wire_heard_group(&panel_weak, state);
 
     let wiring = SatWiring {
         panel_weak,

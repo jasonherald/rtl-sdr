@@ -177,6 +177,13 @@ pub const LEFT_ACTIVITIES: &[ActivityBarEntry] = &[
         shortcut_label: "Ctrl+8",
         accelerator: "<Ctrl>8",
     },
+    ActivityBarEntry {
+        name: "orbcomm",
+        icon_name: "network-cellular-signal-excellent-symbolic",
+        display_name: "Orbcomm",
+        shortcut_label: "Ctrl+9",
+        accelerator: "<Ctrl>9",
+    },
 ];
 
 /// Canonical right-activity-bar entries — Transcript + Bookmarks.

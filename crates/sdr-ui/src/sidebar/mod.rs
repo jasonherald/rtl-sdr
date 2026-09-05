@@ -11,6 +11,7 @@ pub mod bookmarks_panel;
 pub mod display_panel;
 pub mod general_panel;
 pub mod navigation_panel;
+pub mod orbcomm_panel;
 pub mod radio_panel;
 pub mod satellites_heard;
 pub mod satellites_notify;
@@ -31,6 +32,7 @@ pub use bookmarks_panel::{BookmarksPanel, build_bookmarks_panel};
 pub use display_panel::{DisplayPanel, build_display_panel};
 pub use general_panel::{GeneralPanel, build_general_panel};
 pub use navigation_panel::{NavigationPanel, build_navigation_panel};
+pub use orbcomm_panel::{OrbcommPanel, build_orbcomm_panel};
 pub use radio_panel::{RadioPanel, build_radio_panel};
 pub use satellites_panel::{SatellitesPanel, build_satellites_panel};
 pub use scanner_panel::{ScannerPanel, build_scanner_panel};
@@ -81,6 +83,10 @@ pub struct SidebarPanels {
     /// stats, and a button that opens the floating viewer. Drives
     /// the "Aviation" left activity (epic #474, sub-project 3).
     pub aviation: AviationPanel,
+    /// Orbcomm activity panel — Decode toggle, 3×3 channel grid,
+    /// By-Spacecraft list, packet-type breakdown, and packet/message
+    /// log. Drives the "Orbcomm" left activity (epic #867).
+    pub orbcomm: OrbcommPanel,
 }
 
 /// Build every sidebar panel. Activity-bar migration: each panel
@@ -103,6 +109,7 @@ pub fn build_panels() -> SidebarPanels {
     // path and rebuild the panel on the wiring side. Seed the
     // initial widget at the predefined width.
     let aviation = build_aviation_panel(sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT);
+    let orbcomm = build_orbcomm_panel();
     // Flyout is built after navigation because it borrows the
     // left-sidebar `name_entry` — its row actions (recall,
     // delete-of-active) sync the entry field.
@@ -128,5 +135,6 @@ pub fn build_panels() -> SidebarPanels {
         scanner,
         satellites,
         aviation,
+        orbcomm,
     }
 }
