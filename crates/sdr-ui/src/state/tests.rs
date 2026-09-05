@@ -2,7 +2,11 @@ use super::*;
 
 fn make_test_state() -> Rc<AppState> {
     let (tx, _rx) = mpsc::channel();
-    AppState::new_shared(tx)
+    AppState::new_shared(tx, test_config())
+}
+
+fn test_config() -> std::sync::Arc<sdr_config::ConfigManager> {
+    std::sync::Arc::new(sdr_config::ConfigManager::in_memory(&serde_json::json!({})))
 }
 
 #[test]
@@ -142,7 +146,7 @@ fn test_state_mutation() {
 #[test]
 fn test_send_dsp_with_dropped_receiver() {
     let (tx, rx) = mpsc::channel();
-    let state = AppState::new_shared(tx);
+    let state = AppState::new_shared(tx, test_config());
     drop(rx);
     // Should not panic — just logs a warning.
     state.send_dsp(UiToDsp::Stop);

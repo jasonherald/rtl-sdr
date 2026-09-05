@@ -354,7 +354,7 @@ pub fn build_window(
     let fft_shared = engine.fft_buffer();
 
     // Shared application state with DSP sender.
-    let state = AppState::new_shared(ui_tx);
+    let state = AppState::new_shared(ui_tx, std::sync::Arc::clone(config));
 
     // --- Build UI ---
     let LayoutHandles {
