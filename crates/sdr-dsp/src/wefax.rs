@@ -4,6 +4,7 @@
 
 mod assembly;
 mod discriminator;
+mod tones;
 
 use assembly::LineAssembler;
 use discriminator::Discriminator;
