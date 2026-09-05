@@ -123,6 +123,31 @@ fn sync_only_record_leaves_velocity_and_time_none() {
 }
 
 #[test]
+fn record_increments_packet_count() {
+    let mut heard = HeardSatellites::new();
+    let now = Instant::now();
+    heard.record(
+        0x2C,
+        Some((1.0, 2.0, 700_000.0)),
+        Some(7400.0),
+        Some(111),
+        now,
+    );
+    heard.record(0x2C, None, None, None, now);
+    heard.record(
+        0x2C,
+        Some((1.1, 2.1, 700_100.0)),
+        Some(7401.0),
+        Some(112),
+        now,
+    );
+
+    let rows = heard.rows(now);
+
+    assert_eq!(rows[0].packet_count, 3);
+}
+
+#[test]
 fn sync_after_ephemeris_preserves_last_velocity_and_time() {
     let now = Instant::now();
     let mut heard = HeardSatellites::new();

@@ -39,15 +39,19 @@ pub struct HeardRow {
     /// Last-known `(lat_deg, lon_deg, alt_m)`, or `None` if only
     /// Sync beacons (no position) have been heard so far.
     pub position: Option<(f64, f64, f64)>,
-    /// Last-known ground-track velocity in m/s from an Ephemeris
-    /// packet, or `None` if none has decoded yet. Preserved across
-    /// subsequent Sync-only beacons, same as `position`.
+    /// Last-known ECEF speed magnitude (3D) in m/s from an Ephemeris
+    /// packet, mirroring `sdr_orbcomm::packet::Ephemeris::vel_ms`, or
+    /// `None` if none has decoded yet. Preserved across subsequent
+    /// Sync-only beacons, same as `position`.
     pub vel_ms: Option<f64>,
     /// Last-known satellite-reported clock, as a Unix timestamp, from
     /// an Ephemeris packet, or `None` if none has decoded yet.
     /// Preserved across subsequent Sync-only beacons, same as
     /// `position`.
     pub sat_time_unix: Option<i64>,
+    /// Total identity-bearing packets (Sync + Ephemeris) heard from
+    /// this `sat_id` this session.
+    pub packet_count: u64,
 }
 
 /// Per-satellite tracking state. Not `pub` — callers only see the
@@ -57,6 +61,7 @@ struct Entry {
     vel_ms: Option<f64>,
     sat_time_unix: Option<i64>,
     last_heard: Instant,
+    packet_count: u64,
 }
 
 /// Session-scoped "heard via Orbcomm" tracker, keyed by `sat_id`.
@@ -105,6 +110,7 @@ impl HeardSatellites {
             vel_ms: None,
             sat_time_unix: None,
             last_heard: now,
+            packet_count: 0,
         });
         if position.is_some() {
             entry.position = position;
@@ -116,6 +122,7 @@ impl HeardSatellites {
             entry.sat_time_unix = sat_time_unix;
         }
         entry.last_heard = now;
+        entry.packet_count = entry.packet_count.saturating_add(1);
     }
 
     /// Snapshot the currently-heard (not yet expired) satellites,
@@ -140,6 +147,7 @@ impl HeardSatellites {
                 position: entry.position,
                 vel_ms: entry.vel_ms,
                 sat_time_unix: entry.sat_time_unix,
+                packet_count: entry.packet_count,
             })
             .collect()
     }

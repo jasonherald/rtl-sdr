@@ -298,6 +298,7 @@ pub(crate) fn format_heard_subtitle(row: &HeardRow) -> String {
         parts.push(format_utc_hms(t));
     }
     parts.push(format!("{}s ago", row.age_secs));
+    parts.push(format!("{} pkts", row.packet_count));
     parts.join(" · ")
 }
 

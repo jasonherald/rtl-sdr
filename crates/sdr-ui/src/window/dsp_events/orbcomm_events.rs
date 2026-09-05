@@ -62,9 +62,16 @@ pub(super) fn on_orbcomm_enabled_changed(ctx: &DspEventCtx, enabled: bool) {
     state.orbcomm_enabled.set(enabled);
     if !enabled {
         state.orbcomm_tally.borrow_mut().reset();
+        // Clear before any handles read it below — the borrow_mut here
+        // must not overlap with refresh_breakdown's borrow() of the
+        // same RefCell.
+        *state.orbcomm_channel_stats.borrow_mut() = Vec::new();
     }
     if let Some(handles) = state.orbcomm_panel_handles.borrow().as_ref() {
         handles.apply_enabled_ack(enabled);
+        if !enabled {
+            handles.refresh_channel_grid(&[]);
+        }
         refresh_breakdown(handles, state);
         repaint_heard(handles, state);
     }
@@ -73,13 +80,17 @@ pub(super) fn on_orbcomm_enabled_changed(ctx: &DspEventCtx, enabled: bool) {
 /// Sum checksum-fail + repaired across channels and repaint the
 /// packet-type breakdown label.
 fn refresh_breakdown(handles: &OrbcommPanelHandles, state: &Rc<AppState>) {
-    let (fail, repaired) = state
-        .orbcomm_channel_stats
-        .borrow()
-        .iter()
-        .fold((0u64, 0u64), |(f, r), s| {
-            (f + s.checksum_fail, r + s.repaired)
-        });
+    let (fail, repaired) =
+        state
+            .orbcomm_channel_stats
+            .borrow()
+            .iter()
+            .fold((0u64, 0u64), |(f, r), s| {
+                (
+                    f.saturating_add(s.checksum_fail),
+                    r.saturating_add(s.repaired),
+                )
+            });
     let text = state
         .orbcomm_tally
         .borrow()
