@@ -214,16 +214,28 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
 
 /// Push `entry` onto the ring, dropping from the front while it
 /// exceeds [`MAX_LOG_ENTRIES`]. Pure so the rotation logic is testable
-/// without a GTK harness; `append_log_entry` reports how many entries
-/// were evicted so it knows how much to trim from the `GtkTextBuffer`.
-fn push_log_ring(ring: &mut VecDeque<String>, entry: String) -> usize {
+/// without a GTK harness. Returns the evicted entries (front-to-back)
+/// so `append_log_entry` can trim exactly their `GtkTextBuffer` lines —
+/// an entry may span several buffer lines (a `MessageComplete` hexdump
+/// block), so the count of *entries* is not the count of buffer *lines*.
+fn push_log_ring(ring: &mut VecDeque<String>, entry: String) -> Vec<String> {
     ring.push_back(entry);
-    let mut evicted = 0;
+    let mut evicted = Vec::new();
     while ring.len() > MAX_LOG_ENTRIES {
-        ring.pop_front();
-        evicted += 1;
+        if let Some(old) = ring.pop_front() {
+            evicted.push(old);
+        }
     }
     evicted
+}
+
+/// Number of `GtkTextBuffer` lines a rendered log entry occupies. The
+/// buffer joins entries with `\n`, so an entry with `n` internal
+/// newlines takes `n + 1` lines — `split('\n').count()` — and deleting
+/// it from the front also consumes the `\n` separator that follows it,
+/// which is exactly this many `forward_line` steps.
+fn entry_buffer_lines(entry: &str) -> usize {
+    entry.split('\n').count()
 }
 
 impl OrbcommPanelHandles {
@@ -245,10 +257,18 @@ impl OrbcommPanelHandles {
         };
 
         let buffer = self.log_view.buffer();
-        for _ in 0..evicted {
+        // Delete the evicted entries' buffer lines from the front. Each
+        // entry may span several lines (a hexdump block), so trim by the
+        // summed line count, not one line per entry — otherwise a
+        // multi-line entry leaves orphaned rows and the buffer desyncs
+        // from the ring.
+        let lines_to_delete: usize = evicted.iter().map(|e| entry_buffer_lines(e)).sum();
+        if lines_to_delete > 0 {
             let mut start = buffer.start_iter();
             let mut cut = buffer.start_iter();
-            cut.forward_line();
+            for _ in 0..lines_to_delete {
+                cut.forward_line();
+            }
             buffer.delete(&mut start, &mut cut);
         }
         let mut end = buffer.end_iter();
