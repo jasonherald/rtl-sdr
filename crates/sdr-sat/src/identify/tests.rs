@@ -18,11 +18,11 @@ fn sat(t: (&str, &str, &str)) -> Satellite {
     Satellite::from_tle(t.0, t.1, t.2).expect("valid TLE fixture")
 }
 
-/// A satellite's own propagated position (at true UTC `t`) fed back as
-/// the decoded ECEF, with `when = t + leap`, matches that satellite at
-/// ~0 km — exercising the leap-second correction end to end.
+/// A satellite's own propagated position (at reception time `t`) fed
+/// back as the decoded ECEF, with `when = t`, matches that satellite at
+/// ~0 km.
 #[test]
-fn matches_self_with_leap_correction() {
+fn matches_self_at_reception_time() {
     let t = Utc.with_ymd_and_hms(2026, 9, 5, 12, 0, 0).unwrap();
     let fm06 = sat(FM06);
     let eci = fm06.propagate(t).unwrap();
@@ -31,7 +31,7 @@ fn matches_self_with_leap_correction() {
         ("ORBCOMM FM06".into(), sat(FM06)),
         ("ORBCOMM FM04".into(), sat(FM04)),
     ];
-    let when = t + chrono::Duration::seconds(GPS_UTC_LEAP_SECONDS);
+    let when = t;
     let m = identify_from_ecef(target, when, &candidates, DEFAULT_MATCH_MAX_DIST_KM)
         .expect("should identify FM06");
     assert_eq!(m.name, "ORBCOMM FM06");
@@ -63,6 +63,40 @@ fn ambiguous_returns_none() {
     // Same satellite twice under different names: both at distance ~0,
     // runner-up not MARGIN× farther → ambiguous.
     let candidates = vec![("A".into(), sat(FM06)), ("B".into(), sat(FM06))];
-    let when = t + chrono::Duration::seconds(GPS_UTC_LEAP_SECONDS);
+    let when = t;
     assert!(identify_from_ecef(target, when, &candidates, 500.0).is_none());
+}
+
+/// Real FM108 pass calibration: a live decoded ephemeris position from
+/// this bird, matched against candidate TLEs propagated to reception
+/// time, identifies FM108 unambiguously (~47 km vs a >3000 km
+/// runner-up). Regression guard for the reception-time fix (#900).
+#[test]
+fn identifies_fm108_from_real_pass() {
+    const FM108: (&str, &str, &str) = (
+        "ORBCOMM FM108",
+        "1 41187U 15081J   26248.48179345  .00000253  00000+0  89670-4 0  9992",
+        "2 41187  47.0044 162.5353 0002300 224.2950 135.7752 14.58968400571802",
+    );
+    let candidates = vec![
+        ("ORBCOMM FM108".into(), sat(FM108)),
+        ("ORBCOMM FM06".into(), sat(FM06)),
+        ("ORBCOMM FM04".into(), sat(FM04)),
+    ];
+    let when = Utc.with_ymd_and_hms(2026, 9, 5, 20, 1, 39).unwrap();
+    let m = identify_spacecraft(
+        36.2,
+        -81.6,
+        700_000.0,
+        when,
+        &candidates,
+        DEFAULT_MATCH_MAX_DIST_KM,
+    )
+    .expect("should identify FM108");
+    assert_eq!(m.name, "ORBCOMM FM108");
+    assert!(
+        m.distance_km < 100.0,
+        "distance {} km too large",
+        m.distance_km
+    );
 }

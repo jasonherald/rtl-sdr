@@ -41,8 +41,13 @@ pub(super) fn on_orbcomm_event(ctx: &DspEventCtx, event: &sdr_orbcomm::OrbcommEv
 
 /// Try to resolve an unknown ephemeris `sat_id` to a real name via
 /// ephemeris↔TLE matching; on success, learn + persist it.
+///
+/// Matches against the reception time (`Utc::now()`), not the decoded
+/// ephemeris's own timestamp — that timestamp can be off by hours
+/// (`sdr-orbcomm` #900), while a live-received ephemeris's position is
+/// current, so "now" is the trustworthy reference for propagation.
 fn maybe_identify(state: &Rc<AppState>, f: &crate::orbcomm_render::HeardFields) {
-    let (Some((lat, lon, alt)), Some(t)) = (f.position, f.sat_time_unix) else {
+    let Some((lat, lon, alt)) = f.position else {
         return;
     };
     if state.orbcomm_sat_names.borrow().contains_key(&f.sat_id) {
@@ -52,9 +57,7 @@ fn maybe_identify(state: &Rc<AppState>, f: &crate::orbcomm_render::HeardFields) 
     if tles.is_empty() {
         return;
     }
-    let Some(when) = chrono::DateTime::from_timestamp(t, 0) else {
-        return;
-    };
+    let when = chrono::Utc::now();
     if let Some(m) = sdr_sat::identify_spacecraft(
         lat,
         lon,

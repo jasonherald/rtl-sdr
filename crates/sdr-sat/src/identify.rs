@@ -1,22 +1,17 @@
 //! Positional Orbcomm spacecraft identification: match a decoded
 //! ephemeris sub-satellite position against SGP4-propagated candidate
-//! TLEs. Pure — no I/O. The decoded timestamp is GPS-derived and
-//! uncorrected (see `GPS_UTC_LEAP_SECONDS`), so propagation is done at
-//! `when − leap`.
+//! TLEs. Pure — no I/O. The decoded ephemeris's own timestamp is
+//! unreliable (`sdr-orbcomm` issue #900 — it can be off by hours), so
+//! the caller passes the *reception time* instead: a live-received
+//! ephemeris reflects the satellite's current position, so propagating
+//! candidate TLEs to "now" is the more trustworthy reference.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
 use crate::sgp4_core::{Satellite, eci_to_ecef, geodetic_to_ecef};
 
-/// GPS−UTC offset (leap seconds). GPS time has no leap seconds; the
-/// Orbcomm ephemeris timestamp is GPS-derived and uncorrected, so it
-/// runs this many seconds ahead of true UTC. 18 s as of 2026-01; update
-/// when a new leap second is announced. A wrong value only loosens
-/// matches — the distance threshold absorbs small errors.
-pub const GPS_UTC_LEAP_SECONDS: i64 = 18;
-
 /// Default max ECEF distance (km) for a confident match.
-pub const DEFAULT_MATCH_MAX_DIST_KM: f64 = 50.0;
+pub const DEFAULT_MATCH_MAX_DIST_KM: f64 = 100.0;
 
 /// The nearest candidate must be at least this many times closer than
 /// the runner-up to be accepted (guards ambiguous overhead cases).
@@ -31,10 +26,10 @@ pub struct SpacecraftMatch {
     pub distance_km: f64,
 }
 
-/// Identify a spacecraft from a decoded sub-satellite geodetic position
-/// and timestamp. Converts to ECEF and delegates to
-/// [`identify_from_ecef`]. `when` is the raw ephemeris timestamp (the
-/// leap-second correction is applied internally).
+/// Identify a spacecraft from a decoded sub-satellite geodetic position.
+/// Converts to ECEF and delegates to [`identify_from_ecef`]. `when`
+/// should be the reception time (e.g. `Utc::now()`), not the decoded
+/// ephemeris timestamp — see the module docs.
 #[must_use]
 pub fn identify_spacecraft(
     lat_deg: f64,
@@ -49,23 +44,22 @@ pub fn identify_spacecraft(
 }
 
 /// Core matcher over an ECEF target (km). Propagates each candidate to
-/// `when − GPS_UTC_LEAP_SECONDS`, keeps the nearest and runner-up, and
-/// returns the nearest iff it is within `max_dist_km` AND at least
-/// `MATCH_AMBIGUITY_MARGIN`× closer than the runner-up.
+/// `when`, keeps the nearest and runner-up, and returns the nearest iff
+/// it is within `max_dist_km` AND at least `MATCH_AMBIGUITY_MARGIN`×
+/// closer than the runner-up.
 fn identify_from_ecef(
     target_km: [f64; 3],
     when: DateTime<Utc>,
     candidates: &[(String, Satellite)],
     max_dist_km: f64,
 ) -> Option<SpacecraftMatch> {
-    let prop_time = when - Duration::seconds(GPS_UTC_LEAP_SECONDS);
     let mut best: Option<(usize, f64)> = None;
     let mut runner_up_km = f64::INFINITY;
     for (i, (_, sat)) in candidates.iter().enumerate() {
-        let Ok(eci) = sat.propagate(prop_time) else {
+        let Ok(eci) = sat.propagate(when) else {
             continue;
         };
-        let ecef = eci_to_ecef(eci.position_km, prop_time);
+        let ecef = eci_to_ecef(eci.position_km, when);
         let d = distance_km(ecef, target_km);
         match best {
             Some((_, bd)) if d >= bd => {
