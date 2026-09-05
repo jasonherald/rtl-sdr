@@ -18,13 +18,22 @@ ORBCOMM FM04
     assert_eq!(got[1].0, "ORBCOMM FM04");
 }
 
+/// `CodeRabbit` review on #903 (Major): a `1 …`/`2 …` pair that merely
+/// matches the prefix shape but fails SGP4 parsing (truncated numeric
+/// fields here) must be dropped, not returned — otherwise it could
+/// slip past `force_refresh_group`'s `is_empty()` guard and poison the
+/// cache. Only the well-formed, SGP4-valid entry survives.
 #[test]
-fn parse_group_tles_skips_malformed() {
-    // A stray line with no following element lines is ignored.
+fn parse_group_tles_rejects_sgp4_invalid_pairs() {
+    // A stray line with no following element lines is ignored, and the
+    // truncated/malformed numeric fields on the first TLE-shaped pair
+    // fail SGP4 validation and are dropped.
     let body = "GARBAGE\nnot a tle line\nORBCOMM FM06\n1 25118U 97084G   26248.1 .0 0 0 0 9991\n2 25118  45.0 27.7 0001 213 317 14.47\n";
     let got = parse_group_tles(body);
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0].0, "ORBCOMM FM06");
+    assert!(
+        got.is_empty(),
+        "SGP4-invalid TLE lines must be dropped, got {got:?}"
+    );
 }
 
 #[test]
@@ -67,14 +76,25 @@ fn parse_group_tles_rejects_data_line_names() {
     );
 }
 
+/// Real, SGP4-valid ORBCOMM TLE fixture (two satellites) shared by the
+/// `force_refresh_group` tests below.
+const VALID_GROUP_BODY: &str = "\
+ORBCOMM FM06
+1 25118U 97084G   26248.14598269  .00000608  00000+0  20228-3 0  9991
+2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974
+ORBCOMM FM04
+1 25159U 98007C   26248.16811710  .00000396  00000+0  18072-3 0  9991
+2 25159 107.9604 334.0349 0041099 188.9146 171.1268 14.35849962488071
+";
+
 #[test]
 fn force_refresh_group_writes_and_reads_cache() {
     let dir = tempfile::tempdir().unwrap();
-    let body = "ORBCOMM FM06\n1 25118U 97084G   26248.1  .0  0  0 0  9991\n2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974\n".to_string();
-    let cache = TleCache::with_dir(dir.path().to_path_buf())
-        .with_group_fetcher(std::sync::Arc::new(move |_slug: &str| Ok(body.clone())));
+    let cache = TleCache::with_dir(dir.path().to_path_buf()).with_group_fetcher(
+        std::sync::Arc::new(|_slug: &str| Ok(VALID_GROUP_BODY.to_string())),
+    );
     let fetched = cache.force_refresh_group("ORBCOMM").unwrap();
-    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched.len(), 2);
     // Cache-only read now returns the same without a fetcher hit.
     let cached = cache.cached_group_tles("ORBCOMM").unwrap();
     assert_eq!(cached[0].0, "ORBCOMM FM06");
@@ -90,15 +110,13 @@ fn force_refresh_group_writes_and_reads_cache() {
 #[test]
 fn force_refresh_group_rejects_non_tle_body() {
     let dir = tempfile::tempdir().unwrap();
-    let good_body = "ORBCOMM FM06\n1 25118U 97084G   26248.1  .0  0  0 0  9991\n2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974\n".to_string();
 
     // Seed a good group cache first via a good fetcher.
-    let good_body_for_fetcher = good_body.clone();
     let cache = TleCache::with_dir(dir.path().to_path_buf()).with_group_fetcher(
-        std::sync::Arc::new(move |_slug: &str| Ok(good_body_for_fetcher.clone())),
+        std::sync::Arc::new(|_slug: &str| Ok(VALID_GROUP_BODY.to_string())),
     );
     let fetched = cache.force_refresh_group("ORBCOMM").unwrap();
-    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched.len(), 2);
     assert_eq!(fetched[0].0, "ORBCOMM FM06");
 
     // Swap to a garbage (HTML/captive-portal) fetcher and try again.
@@ -110,6 +128,22 @@ fn force_refresh_group_rejects_non_tle_body() {
 
     // The pre-existing good cache file must NOT have been overwritten.
     let cached = cache.cached_group_tles("ORBCOMM").unwrap();
-    assert_eq!(cached.len(), 1);
+    assert_eq!(cached.len(), 2);
+    assert_eq!(cached[0].0, "ORBCOMM FM06");
+
+    // A body whose lines are prefix-shaped like a TLE pair (`1 `/`2 `)
+    // but fail SGP4 validation must also be rejected — this is the
+    // CodeRabbit #903 regression: prefix-matching-but-invalid entries
+    // used to slide past `parse_group_tles(&body).is_empty()` and
+    // overwrite a good cache.
+    let cache = TleCache::with_dir(dir.path().to_path_buf()).with_group_fetcher(
+        std::sync::Arc::new(|_slug: &str| {
+            Ok("ORBCOMM BOGUS\n1 25118U 97084G   26248.1 .0 0 0 0 9991\n2 25118  45.0 27.7 0001 213 317 14.47\n".to_string())
+        }),
+    );
+    let err = cache.force_refresh_group("ORBCOMM").unwrap_err();
+    assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+    let cached = cache.cached_group_tles("ORBCOMM").unwrap();
+    assert_eq!(cached.len(), 2);
     assert_eq!(cached[0].0, "ORBCOMM FM06");
 }

@@ -88,6 +88,13 @@ pub type GroupFetcher = dyn Fn(&str) -> Result<String, TleCacheError> + Send + S
 /// rejected and falls back to `"UNKNOWN"` — for back-to-back nameless
 /// 2LE entries, that "preceding line" is actually the previous entry's
 /// `2 …` line, not a name.
+///
+/// A `1 …`/`2 …` pair that merely matches the prefix shape but fails
+/// SGP4 parsing (bad checksum, truncated numeric fields, etc.) is
+/// dropped rather than returned: this is the only validity gate
+/// [`TleCache::force_refresh_group`]'s `is_empty()` guard has, so a
+/// prefix-matching-but-invalid body must not slip through and overwrite
+/// a good cache (`CodeRabbit` on #903).
 #[must_use]
 pub fn parse_group_tles(text: &str) -> Vec<(String, String, String)> {
     let lines: Vec<&str> = text.lines().collect();
@@ -103,7 +110,9 @@ pub fn parse_group_tles(text: &str) -> Vec<(String, String, String)> {
                 .filter(|n| !n.starts_with("1 ") && !n.starts_with("2 "))
                 .unwrap_or("UNKNOWN")
                 .to_string();
-            out.push((name, l1.to_string(), l2.to_string()));
+            if crate::sgp4_core::Satellite::from_tle(&name, l1, l2).is_ok() {
+                out.push((name, l1.to_string(), l2.to_string()));
+            }
             i += 2;
         } else {
             i += 1;
