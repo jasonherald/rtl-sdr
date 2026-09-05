@@ -113,3 +113,55 @@ fn entry_buffer_lines_counts_all_lines() {
     assert_eq!(entry_buffer_lines("single"), 1);
     assert_eq!(entry_buffer_lines("a\nb\nc"), 3);
 }
+
+fn dummy_pass(start: chrono::DateTime<chrono::Utc>) -> sdr_sat::Pass {
+    sdr_sat::Pass {
+        satellite: "ORBCOMM FM06".to_string(),
+        start,
+        end: start + chrono::Duration::minutes(10),
+        max_elevation_deg: 42.0,
+        max_el_time: start + chrono::Duration::minutes(5),
+        start_az_deg: 10.0,
+        end_az_deg: 200.0,
+        tle_age: chrono::Duration::hours(1),
+    }
+}
+
+/// A pass whose local start date is today gets no weekday prefix.
+#[test]
+fn format_orbcomm_pass_row_no_weekday_prefix_for_today() {
+    let today_local_noon = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let pass = dummy_pass(today_local_noon);
+    let (_, subtitle) = passes::format_orbcomm_pass_row(&pass, &HashMap::new());
+    let start_local = pass.start.with_timezone(&chrono::Local);
+    let end_local = pass.end.with_timezone(&chrono::Local);
+    let expected = format!(
+        "{}–{} (local) · {:.0}°",
+        start_local.format("%H:%M"),
+        end_local.format("%H:%M"),
+        pass.max_elevation_deg,
+    );
+    assert_eq!(subtitle, expected);
+}
+
+/// A pass whose local start date is NOT today is prefixed with a
+/// weekday abbreviation so a 24h-lookahead pass spanning a local date
+/// boundary isn't ambiguous (`CodeRabbit` review on #903).
+#[test]
+fn format_orbcomm_pass_row_adds_weekday_prefix_for_other_day() {
+    let two_days_out = chrono::Utc::now() + chrono::Duration::days(2);
+    let pass = dummy_pass(two_days_out);
+    let (_, subtitle) = passes::format_orbcomm_pass_row(&pass, &HashMap::new());
+    let start_local = pass.start.with_timezone(&chrono::Local);
+    let expected_prefix = format!("{} ", start_local.format("%a"));
+    assert!(
+        subtitle.starts_with(&expected_prefix),
+        "expected subtitle {subtitle:?} to start with weekday prefix {expected_prefix:?}"
+    );
+}

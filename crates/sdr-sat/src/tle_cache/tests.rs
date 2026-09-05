@@ -731,6 +731,29 @@ fn group_cache_is_fresh_false_when_missing() {
     assert!(!cache.group_cache_is_fresh("ORBCOMM"));
 }
 
+/// `CodeRabbit` review on #903: back-to-back nameless 2LE entries (no
+/// name line between them at all) must never let one entry's `2 …`
+/// data line get mistaken for the *next* entry's name — it must fall
+/// back to `"UNKNOWN"` instead.
+#[test]
+fn parse_group_tles_rejects_data_line_names() {
+    let body = "\
+1 25118U 97084G   26248.14598269  .00000608  00000+0  20228-3 0  9991
+2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974
+1 25159U 98007C   26248.16811710  .00000396  00000+0  18072-3 0  9991
+2 25159 107.9604 334.0349 0041099 188.9146 171.1268 14.35849962488071
+";
+    let got = parse_group_tles(body);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].0, "UNKNOWN");
+    assert_eq!(got[1].0, "UNKNOWN");
+    assert!(
+        !got[1].0.starts_with("1 ") && !got[1].0.starts_with("2 "),
+        "second entry's name must not be the first entry's data line: {:?}",
+        got[1].0
+    );
+}
+
 #[test]
 fn force_refresh_group_writes_and_reads_cache() {
     let dir = tempfile::tempdir().unwrap();
@@ -741,5 +764,39 @@ fn force_refresh_group_writes_and_reads_cache() {
     assert_eq!(fetched.len(), 1);
     // Cache-only read now returns the same without a fetcher hit.
     let cached = cache.cached_group_tles("ORBCOMM").unwrap();
+    assert_eq!(cached[0].0, "ORBCOMM FM06");
+}
+
+/// `CodeRabbit` review on #903 (Major): unlike the per-NORAD
+/// `force_refresh` (which routes through `fetch_validated`),
+/// `force_refresh_group` used to write whatever the fetch returned —
+/// a captive-portal/HTML 200 response would overwrite a good cache,
+/// parse to empty, AND reset the 24h freshness clock. Guard must
+/// reject a body with no valid TLE pair BEFORE writing, and must
+/// leave a pre-existing good cache file untouched.
+#[test]
+fn force_refresh_group_rejects_non_tle_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let good_body = "ORBCOMM FM06\n1 25118U 97084G   26248.1  .0  0  0 0  9991\n2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974\n".to_string();
+
+    // Seed a good group cache first via a good fetcher.
+    let good_body_for_fetcher = good_body.clone();
+    let cache = TleCache::with_dir(dir.path().to_path_buf()).with_group_fetcher(
+        std::sync::Arc::new(move |_slug: &str| Ok(good_body_for_fetcher.clone())),
+    );
+    let fetched = cache.force_refresh_group("ORBCOMM").unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].0, "ORBCOMM FM06");
+
+    // Swap to a garbage (HTML/captive-portal) fetcher and try again.
+    let cache = TleCache::with_dir(dir.path().to_path_buf()).with_group_fetcher(
+        std::sync::Arc::new(|_slug: &str| Ok("<html>portal</html>".to_string())),
+    );
+    let err = cache.force_refresh_group("ORBCOMM").unwrap_err();
+    assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+
+    // The pre-existing good cache file must NOT have been overwritten.
+    let cached = cache.cached_group_tles("ORBCOMM").unwrap();
+    assert_eq!(cached.len(), 1);
     assert_eq!(cached[0].0, "ORBCOMM FM06");
 }

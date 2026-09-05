@@ -82,8 +82,13 @@ fn is_heard(name: &str, heard: &HashMap<u8, String>) -> bool {
 }
 
 /// Format one pass row's title (name, heard-marked) and subtitle
-/// (local AOS-LOS window + peak elevation).
-fn format_orbcomm_pass_row(pass: &Pass, heard: &HashMap<u8, String>) -> (String, String) {
+/// (local AOS-LOS window + peak elevation). `pub(crate)` so
+/// `orbcomm_panel::tests` can exercise the weekday-prefix behaviour
+/// directly rather than only via `refresh_passes`'s widget side effects.
+pub(crate) fn format_orbcomm_pass_row(
+    pass: &Pass,
+    heard: &HashMap<u8, String>,
+) -> (String, String) {
     let marker = if is_heard(&pass.satellite, heard) {
         "📡 "
     } else {
@@ -92,8 +97,16 @@ fn format_orbcomm_pass_row(pass: &Pass, heard: &HashMap<u8, String>) -> (String,
     let title = format!("{marker}{}", pass.satellite);
     let start_local = pass.start.with_timezone(&chrono::Local);
     let end_local = pass.end.with_timezone(&chrono::Local);
+    // A 24h lookahead can span a local-date boundary; prefix with a
+    // weekday abbreviation when the pass isn't on today's local date so
+    // the AOS-LOS window isn't ambiguous.
+    let day_prefix = if start_local.date_naive() == chrono::Local::now().date_naive() {
+        String::new()
+    } else {
+        format!("{} ", start_local.format("%a")) // e.g. "Sat "
+    };
     let subtitle = format!(
-        "{}–{} (local) · {:.0}°",
+        "{day_prefix}{}–{} (local) · {:.0}°",
         start_local.format("%H:%M"),
         end_local.format("%H:%M"),
         pass.max_elevation_deg,

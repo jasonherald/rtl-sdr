@@ -83,7 +83,11 @@ pub type GroupFetcher = dyn Fn(&str) -> Result<String, TleCacheError> + Send + S
 
 /// Parse a multi-entry TLE body into `(name, line1, line2)` triples.
 /// A name is the last non-blank line before a `1 …` line whose matching
-/// `2 …` line immediately follows; malformed groups are skipped.
+/// `2 …` line immediately follows; malformed groups are skipped. A name
+/// candidate that itself looks like a TLE data line (`1 …`/`2 …`) is
+/// rejected and falls back to `"UNKNOWN"` — for back-to-back nameless
+/// 2LE entries, that "preceding line" is actually the previous entry's
+/// `2 …` line, not a name.
 #[must_use]
 pub fn parse_group_tles(text: &str) -> Vec<(String, String, String)> {
     let lines: Vec<&str> = text.lines().collect();
@@ -96,6 +100,7 @@ pub fn parse_group_tles(text: &str) -> Vec<(String, String, String)> {
             let name = (i > 0)
                 .then(|| lines[i - 1].trim())
                 .filter(|n| !n.is_empty())
+                .filter(|n| !n.starts_with("1 ") && !n.starts_with("2 "))
                 .unwrap_or("UNKNOWN")
                 .to_string();
             out.push((name, l1.to_string(), l2.to_string()));
@@ -308,7 +313,10 @@ impl TleCache {
     ///
     /// # Errors
     ///
-    /// * [`TleCacheError::Fetch`] — network failure or non-2xx status.
+    /// * [`TleCacheError::Fetch`] — network failure, non-2xx status, or
+    ///   the fetched body contained no valid TLE pair (HTML error page,
+    ///   captive portal, etc.). The on-disk group cache is left
+    ///   untouched and its freshness clock does not advance.
     /// * [`TleCacheError::Io`] — the freshly-fetched body could not be
     ///   written to the cache file.
     pub fn force_refresh_group(
@@ -319,6 +327,14 @@ impl TleCache {
             Some(f) => f(slug)?,
             None => default_group_fetch(slug, self.fetch_timeout)?,
         };
+        // Guard like the per-NORAD fetch_validated: never let an HTML error
+        // page / captive portal overwrite a good cache and reset the 24h
+        // freshness clock. parse_group_tles yields no pairs for non-TLE bodies.
+        if parse_group_tles(&body).is_empty() {
+            return Err(TleCacheError::Fetch(format!(
+                "group {slug} response body contained no valid TLE pair (captive portal or HTML error page?)"
+            )));
+        }
         let path = self.group_cache_path(slug);
         // `write_cache` is already fully generic over path + text (no
         // NORAD-specific logic) — reuse it rather than duplicating the
