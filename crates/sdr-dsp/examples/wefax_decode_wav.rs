@@ -56,91 +56,16 @@ fn main() {
     let input = Path::new(&args[1]);
     let output = Path::new(&args[2]);
 
-    let mut reader =
-        hound::WavReader::open(input).unwrap_or_else(|e| panic!("open {}: {e}", input.display()));
-    let spec = reader.spec();
-    eprintln!(
-        "input: {} ch, {} Hz, {} bits/sample, {:?}",
-        spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format,
-    );
-    if spec.channels != 1 {
-        eprintln!(
-            "note: input is {} channel; averaging to mono",
-            spec.channels
-        );
-    }
-
-    // Read all samples, normalize to f32 in [-1, 1]. Signed 16-bit PCM
-    // normalizes by 2^15 (not `i16::MAX`) so `i16::MIN` maps to exactly
-    // -1.0, matching the convention used throughout the sdr-dsp examples.
-    const PCM16_SCALE: f32 = 32_768.0;
-    // Some real-world captures declare more data in the RIFF header than
-    // is actually present (a truncated download, in the fixture this
-    // harness is exercised against). Rather than aborting the whole
-    // render over a short tail, warn and decode whatever samples were
-    // actually readable.
-    let raw: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => {
-            let mut out = Vec::with_capacity(reader.duration() as usize);
-            for sample in reader.samples::<i16>() {
-                match sample {
-                    Ok(s) => out.push(f32::from(s) / PCM16_SCALE),
-                    Err(e) => {
-                        eprintln!(
-                            "warning: WAV data chunk truncated after sample {}: {e} — \
-                             decoding what was read",
-                            out.len()
-                        );
-                        break;
-                    }
-                }
-            }
-            out
-        }
-        hound::SampleFormat::Float => {
-            let mut out = Vec::with_capacity(reader.duration() as usize);
-            for sample in reader.samples::<f32>() {
-                match sample {
-                    Ok(s) => out.push(if s.is_finite() { s } else { 0.0 }),
-                    Err(e) => {
-                        eprintln!(
-                            "warning: WAV data chunk truncated after sample {}: {e} — \
-                             decoding what was read",
-                            out.len()
-                        );
-                        break;
-                    }
-                }
-            }
-            out
-        }
-    };
-    let mono: Vec<f32> = if spec.channels == 1 {
-        raw
-    } else {
-        let n = spec.channels as usize;
-        raw.chunks_exact(n)
-            .map(|frame| frame.iter().sum::<f32>() / n as f32)
-            .collect()
-    };
+    let (mono, rate) =
+        load_wav_mono(input).unwrap_or_else(|e| panic!("load {}: {e}", input.display()));
     eprintln!(
         "loaded {} samples ({:.1} s)",
         mono.len(),
-        mono.len() as f64 / f64::from(spec.sample_rate)
+        mono.len() as f64 / f64::from(rate)
     );
 
-    let mut decoder = WefaxDecoder::new(spec.sample_rate)
-        .unwrap_or_else(|e| panic!("WefaxDecoder::new({}): {e}", spec.sample_rate));
-    let mut buf = vec![WefaxLine::default(); READY_QUEUE_CAP];
-    let mut rows: Vec<[u8; PIXELS_PER_LINE]> = Vec::new();
-
-    for chunk in mono.chunks(CHUNK_SAMPLES) {
-        let n = decoder.process(chunk, &mut buf).expect("WEFAX process");
-        for line in buf.iter().take(n) {
-            rows.push(line.pixels);
-        }
-    }
-
+    let rows =
+        decode_lines(&mono, rate).unwrap_or_else(|e| panic!("WefaxDecoder::new({rate}): {e}"));
     if rows.is_empty() {
         eprintln!("decoded 0 lines — input too short for even one scanline");
         std::process::exit(1);
@@ -160,6 +85,119 @@ fn main() {
         PIXELS_PER_LINE,
         height
     );
+}
+
+/// Open `path`, normalize samples to f32 in [-1, 1], and downmix to mono.
+/// Returns the mono samples plus the WAV's sample rate.
+///
+/// Signed 16-bit PCM normalizes by 2^15 (not `i16::MAX`) so `i16::MIN`
+/// maps to exactly -1.0, matching the convention used throughout the
+/// sdr-dsp examples. Only 16-bit integer WAVs are accepted (mirrors
+/// `apt_decode_wav.rs`'s depth guard) — anything else fails fast with a
+/// clear message instead of silently misreading the bit pattern.
+///
+/// Some real-world captures declare more data in the RIFF header than is
+/// actually present (a truncated download, in the fixture this harness is
+/// exercised against). Rather than aborting the whole render over a short
+/// tail, a read error mid-stream warns and returns whatever was read.
+fn load_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), Box<dyn std::error::Error>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    eprintln!(
+        "input: {} ch, {} Hz, {} bits/sample, {:?}",
+        spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format,
+    );
+    if matches!(spec.sample_format, hound::SampleFormat::Int) && spec.bits_per_sample != 16 {
+        return Err(format!(
+            "unsupported integer WAV depth: {} bits/sample (need 16-bit PCM)",
+            spec.bits_per_sample,
+        )
+        .into());
+    }
+    if spec.channels != 1 {
+        eprintln!(
+            "note: input is {} channel; averaging to mono",
+            spec.channels
+        );
+    }
+
+    let raw = read_raw_samples(&mut reader, spec);
+    let mono: Vec<f32> = if spec.channels == 1 {
+        raw
+    } else {
+        let n = spec.channels as usize;
+        raw.chunks_exact(n)
+            .map(|frame| frame.iter().sum::<f32>() / n as f32)
+            .collect()
+    };
+    Ok((mono, spec.sample_rate))
+}
+
+/// Read every sample in `reader` as f32 in [-1, 1] (interleaved if
+/// multi-channel — downmixing happens in the caller). Some real-world
+/// captures declare more data in the RIFF header than is actually present
+/// (a truncated download, in the fixture this harness is exercised
+/// against): a read error mid-stream warns and returns whatever was read
+/// instead of propagating the error.
+fn read_raw_samples(
+    reader: &mut hound::WavReader<std::io::BufReader<File>>,
+    spec: hound::WavSpec,
+) -> Vec<f32> {
+    const PCM16_SCALE: f32 = 32_768.0;
+    let mut out = Vec::with_capacity(reader.duration() as usize);
+    match spec.sample_format {
+        hound::SampleFormat::Int => {
+            for sample in reader.samples::<i16>() {
+                match sample {
+                    Ok(s) => out.push(f32::from(s) / PCM16_SCALE),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: WAV data chunk truncated after sample {}: {e} — \
+                             decoding what was read",
+                            out.len()
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        hound::SampleFormat::Float => {
+            for sample in reader.samples::<f32>() {
+                match sample {
+                    Ok(s) => out.push(if s.is_finite() { s } else { 0.0 }),
+                    Err(e) => {
+                        eprintln!(
+                            "warning: WAV data chunk truncated after sample {}: {e} — \
+                             decoding what was read",
+                            out.len()
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Run `mono` through a fresh `WefaxDecoder` at `rate`, streaming in
+/// fixed-size chunks so the streaming path (not one giant call) is
+/// exercised, and return every completed scanline's pixels.
+fn decode_lines(
+    mono: &[f32],
+    rate: u32,
+) -> Result<Vec<[u8; PIXELS_PER_LINE]>, Box<dyn std::error::Error>> {
+    let mut decoder = WefaxDecoder::new(rate)?;
+    let mut buf = vec![WefaxLine::default(); READY_QUEUE_CAP];
+    let mut rows: Vec<[u8; PIXELS_PER_LINE]> = Vec::new();
+
+    for chunk in mono.chunks(CHUNK_SAMPLES) {
+        let n = decoder.process(chunk, &mut buf)?;
+        for line in buf.iter().take(n) {
+            rows.push(line.pixels);
+        }
+    }
+    Ok(rows)
 }
 
 /// Minimal hand-rolled PNG writer — header + IHDR + IDAT + IEND. Mirrors
