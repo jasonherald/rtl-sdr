@@ -686,3 +686,43 @@ fn cached_tle_for_rejects_a_malformed_requested_pair() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn parse_group_tles_extracts_all_named_entries() {
+    let body = "\
+ORBCOMM FM06
+1 25118U 97084G   26248.14598269  .00000608  00000+0  20228-3 0  9991
+2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974
+ORBCOMM FM04
+1 25159U 98007C   26248.16811710  .00000396  00000+0  18072-3 0  9991
+2 25159 107.9604 334.0349 0041099 188.9146 171.1268 14.35849962488071
+";
+    let got = parse_group_tles(body);
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].0, "ORBCOMM FM06");
+    assert!(got[0].1.starts_with("1 25118"));
+    assert!(got[0].2.starts_with("2 25118"));
+    assert_eq!(got[1].0, "ORBCOMM FM04");
+}
+
+#[test]
+fn parse_group_tles_skips_malformed() {
+    // A stray line with no following element lines is ignored.
+    let body = "GARBAGE\nnot a tle line\nORBCOMM FM06\n1 25118U 97084G   26248.1 .0 0 0 0 9991\n2 25118  45.0 27.7 0001 213 317 14.47\n";
+    let got = parse_group_tles(body);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].0, "ORBCOMM FM06");
+}
+
+#[test]
+fn force_refresh_group_writes_and_reads_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "ORBCOMM FM06\n1 25118U 97084G   26248.1  .0  0  0 0  9991\n2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974\n".to_string();
+    let cache = TleCache::with_dir(dir.path().to_path_buf())
+        .with_group_fetcher(std::sync::Arc::new(move |_slug: &str| Ok(body.clone())));
+    let fetched = cache.force_refresh_group("ORBCOMM").unwrap();
+    assert_eq!(fetched.len(), 1);
+    // Cache-only read now returns the same without a fetcher hit.
+    let cached = cache.cached_group_tles("ORBCOMM").unwrap();
+    assert_eq!(cached[0].0, "ORBCOMM FM06");
+}

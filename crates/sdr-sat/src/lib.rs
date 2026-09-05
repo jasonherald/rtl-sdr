@@ -38,7 +38,10 @@ pub use identify::{
 pub use passes::{GroundStation, Pass, Track, is_ascending, track, upcoming_passes};
 pub use postal_lookup::{PostalLocation, PostalLookupError, lookup_us_zip};
 pub use sgp4_core::{Satellite, SatelliteError, TLE_MAX_AGE, TLE_WARN_AGE, TleFreshness};
-pub use tle_cache::{TleCache, TleCacheError, celestrak_gp_url};
+pub use tle_cache::{
+    GroupFetcher, ORBCOMM_TLE_GROUP, TleCache, TleCacheError, celestrak_gp_url,
+    celestrak_group_url, parse_group_tles,
+};
 
 mod catalog;
 mod types;
