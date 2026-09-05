@@ -180,24 +180,32 @@ pub(crate) fn wire_orbcomm_passes(handles: &Rc<OrbcommPanelHandles>, state: &Rc<
 /// left untouched. A no-op if the platform never gave us a TLE cache
 /// directory (`state.orbcomm_tle_cache` is `None`).
 ///
-/// Staleness-gated: if the on-disk group cache is still fresh (per
-/// `TleCache::group_cache_is_fresh`, the same `refresh_max_age` window
-/// the per-NORAD path uses), the network fetch is skipped entirely —
-/// `seed_orbcomm_state` already loaded the cached candidates, so
-/// there's nothing to gain from re-fetching on every decode-enable
-/// toggle. The freshness check is a cheap filesystem `stat`, safe on
-/// the GTK thread; only the fetch itself needs `spawn_blocking`.
+/// `force` selects staleness behaviour:
+///
+/// * `false` — staleness-gated. If the on-disk group cache is still
+///   fresh (per `TleCache::group_cache_is_fresh`, the same
+///   `refresh_max_age` window the per-NORAD path uses), the network
+///   fetch is skipped entirely — `seed_orbcomm_state` already loaded
+///   the cached candidates, so there's nothing to gain from
+///   re-fetching on every decode-enable toggle. The freshness check
+///   is a cheap filesystem `stat`, safe on the GTK thread; only the
+///   fetch itself needs `spawn_blocking`.
+/// * `true` — always fetches, bypassing the staleness check. The
+///   manual "Refresh TLEs" button uses this: a user-initiated refresh
+///   means "do the network round trip now", matching how that same
+///   button force-refreshes the per-NORAD TLEs
+///   (`force_refresh_all_tles`) regardless of their cache age.
 ///
 /// Armed from two call sites: `on_orbcomm_enabled_changed`'s enabled
-/// path, and the satellites-panel TLE-refresh button
-/// (`window/satellites/passes.rs::finish_tle_refresh`) — both reuse
-/// this single implementation rather than duplicating the
-/// spawn/parse/repaint sequence.
-pub(crate) fn refresh_orbcomm_tles(state: &Rc<AppState>) {
+/// path (`force=false`), and the satellites-panel TLE-refresh button
+/// (`window/satellites/passes.rs::finish_tle_refresh`, `force=true`)
+/// — both reuse this single implementation rather than duplicating
+/// the spawn/parse/repaint sequence.
+pub(crate) fn refresh_orbcomm_tles(state: &Rc<AppState>, force: bool) {
     let Some(cache) = state.orbcomm_tle_cache.borrow().clone() else {
         return;
     };
-    if cache.group_cache_is_fresh(sdr_sat::ORBCOMM_TLE_GROUP) {
+    if !force && cache.group_cache_is_fresh(sdr_sat::ORBCOMM_TLE_GROUP) {
         return;
     }
     let state = Rc::clone(state);

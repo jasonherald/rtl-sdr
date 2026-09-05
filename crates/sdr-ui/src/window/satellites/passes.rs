@@ -121,7 +121,10 @@ pub(super) fn wire_tle_refresh_button(
             // Also refresh the Orbcomm TLE group — same button, same
             // "the user asked for fresh elements" intent. Off the GTK
             // thread; a no-op if the platform never gave us a cache.
-            crate::sidebar::orbcomm_panel::refresh_orbcomm_tles(&state_done);
+            // force=true: a manual refresh click must always hit the
+            // network, matching how this same button force-refreshes
+            // the per-NORAD TLEs above regardless of cache age.
+            crate::sidebar::orbcomm_panel::refresh_orbcomm_tles(&state_done, true);
         });
     });
 }

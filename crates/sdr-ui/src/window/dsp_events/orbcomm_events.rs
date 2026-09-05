@@ -101,7 +101,10 @@ pub(super) fn on_orbcomm_enabled_changed(ctx: &DspEventCtx, enabled: bool) {
         // identification matcher and the passes section both have a
         // fresh candidate list for this session. Off the GTK thread;
         // a no-op if the platform never gave us a TLE cache.
-        crate::sidebar::orbcomm_panel::refresh_orbcomm_tles(state);
+        // Staleness-gated (force=false): the cached candidates already
+        // seed identification, so skip the fetch if the group cache
+        // is still fresh rather than re-fetching on every toggle.
+        crate::sidebar::orbcomm_panel::refresh_orbcomm_tles(state, false);
     }
     if !enabled {
         state.orbcomm_tally.borrow_mut().reset();
