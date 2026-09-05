@@ -29,6 +29,9 @@ use crate::orbcomm_render::{
 use crate::sidebar::satellites_heard::HeardRow;
 use crate::state::AppState;
 
+mod passes;
+pub(crate) use passes::refresh_orbcomm_tles;
+
 /// Heard-list aging tick (seconds) — matches the old heard-group tick.
 const HEARD_TICK_SECS: u32 = 5;
 
@@ -77,6 +80,11 @@ pub struct OrbcommPanelHandles {
     pub channel_cells: Vec<gtk4::Label>,
     pub heard_group: adw::PreferencesGroup,
     pub heard_rows: RefCell<Vec<adw::ActionRow>>,
+    /// "Next Orbcomm passes" group + its rendered rows. Populated by
+    /// `passes::wire_orbcomm_passes` / `passes::refresh_orbcomm_tles`
+    /// via `OrbcommPanelHandles::refresh_passes`.
+    pub passes_group: adw::PreferencesGroup,
+    pub passes_rows: RefCell<Vec<adw::ActionRow>>,
     pub breakdown_label: gtk4::Label,
     pub log_view: gtk4::TextView,
     pub scrolled_window: gtk4::ScrolledWindow,
@@ -184,12 +192,14 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
     let (enable_group, enable_switch) = build_enable_group();
     let (channel_group, channel_cells) = build_channel_grid_group();
     let heard_group = build_heard_group();
+    let passes_group = passes::build_passes_group();
     let (breakdown_group, breakdown_label) = build_breakdown_group();
     let (log_view, scrolled_window) = build_log_view();
 
     root.append(&enable_group);
     root.append(&channel_group);
     root.append(&heard_group);
+    root.append(&passes_group);
     root.append(&breakdown_group);
     root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     root.append(&scrolled_window);
@@ -200,6 +210,8 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
         channel_cells,
         heard_group,
         heard_rows: RefCell::new(Vec::new()),
+        passes_group,
+        passes_rows: RefCell::new(Vec::new()),
         breakdown_label,
         log_view,
         scrolled_window,
@@ -389,10 +401,25 @@ pub(crate) fn format_heard_subtitle(row: &HeardRow) -> String {
 
 /// Wire the Orbcomm panel: stash its handles on `AppState` for the
 /// `DspToUi::Orbcomm*` dispatch sites, dispatch `SetOrbcommEnabled` on
-/// the Decode switch, and arm the heard-list aging tick.
-pub fn connect_orbcomm_panel(panels: &crate::sidebar::SidebarPanels, state: &Rc<AppState>) {
+/// the Decode switch, arm the heard-list aging tick, and wire the
+/// "Next Orbcomm passes" section.
+///
+/// `tle_cache` is the SAME `Arc<TleCache>` the satellites panel holds
+/// (threaded in from `window.rs`, which builds it once via
+/// `connect_satellites_panel`'s return value) — never a second cache
+/// instance. Stashed on `AppState::orbcomm_tle_cache` so
+/// `on_orbcomm_enabled_changed` and the satellites-panel TLE-refresh
+/// button can each kick `passes::refresh_orbcomm_tles` without
+/// threading the cache through every call site.
+pub fn connect_orbcomm_panel(
+    panels: &crate::sidebar::SidebarPanels,
+    state: &Rc<AppState>,
+    tle_cache: Option<std::sync::Arc<sdr_sat::TleCache>>,
+) {
     let handles = Rc::clone(&panels.orbcomm.handles);
     *state.orbcomm_panel_handles.borrow_mut() = Some(Rc::clone(&handles));
+    *state.orbcomm_tle_cache.borrow_mut() = tle_cache;
+    passes::wire_orbcomm_passes(&handles, state);
 
     // Enable switch → SetOrbcommEnabled (ack-driven state; guard the
     // programmatic set_active in apply_enabled_ack).

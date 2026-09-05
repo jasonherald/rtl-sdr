@@ -1,5 +1,71 @@
 use super::*;
 
+// Real Orbcomm TLEs (Celestrak, epoch 2026-248) — same fixtures as
+// `sdr_sat::identify::tests`, reused here since `collect_orbcomm_passes`
+// needs propagatable candidates rather than the identification path's
+// ECEF targets.
+const FM06: (&str, &str, &str) = (
+    "ORBCOMM FM06",
+    "1 25118U 97084G   26248.14598269  .00000608  00000+0  20228-3 0  9991",
+    "2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974",
+);
+const FM04: (&str, &str, &str) = (
+    "ORBCOMM FM04",
+    "1 25159U 98007C   26248.16811710  .00000396  00000+0  18072-3 0  9991",
+    "2 25159 107.9604 334.0349 0041099 188.9146 171.1268 14.35849962488071",
+);
+
+fn sat(t: (&str, &str, &str)) -> sdr_sat::Satellite {
+    sdr_sat::Satellite::from_tle(t.0, t.1, t.2).expect("valid TLE fixture")
+}
+
+/// `collect_orbcomm_passes` loops every candidate through
+/// `upcoming_passes`, merges the results, and returns them sorted by
+/// AOS regardless of per-candidate order. Mirrors
+/// `satellites_panel::passes::enumerate_upcoming_passes` but over an
+/// explicit candidate list rather than `KNOWN_SATELLITES`.
+#[test]
+fn collect_orbcomm_passes_sorted_by_start() {
+    use chrono::TimeZone;
+
+    let station = sdr_sat::GroundStation::new(37.1353, -80.4188, 660.0);
+    let cands = vec![
+        ("ORBCOMM FM06".to_string(), sat(FM06)),
+        ("ORBCOMM FM04".to_string(), sat(FM04)),
+    ];
+    let from = chrono::Utc.with_ymd_and_hms(2026, 9, 5, 12, 0, 0).unwrap();
+    let passes = passes::collect_orbcomm_passes(&station, &cands, from, 8, 10.0);
+
+    assert!(
+        !passes.is_empty(),
+        "expected at least one pass across two Orbcomm candidates in an 8h window"
+    );
+    for w in passes.windows(2) {
+        assert!(w[0].start <= w[1].start);
+    }
+}
+
+/// The cap is enforced even when the candidate list would otherwise
+/// produce more passes than `MAX_ORBCOMM_PASSES`.
+#[test]
+fn collect_orbcomm_passes_truncates_to_max() {
+    use chrono::TimeZone;
+
+    let station = sdr_sat::GroundStation::new(37.1353, -80.4188, 660.0);
+    // Duplicate the same two real candidates several times over — each
+    // duplicate propagates identically, so a long-enough window
+    // reliably produces more raw passes than the cap.
+    let mut cands = Vec::new();
+    for i in 0..8 {
+        cands.push((format!("ORBCOMM FM06 #{i}"), sat(FM06)));
+        cands.push((format!("ORBCOMM FM04 #{i}"), sat(FM04)));
+    }
+    let from = chrono::Utc.with_ymd_and_hms(2026, 9, 5, 12, 0, 0).unwrap();
+    let passes = passes::collect_orbcomm_passes(&station, &cands, from, 48, 5.0);
+
+    assert!(passes.len() <= passes::MAX_ORBCOMM_PASSES);
+}
+
 #[test]
 fn log_ring_caps_at_max_entries() {
     let mut ring: std::collections::VecDeque<String> = std::collections::VecDeque::new();

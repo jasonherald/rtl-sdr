@@ -464,6 +464,14 @@ pub struct AppState {
     /// `Satellite`) loaded from the shared TLE cache. Populated by
     /// later wiring (Task 5/7); empty at construction.
     pub orbcomm_tles: RefCell<Vec<(String, sdr_sat::Satellite)>>,
+    /// Shared TLE cache handle — the SAME `Arc` the satellites panel
+    /// holds, threaded in by `connect_orbcomm_panel` (Task 7) so
+    /// `refresh_orbcomm_tles` (armed from decode-enable and the
+    /// satellites-panel TLE-refresh button) can kick an off-GTK-thread
+    /// Orbcomm TLE group refresh without constructing a second
+    /// `TleCache`. `None` when the platform refused a cache directory,
+    /// mirroring the satellites panel's `Option`.
+    pub orbcomm_tle_cache: RefCell<Option<std::sync::Arc<sdr_sat::TleCache>>>,
     /// Shared config handle (same `Arc` the satellites panel and the
     /// rest of the app use — never a second `ConfigManager`
     /// instance). Needed by `dsp_events::orbcomm_events::maybe_identify`
@@ -588,6 +596,7 @@ impl AppState {
             orbcomm_tally: RefCell::new(crate::orbcomm_tally::OrbcommTally::default()),
             orbcomm_sat_names: RefCell::new(std::collections::HashMap::new()),
             orbcomm_tles: RefCell::new(Vec::new()),
+            orbcomm_tle_cache: RefCell::new(None),
             config,
             pending_aos_actions: RefCell::new(None),
             recorder_action_interpreter: RefCell::new(None),

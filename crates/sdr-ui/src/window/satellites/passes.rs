@@ -81,6 +81,7 @@ pub(super) fn wire_tle_refresh_button(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
     recompute: &Rc<dyn Fn()>,
+    state: &Rc<crate::state::AppState>,
 ) {
     let Some(cache_outer) = cache else {
         // No cache — the button was already disabled by
@@ -91,6 +92,7 @@ pub(super) fn wire_tle_refresh_button(
     let config_refresh = std::sync::Arc::clone(config);
     let panel_weak_refresh = panel_weak.clone();
     let recompute_refresh = Rc::clone(recompute);
+    let state_refresh = Rc::clone(state);
     panel.refresh_button.connect_clicked(move |_| {
         let Some(panel) = panel_weak_refresh.upgrade() else {
             return;
@@ -103,6 +105,7 @@ pub(super) fn wire_tle_refresh_button(
         let config_done = std::sync::Arc::clone(&config_refresh);
         let panel_weak_done = panel_weak_refresh.clone();
         let recompute_done = Rc::clone(&recompute_refresh);
+        let state_done = Rc::clone(&state_refresh);
 
         glib::spawn_future_local(async move {
             let result = gio::spawn_blocking(move || force_refresh_all_tles(&cache_task)).await;
@@ -115,6 +118,10 @@ pub(super) fn wire_tle_refresh_button(
             panel.refresh_button.set_sensitive(true);
 
             finish_tle_refresh(&panel, &config_done, &recompute_done, result);
+            // Also refresh the Orbcomm TLE group — same button, same
+            // "the user asked for fresh elements" intent. Off the GTK
+            // thread; a no-op if the platform never gave us a cache.
+            crate::sidebar::orbcomm_panel::refresh_orbcomm_tles(&state_done);
         });
     });
 }

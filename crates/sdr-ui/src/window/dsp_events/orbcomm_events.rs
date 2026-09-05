@@ -96,6 +96,13 @@ pub(super) fn on_orbcomm_channel_stats(ctx: &DspEventCtx, stats: Box<[sdr_orbcom
 pub(super) fn on_orbcomm_enabled_changed(ctx: &DspEventCtx, enabled: bool) {
     let DspEventCtx { state, .. } = ctx;
     state.orbcomm_enabled.set(enabled);
+    if enabled {
+        // Kick a background Orbcomm TLE group refresh so the
+        // identification matcher and the passes section both have a
+        // fresh candidate list for this session. Off the GTK thread;
+        // a no-op if the platform never gave us a TLE cache.
+        crate::sidebar::orbcomm_panel::refresh_orbcomm_tles(state);
+    }
     if !enabled {
         state.orbcomm_tally.borrow_mut().reset();
         // Clear before any handles read it below — the borrow_mut here

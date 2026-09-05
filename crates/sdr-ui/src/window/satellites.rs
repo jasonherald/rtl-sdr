@@ -259,6 +259,11 @@ fn wire_station_rows(
 /// to the passes group so it returns `ControlFlow::Break` once
 /// the window is destroyed; same lifecycle pattern as the DSP
 /// poll loop.
+///
+/// Returns the shared `Arc<TleCache>` (or `None` if the platform
+/// refused a cache directory) so the caller can thread the SAME
+/// instance into `orbcomm_panel::connect_orbcomm_panel` (Task 7)
+/// rather than constructing a second cache.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn connect_satellites_panel(
     panels: &SidebarPanels,
@@ -267,7 +272,7 @@ pub(super) fn connect_satellites_panel(
     toast_overlay: &adw::ToastOverlay,
     tune_to_satellite: &Rc<TuneFn>,
     set_playing: &Rc<dyn Fn(bool)>,
-) {
+) -> Option<std::sync::Arc<sdr_sat::TleCache>> {
     use sidebar::satellites_panel::{SatellitesPanelWeak, load_watched_satellites};
 
     let state = &tune_ctx.state;
@@ -287,6 +292,7 @@ pub(super) fn connect_satellites_panel(
     wire_notify_lead_persistence(panel, config);
 
     let cache = init_tle_cache(panel);
+    let cache_for_orbcomm = cache.clone();
 
     let displayed: Rc<RefCell<Vec<DisplayedPass>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -327,7 +333,14 @@ pub(super) fn connect_satellites_panel(
     //      so there's nothing for the *behavior* to do.
     wire_doppler(panels, state, config, cache.as_ref(), status_bar);
 
-    wire_tle_refresh_button(panel, cache.as_ref(), config, &panel_weak, &recompute);
+    wire_tle_refresh_button(
+        panel,
+        cache.as_ref(),
+        config,
+        &panel_weak,
+        &recompute,
+        state,
+    );
 
     wire_zip_lookup(panel, &panel_weak);
 
@@ -347,6 +360,8 @@ pub(super) fn connect_satellites_panel(
         set_playing,
         &wiring,
     );
+
+    cache_for_orbcomm
 }
 
 /// Toast through a weak overlay handle — no-op when the window is
