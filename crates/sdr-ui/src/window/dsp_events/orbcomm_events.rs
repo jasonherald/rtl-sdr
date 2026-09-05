@@ -25,7 +25,7 @@ pub(super) fn on_orbcomm_event(ctx: &DspEventCtx, event: &sdr_orbcomm::OrbcommEv
     if let Some(handles) = state.orbcomm_viewer_handles.borrow().as_ref() {
         crate::orbcomm_viewer::append_log_entry(
             handles,
-            &crate::orbcomm_viewer::format_packet_row(event),
+            &crate::orbcomm_render::format_packet_row(event),
         );
     }
     record_heard_satellite(state, event);

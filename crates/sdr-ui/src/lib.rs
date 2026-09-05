@@ -20,6 +20,7 @@ pub mod doppler_tracker;
 pub mod header;
 pub mod lrpt_viewer;
 pub mod notify;
+pub mod orbcomm_render;
 pub mod orbcomm_viewer;
 pub mod preferences;
 pub mod radioreference;

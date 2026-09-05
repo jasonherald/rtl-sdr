@@ -40,8 +40,8 @@ fn format_heard_subtitle(row: &sidebar::satellites_heard::HeardRow) -> String {
     match row.position {
         Some((lat_deg, lon_deg, alt_m)) => format!(
             "{age}  ·  {} {}  ·  {:.0} km",
-            crate::orbcomm_viewer::format_lat(lat_deg),
-            crate::orbcomm_viewer::format_lon(lon_deg),
+            crate::orbcomm_render::format_lat(lat_deg),
+            crate::orbcomm_render::format_lon(lon_deg),
             alt_m / 1000.0,
         ),
         None => age,
