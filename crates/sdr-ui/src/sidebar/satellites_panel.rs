@@ -328,16 +328,6 @@ pub struct SatellitesPanel {
     /// lookahead window. Removed from the group when real pass
     /// rows are added; re-added when the list goes empty.
     pub passes_status_row: adw::ActionRow,
-
-    // Heard-via-Orbcomm group ------------------------------------------------
-    /// The preferences group hosting the dynamically-built
-    /// "Heard via Orbcomm" rows (issue #865, Task 12).
-    /// `window/satellites/heard.rs` adds / removes `AdwActionRow`s
-    /// here and toggles the group's own visibility — hidden when
-    /// empty or when the Orbcomm decoder is disabled. Built
-    /// `visible(false)` since nothing has been heard yet at
-    /// construction time.
-    pub heard_group: adw::PreferencesGroup,
 }
 
 /// Weak counterpart of [`SatellitesPanel`] — every field is a
@@ -393,8 +383,6 @@ pub struct SatellitesPanelWeak {
     pub passes_group: glib::WeakRef<adw::PreferencesGroup>,
     /// Weak ref to [`SatellitesPanel::passes_status_row`].
     pub passes_status_row: glib::WeakRef<adw::ActionRow>,
-    /// Weak ref to [`SatellitesPanel::heard_group`].
-    pub heard_group: glib::WeakRef<adw::PreferencesGroup>,
 }
 
 impl SatellitesPanel {
@@ -422,7 +410,6 @@ impl SatellitesPanel {
             doppler_switch: self.doppler_switch.downgrade(),
             passes_group: self.passes_group.downgrade(),
             passes_status_row: self.passes_status_row.downgrade(),
-            heard_group: self.heard_group.downgrade(),
         }
     }
 }
@@ -454,7 +441,6 @@ impl SatellitesPanelWeak {
             doppler_switch: self.doppler_switch.upgrade()?,
             passes_group: self.passes_group.upgrade()?,
             passes_status_row: self.passes_status_row.upgrade()?,
-            heard_group: self.heard_group.upgrade()?,
         })
     }
 }

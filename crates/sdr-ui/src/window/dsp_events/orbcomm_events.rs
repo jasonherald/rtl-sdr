@@ -1,114 +1,88 @@
-//! Orbcomm-side `DspToUi` handlers: viewer log append, channel-strip
-//! refresh, enable-switch ack, and the "Heard via Orbcomm" panel
-//! model (issue #865, Tasks 11 + 12). Split out of
-//! `window/dsp_events.rs` beside `acars_events.rs`, same
-//! module-per-topic pattern.
+//! Orbcomm-side `DspToUi` handlers: drive the Orbcomm activity panel
+//! (packet log, channel grid, By-Spacecraft list, packet-type
+//! breakdown, enable-switch ack) plus the pure heard-spacecraft and
+//! tally models on `AppState`.
 
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::time::Instant;
 
 use super::DspEventCtx;
+use crate::sidebar::orbcomm_panel::{OrbcommPanelHandles, repaint_heard};
 use crate::state::AppState;
 
-/// `DspToUi::OrbcommEvent` arm of [`super::handle_dsp_message`]. Two
-/// independent consumers, neither gated on the other being present:
-///
-/// * the viewer log — no-op when no viewer is open (mirrors `AptLine`
-///   / `SstvLineDecoded`: cheap enough to always run, the user can
-///   open the viewer mid-session and start seeing events from that
-///   moment on);
-/// * the "Heard via Orbcomm" panel model — always recorded, since
-///   `AppState::orbcomm_heard` (unlike the viewer) has no open/closed
-///   state to gate on.
 pub(super) fn on_orbcomm_event(ctx: &DspEventCtx, event: &sdr_orbcomm::OrbcommEvent) {
     let DspEventCtx { state, .. } = ctx;
-    if let Some(handles) = state.orbcomm_viewer_handles.borrow().as_ref() {
-        crate::orbcomm_viewer::append_log_entry(
-            handles,
-            &crate::orbcomm_render::format_packet_row(event),
-        );
-    }
+    state.orbcomm_tally.borrow_mut().record(event);
     record_heard_satellite(state, event);
+    if let Some(handles) = state.orbcomm_panel_handles.borrow().as_ref() {
+        handles.append_log_entry(&crate::orbcomm_render::format_packet_row(event));
+        refresh_breakdown(handles, state);
+        repaint_heard(handles, state);
+    }
 }
 
-/// Feed the "Heard via Orbcomm" panel model (Task 12) on `Sync` /
-/// `Ephemeris` packets — the only two kinds that carry a `sat_id`.
-/// `MessageComplete` events and other packet kinds are outside this
-/// task's concern and are silently skipped.
 fn record_heard_satellite(state: &Rc<AppState>, event: &sdr_orbcomm::OrbcommEvent) {
     use sdr_orbcomm::OrbcommEventKind;
     use sdr_orbcomm::packet::OrbcommPacket;
 
-    let (sat_id, position) = match &event.kind {
+    let (sat_id, position, vel, time) = match &event.kind {
         OrbcommEventKind::Packet {
             packet: OrbcommPacket::Sync { sat_id, .. },
             ..
-        } => (*sat_id, None),
+        } => (*sat_id, None, None, None),
         OrbcommEventKind::Packet {
             packet: OrbcommPacket::Ephemeris(eph),
             ..
-        } => (eph.sat_id, Some((eph.lat_deg, eph.lon_deg, eph.alt_m))),
+        } => (
+            eph.sat_id,
+            Some((eph.lat_deg, eph.lon_deg, eph.alt_m)),
+            Some(eph.vel_ms),
+            Some(eph.sat_time_unix),
+        ),
         _ => return,
     };
-
     state
         .orbcomm_heard
         .borrow_mut()
-        .record(sat_id, position, None, None, Instant::now());
-
-    render_heard_group_if_wired(state);
+        .record(sat_id, position, vel, time, Instant::now());
 }
 
-/// Trigger an immediate "Heard via Orbcomm" row rebuild if the panel
-/// has wired up (`window/satellites/heard.rs::wire_heard_group`) and
-/// its render closure is still alive. Silent no-op otherwise — the
-/// next 5 s tick (once the panel does wire up) will still pick up
-/// everything recorded so far.
-fn render_heard_group_if_wired(state: &Rc<AppState>) {
-    if let Some(render) = state
-        .orbcomm_heard_render
-        .borrow()
-        .as_ref()
-        .and_then(Weak::upgrade)
-    {
-        render();
-    } else {
-        tracing::trace!(
-            "Orbcomm heard-group render closure unavailable (panel not wired yet, or dropped); \
-             falling back to the periodic tick"
-        );
-    }
-}
-
-/// `DspToUi::OrbcommChannelStats` arm of [`super::handle_dsp_message`].
-/// Mirrors `on_acars_channel_stats`: stash into `AppState` (read by a
-/// future sidebar panel) and, if a viewer is open, refresh its strip
-/// immediately rather than waiting for the next tick.
 pub(super) fn on_orbcomm_channel_stats(ctx: &DspEventCtx, stats: Box<[sdr_orbcomm::ChannelStats]>) {
     let DspEventCtx { state, .. } = ctx;
     let stats = stats.into_vec();
-    if let Some(handles) = state.orbcomm_viewer_handles.borrow().as_ref() {
-        crate::orbcomm_viewer::refresh_channel_strip(handles, &stats);
+    if let Some(handles) = state.orbcomm_panel_handles.borrow().as_ref() {
+        handles.refresh_channel_grid(&stats);
+        refresh_breakdown(handles, state); // checksum/repaired totals live here
     }
     *state.orbcomm_channel_stats.borrow_mut() = stats;
 }
 
-/// `DspToUi::OrbcommEnabledChanged` arm of [`super::handle_dsp_message`].
-/// Unlike ACARS, construction can't fail synchronously (no airband
-/// lock to contend for), so this is a plain `bool` ack rather than a
-/// `Result` — always mirror it into `AppState::orbcomm_enabled` and,
-/// if open, the viewer's switch. Also fires on the DSP's own
-/// force-disable ack at source-stop cleanup, which is exactly why the
-/// switch tracks this ack instead of setting itself optimistically on
-/// user toggle.
 pub(super) fn on_orbcomm_enabled_changed(ctx: &DspEventCtx, enabled: bool) {
     let DspEventCtx { state, .. } = ctx;
     state.orbcomm_enabled.set(enabled);
-    if let Some(handles) = state.orbcomm_viewer_handles.borrow().as_ref() {
-        crate::orbcomm_viewer::apply_enabled_ack(handles, enabled);
+    if !enabled {
+        state.orbcomm_tally.borrow_mut().reset();
     }
-    // The "Heard via Orbcomm" group's visibility is gated on this
-    // flag too (Task 12) — re-render so a disable hides it
-    // immediately rather than waiting out the next 5 s tick.
-    render_heard_group_if_wired(state);
+    if let Some(handles) = state.orbcomm_panel_handles.borrow().as_ref() {
+        handles.apply_enabled_ack(enabled);
+        refresh_breakdown(handles, state);
+        repaint_heard(handles, state);
+    }
+}
+
+/// Sum checksum-fail + repaired across channels and repaint the
+/// packet-type breakdown label.
+fn refresh_breakdown(handles: &OrbcommPanelHandles, state: &Rc<AppState>) {
+    let (fail, repaired) = state
+        .orbcomm_channel_stats
+        .borrow()
+        .iter()
+        .fold((0u64, 0u64), |(f, r), s| {
+            (f + s.checksum_fail, r + s.repaired)
+        });
+    let text = state
+        .orbcomm_tally
+        .borrow()
+        .format_breakdown(fail, repaired);
+    handles.set_breakdown(&text);
 }

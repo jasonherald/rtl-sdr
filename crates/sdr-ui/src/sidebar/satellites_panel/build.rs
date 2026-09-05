@@ -1,8 +1,9 @@
 //! Widget construction for the Satellites scheduler panel —
 //! [`build_satellites_panel`] lays out the ground-station, TLE,
-//! notifications, recording, upcoming-passes, and Heard-via-Orbcomm
-//! groups. Split out of `satellites_panel.rs` per the file-size
-//! pass (issue #819).
+//! notifications, recording, and upcoming-passes groups. Split out of
+//! `satellites_panel.rs` per the file-size pass (issue #819). (The
+//! former Heard-via-Orbcomm group moved to the dedicated Orbcomm
+//! activity panel in epic #867.)
 
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -26,14 +27,15 @@ pub fn build_satellites_panel() -> SatellitesPanel {
 
     // Attachment order == call order (each builder adds its group
     // to the page): Ground Station → TLE Data → Notifications →
-    // Recording → Upcoming Passes → Heard via Orbcomm — the same
-    // top-to-bottom order the pre-split monolithic builder used.
+    // Recording → Upcoming Passes — the same top-to-bottom order the
+    // pre-split monolithic builder used. (The former "Heard via
+    // Orbcomm" group moved to the dedicated Orbcomm activity panel in
+    // epic #867.)
     let station = build_station_group(&page);
     let (last_refresh_row, refresh_button, refresh_spinner) = build_tle_group(&page);
     let notify_lead_row = build_notify_group(&page);
     let recording = build_recording_group(&page);
     let (passes_group, passes_status_row) = build_passes_group(&page);
-    let heard_group = build_heard_group(&page);
 
     SatellitesPanel {
         widget: page,
@@ -53,7 +55,6 @@ pub fn build_satellites_panel() -> SatellitesPanel {
         doppler_switch: recording.doppler_switch,
         passes_group,
         passes_status_row,
-        heard_group,
     }
 }
 
@@ -379,22 +380,4 @@ fn build_passes_group(page: &adw::PreferencesPage) -> (adw::PreferencesGroup, ad
     page.add(&passes_group);
 
     (passes_group, passes_status_row)
-}
-
-/// Heard-via-Orbcomm group (issue #865, Task 12) — built hidden.
-/// Split out per the 50-NLOC gate (#819).
-fn build_heard_group(page: &adw::PreferencesPage) -> adw::PreferencesGroup {
-    // ─── Heard via Orbcomm (issue #865, Task 12) ───────────────
-    // Built hidden — nothing has been heard yet at construction
-    // time. `window/satellites/heard.rs` reveals it once the
-    // model has at least one non-expired row AND the decoder is
-    // enabled.
-    let heard_group = adw::PreferencesGroup::builder()
-        .title("Heard via Orbcomm")
-        .description("Spacecraft decoded from the 137 MHz downlink during this session.")
-        .visible(false)
-        .build();
-    page.add(&heard_group);
-
-    heard_group
 }

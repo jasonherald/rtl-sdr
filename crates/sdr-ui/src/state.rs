@@ -420,43 +420,40 @@ pub struct AppState {
     /// Orbcomm toggle, ack-driven mirror of the DSP-side decode-tap
     /// state (issue #865, Task 11). Unlike ACARS this is a plain
     /// bool with no geometry lock to unwind, so there's no paired
-    /// `*_pending` flag — the viewer's enable switch tracks the ack
+    /// `*_pending` flag — the panel's enable switch tracks the ack
     /// directly rather than optimistically, per
-    /// `crate::orbcomm_viewer`'s doc comments.
+    /// `crate::sidebar::orbcomm_panel`'s doc comments.
     pub orbcomm_enabled: Cell<bool>,
     /// Latest per-channel Orbcomm stats, populated by the
     /// `DspToUi::OrbcommChannelStats` arm. Mirrors
-    /// `acars_channel_stats`; consumed by the viewer's
-    /// channel-activity strip (and, in a later task, a sidebar
-    /// panel).
+    /// `acars_channel_stats`; consumed by the Orbcomm panel's
+    /// channel-activity grid and the packet-type breakdown's
+    /// checksum-fail / repaired totals.
     pub orbcomm_channel_stats: RefCell<Vec<sdr_orbcomm::ChannelStats>>,
-    /// Currently-open Orbcomm viewer window, or `None` when no
-    /// viewer is open. `glib::WeakRef` so the `AppState` slot
-    /// doesn't keep the window alive past its natural lifetime.
-    /// Set by [`crate::orbcomm_viewer::open_orbcomm_viewer_if_needed`];
-    /// cleared by the window's `close-request` handler.
-    pub orbcomm_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
-    /// Per-viewer mutable handles (log view, channel-strip labels,
-    /// enable switch). `Some` only while a viewer window is open.
-    /// Mirrors `acars_viewer_handles`.
-    pub orbcomm_viewer_handles: RefCell<Option<Rc<crate::orbcomm_viewer::ViewerHandles>>>,
+    /// Runtime handles for the docked Orbcomm activity panel
+    /// (epic #867). Stashed by
+    /// [`crate::sidebar::orbcomm_panel::connect_orbcomm_panel`] so the
+    /// `DspToUi::Orbcomm*` dispatch sites can drive the log, channel
+    /// grid, By-Spacecraft list, breakdown, and enable-switch ack.
+    /// The panel lives for the app lifetime, so this is set once and
+    /// never cleared. Replaces the retired `orbcomm_viewer_*` slots.
+    pub orbcomm_panel_handles:
+        RefCell<Option<Rc<crate::sidebar::orbcomm_panel::OrbcommPanelHandles>>>,
     /// "Heard via Orbcomm" session tracker (issue #865, Task 12):
     /// every spacecraft `sat_id` seen this session, when it was last
-    /// heard, and its last-known position. Updated by the
-    /// `DspToUi::OrbcommEvent` arm on every `Sync` / `Ephemeris`
-    /// packet; read by `window/satellites/heard.rs`'s render
-    /// closure. Deliberately data-only (no GTK type) so the
-    /// `dsp_events` handler doesn't need to know about the Satellites
-    /// panel's widgets — mirrors `orbcomm_channel_stats`.
+    /// heard, and its last-known position / velocity / sat-clock.
+    /// Updated by the `DspToUi::OrbcommEvent` arm on every `Sync` /
+    /// `Ephemeris` packet; read by the Orbcomm panel's By-Spacecraft
+    /// rebuild. Deliberately data-only (no GTK type) so the
+    /// `dsp_events` handler doesn't need to know about the panel's
+    /// widgets — mirrors `orbcomm_channel_stats`.
     pub orbcomm_heard: RefCell<crate::sidebar::satellites_heard::HeardSatellites>,
-    /// Weak handle to the "Heard via Orbcomm" group's render closure,
-    /// built by `window/satellites/heard.rs::wire_heard_group`. Lets
-    /// a recorded event trigger an immediate row rebuild instead of
-    /// waiting for the next 5 s tick. `None` before the panel wires
-    /// up; upgrade failure (the tick's `GLib` source — the closure's
-    /// strong owner — has been dropped) is a silent no-op. Mirrors
-    /// `recorder_action_interpreter`.
-    pub orbcomm_heard_render: RefCell<Option<Weak<dyn Fn()>>>,
+    /// Session packet-type tally driving the Orbcomm panel's
+    /// "Packet types" breakdown (epic #867). Recorded on every
+    /// `DspToUi::OrbcommEvent`; reset when the decoder is disabled.
+    /// Pure UI-side classification — the decoder emits no per-type
+    /// counts.
+    pub orbcomm_tally: RefCell<crate::orbcomm_tally::OrbcommTally>,
     /// Stash for the **full batch** of `RecorderAction`s a
     /// recorder tick yielded when ACARS was engaged. The
     /// recorder tick site detects a `StartAutoRecord` in the
@@ -567,10 +564,9 @@ impl AppState {
             suppress_volume_notify: Cell::new(false),
             orbcomm_enabled: Cell::new(false),
             orbcomm_channel_stats: RefCell::new(Vec::new()),
-            orbcomm_viewer_window: RefCell::new(None),
-            orbcomm_viewer_handles: RefCell::new(None),
+            orbcomm_panel_handles: RefCell::new(None),
             orbcomm_heard: RefCell::new(crate::sidebar::satellites_heard::HeardSatellites::new()),
-            orbcomm_heard_render: RefCell::new(None),
+            orbcomm_tally: RefCell::new(crate::orbcomm_tally::OrbcommTally::default()),
             pending_aos_actions: RefCell::new(None),
             recorder_action_interpreter: RefCell::new(None),
         })

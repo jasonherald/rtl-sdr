@@ -689,12 +689,28 @@ pub fn build_window(
         // symmetric. Per epic #469 task 7.5.
         crate::lrpt_viewer::connect_lrpt_action(app, &parent_provider, &state);
         crate::sstv_viewer::connect_sstv_action(app, &parent_provider, &state);
-        // Orbcomm viewer wiring (`Ctrl+Shift+O` / `app.orbcomm-open`,
-        // issue #865). No `parent_provider` — like `acars_viewer`,
-        // the window pulls its parent app via the gio
-        // default-application registry rather than a caller-supplied
-        // window.
-        crate::orbcomm_viewer::connect_orbcomm_action(app, &state);
+    }
+
+    // Orbcomm wiring (`Ctrl+Shift+O` / `app.orbcomm-open`, epic #867):
+    // the floating viewer is retired, so this now selects the docked
+    // Orbcomm left activity instead of opening a window. Inline (not
+    // via a `select_left_activity` helper) because `ActivityBar` isn't
+    // `Clone`; capture the `buttons` map — its `ToggleButton`s are
+    // cheap glib refs — plus the left stack and split view.
+    {
+        let action = gio::SimpleAction::new("orbcomm-open", None);
+        let stack = left_stack.clone();
+        let bar_buttons = left_activity_bar.buttons.clone();
+        let split = left_split_view.clone();
+        action.connect_activate(move |_, _| {
+            for (n, btn) in &bar_buttons {
+                btn.set_active(*n == "orbcomm");
+            }
+            stack.set_visible_child_name("orbcomm");
+            split.set_show_sidebar(true);
+        });
+        app.add_action(&action);
+        app.set_accels_for_action("app.orbcomm-open", &["<Ctrl><Shift>o"]);
     }
 
     // Set initial status bar values and mode-specific control visibility.
@@ -1618,6 +1634,7 @@ fn connect_sidebar_panels(
         set_playing,
     );
     connect_aviation_panel(&panels.aviation, state, config, toast_overlay);
+    crate::sidebar::orbcomm_panel::connect_orbcomm_panel(panels, state);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(panels, tune_ctx, volume_button);
 

@@ -1,7 +1,7 @@
 //! Orbcomm activity panel (epic #867, Orbcomm slice).
 //!
 //! Docked left-activity surface that replaces the former floating
-//! orbcomm_viewer window: enable toggle, a 3×3 channel-activity grid,
+//! `orbcomm_viewer` window: enable toggle, a 3×3 channel-activity grid,
 //! a "By Spacecraft" list, a packet-type breakdown, and the raw
 //! packet/message log.
 //!
@@ -27,6 +27,10 @@ use crate::orbcomm_render::{
     METERS_PER_KM, channel_label_text, format_lat, format_lon, format_utc_hms,
 };
 use crate::sidebar::satellites_heard::HeardRow;
+use crate::state::AppState;
+
+/// Heard-list aging tick (seconds) — matches the old heard-group tick.
+const HEARD_TICK_SECS: u32 = 5;
 
 /// Cap on retained log entries; the oldest is trimmed once this is
 /// exceeded. Named `_ENTRIES` rather than `_LINES`: one entry is one
@@ -51,7 +55,7 @@ pub struct OrbcommPanelHandles {
     /// the switch's own `active` notify handler doesn't re-dispatch
     /// `SetOrbcommEnabled` for a state change WE just made.
     pub suppress_switch_notify: Cell<bool>,
-    /// One label per ORBCOMM_CHANNELS_HZ entry, same order, laid out
+    /// One label per `ORBCOMM_CHANNELS_HZ` entry, same order, laid out
     /// row-major in the 3×3 grid.
     pub channel_cells: Vec<gtk4::Label>,
     pub heard_group: adw::PreferencesGroup,
@@ -295,4 +299,47 @@ pub(crate) fn format_heard_subtitle(row: &HeardRow) -> String {
     }
     parts.push(format!("{}s ago", row.age_secs));
     parts.join(" · ")
+}
+
+/// Wire the Orbcomm panel: stash its handles on `AppState` for the
+/// `DspToUi::Orbcomm*` dispatch sites, dispatch `SetOrbcommEnabled` on
+/// the Decode switch, and arm the heard-list aging tick.
+pub fn connect_orbcomm_panel(panels: &crate::sidebar::SidebarPanels, state: &Rc<AppState>) {
+    let handles = Rc::clone(&panels.orbcomm.handles);
+    *state.orbcomm_panel_handles.borrow_mut() = Some(Rc::clone(&handles));
+
+    // Enable switch → SetOrbcommEnabled (ack-driven state; guard the
+    // programmatic set_active in apply_enabled_ack).
+    {
+        let state = Rc::clone(state);
+        let handles = Rc::clone(&handles);
+        handles
+            .enable_switch
+            .clone()
+            .connect_active_notify(move |sw| {
+                if handles.suppress_switch_notify.get() {
+                    return;
+                }
+                state.send_dsp(crate::messages::UiToDsp::SetOrbcommEnabled(sw.is_active()));
+            });
+    }
+
+    // 5 s heard-aging tick: repaint the By-Spacecraft list so ages
+    // advance and expired birds drop even without new packets. The
+    // panel lives for the app lifetime, so this never needs to stop.
+    {
+        let state = Rc::clone(state);
+        let handles = Rc::clone(&handles);
+        glib::timeout_add_seconds_local(HEARD_TICK_SECS, move || {
+            repaint_heard(&handles, &state);
+            glib::ControlFlow::Continue
+        });
+    }
+}
+
+/// Rebuild the By-Spacecraft list from the current model + enable flag.
+pub(crate) fn repaint_heard(handles: &OrbcommPanelHandles, state: &Rc<AppState>) {
+    let rows = state.orbcomm_heard.borrow().rows(std::time::Instant::now());
+    let visible = state.orbcomm_enabled.get() && !rows.is_empty();
+    handles.rebuild_heard_list(&rows, visible);
 }
