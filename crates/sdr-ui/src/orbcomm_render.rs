@@ -191,6 +191,43 @@ pub(crate) fn channel_label_text(freq_hz: f64, stats: Option<&ChannelStats>) -> 
     }
 }
 
+/// The per-spacecraft fields extracted from an identity-bearing event.
+/// `Sync` gives only `sat_id`; `Ephemeris` fills position/velocity/time.
+pub struct HeardFields {
+    pub sat_id: u8,
+    pub position: Option<(f64, f64, f64)>,
+    pub vel_ms: Option<f64>,
+    pub sat_time_unix: Option<i64>,
+}
+
+/// Map an event to its heard-spacecraft fields, or `None` for events
+/// that carry no `sat_id` (`MessageComplete`). Pure — the single source
+/// of the event→fields mapping used by the heard model and the matcher.
+#[must_use]
+pub fn heard_fields(event: &OrbcommEvent) -> Option<HeardFields> {
+    match &event.kind {
+        OrbcommEventKind::Packet {
+            packet: OrbcommPacket::Sync { sat_id, .. },
+            ..
+        } => Some(HeardFields {
+            sat_id: *sat_id,
+            position: None,
+            vel_ms: None,
+            sat_time_unix: None,
+        }),
+        OrbcommEventKind::Packet {
+            packet: OrbcommPacket::Ephemeris(eph),
+            ..
+        } => Some(HeardFields {
+            sat_id: eph.sat_id,
+            position: Some((eph.lat_deg, eph.lon_deg, eph.alt_m)),
+            vel_ms: Some(eph.vel_ms),
+            sat_time_unix: Some(eph.sat_time_unix),
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
