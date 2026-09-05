@@ -823,3 +823,7 @@ fn alpha5_to_norad_id(field: &str) -> Option<u32> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod group_tests;

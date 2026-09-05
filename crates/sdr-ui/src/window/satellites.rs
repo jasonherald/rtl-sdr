@@ -275,9 +275,6 @@ pub(super) fn connect_satellites_panel(
 ) -> Option<std::sync::Arc<sdr_sat::TleCache>> {
     use sidebar::satellites_panel::{SatellitesPanelWeak, load_watched_satellites};
 
-    let state = &tune_ctx.state;
-    let status_bar = &tune_ctx.status_bar;
-
     // Borrow the panel for synchronous setup, then capture only
     // weak refs in long-lived closures. Cloning the strong panel
     // into a closure stored on its own widget creates a refcount
@@ -318,6 +315,46 @@ pub(super) fn connect_satellites_panel(
     wire_station_rows(panel, config, &recompute);
 
     wire_auto_record_persistence(panel, config);
+
+    wire_satellites_behaviors(
+        panels,
+        panel,
+        config,
+        tune_ctx,
+        toast_overlay,
+        tune_to_satellite,
+        set_playing,
+        panel_weak,
+        recompute,
+        displayed,
+        watched,
+        cache,
+    );
+
+    cache_for_orbcomm
+}
+
+/// Wire the remaining satellites-panel behaviors: Doppler tracking,
+/// the TLE refresh button, ZIP lookup, and the auto-record/recorder
+/// tick. Split out of `connect_satellites_panel` per the 50-NLOC gate
+/// — pure move, no behavior/order change.
+#[allow(clippy::too_many_arguments)]
+fn wire_satellites_behaviors(
+    panels: &SidebarPanels,
+    panel: &sidebar::satellites_panel::SatellitesPanel,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    tune_ctx: &TuneCtx,
+    toast_overlay: &adw::ToastOverlay,
+    tune_to_satellite: &Rc<TuneFn>,
+    set_playing: &Rc<dyn Fn(bool)>,
+    panel_weak: sidebar::satellites_panel::SatellitesPanelWeak,
+    recompute: Rc<dyn Fn()>,
+    displayed: Rc<RefCell<Vec<DisplayedPass>>>,
+    watched: Rc<RefCell<std::collections::HashSet<u32>>>,
+    cache: Option<std::sync::Arc<sdr_sat::TleCache>>,
+) {
+    let state = &tune_ctx.state;
+    let status_bar = &tune_ctx.status_bar;
 
     // Doppler-correction tracker (#521).
     //
@@ -360,8 +397,6 @@ pub(super) fn connect_satellites_panel(
         set_playing,
         &wiring,
     );
-
-    cache_for_orbcomm
 }
 
 /// Toast through a weak overlay handle — no-op when the window is
