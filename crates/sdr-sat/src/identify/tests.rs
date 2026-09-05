@@ -18,6 +18,12 @@ fn sat(t: (&str, &str, &str)) -> Satellite {
     Satellite::from_tle(t.0, t.1, t.2).expect("valid TLE fixture")
 }
 
+/// Deliberately unrestricted distance cap (km) for the promotion-branch
+/// tests, which exercise the ambiguity margin — not the distance
+/// threshold. Large enough that the real inter-satellite distances never
+/// trip the cap.
+const UNRESTRICTED_DIST_CAP_KM: f64 = 1.0e7;
+
 /// A candidate's propagated ECEF position (km) at `when`.
 fn ecef_at(t: (&str, &str, &str), when: DateTime<Utc>) -> [f64; 3] {
     let eci = sat(t).propagate(when).expect("propagates over test window");
@@ -139,7 +145,7 @@ fn promoted_runner_up_enforces_margin() {
     ];
     // Large threshold: this exercises the margin/promotion path, not the
     // distance cap.
-    assert!(identify_from_ecef(target, when, &candidates, 1.0e7).is_none());
+    assert!(identify_from_ecef(target, when, &candidates, UNRESTRICTED_DIST_CAP_KM).is_none());
 }
 
 /// Runner-up promotion, positive case. Same displacing order (FM04 first,
@@ -155,7 +161,7 @@ fn promotes_previous_best_and_matches() {
         ("ORBCOMM FM04".into(), sat(FM04)),
         ("ORBCOMM FM06".into(), sat(FM06)),
     ];
-    let m = identify_from_ecef(target, when, &candidates, 1.0e7)
+    let m = identify_from_ecef(target, when, &candidates, UNRESTRICTED_DIST_CAP_KM)
         .expect("FM06 clears the ambiguity margin");
     assert_eq!(m.name, "ORBCOMM FM06");
 }
