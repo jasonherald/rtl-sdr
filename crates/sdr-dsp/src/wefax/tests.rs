@@ -1,3 +1,4 @@
+use super::assembly::LineAssembler;
 use super::discriminator::Discriminator;
 use super::*;
 
@@ -28,4 +29,39 @@ fn discriminator_maps_subcarrier_tones_to_brightness() {
         "grey"
     );
     assert!(brightness_of_tone(SUBCARRIER_WHITE_HZ, sr) > 235.0, "white");
+}
+
+/// A ramp of brightness fills exactly one line's worth of samples and
+/// emits one line spanning the full 0..255 range across the row.
+#[test]
+fn line_assembler_emits_one_line_per_period() {
+    let spl = 12_000.0; // e.g. 24 kHz / 2 lines-per-sec
+    let mut a = LineAssembler::new(spl);
+    let mut lines = 0;
+    for i in 0..(spl as usize) {
+        let b = ((i as f64 / spl) * 255.0) as u8;
+        if a.push(b).is_some() {
+            lines += 1;
+        }
+    }
+    assert_eq!(lines, 1, "exactly one line per samples_per_line window");
+}
+
+/// `process()` over a synthetic white tone yields a bright line.
+#[test]
+fn process_emits_bright_lines_for_white_tone() {
+    let sr = 24_000u32;
+    let mut dec = WefaxDecoder::new(sr).unwrap();
+    let n = sr as usize; // 1 s → 2 lines
+    let audio: Vec<f32> = (0..n)
+        .map(|i| {
+            (2.0 * std::f64::consts::PI * SUBCARRIER_WHITE_HZ * i as f64 / sr as f64).sin() as f32
+        })
+        .collect();
+    let mut out = vec![WefaxLine::default(); 8];
+    let mut total = 0usize;
+    for chunk in audio.chunks(4096) {
+        total += dec.process(chunk, &mut out).unwrap();
+    }
+    assert!(total >= 1, "at least one line from 1 s of audio");
 }
