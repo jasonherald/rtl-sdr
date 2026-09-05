@@ -2,8 +2,9 @@
 //!
 //! Docked left-activity surface that replaces the former floating
 //! `orbcomm_viewer` window: enable toggle, a 3×3 channel-activity grid,
-//! a "By Spacecraft" list, a packet-type breakdown, and the raw
-//! packet/message log.
+//! a "By Spacecraft" list, a packet-type breakdown, a "Next Orbcomm
+//! passes" section (`passes` submodule), and the raw packet/message
+//! log.
 //!
 //! Layout deviation (deliberate): activity panels are normally an
 //! `AdwPreferencesPage` of flat groups. This one is a data surface
