@@ -88,10 +88,9 @@ pub struct OrbcommPanel {
     pub handles: Rc<OrbcommPanelHandles>,
 }
 
-pub fn build_orbcomm_panel() -> OrbcommPanel {
-    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-
-    // ── Enable toggle ("Decode") ──
+/// Build the "Decode" enable row (switch + accessible label) inside its
+/// own `PreferencesGroup`.
+fn build_enable_group() -> (adw::PreferencesGroup, gtk4::Switch) {
     let enable_switch = gtk4::Switch::builder().valign(gtk4::Align::Center).build();
     enable_switch.update_property(&[gtk4::accessible::Property::Label("Enable Orbcomm decoding")]);
     let enable_row = adw::ActionRow::builder()
@@ -101,8 +100,11 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
     enable_row.add_suffix(&enable_switch);
     let enable_group = adw::PreferencesGroup::new();
     enable_group.add(&enable_row);
+    (enable_group, enable_switch)
+}
 
-    // ── 3×3 channel grid ──
+/// Build the 3×3 channel-activity grid, wrapped in the "Channels" group.
+fn build_channel_grid_group() -> (adw::PreferencesGroup, Vec<gtk4::Label>) {
     let grid = gtk4::Grid::builder()
         .row_spacing(GRID_SPACING)
         .column_spacing(GRID_COLUMN_SPACING)
@@ -124,15 +126,21 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
     }
     let channel_group = adw::PreferencesGroup::builder().title("Channels").build();
     channel_group.add(&grid);
+    (channel_group, channel_cells)
+}
 
-    // ── By Spacecraft ──
-    let heard_group = adw::PreferencesGroup::builder()
+/// Build the (initially hidden) "By Spacecraft" group.
+fn build_heard_group() -> adw::PreferencesGroup {
+    adw::PreferencesGroup::builder()
         .title("By Spacecraft")
         .description("Spacecraft decoded from the 137 MHz downlink this session.")
         .visible(false)
-        .build();
+        .build()
+}
 
-    // ── Packet-type breakdown ──
+/// Build the monospace packet-type breakdown label inside its
+/// "Packet types" group.
+fn build_breakdown_group() -> (adw::PreferencesGroup, gtk4::Label) {
     // GtkLabel has no `monospace` property (that lives on GtkTextView);
     // the built-in `.monospace` CSS style class gives the same effect.
     let breakdown_label = gtk4::Label::builder()
@@ -147,8 +155,11 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
         .title("Packet types")
         .build();
     breakdown_group.add(&breakdown_label);
+    (breakdown_group, breakdown_label)
+}
 
-    // ── Packet / message log ──
+/// Build the packet/message log `TextView` and its scrolling container.
+fn build_log_view() -> (gtk4::TextView, gtk4::ScrolledWindow) {
     let log_view = gtk4::TextView::builder()
         .editable(false)
         .cursor_visible(false)
@@ -164,6 +175,17 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
         .vexpand(true)
         .hexpand(true)
         .build();
+    (log_view, scrolled_window)
+}
+
+pub fn build_orbcomm_panel() -> OrbcommPanel {
+    let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+    let (enable_group, enable_switch) = build_enable_group();
+    let (channel_group, channel_cells) = build_channel_grid_group();
+    let heard_group = build_heard_group();
+    let (breakdown_group, breakdown_label) = build_breakdown_group();
+    let (log_view, scrolled_window) = build_log_view();
 
     root.append(&enable_group);
     root.append(&channel_group);
