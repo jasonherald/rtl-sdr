@@ -15,7 +15,7 @@
 //! for full 16-byte hexdump rows.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use gtk4::glib;
@@ -212,45 +212,58 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
     }
 }
 
+/// Push `entry` onto the ring, dropping from the front while it
+/// exceeds [`MAX_LOG_ENTRIES`]. Pure so the rotation logic is testable
+/// without a GTK harness; `append_log_entry` reports how many entries
+/// were evicted so it knows how much to trim from the `GtkTextBuffer`.
+fn push_log_ring(ring: &mut VecDeque<String>, entry: String) -> usize {
+    ring.push_back(entry);
+    let mut evicted = 0;
+    while ring.len() > MAX_LOG_ENTRIES {
+        ring.pop_front();
+        evicted += 1;
+    }
+    evicted
+}
+
 impl OrbcommPanelHandles {
     /// Append one rendered log entry (a `format_packet_row` result) to
     /// the panel's log, trimming from the front once [`MAX_LOG_ENTRIES`]
     /// is exceeded, and auto-scrolling to the bottom if the user was
-    /// already there. Ported verbatim in behavior from the retired
-    /// `orbcomm_viewer::append_log_entry`.
+    /// already there. Edits the `GtkTextBuffer` incrementally (insert
+    /// the new entry, delete evicted lines from the front) rather than
+    /// rebuilding it wholesale on every append.
     pub fn append_log_entry(&self, entry: &str) {
         let adj = self.scrolled_window.vadjustment();
         let was_at_bottom = (adj.value() + adj.page_size() - adj.upper()).abs()
             < SCROLL_BOTTOM_TOLERANCE_PX
             || adj.upper() <= adj.page_size();
 
-        let joined = {
+        let evicted = {
             let mut entries = self.log_entries.borrow_mut();
-            entries.push_back(entry.to_string());
-            while entries.len() > MAX_LOG_ENTRIES {
-                entries.pop_front();
-            }
-            // Reference each entry (`String::as_str`) rather than
-            // cloning it — the ring already owns every entry's bytes
-            // once, so this join is the only content copy on the
-            // append path (into the new joined `String`), not two.
-            entries
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join("\n")
+            push_log_ring(&mut entries, entry.to_string())
         };
-        self.log_view.buffer().set_text(&joined);
+
+        let buffer = self.log_view.buffer();
+        for _ in 0..evicted {
+            let mut start = buffer.start_iter();
+            let mut cut = buffer.start_iter();
+            cut.forward_line();
+            buffer.delete(&mut start, &mut cut);
+        }
+        let mut end = buffer.end_iter();
+        let prefix = if buffer.char_count() > 0 { "\n" } else { "" };
+        buffer.insert(&mut end, &format!("{prefix}{entry}"));
 
         if was_at_bottom {
             // GTK4 recomputes `GtkTextView`'s adjustment bounds on the
             // next size-allocate pass, not synchronously inside
-            // `set_text` — reading `adj.upper()` right here can still
-            // observe the PRE-append bound and leave the view one
-            // entry short on every auto-follow. Defer the scroll to
-            // the next main-loop idle so it reads the bound only after
-            // GTK has recomputed it. Weak ref: if the panel is torn
-            // down before the idle fires, just drop the scroll.
+            // `insert`/`delete` — reading `adj.upper()` right here can
+            // still observe the PRE-append bound and leave the view
+            // one entry short on every auto-follow. Defer the scroll
+            // to the next main-loop idle so it reads the bound only
+            // after GTK has recomputed it. Weak ref: if the panel is
+            // torn down before the idle fires, just drop the scroll.
             let adj_weak = adj.downgrade();
             glib::idle_add_local_once(move || {
                 if let Some(adj) = adj_weak.upgrade() {
@@ -299,17 +312,32 @@ impl OrbcommPanelHandles {
         self.suppress_switch_notify.set(false);
     }
 
-    /// Rebuild the By-Spacecraft rows from a `HeardRow` snapshot.
-    pub fn rebuild_heard_list(&self, rows: &[HeardRow], visible: bool) {
+    /// Rebuild the By-Spacecraft rows from a `HeardRow` snapshot,
+    /// resolving each row's title through the learned `sat_id` → name
+    /// table (`AppState::orbcomm_sat_names`). Unresolved satellites
+    /// keep `row.label` ("Sat 0xNN") as the title; resolved ones show
+    /// the real name as the title and fold `row.label` into the
+    /// subtitle so the raw id stays visible.
+    pub fn rebuild_heard_list(
+        &self,
+        rows: &[HeardRow],
+        visible: bool,
+        sat_names: &HashMap<u8, String>,
+    ) {
         let mut displayed = self.heard_rows.borrow_mut();
         for row in displayed.drain(..) {
             self.heard_group.remove(&row);
         }
         self.heard_group.set_visible(visible);
         for row in rows {
+            let detail = format_heard_subtitle(row);
+            let (title, subtitle) = match sat_names.get(&row.sat_id) {
+                Some(name) => (name.clone(), format!("{} · {detail}", row.label)),
+                None => (row.label.clone(), detail),
+            };
             let action_row = adw::ActionRow::builder()
-                .title(&row.label)
-                .subtitle(format_heard_subtitle(row))
+                .title(&title)
+                .subtitle(&subtitle)
                 .build();
             self.heard_group.add(&action_row);
             displayed.push(action_row);
@@ -379,5 +407,9 @@ pub fn connect_orbcomm_panel(panels: &crate::sidebar::SidebarPanels, state: &Rc<
 pub(crate) fn repaint_heard(handles: &OrbcommPanelHandles, state: &Rc<AppState>) {
     let rows = state.orbcomm_heard.borrow().rows(std::time::Instant::now());
     let visible = state.orbcomm_enabled.get() && !rows.is_empty();
-    handles.rebuild_heard_list(&rows, visible);
+    handles.rebuild_heard_list(&rows, visible, &state.orbcomm_sat_names.borrow());
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests;

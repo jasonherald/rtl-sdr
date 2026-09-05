@@ -11,6 +11,7 @@ fn record_and_rows_round_trip() {
     let rows = model.rows(now);
 
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sat_id, 0x2C);
     assert_eq!(rows[0].label, sdr_orbcomm::sat_names::sat_label(0x2C));
     assert_eq!(rows[0].age_secs, 0);
     assert_eq!(rows[0].position, Some((51.2, 7.4, 715_000.0)));

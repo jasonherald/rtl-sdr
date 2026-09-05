@@ -29,6 +29,10 @@ pub const HEARD_EXPIRY_SECS: u64 = 1200;
 /// position (`None` until an Ephemeris packet has decoded for it).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeardRow {
+    /// Raw Orbcomm `sat_id`, so callers can resolve a learned
+    /// spacecraft name (see `orbcomm_sat_names`) without re-deriving
+    /// it from `label`.
+    pub sat_id: u8,
     /// Display label — always [`sdr_orbcomm::sat_names::sat_label`]'s
     /// output ("Sat 0xNN"). No spacecraft-name table exists yet
     /// (see that function's docs).
@@ -142,6 +146,7 @@ impl HeardSatellites {
         entries
             .into_iter()
             .map(|(sat_id, entry)| HeardRow {
+                sat_id,
                 label: sdr_orbcomm::sat_names::sat_label(sat_id),
                 age_secs: now.saturating_duration_since(entry.last_heard).as_secs(),
                 position: entry.position,
