@@ -8,8 +8,12 @@
 use sdr_orbcomm::packet::{OrbcommPacket, PacketType};
 use sdr_orbcomm::{OrbcommEvent, OrbcommEventKind};
 
+/// Number of distinct `PacketType` variants tallied — the fixed size of
+/// `TYPE_ORDER` and `OrbcommTally::counts`.
+const PACKET_TYPE_COUNT: usize = 8;
+
 /// Fixed display order of the eight packet types (index = tally slot).
-const TYPE_ORDER: [(PacketType, &str); 8] = [
+const TYPE_ORDER: [(PacketType, &str); PACKET_TYPE_COUNT] = [
     (PacketType::Sync, "Sync"),
     (PacketType::Message, "Message"),
     (PacketType::UplinkInfo, "Uplink"),
@@ -27,7 +31,7 @@ fn type_index(ty: PacketType) -> usize {
 
 #[derive(Default)]
 pub struct OrbcommTally {
-    counts: [u64; 8],
+    counts: [u64; PACKET_TYPE_COUNT],
 }
 
 impl OrbcommTally {
@@ -48,7 +52,7 @@ impl OrbcommTally {
 
     /// Zero every count (called on decoder disable).
     pub fn reset(&mut self) {
-        self.counts = [0; 8];
+        self.counts = [0; PACKET_TYPE_COUNT];
     }
 
     /// Multi-line breakdown for the panel label. `checksum_fail` and

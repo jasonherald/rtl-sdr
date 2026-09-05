@@ -28,9 +28,17 @@ fn counts_each_packet_type() {
         bytes: vec![],
     }));
     let out = t.format_breakdown(0, 0);
-    assert!(out.contains("Sync"));
-    assert!(out.contains('2'));
-    assert!(out.contains("Message"));
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("Sync") && l.split_whitespace().last() == Some("2"))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("Message") && l.split_whitespace().last() == Some("1"))
+    );
 }
 
 #[test]

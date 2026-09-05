@@ -131,9 +131,9 @@ EOF
 
 **Interfaces:**
 - Produces:
-  - `pub struct HeardRow { pub label: String, pub age_secs: u64, pub position: Option<(f64, f64, f64)>, pub vel_ms: Option<f64>, pub sat_time_unix: Option<i64> }`
-  - `pub fn record(&mut self, sat_id: u8, position: Option<(f64, f64, f64)>, vel_ms: Option<f64>, sat_time_unix: Option<i64>, now: Instant)`
-  - `pub fn rows(&self, now: Instant) -> Vec<HeardRow>` (unchanged signature; richer rows)
+  - `pub struct HeardRow { pub label: String, pub age_secs: u64, pub position: Option<(f64, f64, f64)>, pub vel_ms: Option<f64>, pub sat_time_unix: Option<i64>, pub packet_count: u64 }`
+  - `pub fn record(&mut self, sat_id: u8, position: Option<(f64, f64, f64)>, vel_ms: Option<f64>, sat_time_unix: Option<i64>, now: Instant)` (increments `packet_count` on every call, not just position/velocity updates)
+  - `pub fn rows(&self, now: Instant) -> Vec<HeardRow>` (unchanged signature; richer rows, `packet_count` copied straight from the entry)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -669,9 +669,12 @@ pub(crate) fn format_heard_subtitle(row: &HeardRow) -> String {
         parts.push(format_utc_hms(t));
     }
     parts.push(format!("{}s ago", row.age_secs));
+    parts.push(format!("{} pkts", row.packet_count));
     parts.join(" · ")
 }
 ```
+
+(`row.packet_count` renders as `N pkts`, appended after the trailing age.)
 
 Note: `HZ_PER_MHZ` import is used by `channel_label_text` internally; keep the `use` only if referenced (drop unused imports to satisfy clippy).
 
@@ -1018,7 +1021,7 @@ Keep the architecture guide accurate: the Orbcomm surface is now an activity pan
 
 Replace the `orbcomm_viewer.rs` line so it reads (adjust wording to fit the surrounding list):
 
-```
+```text
 - `crates/sdr-ui/src/sidebar/orbcomm_panel.rs` — Orbcomm activity panel
   (left bar, Ctrl+9): Decode toggle, 3×3 channel-activity grid,
   By-Spacecraft list (position/velocity/sat-clock/age), packet-type

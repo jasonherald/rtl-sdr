@@ -43,6 +43,23 @@ const MAX_LOG_ENTRIES: usize = 500;
 /// `upper() - page_size()` would miss sub-pixel rests.
 const SCROLL_BOTTOM_TOLERANCE_PX: f64 = 1.0;
 
+/// Columns in the channel-activity grid. Used for both the column and
+/// row index math (`i % GRID_COLUMNS`, `i / GRID_COLUMNS`) so a grid-size
+/// change can't desync the two.
+const GRID_COLUMNS: usize = 3;
+
+/// Row/column spacing (px) in the channel-activity grid.
+const GRID_SPACING: i32 = 6;
+
+/// Grid column spacing (px); wider than `GRID_SPACING` to separate columns.
+const GRID_COLUMN_SPACING: i32 = 12;
+
+/// Grid start/end margin (px).
+const GRID_MARGIN_HORIZONTAL: i32 = 12;
+
+/// Grid top/bottom margin (px).
+const GRID_MARGIN_VERTICAL: i32 = 6;
+
 /// Per-panel runtime handles the `DspToUi::Orbcomm*` dispatch sites
 /// in `window/dsp_events/orbcomm_events.rs` drive. Stashed on
 /// `AppState::orbcomm_panel_handles` so those handlers can reach the
@@ -87,12 +104,12 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
 
     // ── 3×3 channel grid ──
     let grid = gtk4::Grid::builder()
-        .row_spacing(6)
-        .column_spacing(12)
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(6)
-        .margin_bottom(6)
+        .row_spacing(GRID_SPACING)
+        .column_spacing(GRID_COLUMN_SPACING)
+        .margin_start(GRID_MARGIN_HORIZONTAL)
+        .margin_end(GRID_MARGIN_HORIZONTAL)
+        .margin_top(GRID_MARGIN_VERTICAL)
+        .margin_bottom(GRID_MARGIN_VERTICAL)
         .build();
     let mut channel_cells = Vec::with_capacity(sdr_orbcomm::ORBCOMM_CHANNELS_HZ.len());
     for (i, &hz) in sdr_orbcomm::ORBCOMM_CHANNELS_HZ.iter().enumerate() {
@@ -100,10 +117,8 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
             .label(channel_label_text(hz, None))
             .justify(gtk4::Justification::Center)
             .build();
-        let (col, row) = (
-            i32::try_from(i % 3).unwrap_or(0),
-            i32::try_from(i / 3).unwrap_or(0),
-        );
+        let col = i32::try_from(i % GRID_COLUMNS).unwrap_or(0);
+        let row = i32::try_from(i / GRID_COLUMNS).unwrap_or(0);
         grid.attach(&label, col, row, 1, 1);
         channel_cells.push(label);
     }

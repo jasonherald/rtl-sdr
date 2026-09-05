@@ -52,9 +52,11 @@ pub(super) fn on_orbcomm_channel_stats(ctx: &DspEventCtx, stats: Box<[sdr_orbcom
     let stats = stats.into_vec();
     if let Some(handles) = state.orbcomm_panel_handles.borrow().as_ref() {
         handles.refresh_channel_grid(&stats);
-        refresh_breakdown(handles, state); // checksum/repaired totals live here
     }
     *state.orbcomm_channel_stats.borrow_mut() = stats;
+    if let Some(handles) = state.orbcomm_panel_handles.borrow().as_ref() {
+        refresh_breakdown(handles, state); // checksum/repaired totals live here
+    }
 }
 
 pub(super) fn on_orbcomm_enabled_changed(ctx: &DspEventCtx, enabled: bool) {
