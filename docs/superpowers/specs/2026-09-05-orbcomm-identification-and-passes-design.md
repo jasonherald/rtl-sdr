@@ -172,3 +172,5 @@ A live FM108 pass (88° overhead) showed that the decoded ephemeris's own timest
 The matcher now propagates candidate TLEs to the reception time (`Utc::now()`) instead of `sat_time_unix`, since a live-received ephemeris reflects the satellite's current position regardless of what its own clock says. The 18 s leap-second correction is removed as no longer meaningful once the reference time is reception time, not a GPS-derived timestamp. The match threshold is raised from 50 km to 100 km to absorb ordinary propagation/reception-time slop.
 
 Validated against the real FM108 pass: propagating to reception time identifies ORBCOMM FM108 at 47 km (runner-up 3190 km, unambiguous); propagating to the buggy `sat_time_unix` instead matches garbage.
+
+This supersedes the leap-second rationale in the Decode/timing-facts section and the `GPS_UTC_LEAP_SECONDS` / 50 km design in section 1 above.

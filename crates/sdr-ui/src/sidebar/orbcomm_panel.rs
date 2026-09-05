@@ -8,12 +8,15 @@
 //!
 //! Layout deviation (deliberate): activity panels are normally an
 //! `AdwPreferencesPage` of flat groups. This one is a data surface
-//! hosting a scrolling log that must vexpand-fill, and an
-//! `AdwPreferencesPage` self-scrolls — nesting a scrolling log inside
-//! it fights itself. So the root is a vertical `gtk4::Box`: compact
-//! dashboard groups at natural height on top, the packet log
-//! (vexpand) filling the rest. Widen the sidebar via the drag handle
-//! for full 16-byte hexdump rows.
+//! hosting a scrolling log, and an `AdwPreferencesPage` self-scrolls —
+//! nesting a scrolling log inside it fights itself. So the root is a
+//! vertical `gtk4::Box`: compact dashboard groups at natural height on
+//! top, then a bounded, internally-scrolling packet log. The `Box` has
+//! no scroller of its own, so the whole thing is wrapped in an outer
+//! `gtk4::ScrolledWindow` (the panel's public `widget`) so the panel
+//! scrolls independently instead of forcing every sibling activity
+//! page to its tall natural height. Widen the sidebar via the drag
+//! handle for full 16-byte hexdump rows.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -64,6 +67,12 @@ const GRID_MARGIN_HORIZONTAL: i32 = 12;
 /// Grid top/bottom margin (px).
 const GRID_MARGIN_VERTICAL: i32 = 6;
 
+/// Minimum height (px) of the packet/message log's own scroller. The
+/// log scrolls internally rather than `vexpand`-filling the panel, so
+/// it needs a floor tall enough to be useful even when the outer
+/// panel scroller (see [`build_orbcomm_panel`]) is itself short.
+const LOG_MIN_CONTENT_HEIGHT_PX: i32 = 180;
+
 /// Per-panel runtime handles the `DspToUi::Orbcomm*` dispatch sites
 /// in `window/dsp_events/orbcomm_events.rs` drive. Stashed on
 /// `AppState::orbcomm_panel_handles` so those handlers can reach the
@@ -93,7 +102,11 @@ pub struct OrbcommPanelHandles {
 }
 
 pub struct OrbcommPanel {
-    pub widget: gtk4::Box,
+    /// Outer `ScrolledWindow` wrapping the panel's vertical `Box` (see
+    /// [`build_orbcomm_panel`]) — the panel self-scrolls rather than
+    /// relying on an `AdwPreferencesPage`'s built-in scrolling, since
+    /// its root is a bare `Box`.
+    pub widget: gtk4::ScrolledWindow,
     pub handles: Rc<OrbcommPanelHandles>,
 }
 
@@ -179,9 +192,14 @@ fn build_log_view() -> (gtk4::TextView, gtk4::ScrolledWindow) {
         .left_margin(6)
         .right_margin(6)
         .build();
+    // Bounded, not `vexpand`-filling: the outer panel scroller (see
+    // `build_orbcomm_panel`) now owns overall overflow, so the log
+    // gets a fixed, usable region that scrolls internally instead of
+    // swallowing the rest of the panel's vertical space.
     let scrolled_window = gtk4::ScrolledWindow::builder()
         .child(&log_view)
-        .vexpand(true)
+        .min_content_height(LOG_MIN_CONTENT_HEIGHT_PX)
+        .vexpand(false)
         .hexpand(true)
         .build();
     (log_view, scrolled_window)
@@ -205,6 +223,21 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
     root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     root.append(&scrolled_window);
 
+    // The root `Box` above has no scroller of its own (unlike the
+    // `AdwPreferencesPage` panels), and its natural height — every
+    // section stacked plus the "Next Orbcomm passes" list — can run
+    // well past the window's available height. Wrap it in its own
+    // `ScrolledWindow` so the panel scrolls independently rather than
+    // forcing the left activity stack (and every sibling page) to its
+    // full natural height.
+    let scroller = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_width(true)
+        .vexpand(true)
+        .hexpand(true)
+        .child(&root)
+        .build();
+
     let handles = Rc::new(OrbcommPanelHandles {
         enable_switch,
         suppress_switch_notify: Cell::new(false),
@@ -220,7 +253,7 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
     });
 
     OrbcommPanel {
-        widget: root,
+        widget: scroller,
         handles,
     }
 }
