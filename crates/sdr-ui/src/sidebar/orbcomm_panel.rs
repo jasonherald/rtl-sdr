@@ -2,20 +2,24 @@
 //!
 //! Docked left-activity surface that replaces the former floating
 //! `orbcomm_viewer` window: enable toggle, a 3×3 channel-activity grid,
-//! a "By Spacecraft" list, a packet-type breakdown, and the raw
-//! packet/message log.
+//! a "By Spacecraft" list, a packet-type breakdown, a "Next Orbcomm
+//! passes" section (`passes` submodule), and the raw packet/message
+//! log.
 //!
 //! Layout deviation (deliberate): activity panels are normally an
 //! `AdwPreferencesPage` of flat groups. This one is a data surface
-//! hosting a scrolling log that must vexpand-fill, and an
-//! `AdwPreferencesPage` self-scrolls — nesting a scrolling log inside
-//! it fights itself. So the root is a vertical `gtk4::Box`: compact
-//! dashboard groups at natural height on top, the packet log
-//! (vexpand) filling the rest. Widen the sidebar via the drag handle
-//! for full 16-byte hexdump rows.
+//! hosting a scrolling log, and an `AdwPreferencesPage` self-scrolls —
+//! nesting a scrolling log inside it fights itself. So the root is a
+//! vertical `gtk4::Box`: compact dashboard groups at natural height on
+//! top, then a bounded, internally-scrolling packet log. The `Box` has
+//! no scroller of its own, so the whole thing is wrapped in an outer
+//! `gtk4::ScrolledWindow` (the panel's public `widget`) so the panel
+//! scrolls independently instead of forcing every sibling activity
+//! page to its tall natural height. Widen the sidebar via the drag
+//! handle for full 16-byte hexdump rows.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use gtk4::glib;
@@ -28,6 +32,9 @@ use crate::orbcomm_render::{
 };
 use crate::sidebar::satellites_heard::HeardRow;
 use crate::state::AppState;
+
+mod passes;
+pub(crate) use passes::refresh_orbcomm_tles;
 
 /// Heard-list aging tick (seconds) — matches the old heard-group tick.
 const HEARD_TICK_SECS: u32 = 5;
@@ -60,6 +67,12 @@ const GRID_MARGIN_HORIZONTAL: i32 = 12;
 /// Grid top/bottom margin (px).
 const GRID_MARGIN_VERTICAL: i32 = 6;
 
+/// Minimum height (px) of the packet/message log's own scroller. The
+/// log scrolls internally rather than `vexpand`-filling the panel, so
+/// it needs a floor tall enough to be useful even when the outer
+/// panel scroller (see [`build_orbcomm_panel`]) is itself short.
+const LOG_MIN_CONTENT_HEIGHT_PX: i32 = 180;
+
 /// Per-panel runtime handles the `DspToUi::Orbcomm*` dispatch sites
 /// in `window/dsp_events/orbcomm_events.rs` drive. Stashed on
 /// `AppState::orbcomm_panel_handles` so those handlers can reach the
@@ -77,6 +90,11 @@ pub struct OrbcommPanelHandles {
     pub channel_cells: Vec<gtk4::Label>,
     pub heard_group: adw::PreferencesGroup,
     pub heard_rows: RefCell<Vec<adw::ActionRow>>,
+    /// "Next Orbcomm passes" group + its rendered rows. Populated by
+    /// `passes::wire_orbcomm_passes` / `passes::refresh_orbcomm_tles`
+    /// via `OrbcommPanelHandles::refresh_passes`.
+    pub passes_group: adw::PreferencesGroup,
+    pub passes_rows: RefCell<Vec<adw::ActionRow>>,
     pub breakdown_label: gtk4::Label,
     pub log_view: gtk4::TextView,
     pub scrolled_window: gtk4::ScrolledWindow,
@@ -84,7 +102,11 @@ pub struct OrbcommPanelHandles {
 }
 
 pub struct OrbcommPanel {
-    pub widget: gtk4::Box,
+    /// Outer `ScrolledWindow` wrapping the panel's vertical `Box` (see
+    /// [`build_orbcomm_panel`]) — the panel self-scrolls rather than
+    /// relying on an `AdwPreferencesPage`'s built-in scrolling, since
+    /// its root is a bare `Box`.
+    pub widget: gtk4::ScrolledWindow,
     pub handles: Rc<OrbcommPanelHandles>,
 }
 
@@ -170,9 +192,14 @@ fn build_log_view() -> (gtk4::TextView, gtk4::ScrolledWindow) {
         .left_margin(6)
         .right_margin(6)
         .build();
+    // Bounded, not `vexpand`-filling: the outer panel scroller (see
+    // `build_orbcomm_panel`) now owns overall overflow, so the log
+    // gets a fixed, usable region that scrolls internally instead of
+    // swallowing the rest of the panel's vertical space.
     let scrolled_window = gtk4::ScrolledWindow::builder()
         .child(&log_view)
-        .vexpand(true)
+        .min_content_height(LOG_MIN_CONTENT_HEIGHT_PX)
+        .vexpand(false)
         .hexpand(true)
         .build();
     (log_view, scrolled_window)
@@ -184,15 +211,32 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
     let (enable_group, enable_switch) = build_enable_group();
     let (channel_group, channel_cells) = build_channel_grid_group();
     let heard_group = build_heard_group();
+    let passes_group = passes::build_passes_group();
     let (breakdown_group, breakdown_label) = build_breakdown_group();
     let (log_view, scrolled_window) = build_log_view();
 
     root.append(&enable_group);
     root.append(&channel_group);
     root.append(&heard_group);
+    root.append(&passes_group);
     root.append(&breakdown_group);
     root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
     root.append(&scrolled_window);
+
+    // The root `Box` above has no scroller of its own (unlike the
+    // `AdwPreferencesPage` panels), and its natural height — every
+    // section stacked plus the "Next Orbcomm passes" list — can run
+    // well past the window's available height. Wrap it in its own
+    // `ScrolledWindow` so the panel scrolls independently rather than
+    // forcing the left activity stack (and every sibling page) to its
+    // full natural height.
+    let scroller = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .propagate_natural_width(true)
+        .vexpand(true)
+        .hexpand(true)
+        .child(&root)
+        .build();
 
     let handles = Rc::new(OrbcommPanelHandles {
         enable_switch,
@@ -200,6 +244,8 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
         channel_cells,
         heard_group,
         heard_rows: RefCell::new(Vec::new()),
+        passes_group,
+        passes_rows: RefCell::new(Vec::new()),
         breakdown_label,
         log_view,
         scrolled_window,
@@ -207,50 +253,83 @@ pub fn build_orbcomm_panel() -> OrbcommPanel {
     });
 
     OrbcommPanel {
-        widget: root,
+        widget: scroller,
         handles,
     }
+}
+
+/// Push `entry` onto the ring, dropping from the front while it
+/// exceeds [`MAX_LOG_ENTRIES`]. Pure so the rotation logic is testable
+/// without a GTK harness. Returns the evicted entries (front-to-back)
+/// so `append_log_entry` can trim exactly their `GtkTextBuffer` lines —
+/// an entry may span several buffer lines (a `MessageComplete` hexdump
+/// block), so the count of *entries* is not the count of buffer *lines*.
+fn push_log_ring(ring: &mut VecDeque<String>, entry: String) -> Vec<String> {
+    ring.push_back(entry);
+    let mut evicted = Vec::new();
+    while ring.len() > MAX_LOG_ENTRIES {
+        if let Some(old) = ring.pop_front() {
+            evicted.push(old);
+        }
+    }
+    evicted
+}
+
+/// Number of `GtkTextBuffer` lines a rendered log entry occupies. The
+/// buffer joins entries with `\n`, so an entry with `n` internal
+/// newlines takes `n + 1` lines — `split('\n').count()` — and deleting
+/// it from the front also consumes the `\n` separator that follows it,
+/// which is exactly this many `forward_line` steps.
+fn entry_buffer_lines(entry: &str) -> usize {
+    entry.split('\n').count()
 }
 
 impl OrbcommPanelHandles {
     /// Append one rendered log entry (a `format_packet_row` result) to
     /// the panel's log, trimming from the front once [`MAX_LOG_ENTRIES`]
     /// is exceeded, and auto-scrolling to the bottom if the user was
-    /// already there. Ported verbatim in behavior from the retired
-    /// `orbcomm_viewer::append_log_entry`.
+    /// already there. Edits the `GtkTextBuffer` incrementally (insert
+    /// the new entry, delete evicted lines from the front) rather than
+    /// rebuilding it wholesale on every append.
     pub fn append_log_entry(&self, entry: &str) {
         let adj = self.scrolled_window.vadjustment();
         let was_at_bottom = (adj.value() + adj.page_size() - adj.upper()).abs()
             < SCROLL_BOTTOM_TOLERANCE_PX
             || adj.upper() <= adj.page_size();
 
-        let joined = {
+        let evicted = {
             let mut entries = self.log_entries.borrow_mut();
-            entries.push_back(entry.to_string());
-            while entries.len() > MAX_LOG_ENTRIES {
-                entries.pop_front();
-            }
-            // Reference each entry (`String::as_str`) rather than
-            // cloning it — the ring already owns every entry's bytes
-            // once, so this join is the only content copy on the
-            // append path (into the new joined `String`), not two.
-            entries
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join("\n")
+            push_log_ring(&mut entries, entry.to_string())
         };
-        self.log_view.buffer().set_text(&joined);
+
+        let buffer = self.log_view.buffer();
+        // Delete the evicted entries' buffer lines from the front. Each
+        // entry may span several lines (a hexdump block), so trim by the
+        // summed line count, not one line per entry — otherwise a
+        // multi-line entry leaves orphaned rows and the buffer desyncs
+        // from the ring.
+        let lines_to_delete: usize = evicted.iter().map(|e| entry_buffer_lines(e)).sum();
+        if lines_to_delete > 0 {
+            let mut start = buffer.start_iter();
+            let mut cut = buffer.start_iter();
+            for _ in 0..lines_to_delete {
+                cut.forward_line();
+            }
+            buffer.delete(&mut start, &mut cut);
+        }
+        let mut end = buffer.end_iter();
+        let prefix = if buffer.char_count() > 0 { "\n" } else { "" };
+        buffer.insert(&mut end, &format!("{prefix}{entry}"));
 
         if was_at_bottom {
             // GTK4 recomputes `GtkTextView`'s adjustment bounds on the
             // next size-allocate pass, not synchronously inside
-            // `set_text` — reading `adj.upper()` right here can still
-            // observe the PRE-append bound and leave the view one
-            // entry short on every auto-follow. Defer the scroll to
-            // the next main-loop idle so it reads the bound only after
-            // GTK has recomputed it. Weak ref: if the panel is torn
-            // down before the idle fires, just drop the scroll.
+            // `insert`/`delete` — reading `adj.upper()` right here can
+            // still observe the PRE-append bound and leave the view
+            // one entry short on every auto-follow. Defer the scroll
+            // to the next main-loop idle so it reads the bound only
+            // after GTK has recomputed it. Weak ref: if the panel is
+            // torn down before the idle fires, just drop the scroll.
             let adj_weak = adj.downgrade();
             glib::idle_add_local_once(move || {
                 if let Some(adj) = adj_weak.upgrade() {
@@ -299,17 +378,32 @@ impl OrbcommPanelHandles {
         self.suppress_switch_notify.set(false);
     }
 
-    /// Rebuild the By-Spacecraft rows from a `HeardRow` snapshot.
-    pub fn rebuild_heard_list(&self, rows: &[HeardRow], visible: bool) {
+    /// Rebuild the By-Spacecraft rows from a `HeardRow` snapshot,
+    /// resolving each row's title through the learned `sat_id` → name
+    /// table (`AppState::orbcomm_sat_names`). Unresolved satellites
+    /// keep `row.label` ("Sat 0xNN") as the title; resolved ones show
+    /// the real name as the title and fold `row.label` into the
+    /// subtitle so the raw id stays visible.
+    pub fn rebuild_heard_list(
+        &self,
+        rows: &[HeardRow],
+        visible: bool,
+        sat_names: &HashMap<u8, String>,
+    ) {
         let mut displayed = self.heard_rows.borrow_mut();
         for row in displayed.drain(..) {
             self.heard_group.remove(&row);
         }
         self.heard_group.set_visible(visible);
         for row in rows {
+            let detail = format_heard_subtitle(row);
+            let (title, subtitle) = match sat_names.get(&row.sat_id) {
+                Some(name) => (name.clone(), format!("{} · {detail}", row.label)),
+                None => (row.label.clone(), detail),
+            };
             let action_row = adw::ActionRow::builder()
-                .title(&row.label)
-                .subtitle(format_heard_subtitle(row))
+                .title(&title)
+                .subtitle(&subtitle)
                 .build();
             self.heard_group.add(&action_row);
             displayed.push(action_row);
@@ -341,10 +435,25 @@ pub(crate) fn format_heard_subtitle(row: &HeardRow) -> String {
 
 /// Wire the Orbcomm panel: stash its handles on `AppState` for the
 /// `DspToUi::Orbcomm*` dispatch sites, dispatch `SetOrbcommEnabled` on
-/// the Decode switch, and arm the heard-list aging tick.
-pub fn connect_orbcomm_panel(panels: &crate::sidebar::SidebarPanels, state: &Rc<AppState>) {
+/// the Decode switch, arm the heard-list aging tick, and wire the
+/// "Next Orbcomm passes" section.
+///
+/// `tle_cache` is the SAME `Arc<TleCache>` the satellites panel holds
+/// (threaded in from `window.rs`, which builds it once via
+/// `connect_satellites_panel`'s return value) — never a second cache
+/// instance. Stashed on `AppState::orbcomm_tle_cache` so
+/// `on_orbcomm_enabled_changed` and the satellites-panel TLE-refresh
+/// button can each kick `passes::refresh_orbcomm_tles` without
+/// threading the cache through every call site.
+pub fn connect_orbcomm_panel(
+    panels: &crate::sidebar::SidebarPanels,
+    state: &Rc<AppState>,
+    tle_cache: Option<std::sync::Arc<sdr_sat::TleCache>>,
+) {
     let handles = Rc::clone(&panels.orbcomm.handles);
     *state.orbcomm_panel_handles.borrow_mut() = Some(Rc::clone(&handles));
+    *state.orbcomm_tle_cache.borrow_mut() = tle_cache;
+    passes::wire_orbcomm_passes(&handles, state);
 
     // Enable switch → SetOrbcommEnabled (ack-driven state; guard the
     // programmatic set_active in apply_enabled_ack).
@@ -379,5 +488,9 @@ pub fn connect_orbcomm_panel(panels: &crate::sidebar::SidebarPanels, state: &Rc<
 pub(crate) fn repaint_heard(handles: &OrbcommPanelHandles, state: &Rc<AppState>) {
     let rows = state.orbcomm_heard.borrow().rows(std::time::Instant::now());
     let visible = state.orbcomm_enabled.get() && !rows.is_empty();
-    handles.rebuild_heard_list(&rows, visible);
+    handles.rebuild_heard_list(&rows, visible, &state.orbcomm_sat_names.borrow());
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests;

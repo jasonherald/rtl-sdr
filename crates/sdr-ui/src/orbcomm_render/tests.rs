@@ -147,3 +147,50 @@ fn message_complete_without_partial_has_no_marker() {
     assert!(row.starts_with("Message complete · 137.8000 MHz\n"));
     assert!(!row.contains("[partial]"));
 }
+
+#[test]
+fn heard_fields_ephemeris_populates_all() {
+    let ev = OrbcommEvent {
+        channel_hz: 137_800_000.0,
+        kind: OrbcommEventKind::Packet {
+            packet: OrbcommPacket::Ephemeris(sample_ephemeris(51.2, 7.4)),
+            repaired: false,
+        },
+    };
+    let f = heard_fields(&ev).expect("ephemeris yields fields");
+    assert_eq!(f.sat_id, 0x2C);
+    assert_eq!(f.position, Some((51.2, 7.4, 715_000.0)));
+    assert_eq!(f.vel_ms, Some(7_450.0));
+    assert_eq!(f.sat_time_unix, Some(19 * 3600 + 42 * 60 + 11));
+}
+
+#[test]
+fn heard_fields_sync_has_id_only() {
+    let ev = OrbcommEvent {
+        channel_hz: 137_800_000.0,
+        kind: OrbcommEventKind::Packet {
+            packet: OrbcommPacket::Sync {
+                code: 0x0065_6565,
+                sat_id: 0x2C,
+            },
+            repaired: false,
+        },
+    };
+    let f = heard_fields(&ev).expect("sync yields id");
+    assert_eq!(f.sat_id, 0x2C);
+    assert_eq!(f.position, None);
+    assert_eq!(f.vel_ms, None);
+    assert_eq!(f.sat_time_unix, None);
+}
+
+#[test]
+fn heard_fields_message_complete_is_none() {
+    let ev = OrbcommEvent {
+        channel_hz: 137_800_000.0,
+        kind: OrbcommEventKind::MessageComplete {
+            bytes: vec![1, 2, 3],
+            partial: false,
+        },
+    };
+    assert!(heard_fields(&ev).is_none());
+}

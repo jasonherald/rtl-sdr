@@ -32,8 +32,8 @@
 //! someone having to figure out which group each satellite lives in.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, SystemTime};
 
 /// Process-wide monotonic counter for unique tempfile names. Combined
@@ -59,6 +59,66 @@ pub const DEFAULT_FETCH_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 #[must_use]
 pub fn celestrak_gp_url(norad_id: u32) -> String {
     format!("https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle")
+}
+
+/// Celestrak group slug for the Orbcomm constellation.
+pub const ORBCOMM_TLE_GROUP: &str = "ORBCOMM";
+
+/// Celestrak GP URL for a whole named group (many TLEs in one body).
+///
+/// Unlike the per-NORAD endpoint above, group endpoints are still
+/// live for constellations like Orbcomm that Celestrak groups
+/// explicitly — this feeds spacecraft identification (matching a
+/// decoded downlink to its NORAD id) rather than per-satellite pass
+/// prediction, so the group-churn caveat in the module docs above
+/// doesn't apply here.
+#[must_use]
+pub fn celestrak_group_url(slug: &str) -> String {
+    format!("https://celestrak.org/NORAD/elements/gp.php?GROUP={slug}&FORMAT=tle")
+}
+
+/// Injected group fetcher (test seam), mirroring [`Fetcher`] but keyed
+/// by group slug and returning a multi-entry body.
+pub type GroupFetcher = dyn Fn(&str) -> Result<String, TleCacheError> + Send + Sync;
+
+/// Parse a multi-entry TLE body into `(name, line1, line2)` triples.
+/// A name is the last non-blank line before a `1 …` line whose matching
+/// `2 …` line immediately follows; malformed groups are skipped. A name
+/// candidate that itself looks like a TLE data line (`1 …`/`2 …`) is
+/// rejected and falls back to `"UNKNOWN"` — for back-to-back nameless
+/// 2LE entries, that "preceding line" is actually the previous entry's
+/// `2 …` line, not a name.
+///
+/// A `1 …`/`2 …` pair that merely matches the prefix shape but fails
+/// SGP4 parsing (bad checksum, truncated numeric fields, etc.) is
+/// dropped rather than returned: this is the only validity gate
+/// [`TleCache::force_refresh_group`]'s `is_empty()` guard has, so a
+/// prefix-matching-but-invalid body must not slip through and overwrite
+/// a good cache (`CodeRabbit` on #903).
+#[must_use]
+pub fn parse_group_tles(text: &str) -> Vec<(String, String, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < lines.len() {
+        let l1 = lines[i].trim_end();
+        let l2 = lines[i + 1].trim_end();
+        if l1.starts_with("1 ") && l2.starts_with("2 ") {
+            let name = (i > 0)
+                .then(|| lines[i - 1].trim())
+                .filter(|n| !n.is_empty())
+                .filter(|n| !n.starts_with("1 ") && !n.starts_with("2 "))
+                .unwrap_or("UNKNOWN")
+                .to_string();
+            if crate::sgp4_core::Satellite::from_tle(&name, l1, l2).is_ok() {
+                out.push((name, l1.to_string(), l2.to_string()));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Errors from cache lookup or HTTP fetch.
@@ -122,6 +182,13 @@ pub struct TleCache {
     /// regression tests hermetic — no live HTTP, no DNS, no flakiness
     /// from celestrak.org being slow on a particular CI run.
     fetcher: Option<Box<Fetcher>>,
+    /// Optional group-fetcher override, mirroring `fetcher` above but
+    /// for [`TleCache::force_refresh_group`]. `Arc` (not `Box`) since
+    /// the brief's test seam constructs it once and the production
+    /// default path never needs to swap it — `Arc` also keeps the
+    /// door open for a future caller that wants to share one fetcher
+    /// closure across multiple `TleCache` instances.
+    group_fetcher: Option<Arc<GroupFetcher>>,
 }
 
 impl TleCache {
@@ -148,6 +215,7 @@ impl TleCache {
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
             client: OnceLock::new(),
             fetcher: None,
+            group_fetcher: None,
         }
     }
 
@@ -175,6 +243,16 @@ impl TleCache {
         self
     }
 
+    /// Override the group-network fetcher with a custom closure —
+    /// the [`TleCache::with_fetcher`] counterpart for
+    /// [`TleCache::force_refresh_group`]. Same two real uses: hermetic
+    /// tests, and custom HTTP stacks for the group endpoint.
+    #[must_use]
+    pub fn with_group_fetcher(mut self, fetcher: Arc<GroupFetcher>) -> Self {
+        self.group_fetcher = Some(fetcher);
+        self
+    }
+
     /// Override the cache freshness window. Values shorter than ~1 hour
     /// will hammer Celestrak unnecessarily; longer than ~7 days will
     /// degrade SGP4 accuracy as TLEs get stale.
@@ -197,6 +275,81 @@ impl TleCache {
     #[must_use]
     pub fn cache_path(&self, norad_id: u32) -> PathBuf {
         self.cache_dir.join(format!("{norad_id}.tle"))
+    }
+
+    /// Path on disk where a Celestrak group's TLE body is cached, e.g.
+    /// [`ORBCOMM_TLE_GROUP`] → `group-ORBCOMM.tle`. The `group-` prefix
+    /// keeps it visually distinct from per-NORAD files in the same
+    /// directory listing.
+    #[must_use]
+    pub fn group_cache_path(&self, slug: &str) -> PathBuf {
+        self.cache_dir.join(format!("group-{slug}.tle"))
+    }
+
+    /// Cache-only read of a group's parsed TLEs. Never hits the
+    /// network — safe to call on the GTK thread. Errors if the group
+    /// file is absent or unreadable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TleCacheError::Io`] if the group cache file cannot be
+    /// read.
+    pub fn cached_group_tles(
+        &self,
+        slug: &str,
+    ) -> Result<Vec<(String, String, String)>, TleCacheError> {
+        let path = self.group_cache_path(slug);
+        let text =
+            std::fs::read_to_string(&path).map_err(|source| TleCacheError::Io { path, source })?;
+        Ok(parse_group_tles(&text))
+    }
+
+    /// `true` if the on-disk group cache for `slug` exists and is
+    /// younger than this cache's `refresh_max_age` — i.e. a caller can
+    /// skip [`TleCache::force_refresh_group`] and rely on
+    /// [`TleCache::cached_group_tles`] instead. Cheap filesystem
+    /// `stat`, safe to call on the GTK thread (mirrors [`is_stale`],
+    /// the per-NORAD path's freshness check).
+    #[must_use]
+    pub fn group_cache_is_fresh(&self, slug: &str) -> bool {
+        !is_stale(&self.group_cache_path(slug), self.refresh_max_age)
+    }
+
+    /// Forced network round trip: fetch the group body, write it
+    /// atomically to the group cache file, and return the parsed
+    /// triples. Call off-thread (blocking) — same contract as
+    /// [`TleCache::force_refresh`].
+    ///
+    /// # Errors
+    ///
+    /// * [`TleCacheError::Fetch`] — network failure, non-2xx status, or
+    ///   the fetched body contained no valid TLE pair (HTML error page,
+    ///   captive portal, etc.). The on-disk group cache is left
+    ///   untouched and its freshness clock does not advance.
+    /// * [`TleCacheError::Io`] — the freshly-fetched body could not be
+    ///   written to the cache file.
+    pub fn force_refresh_group(
+        &self,
+        slug: &str,
+    ) -> Result<Vec<(String, String, String)>, TleCacheError> {
+        let body = match &self.group_fetcher {
+            Some(f) => f(slug)?,
+            None => default_group_fetch(slug, self.fetch_timeout)?,
+        };
+        // Guard like the per-NORAD fetch_validated: never let an HTML error
+        // page / captive portal overwrite a good cache and reset the 24h
+        // freshness clock. parse_group_tles yields no pairs for non-TLE bodies.
+        if parse_group_tles(&body).is_empty() {
+            return Err(TleCacheError::Fetch(format!(
+                "group {slug} response body contained no valid TLE pair (captive portal or HTML error page?)"
+            )));
+        }
+        let path = self.group_cache_path(slug);
+        // `write_cache` is already fully generic over path + text (no
+        // NORAD-specific logic) — reuse it rather than duplicating the
+        // atomic tempfile+rename dance.
+        self.write_cache(&path, &body)?;
+        Ok(parse_group_tles(&body))
     }
 
     /// Look up the TLE pair for `norad_id`, refreshing from Celestrak
@@ -454,6 +607,32 @@ impl TleCache {
     }
 }
 
+/// Default (non-overridden) group fetcher: a blocking `reqwest` GET on
+/// [`celestrak_group_url`]. Mirrors [`TleCache::fetch`]'s request shape
+/// but is a free function — [`TleCache::force_refresh_group`] only
+/// needs it when no [`GroupFetcher`] override was installed, so it
+/// builds its own one-shot client rather than sharing the cached
+/// per-`TleCache` connection pool used by the per-NORAD path.
+fn default_group_fetch(slug: &str, timeout: StdDuration) -> Result<String, TleCacheError> {
+    crate::ensure_tls_provider();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .user_agent(concat!("sdr-rs/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| TleCacheError::Fetch(format!("client build: {e}")))?;
+    let url = celestrak_group_url(slug);
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| TleCacheError::Fetch(format!("GET {url}: {e}")))?;
+    let response = response
+        .error_for_status()
+        .map_err(|e| TleCacheError::Fetch(format!("HTTP status: {e}")))?;
+    response
+        .text()
+        .map_err(|e| TleCacheError::Fetch(format!("response body: {e}")))
+}
+
 /// Read a UTF-8 file or return `None` for "not present-ish".
 ///
 /// `NotFound` and `InvalidData` (non-UTF-8 contents — e.g. a corrupt
@@ -653,3 +832,7 @@ fn alpha5_to_norad_id(field: &str) -> Option<u32> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod group_tests;

@@ -4,7 +4,6 @@
 //! tally models on `AppState`.
 
 use std::rc::Rc;
-use std::time::Instant;
 
 use super::DspEventCtx;
 use crate::sidebar::orbcomm_panel::{OrbcommPanelHandles, repaint_heard};
@@ -12,39 +11,77 @@ use crate::state::AppState;
 
 pub(super) fn on_orbcomm_event(ctx: &DspEventCtx, event: &sdr_orbcomm::OrbcommEvent) {
     let DspEventCtx { state, .. } = ctx;
-    state.orbcomm_tally.borrow_mut().record(event);
-    record_heard_satellite(state, event);
+    let is_packet = matches!(event.kind, sdr_orbcomm::OrbcommEventKind::Packet { .. });
+    if is_packet {
+        state.orbcomm_tally.borrow_mut().record(event);
+    }
+
+    let fields = crate::orbcomm_render::heard_fields(event);
+    if let Some(f) = &fields {
+        state.orbcomm_heard.borrow_mut().record(
+            f.sat_id,
+            f.position,
+            f.vel_ms,
+            f.sat_time_unix,
+            std::time::Instant::now(),
+        );
+        maybe_identify(state, f);
+    }
+
     if let Some(handles) = state.orbcomm_panel_handles.borrow().as_ref() {
         handles.append_log_entry(&crate::orbcomm_render::format_packet_row(event));
-        refresh_breakdown(handles, state);
-        repaint_heard(handles, state);
+        if is_packet {
+            refresh_breakdown(handles, state);
+        }
+        if fields.is_some() {
+            crate::sidebar::orbcomm_panel::repaint_heard(handles, state);
+        }
     }
 }
 
-fn record_heard_satellite(state: &Rc<AppState>, event: &sdr_orbcomm::OrbcommEvent) {
-    use sdr_orbcomm::OrbcommEventKind;
-    use sdr_orbcomm::packet::OrbcommPacket;
-
-    let (sat_id, position, vel, time) = match &event.kind {
-        OrbcommEventKind::Packet {
-            packet: OrbcommPacket::Sync { sat_id, .. },
-            ..
-        } => (*sat_id, None, None, None),
-        OrbcommEventKind::Packet {
-            packet: OrbcommPacket::Ephemeris(eph),
-            ..
-        } => (
-            eph.sat_id,
-            Some((eph.lat_deg, eph.lon_deg, eph.alt_m)),
-            Some(eph.vel_ms),
-            Some(eph.sat_time_unix),
-        ),
-        _ => return,
+/// Try to resolve an unknown ephemeris `sat_id` to a real name via
+/// ephemeris↔TLE matching; on success, learn + persist it.
+///
+/// Matches against the reception time (`Utc::now()`), not the decoded
+/// ephemeris's own timestamp — that timestamp can be off by hours
+/// (`sdr-orbcomm` #900), while a live-received ephemeris's position is
+/// current, so "now" is the trustworthy reference for propagation.
+fn maybe_identify(state: &Rc<AppState>, f: &crate::orbcomm_render::HeardFields) {
+    let Some((lat, lon, alt)) = f.position else {
+        return;
     };
-    state
-        .orbcomm_heard
-        .borrow_mut()
-        .record(sat_id, position, vel, time, Instant::now());
+    if state.orbcomm_sat_names.borrow().contains_key(&f.sat_id) {
+        return;
+    }
+    let tles = state.orbcomm_tles.borrow();
+    if tles.is_empty() {
+        return;
+    }
+    let when = chrono::Utc::now();
+    if let Some(m) = sdr_sat::identify_spacecraft(
+        lat,
+        lon,
+        alt,
+        when,
+        &tles,
+        sdr_sat::DEFAULT_MATCH_MAX_DIST_KM,
+    ) {
+        drop(tles);
+        state
+            .orbcomm_sat_names
+            .borrow_mut()
+            .insert(f.sat_id, m.name.clone());
+        crate::sidebar::orbcomm_persistence::save_orbcomm_sat_names(
+            &state.config,
+            &state.orbcomm_sat_names.borrow(),
+        );
+        tracing::info!(
+            "Orbcomm: identified Sat {:#04X} as {} ({:.0} km)",
+            f.sat_id,
+            m.name,
+            m.distance_km
+        );
+    }
 }
 
 pub(super) fn on_orbcomm_channel_stats(ctx: &DspEventCtx, stats: Box<[sdr_orbcomm::ChannelStats]>) {
@@ -62,6 +99,16 @@ pub(super) fn on_orbcomm_channel_stats(ctx: &DspEventCtx, stats: Box<[sdr_orbcom
 pub(super) fn on_orbcomm_enabled_changed(ctx: &DspEventCtx, enabled: bool) {
     let DspEventCtx { state, .. } = ctx;
     state.orbcomm_enabled.set(enabled);
+    if enabled {
+        // Kick a background Orbcomm TLE group refresh so the
+        // identification matcher and the passes section both have a
+        // fresh candidate list for this session. Off the GTK thread;
+        // a no-op if the platform never gave us a TLE cache.
+        // Staleness-gated (force=false): the cached candidates already
+        // seed identification, so skip the fetch if the group cache
+        // is still fresh rather than re-fetching on every toggle.
+        crate::sidebar::orbcomm_panel::refresh_orbcomm_tles(state, false);
+    }
     if !enabled {
         state.orbcomm_tally.borrow_mut().reset();
         // Clear before any handles read it below — the borrow_mut here

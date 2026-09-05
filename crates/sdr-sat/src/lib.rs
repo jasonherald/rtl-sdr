@@ -24,16 +24,23 @@
 //! [`KNOWN_SATELLITES`] so callers don't need to look them up.
 
 pub mod elevation;
+pub mod identify;
 pub mod passes;
 pub mod postal_lookup;
 pub mod sgp4_core;
 pub mod tle_cache;
 
 pub use elevation::{ElevationLookupError, lookup_elevation_m};
+pub use identify::{
+    DEFAULT_MATCH_MAX_DIST_KM, MATCH_AMBIGUITY_MARGIN, SpacecraftMatch, identify_spacecraft,
+};
 pub use passes::{GroundStation, Pass, Track, is_ascending, track, upcoming_passes};
 pub use postal_lookup::{PostalLocation, PostalLookupError, lookup_us_zip};
 pub use sgp4_core::{Satellite, SatelliteError, TLE_MAX_AGE, TLE_WARN_AGE, TleFreshness};
-pub use tle_cache::{TleCache, TleCacheError, celestrak_gp_url};
+pub use tle_cache::{
+    GroupFetcher, ORBCOMM_TLE_GROUP, TleCache, TleCacheError, celestrak_gp_url,
+    celestrak_group_url, parse_group_tles,
+};
 
 mod catalog;
 mod types;

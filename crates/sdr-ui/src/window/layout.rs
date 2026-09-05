@@ -597,6 +597,15 @@ fn build_panel_stacks(
         .hexpand(true)
         .vexpand(true)
         .build();
+    // Non-homogeneous: a `GtkStack` defaults `vhomogeneous` to true,
+    // which sizes every page to the TALLEST page. The Orbcomm panel
+    // (a bare `Box`, not an `AdwPreferencesPage`) is naturally much
+    // taller than the others once its "Next Orbcomm passes" section
+    // is populated, so a homogeneous stack was forcing every other
+    // page — including Satellites — to overflow the window and lose
+    // its own scrolling. Each page now sizes (and scrolls) to its
+    // own content instead.
+    left_stack.set_vhomogeneous(false);
     left_stack.add_named(&general_panel.widget, Some("general"));
     left_stack.add_named(&panels.radio.widget, Some("radio"));
     left_stack.add_named(&panels.audio.widget, Some("audio"));
@@ -615,6 +624,10 @@ fn build_panel_stacks(
         .hexpand(true)
         .vexpand(true)
         .build();
+    // See the `left_stack` comment above — same non-homogeneous fix
+    // applies here so a future tall right-activity panel can't force
+    // every other right-panel page to overflow.
+    right_stack.set_vhomogeneous(false);
     right_stack.add_named(
         &page_from_group(&transcript_panel.widget),
         Some("transcript"),

@@ -354,7 +354,7 @@ pub fn build_window(
     let fft_shared = engine.fft_buffer();
 
     // Shared application state with DSP sender.
-    let state = AppState::new_shared(ui_tx);
+    let state = AppState::new_shared(ui_tx, std::sync::Arc::clone(config));
 
     // --- Build UI ---
     let LayoutHandles {
@@ -1625,7 +1625,7 @@ fn connect_sidebar_panels(
     let tune_to_satellite = build_tune_to_satellite(tune_ctx);
     register_tune_satellite_action(app, &tune_to_satellite);
 
-    connect_satellites_panel(
+    let orbcomm_tle_cache = connect_satellites_panel(
         panels,
         config,
         tune_ctx,
@@ -1634,7 +1634,7 @@ fn connect_sidebar_panels(
         set_playing,
     );
     connect_aviation_panel(&panels.aviation, state, config, toast_overlay);
-    crate::sidebar::orbcomm_panel::connect_orbcomm_panel(panels, state);
+    crate::sidebar::orbcomm_panel::connect_orbcomm_panel(panels, state, orbcomm_tle_cache);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(panels, tune_ctx, volume_button);
 

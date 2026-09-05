@@ -454,6 +454,30 @@ pub struct AppState {
     /// Pure UI-side classification — the decoder emits no per-type
     /// counts.
     pub orbcomm_tally: RefCell<crate::orbcomm_tally::OrbcommTally>,
+    /// Learned `sat_id → name` table (epic #865 identification):
+    /// spacecraft names inferred from ephemeris/TLE correlation and
+    /// persisted under a JSON object key, mirroring the
+    /// watched-satellites precedent. Populated by later wiring
+    /// (Task 5/7); empty at construction.
+    pub orbcomm_sat_names: RefCell<std::collections::HashMap<u8, String>>,
+    /// Parsed Orbcomm TLE candidates (name + propagatable
+    /// `Satellite`) loaded from the shared TLE cache. Populated by
+    /// later wiring (Task 5/7); empty at construction.
+    pub orbcomm_tles: RefCell<Vec<(String, sdr_sat::Satellite)>>,
+    /// Shared TLE cache handle — the SAME `Arc` the satellites panel
+    /// holds, threaded in by `connect_orbcomm_panel` (Task 7) so
+    /// `refresh_orbcomm_tles` (armed from decode-enable and the
+    /// satellites-panel TLE-refresh button) can kick an off-GTK-thread
+    /// Orbcomm TLE group refresh without constructing a second
+    /// `TleCache`. `None` when the platform refused a cache directory,
+    /// mirroring the satellites panel's `Option`.
+    pub orbcomm_tle_cache: RefCell<Option<std::sync::Arc<sdr_sat::TleCache>>>,
+    /// Shared config handle (same `Arc` the satellites panel and the
+    /// rest of the app use — never a second `ConfigManager`
+    /// instance). Needed by `dsp_events::orbcomm_events::maybe_identify`
+    /// to persist a learned `sat_id → name` table via
+    /// `crate::sidebar::orbcomm_persistence::save_orbcomm_sat_names`.
+    pub config: std::sync::Arc<sdr_config::ConfigManager>,
     /// Stash for the **full batch** of `RecorderAction`s a
     /// recorder tick yielded when ACARS was engaged. The
     /// recorder tick site detects a `StartAutoRecord` in the
@@ -505,7 +529,10 @@ impl AppState {
     /// Create a new `AppState` wrapped in `Rc` for GTK closure sharing.
     ///
     /// The `ui_tx` sender is used to dispatch commands to the DSP thread.
-    pub fn new_shared(ui_tx: mpsc::Sender<UiToDsp>) -> Rc<Self> {
+    pub fn new_shared(
+        ui_tx: mpsc::Sender<UiToDsp>,
+        config: std::sync::Arc<sdr_config::ConfigManager>,
+    ) -> Rc<Self> {
         Rc::new(Self {
             is_running: Cell::new(false),
             live_source_rates: RefCell::new(None),
@@ -567,6 +594,10 @@ impl AppState {
             orbcomm_panel_handles: RefCell::new(None),
             orbcomm_heard: RefCell::new(crate::sidebar::satellites_heard::HeardSatellites::new()),
             orbcomm_tally: RefCell::new(crate::orbcomm_tally::OrbcommTally::default()),
+            orbcomm_sat_names: RefCell::new(std::collections::HashMap::new()),
+            orbcomm_tles: RefCell::new(Vec::new()),
+            orbcomm_tle_cache: RefCell::new(None),
+            config,
             pending_aos_actions: RefCell::new(None),
             recorder_action_interpreter: RefCell::new(None),
         })
