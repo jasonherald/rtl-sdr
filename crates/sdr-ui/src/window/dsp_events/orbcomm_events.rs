@@ -54,7 +54,7 @@ fn record_heard_satellite(state: &Rc<AppState>, event: &sdr_orbcomm::OrbcommEven
     state
         .orbcomm_heard
         .borrow_mut()
-        .record(sat_id, position, Instant::now());
+        .record(sat_id, position, None, None, Instant::now());
 
     render_heard_group_if_wired(state);
 }
