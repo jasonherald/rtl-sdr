@@ -49,11 +49,13 @@ fn line_assembler_emits_one_line_per_period() {
     assert_eq!(lines, 1, "exactly one line per samples_per_line window");
 }
 
-/// `process()` over a synthetic white tone yields a bright line.
+/// `process()` over a synthetic white tone yields a bright line. Uses the
+/// free-running decoder: a bare white tone carries no start-tone / phasing
+/// preamble, so the sync-gated `new` would (correctly) emit nothing.
 #[test]
 fn process_emits_bright_lines_for_white_tone() {
     let sr = 24_000u32;
-    let mut dec = WefaxDecoder::new(sr).unwrap();
+    let mut dec = WefaxDecoder::new_free_running(sr);
     let n = sr as usize; // 1 s → 2 lines
     let audio: Vec<f32> = (0..n)
         .map(|i| {
@@ -127,5 +129,47 @@ fn phasing_tracker_estimates_slant() {
     assert!(
         (t.slant_columns_per_line() - 1.0).abs() < 0.3,
         "≈1 col/line slant"
+    );
+}
+
+/// Synthesize AF for a mini chart and assert: no lines emitted before lock,
+/// lines emitted during imaging, and `take_chart_complete()` fires after the
+/// stop tone.
+#[test]
+fn sync_gates_emission_and_flags_chart_complete() {
+    let sr = 24_000u32;
+    let mut dec = WefaxDecoder::new(sr).unwrap();
+    let mut out = vec![WefaxLine::default(); 64];
+
+    let push_secs = |dec: &mut WefaxDecoder,
+                     gen_fn: &dyn Fn(usize) -> f32,
+                     secs: f64,
+                     out: &mut [WefaxLine]|
+     -> usize {
+        let n = (sr as f64 * secs) as usize;
+        let audio: Vec<f32> = (0..n).map(gen_fn).collect();
+        let mut t = 0;
+        for c in audio.chunks(4096) {
+            t += dec.process(c, out).unwrap();
+        }
+        t
+    };
+    let tone = |f: f64| {
+        move |i: usize| (2.0 * std::f64::consts::PI * f * i as f64 / sr as f64).sin() as f32
+    };
+
+    let before = push_secs(&mut dec, &tone(START_TONE_HZ), 5.0, &mut out);
+    assert_eq!(before, 0, "no image lines during start tone");
+    // A pure white tone has no phasing pulse, so the machine stays in
+    // Phasing and emits nothing — proving emission is gated on a lock.
+    let during = push_secs(&mut dec, &tone(SUBCARRIER_WHITE_HZ), 5.0, &mut out);
+    assert_eq!(during, 0, "no lines emitted before a phasing lock");
+    // Stop tone finalizes the chart and returns to Idle.
+    let _stop = push_secs(&mut dec, &tone(STOP_TONE_HZ), 5.0, &mut out);
+    assert!(dec.take_chart_complete(), "stop tone flags chart complete");
+    assert_eq!(
+        dec.state(),
+        WefaxState::Idle,
+        "resets to Idle after a chart"
     );
 }

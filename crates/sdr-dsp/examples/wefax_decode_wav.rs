@@ -9,8 +9,14 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run -p sdr-dsp --example wefax_decode_wav -- <input.wav> <output.png>
+//! cargo run -p sdr-dsp --example wefax_decode_wav -- <input.wav> <output.png> [--sync]
 //! ```
+//!
+//! By default the decoder is free-running (guaranteed image — no start-tone /
+//! phasing lock required). Pass a trailing `--sync` (or `sync`) to use the
+//! sync-gated decoder instead, which only emits lines after a phasing lock and
+//! auto-segments on the stop tone; on a fixture whose preamble the current
+//! thresholds don't lock, that path can legitimately render 0 lines.
 
 // CLI tool — relax the workspace-pedantic casts, matching
 // `apt_decode_wav.rs`. Library code (`sdr_dsp::wefax`) stays strict.
@@ -44,17 +50,20 @@ const CHUNK_SAMPLES: usize = 8_192;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
+    if args.len() < 3 || args.len() > 4 {
         eprintln!(
-            "usage: {} <input.wav> <output.png>\n\
+            "usage: {} <input.wav> <output.png> [--sync]\n\
              input.wav: PCM 16-bit OR float WAV; multi-channel input is \
-             downmixed to mono",
+             downmixed to mono\n\
+             --sync: use the sync-gated decoder (default: free-running)",
             args[0],
         );
         std::process::exit(2);
     }
     let input = Path::new(&args[1]);
     let output = Path::new(&args[2]);
+    // Optional 4th token selects the sync-gated decoder; default free-running.
+    let sync = matches!(args.get(3).map(String::as_str), Some("--sync" | "sync"));
 
     let (mono, rate) =
         load_wav_mono(input).unwrap_or_else(|e| panic!("load {}: {e}", input.display()));
@@ -64,8 +73,8 @@ fn main() {
         mono.len() as f64 / f64::from(rate)
     );
 
-    let rows =
-        decode_lines(&mono, rate).unwrap_or_else(|e| panic!("WefaxDecoder::new({rate}): {e}"));
+    let rows = decode_lines(&mono, rate, sync)
+        .unwrap_or_else(|e| panic!("WefaxDecoder::new({rate}): {e}"));
     if rows.is_empty() {
         eprintln!("decoded 0 lines — input too short for even one scanline");
         std::process::exit(1);
@@ -182,12 +191,18 @@ fn read_raw_samples(
 
 /// Run `mono` through a fresh `WefaxDecoder` at `rate`, streaming in
 /// fixed-size chunks so the streaming path (not one giant call) is
-/// exercised, and return every completed scanline's pixels.
+/// exercised, and return every completed scanline's pixels. `sync` selects
+/// the sync-gated decoder; otherwise the free-running one (always renders).
 fn decode_lines(
     mono: &[f32],
     rate: u32,
+    sync: bool,
 ) -> Result<Vec<[u8; PIXELS_PER_LINE]>, Box<dyn std::error::Error>> {
-    let mut decoder = WefaxDecoder::new(rate)?;
+    let mut decoder = if sync {
+        WefaxDecoder::new(rate)?
+    } else {
+        WefaxDecoder::new_free_running(rate)
+    };
     let mut buf = vec![WefaxLine::default(); READY_QUEUE_CAP];
     let mut rows: Vec<[u8; PIXELS_PER_LINE]> = Vec::new();
 
