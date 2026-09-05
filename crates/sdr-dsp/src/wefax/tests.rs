@@ -1,5 +1,6 @@
 use super::assembly::LineAssembler;
 use super::discriminator::Discriminator;
+use super::phasing::PhasingTracker;
 use super::tones::ToneDetector;
 use super::*;
 
@@ -92,5 +93,39 @@ fn tone_detector_fires_on_target_and_rejects_image_tones() {
     assert!(
         !fired2,
         "a 2300 Hz image tone must NOT trigger the 300 Hz detector"
+    );
+}
+
+fn phasing_line(pulse_col: usize) -> [u8; PIXELS_PER_LINE] {
+    let mut l = [10u8; PIXELS_PER_LINE]; // near-black
+    let end = (pulse_col + 90).min(PIXELS_PER_LINE);
+    for px in l.iter_mut().take(end).skip(pulse_col) {
+        *px = 250; // ~white pulse
+    }
+    l
+}
+
+#[test]
+fn phasing_tracker_recovers_pulse_column() {
+    let mut t = PhasingTracker::new();
+    for _ in 0..12 {
+        t.observe_line(&phasing_line(300));
+    }
+    let off = t.column_offset().expect("offset locked after enough lines");
+    assert!(
+        (off - 300).abs() <= 5,
+        "recovered pulse column ~300, got {off}"
+    );
+}
+
+#[test]
+fn phasing_tracker_estimates_slant() {
+    let mut t = PhasingTracker::new();
+    for k in 0..20 {
+        t.observe_line(&phasing_line(300 + k));
+    } // +1 col/line drift
+    assert!(
+        (t.slant_columns_per_line() - 1.0).abs() < 0.3,
+        "≈1 col/line slant"
     );
 }

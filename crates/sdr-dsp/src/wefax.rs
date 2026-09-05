@@ -4,6 +4,7 @@
 
 mod assembly;
 mod discriminator;
+mod phasing;
 mod tones;
 
 use assembly::LineAssembler;
