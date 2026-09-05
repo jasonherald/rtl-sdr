@@ -715,6 +715,23 @@ fn parse_group_tles_skips_malformed() {
 }
 
 #[test]
+fn group_cache_is_fresh_true_for_freshly_written_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = TleCache::with_dir(dir.path().to_path_buf());
+    let path = cache.group_cache_path("ORBCOMM");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "fresh").unwrap();
+    assert!(cache.group_cache_is_fresh("ORBCOMM"));
+}
+
+#[test]
+fn group_cache_is_fresh_false_when_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = TleCache::with_dir(dir.path().to_path_buf());
+    assert!(!cache.group_cache_is_fresh("ORBCOMM"));
+}
+
+#[test]
 fn force_refresh_group_writes_and_reads_cache() {
     let dir = tempfile::tempdir().unwrap();
     let body = "ORBCOMM FM06\n1 25118U 97084G   26248.1  .0  0  0 0  9991\n2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974\n".to_string();

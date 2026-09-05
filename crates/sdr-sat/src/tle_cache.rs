@@ -290,6 +290,17 @@ impl TleCache {
         Ok(parse_group_tles(&text))
     }
 
+    /// `true` if the on-disk group cache for `slug` exists and is
+    /// younger than this cache's `refresh_max_age` — i.e. a caller can
+    /// skip [`TleCache::force_refresh_group`] and rely on
+    /// [`TleCache::cached_group_tles`] instead. Cheap filesystem
+    /// `stat`, safe to call on the GTK thread (mirrors [`is_stale`],
+    /// the per-NORAD path's freshness check).
+    #[must_use]
+    pub fn group_cache_is_fresh(&self, slug: &str) -> bool {
+        !is_stale(&self.group_cache_path(slug), self.refresh_max_age)
+    }
+
     /// Forced network round trip: fetch the group body, write it
     /// atomically to the group cache file, and return the parsed
     /// triples. Call off-thread (blocking) — same contract as

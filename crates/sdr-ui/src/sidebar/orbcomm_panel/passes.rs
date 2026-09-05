@@ -74,6 +74,10 @@ pub(crate) fn build_passes_group() -> adw::PreferencesGroup {
 /// table — i.e. this candidate has been positively identified from a
 /// decoded ephemeris this session.
 fn is_heard(name: &str, heard: &HashMap<u8, String>) -> bool {
+    // Exact-string match is safe here: `name` (`Pass.satellite`) and
+    // every `heard` value derive from the same Celestrak TLE name line
+    // (via `Satellite::from_tle`), so they agree byte-for-byte as long
+    // as neither side normalizes the name.
     heard.values().any(|n| n == name)
 }
 
@@ -176,6 +180,14 @@ pub(crate) fn wire_orbcomm_passes(handles: &Rc<OrbcommPanelHandles>, state: &Rc<
 /// left untouched. A no-op if the platform never gave us a TLE cache
 /// directory (`state.orbcomm_tle_cache` is `None`).
 ///
+/// Staleness-gated: if the on-disk group cache is still fresh (per
+/// `TleCache::group_cache_is_fresh`, the same `refresh_max_age` window
+/// the per-NORAD path uses), the network fetch is skipped entirely —
+/// `seed_orbcomm_state` already loaded the cached candidates, so
+/// there's nothing to gain from re-fetching on every decode-enable
+/// toggle. The freshness check is a cheap filesystem `stat`, safe on
+/// the GTK thread; only the fetch itself needs `spawn_blocking`.
+///
 /// Armed from two call sites: `on_orbcomm_enabled_changed`'s enabled
 /// path, and the satellites-panel TLE-refresh button
 /// (`window/satellites/passes.rs::finish_tle_refresh`) — both reuse
@@ -185,6 +197,9 @@ pub(crate) fn refresh_orbcomm_tles(state: &Rc<AppState>) {
     let Some(cache) = state.orbcomm_tle_cache.borrow().clone() else {
         return;
     };
+    if cache.group_cache_is_fresh(sdr_sat::ORBCOMM_TLE_GROUP) {
+        return;
+    }
     let state = Rc::clone(state);
     glib::spawn_future_local(async move {
         let result =
