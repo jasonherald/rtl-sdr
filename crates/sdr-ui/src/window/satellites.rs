@@ -291,6 +291,16 @@ pub(super) fn connect_satellites_panel(
     let cache = init_tle_cache(panel);
     let cache_for_orbcomm = cache.clone();
 
+    let wiring = SatellitesWiring {
+        panels,
+        panel,
+        config,
+        tune_ctx,
+        toast_overlay,
+        tune_to_satellite,
+        set_playing,
+    };
+
     let displayed: Rc<RefCell<Vec<DisplayedPass>>> = Rc::new(RefCell::new(Vec::new()));
 
     // #510 — per-satellite watched-set + notify scheduler. Loaded
@@ -316,7 +326,40 @@ pub(super) fn connect_satellites_panel(
 
     wire_auto_record_persistence(panel, config);
 
-    wire_satellites_behaviors(
+    wire_satellites_behaviors(&wiring, panel_weak, recompute, displayed, watched, cache);
+
+    cache_for_orbcomm
+}
+
+/// Borrowed wiring refs shared by [`connect_satellites_panel`] and
+/// [`wire_satellites_behaviors`]. Bundling these cuts
+/// `wire_satellites_behaviors` from 12 positional parameters down to
+/// within Codacy's `Lizard_parameter-count-medium` limit (8) — pure
+/// grouping, no behavior change.
+#[derive(Clone, Copy)]
+struct SatellitesWiring<'a> {
+    panels: &'a SidebarPanels,
+    panel: &'a sidebar::satellites_panel::SatellitesPanel,
+    config: &'a std::sync::Arc<sdr_config::ConfigManager>,
+    tune_ctx: &'a TuneCtx,
+    toast_overlay: &'a adw::ToastOverlay,
+    tune_to_satellite: &'a Rc<TuneFn>,
+    set_playing: &'a Rc<dyn Fn(bool)>,
+}
+
+/// Wire the remaining satellites-panel behaviors: Doppler tracking,
+/// the TLE refresh button, ZIP lookup, and the auto-record/recorder
+/// tick. Split out of `connect_satellites_panel` per the 50-NLOC gate
+/// — pure move, no behavior/order change.
+fn wire_satellites_behaviors(
+    wiring: &SatellitesWiring<'_>,
+    panel_weak: sidebar::satellites_panel::SatellitesPanelWeak,
+    recompute: Rc<dyn Fn()>,
+    displayed: Rc<RefCell<Vec<DisplayedPass>>>,
+    watched: Rc<RefCell<std::collections::HashSet<u32>>>,
+    cache: Option<std::sync::Arc<sdr_sat::TleCache>>,
+) {
+    let SatellitesWiring {
         panels,
         panel,
         config,
@@ -324,35 +367,7 @@ pub(super) fn connect_satellites_panel(
         toast_overlay,
         tune_to_satellite,
         set_playing,
-        panel_weak,
-        recompute,
-        displayed,
-        watched,
-        cache,
-    );
-
-    cache_for_orbcomm
-}
-
-/// Wire the remaining satellites-panel behaviors: Doppler tracking,
-/// the TLE refresh button, ZIP lookup, and the auto-record/recorder
-/// tick. Split out of `connect_satellites_panel` per the 50-NLOC gate
-/// — pure move, no behavior/order change.
-#[allow(clippy::too_many_arguments)]
-fn wire_satellites_behaviors(
-    panels: &SidebarPanels,
-    panel: &sidebar::satellites_panel::SatellitesPanel,
-    config: &std::sync::Arc<sdr_config::ConfigManager>,
-    tune_ctx: &TuneCtx,
-    toast_overlay: &adw::ToastOverlay,
-    tune_to_satellite: &Rc<TuneFn>,
-    set_playing: &Rc<dyn Fn(bool)>,
-    panel_weak: sidebar::satellites_panel::SatellitesPanelWeak,
-    recompute: Rc<dyn Fn()>,
-    displayed: Rc<RefCell<Vec<DisplayedPass>>>,
-    watched: Rc<RefCell<std::collections::HashSet<u32>>>,
-    cache: Option<std::sync::Arc<sdr_sat::TleCache>>,
-) {
+    } = *wiring;
     let state = &tune_ctx.state;
     let status_bar = &tune_ctx.status_bar;
 
