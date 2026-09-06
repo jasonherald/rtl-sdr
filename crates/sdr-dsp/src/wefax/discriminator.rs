@@ -1,10 +1,12 @@
-//! Analytic-signal FM discriminator: subcarrier audio → 0..=255 brightness.
+//! Analytic-signal FM discriminator: subcarrier audio → deviation (Hz).
 //! Mix down by the 1900 Hz center, low-pass, then per-sample
 //! instantaneous-frequency (phase difference) = deviation from center.
+//! The brightness mapping lives downstream in [`super::afc::AfcMapper`],
+//! which tracks the black/white references adaptively (AFC).
 
 use std::f64::consts::PI;
 
-use super::{SUBCARRIER_CENTER_HZ, SUBCARRIER_DEV_HZ};
+use super::SUBCARRIER_CENTER_HZ;
 
 /// One-pole low-pass cutoff (Hz) on the complex baseband — passes the
 /// per-line detail (< ~1.8 kHz) while rejecting the sum image at 2·center.
@@ -56,10 +58,10 @@ impl Discriminator {
         (bi, bq)
     }
 
-    /// Brightness for one real audio sample (0=black … 255=white).
-    // `norm` is clamped to 0.0..=1.0 before scaling, so the `as u8` is exact.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    pub(crate) fn push(&mut self, s: f64) -> u8 {
+    /// Instantaneous frequency deviation from the 1900 Hz center, in Hz, for
+    /// one real audio sample. Black tone ≈ −400 Hz, white tone ≈ +400 Hz. The
+    /// adaptive brightness mapping is applied downstream by [`super::afc`].
+    pub(crate) fn push(&mut self, s: f64) -> f64 {
         let (sn, cs) = self.phase.sin_cos();
         let bi = s * cs; // Re{ s·e^{-jθ} }
         let bq = -s * sn; // Im{ s·e^{-jθ} }
@@ -79,7 +81,6 @@ impl Discriminator {
         self.prev_i = i;
         self.prev_q = q;
         self.have_prev = true;
-        let norm = (dev_hz + SUBCARRIER_DEV_HZ) / (2.0 * SUBCARRIER_DEV_HZ);
-        (norm.clamp(0.0, 1.0) * 255.0).round() as u8
+        dev_hz
     }
 }

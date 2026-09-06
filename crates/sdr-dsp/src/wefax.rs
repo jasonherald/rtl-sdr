@@ -2,12 +2,14 @@
 //! greyscale scanlines. Analytic-signal FM discriminator + IOC-576 line
 //! assembly at 120 lpm. No I/O, no threads. See the design spec.
 
+mod afc;
 mod assembly;
 mod discriminator;
 mod phasing;
 mod sync;
 mod tones;
 
+use afc::AfcMapper;
 use assembly::LineAssembler;
 use discriminator::Discriminator;
 use sdr_types::DspError;
@@ -77,6 +79,7 @@ const MIN_INPUT_RATE_HZ: u32 = 8_000;
 /// emits a line every `samples_per_line` input samples regardless of content.
 pub struct WefaxDecoder {
     discriminator: Discriminator,
+    afc: AfcMapper,
     assembler: LineAssembler,
     line_index: u32,
     sync: SyncMachine,
@@ -108,6 +111,7 @@ impl WefaxDecoder {
         let sr = f64::from(rate);
         Self {
             discriminator: Discriminator::new(sr),
+            afc: AfcMapper::new(sr),
             assembler: LineAssembler::new(sr / 2.0),
             line_index: 0,
             sync: SyncMachine::new(sr),
@@ -124,6 +128,7 @@ impl WefaxDecoder {
         let sr = f64::from(input_rate_hz);
         Ok(Self {
             discriminator: Discriminator::new(sr),
+            afc: AfcMapper::new(sr),
             assembler: LineAssembler::new(sr / 2.0), // 120 lpm = 2 lines/s
             line_index: 0,
             sync: SyncMachine::new(sr),
@@ -159,7 +164,8 @@ impl WefaxDecoder {
         let mut written = 0usize;
         for &s in input {
             let sf = f64::from(s);
-            let brightness = self.discriminator.push(sf);
+            let dev = self.discriminator.push(sf);
+            let brightness = self.afc.push(dev);
             if self.gated {
                 self.sync.on_sample(sf);
             }
