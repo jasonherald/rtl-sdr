@@ -130,6 +130,17 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
         DspToUi::OrbcommEvent(event) => on_orbcomm_event(ctx, &event),
         DspToUi::OrbcommChannelStats(ch_stats) => on_orbcomm_channel_stats(ctx, ch_stats),
         DspToUi::OrbcommEnabledChanged(enabled) => on_orbcomm_enabled_changed(ctx, enabled),
+        // WEFAX decode-tap plumbing (issue #877). Live viewer wiring
+        // landed in Task 12; auto-save is a later task.
+        DspToUi::WefaxLineDecoded(line_index) => on_wefax_line_decoded(ctx, line_index),
+        DspToUi::WefaxImageComplete {
+            width,
+            height,
+            pixels,
+        } => {
+            on_wefax_image_complete(ctx, width, height, pixels);
+        }
+        DspToUi::WefaxState(wefax_state) => on_wefax_state(ctx, wefax_state),
     }
 }
 
@@ -721,6 +732,59 @@ fn on_sstv_image_complete(ctx: &DspEventCtx, width: u32, height: u32, pixels: Ve
         "SSTV image complete; {} in buffer",
         state.sstv_completed_images.borrow().len()
     );
+}
+
+/// `DspToUi::WefaxLineDecoded` arm of [`handle_dsp_message`], split
+/// out per the 50-NLOC gate (#817). Mirrors [`on_sstv_line_decoded`].
+fn on_wefax_line_decoded(ctx: &DspEventCtx, _line_index: u32) {
+    let DspEventCtx { state, .. } = ctx;
+    // A new WEFAX scan line has arrived — refresh the open viewer
+    // (if any) from the shared WefaxImage handle. When no viewer is
+    // open we silently drop, mirroring APT/SSTV semantics above.
+    if let Some(view) = state.wefax_viewer.borrow().as_ref() {
+        view.update_from_handle(&state.wefax_image.handle());
+    }
+}
+
+/// `DspToUi::WefaxImageComplete` arm of [`handle_dsp_message`], split
+/// out per the 50-NLOC gate (#817). Mirrors [`on_sstv_image_complete`].
+fn on_wefax_image_complete(ctx: &DspEventCtx, width: u32, height: u32, pixels: Vec<u8>) {
+    let DspEventCtx { state, .. } = ctx;
+    // The WEFAX decoder has closed out a full chart. Accumulate it
+    // so a future auto-save flow (Task 13) can write every chart
+    // received to disk. We deliberately do NOT call
+    // `view.update_from_handle` here: by the time this message
+    // arrives the controller's tap has already called
+    // `WefaxImageHandle::take_completed`, which clears the in-flight
+    // pixel buffer for the next chart. The final row was already
+    // rendered by the previous `WefaxLineDecoded` refresh, so the
+    // viewer already shows the correct end state. Per CR round 3 on
+    // PR #599 (same rationale as the SSTV counterpart).
+    let completed = sdr_radio::wefax_image::CompletedWefaxImage {
+        width,
+        height,
+        pixels,
+    };
+    state.wefax_completed_images.borrow_mut().push(completed);
+    tracing::info!(
+        width,
+        height,
+        "WEFAX chart complete; {} in buffer",
+        state.wefax_completed_images.borrow().len()
+    );
+}
+
+/// `DspToUi::WefaxState` arm of [`handle_dsp_message`], split out
+/// per the 50-NLOC gate (#817).
+fn on_wefax_state(ctx: &DspEventCtx, wefax_state: sdr_dsp::wefax::WefaxState) {
+    let DspEventCtx { state, .. } = ctx;
+    // Decoder phase transition (Idle / Phasing / Imaging / Stopped).
+    // Surface it in the viewer's title subtitle so the user can see
+    // where the decoder is without reading `tracing::info!` in the
+    // journal. No-op when the viewer isn't open.
+    if let Some(view) = state.wefax_viewer.borrow().as_ref() {
+        view.set_state_label(wefax_state);
+    }
 }
 
 /// `DspToUi::SignalLevel` arm of [`handle_dsp_message`], split out per

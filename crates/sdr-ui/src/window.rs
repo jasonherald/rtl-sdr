@@ -689,6 +689,11 @@ pub fn build_window(
         // symmetric. Per epic #469 task 7.5.
         crate::lrpt_viewer::connect_lrpt_action(app, &parent_provider, &state);
         crate::sstv_viewer::connect_sstv_action(app, &parent_provider, &state);
+        // WEFAX viewer wiring (`Ctrl+Shift+F` / `app.wefax-open`).
+        // No auto-record flow exists yet (Task 13), so this is the
+        // only way to open the viewer — mirrors the manual-only
+        // rationale for the APT viewer above. Issue #877.
+        crate::wefax_viewer::connect_wefax_action(app, &parent_provider, &state);
     }
 
     // Orbcomm wiring (`Ctrl+Shift+O` / `app.orbcomm-open`, epic #867):
