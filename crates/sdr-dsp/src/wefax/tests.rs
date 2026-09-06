@@ -1,7 +1,9 @@
 use super::assembly::LineAssembler;
 use super::discriminator::Discriminator;
 use super::phasing::PhasingTracker;
-use super::sync::{LineDisposition, SyncMachine};
+use super::sync::{
+    LineDisposition, SLANT_MAX_COLS_PER_LINE, SyncMachine, clamped_samples_per_line,
+};
 use super::tones::ToneDetector;
 use super::*;
 
@@ -167,6 +169,34 @@ fn phasing_entry_locks_without_start_tone() {
         emitted >= 1,
         "lines emit once imaging starts, got {emitted}"
     );
+}
+
+/// A garbage least-squares slant (like the ~400 cols/line seen on real noisy
+/// phasing) must not reprogram samples-per-line far from `sr/2` and shear the
+/// image. The clamp bounds the correction to ≈1% of `sr/2`; a small plausible
+/// slant still passes through unchanged.
+#[test]
+fn slant_clamp_keeps_samples_per_line_near_base() {
+    let sr = 44_100.0;
+    let base = sr / 2.0;
+    let max_dev = SLANT_MAX_COLS_PER_LINE * (base / PIXELS_PER_LINE as f64);
+
+    for garbage in [400.0, -400.0, 1e6] {
+        let spl = clamped_samples_per_line(sr, garbage);
+        assert!(
+            (spl - base).abs() <= max_dev + 1e-6,
+            "slant {garbage} clamped: spl {spl} within {max_dev} of {base}"
+        );
+        assert!(
+            (spl - base).abs() / base < 0.01,
+            "clamped spl stays within 1% of sr/2"
+        );
+    }
+
+    // A small, physically plausible slant is applied unclamped.
+    let small = clamped_samples_per_line(sr, 0.5);
+    let expected = base - 0.5 * (base / PIXELS_PER_LINE as f64);
+    assert!((small - expected).abs() < 1e-6, "sub-bound slant unchanged");
 }
 
 /// Synthesize AF for a mini chart and assert: no lines emitted before lock,

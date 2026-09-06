@@ -26,6 +26,14 @@ const PHASING_MAX_BRIGHT_FRACTION: f64 = 0.5;
 /// still catching the interval near its beginning.
 const PHASING_ENTRY_LINES: usize = 4;
 
+/// Maximum physically-plausible phasing slant (pulse-column drift per line).
+/// A real TX/RX sample-clock mismatch is far below one column per line; the
+/// least-squares fit over noisy real pulse columns can instead produce a
+/// slope of hundreds of columns/line. Clamping the slant to this bound keeps
+/// the reprogrammed samples-per-line within ≈1% of `sr/2`, so a garbage
+/// estimate can never shear the chart into incoherence.
+pub(crate) const SLANT_MAX_COLS_PER_LINE: f64 = 2.0;
+
 pub(crate) enum LineDisposition {
     Drop,
     Emit,
@@ -135,10 +143,6 @@ impl SyncMachine {
     /// Feed one phasing line to the tracker (only if it carries a genuine
     /// bright pulse) and, once locked, program the assembler and advance to
     /// [`WefaxState::Imaging`].
-    ///
-    /// `PIXELS_PER_LINE` (1809) is far below `f64`'s exact-integer range, so
-    /// the samples-per-line cast never loses precision in practice.
-    #[allow(clippy::cast_precision_loss)]
     fn observe_phasing_line(
         &mut self,
         line: &[u8; super::PIXELS_PER_LINE],
@@ -150,13 +154,28 @@ impl SyncMachine {
         self.phasing.observe_line(line);
         if let Some(off) = self.phasing.column_offset() {
             assembler.set_column_offset(off);
-            let spl = self.sr / 2.0
-                - self.phasing.slant_columns_per_line()
-                    * (self.sr / 2.0 / super::PIXELS_PER_LINE as f64);
+            let spl = clamped_samples_per_line(self.sr, self.phasing.slant_columns_per_line());
             assembler.set_samples_per_line(spl);
             self.state = WefaxState::Imaging;
         }
     }
+}
+
+/// Corrected samples-per-line from the phasing slant, with the slant clamped
+/// to `±SLANT_MAX_COLS_PER_LINE` first. On real captures the leading-edge
+/// pulse-column measurement is jumpy, so the least-squares slope can come out
+/// hundreds of columns/line — which, applied unclamped, reprograms
+/// samples-per-line far from `sr/2` and shears the image into incoherence.
+/// Clamping bounds the correction to ≈1% of `sr/2`, keeping the image
+/// coherent no matter how noisy the lock is.
+///
+/// `PIXELS_PER_LINE` (1809) is far below `f64`'s exact-integer range, so the
+/// cast never loses precision in practice.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn clamped_samples_per_line(sr: f64, slant_cols_per_line: f64) -> f64 {
+    let slant = slant_cols_per_line.clamp(-SLANT_MAX_COLS_PER_LINE, SLANT_MAX_COLS_PER_LINE);
+    let base = sr / 2.0;
+    base - slant * (base / super::PIXELS_PER_LINE as f64)
 }
 
 /// True when a line looks like a genuine phasing pulse: at least one bright
