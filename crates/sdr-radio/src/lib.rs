@@ -12,6 +12,7 @@ pub mod if_chain;
 pub mod lrpt_decoder;
 pub mod lrpt_image;
 pub mod sstv_image;
+pub mod wefax_image;
 
 use sdr_dsp::filter::{DEEMPHASIS_TAU_EU, DEEMPHASIS_TAU_US};
 use sdr_dsp::multirate::RationalResampler;
