@@ -340,10 +340,12 @@ pub struct AppState {
     /// the viewer reads it. Cleared between charts by
     /// `take_completed` inside the DSP tap. Issue #877.
     pub wefax_image: sdr_radio::wefax_image::WefaxImage,
-    /// Completed WEFAX charts accumulated so a future auto-save flow
-    /// (Task 13) can write every chart received during a session, in
-    /// arrival order — mirrors `sstv_completed_images`. Populated by
-    /// the `DspToUi::WefaxImageComplete` handler. Issue #877.
+    /// Completed WEFAX charts, pushed by the `DspToUi::WefaxImageComplete`
+    /// handler and drained by it in the same call to auto-save every
+    /// chart received during a session (Task 13) — mirrors
+    /// `sstv_completed_images` in shape, but WEFAX has no pass/AOS-LOS
+    /// concept to batch against, so this never holds more than the
+    /// just-arrived chart in practice. Issue #877.
     pub wefax_completed_images: RefCell<Vec<sdr_radio::wefax_image::CompletedWefaxImage>>,
     /// ACARS toggle (mirrors persisted `acars_enabled`).
     pub acars_enabled: Cell<bool>,

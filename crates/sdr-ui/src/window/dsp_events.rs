@@ -17,7 +17,7 @@ use scanner_events::{
 };
 
 use super::{
-    AppState, DspToUi, Rc, RefCell, StatusBar, adw, apply_rtl_tcp_connection_state, glib,
+    AppState, DspToUi, Rc, RefCell, StatusBar, adw, apply_rtl_tcp_connection_state, gio, glib,
     handle_rtl_tcp_state_toast, header, plain_toast, sidebar, spectrum,
     update_bandwidth_reset_sensitivity, update_bandwidth_row_range_for_mode,
     update_vfo_reset_button_visibility,
@@ -131,7 +131,7 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
         DspToUi::OrbcommChannelStats(ch_stats) => on_orbcomm_channel_stats(ctx, ch_stats),
         DspToUi::OrbcommEnabledChanged(enabled) => on_orbcomm_enabled_changed(ctx, enabled),
         // WEFAX decode-tap plumbing (issue #877). Live viewer wiring
-        // landed in Task 12; auto-save is a later task.
+        // landed in Task 12; chart auto-save landed in Task 13.
         DspToUi::WefaxLineDecoded(line_index) => on_wefax_line_decoded(ctx, line_index),
         DspToUi::WefaxImageComplete {
             width,
@@ -750,11 +750,9 @@ fn on_wefax_line_decoded(ctx: &DspEventCtx, _line_index: u32) {
 /// out per the 50-NLOC gate (#817). Mirrors [`on_sstv_image_complete`].
 fn on_wefax_image_complete(ctx: &DspEventCtx, width: u32, height: u32, pixels: Vec<u8>) {
     let DspEventCtx { state, .. } = ctx;
-    // The WEFAX decoder has closed out a full chart. Accumulate it
-    // so a future auto-save flow (Task 13) can write every chart
-    // received to disk. We deliberately do NOT call
-    // `view.update_from_handle` here: by the time this message
-    // arrives the controller's tap has already called
+    // The WEFAX decoder has closed out a full chart. We deliberately
+    // do NOT call `view.update_from_handle` here: by the time this
+    // message arrives the controller's tap has already called
     // `WefaxImageHandle::take_completed`, which clears the in-flight
     // pixel buffer for the next chart. The final row was already
     // rendered by the previous `WefaxLineDecoded` refresh, so the
@@ -766,12 +764,63 @@ fn on_wefax_image_complete(ctx: &DspEventCtx, width: u32, height: u32, pixels: V
         pixels,
     };
     state.wefax_completed_images.borrow_mut().push(completed);
+    // Drain immediately and auto-save every accumulated chart (Task
+    // 13). WEFAX has no pass/AOS-LOS concept to batch against like
+    // APT/LRPT/SSTV, so each completed chart is saved as soon as it
+    // arrives — draining here is also what keeps
+    // `wefax_completed_images` from growing unbounded across a long
+    // session.
+    let pending: Vec<_> = state
+        .wefax_completed_images
+        .borrow_mut()
+        .drain(..)
+        .collect();
     tracing::info!(
         width,
         height,
-        "WEFAX chart complete; {} in buffer",
-        state.wefax_completed_images.borrow().len()
+        "WEFAX chart complete; auto-saving {} image(s)",
+        pending.len()
     );
+    for image in pending {
+        save_wefax_png(image, chrono::Local::now());
+    }
+}
+
+/// Encode one completed WEFAX chart to PNG on a `gio::spawn_blocking`
+/// worker and log the outcome. Split out of [`on_wefax_image_complete`]
+/// to keep it under the 50-NLOC gate; mirrors how the SSTV auto-record
+/// path (`window::satellites::saves::save_sstv_batch`) keeps the
+/// CPU-heavy Cairo encode off the GTK main thread. Reuses the exact
+/// encoder the viewer's manual Export button calls
+/// ([`crate::wefax_viewer::write_wefax_gray_png`]) so the two save
+/// paths can never drift in pixel format.
+fn save_wefax_png(
+    image: sdr_radio::wefax_image::CompletedWefaxImage,
+    now: chrono::DateTime<chrono::Local>,
+) {
+    let path = sidebar::satellites_recorder::wefax_output_path(now);
+    gio::spawn_blocking(move || {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!("WEFAX auto-save: failed to create directory {parent:?}: {e}");
+            return;
+        }
+        match crate::wefax_viewer::write_wefax_gray_png(
+            &path,
+            &image.pixels,
+            image.width,
+            image.height,
+        ) {
+            Ok(()) => tracing::info!(
+                ?path,
+                width = image.width,
+                height = image.height,
+                "WEFAX chart auto-saved",
+            ),
+            Err(e) => tracing::warn!("WEFAX auto-save to {path:?} failed: {e}"),
+        }
+    });
 }
 
 /// `DspToUi::WefaxState` arm of [`handle_dsp_message`], split out

@@ -195,6 +195,19 @@ fn audio_toggle_on_emits_paired_start_and_stop() {
 }
 
 #[test]
+fn wefax_output_path_has_prefix_and_png_ext() {
+    // WEFAX isn't a tracked pass — no TLE, no AOS/LOS, no satellite
+    // slug — so unlike `png_path_for` et al. the path carries only
+    // a fixed prefix + timestamp. Per epic #877 task 13.
+    let now = Local.with_ymd_and_hms(2024, 6, 15, 18, 30, 15).unwrap();
+    let p = wefax_output_path(now);
+    let s = p.to_string_lossy();
+    assert!(s.contains("sdr-recordings"));
+    assert!(s.contains("wefax-"));
+    assert!(s.ends_with(".png"));
+}
+
+#[test]
 fn lrpt_dir_includes_satellite_slug_and_no_extension() {
     // LRPT's per-pass artifact is a directory, not a file —
     // pin the slug + stamp + lack-of-extension contract so

@@ -25,7 +25,7 @@
 
 use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use sdr_radio::af_chain::CtcssMode;
 use sdr_sat::Pass;
 use sdr_types::DemodMode;
@@ -782,6 +782,27 @@ fn sstv_dir_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
 #[must_use]
 fn audio_path_for(pass: &Pass, now: DateTime<Utc>) -> PathBuf {
     pass_recording_path(pass, now, "audio", "wav")
+}
+
+/// Build the auto-save path for a completed WEFAX chart:
+/// `~/sdr-recordings/wefax-2026-04-25-143015.png`.
+///
+/// Unlike the satellite-pass artifacts above, WEFAX reception isn't
+/// a tracked pass — there's no TLE, no AOS/LOS, no satellite slug —
+/// it's a manually tuned HF broadcast decoded whenever a chart
+/// happens to complete. So the filename carries only a fixed
+/// `wefax-` prefix plus a timestamp, no [`pass_satellite_slug`].
+///
+/// Reuses [`pass_timestamp`] (which formats in the user's local
+/// timezone) by round-tripping the caller's `Local` instant through
+/// `Utc` — same wall-clock instant, one formatter to maintain. Per
+/// epic #877 task 13.
+#[must_use]
+pub(crate) fn wefax_output_path(now: DateTime<Local>) -> PathBuf {
+    glib::home_dir().join("sdr-recordings").join(format!(
+        "wefax-{stamp}.png",
+        stamp = pass_timestamp(now.with_timezone(&Utc)),
+    ))
 }
 
 /// Project a [`PassOutput`] to the matching save action. Lives
