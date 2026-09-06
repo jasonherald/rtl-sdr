@@ -26,13 +26,15 @@ const PHASING_MAX_BRIGHT_FRACTION: f64 = 0.5;
 /// still catching the interval near its beginning.
 const PHASING_ENTRY_LINES: usize = 4;
 
-/// Maximum physically-plausible phasing slant (pulse-column drift per line).
-/// A real TX/RX sample-clock mismatch is far below one column per line; the
-/// least-squares fit over noisy real pulse columns can instead produce a
-/// slope of hundreds of columns/line. Clamping the slant to this bound keeps
-/// the reprogrammed samples-per-line within ≈1% of `sr/2`, so a garbage
-/// estimate can never shear the chart into incoherence.
-pub(crate) const SLANT_MAX_COLS_PER_LINE: f64 = 2.0;
+/// Largest slant estimate (pulse-column drift per line) still treated as
+/// physically plausible. A real TX/RX sample-clock mismatch is well under one
+/// column per line; the least-squares fit over noisy real pulse columns can
+/// instead produce a slope of hundreds of columns/line. Any estimate beyond
+/// this bound is rejected (slant → 0, nominal `samples_per_line = sr/2`)
+/// rather than applied, because even a clamped-but-nonzero drift accumulates
+/// into a diagonal shear across the whole chart. A genuinely small slant
+/// within the bound is applied as-is and de-slants correctly.
+pub(crate) const SLANT_PLAUSIBLE_MAX_COLS_PER_LINE: f64 = 1.0;
 
 pub(crate) enum LineDisposition {
     Drop,
@@ -154,26 +156,31 @@ impl SyncMachine {
         self.phasing.observe_line(line);
         if let Some(off) = self.phasing.column_offset() {
             assembler.set_column_offset(off);
-            let spl = clamped_samples_per_line(self.sr, self.phasing.slant_columns_per_line());
+            let spl = corrected_samples_per_line(self.sr, self.phasing.slant_columns_per_line());
             assembler.set_samples_per_line(spl);
             self.state = WefaxState::Imaging;
         }
     }
 }
 
-/// Corrected samples-per-line from the phasing slant, with the slant clamped
-/// to `±SLANT_MAX_COLS_PER_LINE` first. On real captures the leading-edge
-/// pulse-column measurement is jumpy, so the least-squares slope can come out
-/// hundreds of columns/line — which, applied unclamped, reprograms
-/// samples-per-line far from `sr/2` and shears the image into incoherence.
-/// Clamping bounds the correction to ≈1% of `sr/2`, keeping the image
-/// coherent no matter how noisy the lock is.
+/// Corrected samples-per-line from the phasing slant, with an implausible
+/// estimate *rejected* (not clamped) to zero. On real captures the
+/// leading-edge pulse-column measurement is jumpy, so the least-squares slope
+/// can come out hundreds of columns/line; even clamped to a small nonzero
+/// bound it would accumulate into a diagonal shear across the chart. When the
+/// raw slant exceeds [`SLANT_PLAUSIBLE_MAX_COLS_PER_LINE`] it is treated as
+/// unreliable and dropped to `0.0`, so `samples_per_line == sr/2` and the
+/// image stays straight. A genuinely small, plausible slant is applied as-is.
 ///
 /// `PIXELS_PER_LINE` (1809) is far below `f64`'s exact-integer range, so the
 /// cast never loses precision in practice.
 #[allow(clippy::cast_precision_loss)]
-pub(crate) fn clamped_samples_per_line(sr: f64, slant_cols_per_line: f64) -> f64 {
-    let slant = slant_cols_per_line.clamp(-SLANT_MAX_COLS_PER_LINE, SLANT_MAX_COLS_PER_LINE);
+pub(crate) fn corrected_samples_per_line(sr: f64, slant_cols_per_line: f64) -> f64 {
+    let slant = if slant_cols_per_line.abs() > SLANT_PLAUSIBLE_MAX_COLS_PER_LINE {
+        0.0 // unreliable noisy estimate — nominal rate, no shear
+    } else {
+        slant_cols_per_line
+    };
     let base = sr / 2.0;
     base - slant * (base / super::PIXELS_PER_LINE as f64)
 }
