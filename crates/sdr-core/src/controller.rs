@@ -1209,6 +1209,13 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // Per epic #472.
         }
 
+        UiToDsp::SetWefaxImage(_) | UiToDsp::ClearWefaxImage => {
+            // Wiring handled in Task 11 (epic #877 task 11). This
+            // no-op arm exists only to keep `handle_command`'s
+            // match exhaustive while the message variants land in
+            // Task 10.
+        }
+
         UiToDsp::ResetImagingDecoders => {
             // Between-pass reset for the auto-record flow when
             // the source stays open across pass boundaries
