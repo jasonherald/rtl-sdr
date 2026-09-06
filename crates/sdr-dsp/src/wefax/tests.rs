@@ -1,6 +1,7 @@
 use super::assembly::LineAssembler;
 use super::discriminator::Discriminator;
 use super::phasing::PhasingTracker;
+use super::sync::{LineDisposition, SyncMachine};
 use super::tones::ToneDetector;
 use super::*;
 
@@ -129,6 +130,42 @@ fn phasing_tracker_estimates_slant() {
     assert!(
         (t.slant_columns_per_line() - 1.0).abs() < 0.3,
         "≈1 col/line slant"
+    );
+}
+
+/// Real WEFAX has no audio start tone — the "300 Hz start" is the black/white
+/// keying rate, not a 300 Hz audio sine — so sync must enter Phasing directly
+/// from line content. Feed a run of mostly-dark-with-pulse lines (no tone at
+/// all) and assert the machine walks Idle → Phasing → Imaging and begins
+/// emitting once the left edge locks.
+#[test]
+fn phasing_entry_locks_without_start_tone() {
+    let sr = 24_000.0;
+    let mut sm = SyncMachine::new(sr);
+    let mut asm = LineAssembler::new(sr / 2.0);
+    assert_eq!(sm.state(), WefaxState::Idle, "starts Idle");
+
+    let mut emitted = 0usize;
+    let mut reached_phasing = false;
+    for _ in 0..12 {
+        let line = phasing_line(300);
+        if let LineDisposition::Emit = sm.on_line(&line, &mut asm) {
+            emitted += 1;
+        }
+        reached_phasing |= sm.state() == WefaxState::Phasing;
+    }
+    assert!(
+        reached_phasing,
+        "a run of phasing-pulse lines drives Idle → Phasing"
+    );
+    assert_eq!(
+        sm.state(),
+        WefaxState::Imaging,
+        "phasing lock advances to Imaging"
+    );
+    assert!(
+        emitted >= 1,
+        "lines emit once imaging starts, got {emitted}"
     );
 }
 

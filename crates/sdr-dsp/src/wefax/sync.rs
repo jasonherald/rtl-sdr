@@ -18,6 +18,14 @@ const PHASING_PULSE_BRIGHTNESS: u8 = 180;
 /// offset and slant lock toward the left edge, so both are skipped.
 const PHASING_MAX_BRIGHT_FRACTION: f64 = 0.5;
 
+/// Consecutive phasing-pulse lines that, seen while Idle, enter Phasing
+/// without an audio start tone. Real WEFAX carries no 300 Hz audio start
+/// tone — the "300 Hz start" is the black/white keying rate of the
+/// subcarrier — so the sync machine must recognize the phasing interval
+/// directly from line content. A short run keeps false starts unlikely while
+/// still catching the interval near its beginning.
+const PHASING_ENTRY_LINES: usize = 4;
+
 pub(crate) enum LineDisposition {
     Drop,
     Emit,
@@ -30,6 +38,10 @@ pub(crate) struct SyncMachine {
     phasing: PhasingTracker,
     state: WefaxState,
     chart_complete: bool,
+    /// Consecutive phasing-pulse lines seen while Idle, buffered so the run
+    /// that triggers entry can be replayed into the fresh tracker (the lock
+    /// needs those samples). Cleared whenever a non-pulse line breaks the run.
+    idle_pulse_run: Vec<[u8; super::PIXELS_PER_LINE]>,
 }
 
 impl SyncMachine {
@@ -41,6 +53,7 @@ impl SyncMachine {
             phasing: PhasingTracker::new(),
             state: WefaxState::Idle,
             chart_complete: false,
+            idle_pulse_run: Vec::new(),
         }
     }
 
@@ -85,7 +98,37 @@ impl SyncMachine {
                 self.state = WefaxState::Idle;
                 LineDisposition::Drop
             }
-            WefaxState::Idle => LineDisposition::Drop,
+            WefaxState::Idle => {
+                self.observe_idle_line(line, assembler);
+                LineDisposition::Drop
+            }
+        }
+    }
+
+    /// While Idle, detect the phasing interval directly from line content: a
+    /// run of [`PHASING_ENTRY_LINES`] consecutive phasing-pulse lines enters
+    /// Phasing without needing an audio start tone (real WEFAX has none). The
+    /// buffered run is replayed into the fresh tracker so the subsequent lock
+    /// has those lines' samples; imaging then proceeds via the normal
+    /// Phasing→Imaging lock.
+    fn observe_idle_line(
+        &mut self,
+        line: &[u8; super::PIXELS_PER_LINE],
+        assembler: &mut LineAssembler,
+    ) {
+        if !is_phasing_pulse(line) {
+            self.idle_pulse_run.clear();
+            return;
+        }
+        self.idle_pulse_run.push(*line);
+        if self.idle_pulse_run.len() < PHASING_ENTRY_LINES {
+            return;
+        }
+        self.state = WefaxState::Phasing;
+        self.phasing = PhasingTracker::new();
+        let run = std::mem::take(&mut self.idle_pulse_run);
+        for l in &run {
+            self.observe_phasing_line(l, assembler);
         }
     }
 
