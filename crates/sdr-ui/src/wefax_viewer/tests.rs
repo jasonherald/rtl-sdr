@@ -87,6 +87,29 @@ fn renderer_same_height_reports_unchanged() {
 }
 
 #[test]
+fn renderer_shrunk_snapshot_resets_instead_of_suppressing() {
+    // Regression for the live-hit "new lines tile in at the bottom"
+    // bug: `WefaxImageHandle::take_completed` resets the shared
+    // buffer to height 0 when a chart completes, so the next chart's
+    // early (small) snapshots must reset the renderer's watermark
+    // and repaint from the top — not be swallowed by the stale
+    // `lines_written` left over from the previous, taller chart.
+    let mut r = WefaxImageRenderer::new();
+    let _ = r.update_from_snapshot(snap(1809, 500));
+    assert_eq!(r.lines_written, 500);
+
+    let changed = r.update_from_snapshot(snap(1809, 3));
+    assert!(
+        changed,
+        "a shorter snapshot after a completed chart must reset and repaint, not suppress"
+    );
+    assert_eq!(
+        r.lines_written, 3,
+        "watermark should reset to the new chart's height, not stay stuck at the old chart's"
+    );
+}
+
+#[test]
 fn renderer_width_change_rebuilds_surface() {
     // A new chart (different width) rebuilds even if the reported
     // height is smaller than the previous chart's.

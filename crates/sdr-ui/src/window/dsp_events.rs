@@ -55,6 +55,14 @@ pub(super) struct DspEventCtx {
     pub(super) pending_controller_busy_toasts: Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
     pub(super) network_sink_status_row_weak: glib::WeakRef<adw::ActionRow>,
     pub(super) transcription_enable_row: adw::SwitchRow,
+    /// Resolves the current main window for
+    /// [`crate::wefax_viewer::open_wefax_viewer_if_needed`], called
+    /// from `on_demod_mode_changed` when the user selects WEFAX demod
+    /// mode. Same shape as the `parent_provider` closure `window.rs`
+    /// builds for the `app.wefax-open` action — rebuilt here rather
+    /// than shared because the action's copy is scoped to a `{ }`
+    /// block that ends before `DspEventCtx` is constructed.
+    pub(super) wefax_parent_provider: Rc<dyn Fn() -> Option<gtk4::Window>>,
     #[cfg(feature = "sherpa")]
     pub(super) auto_break_row: adw::SwitchRow,
     #[cfg(feature = "sherpa")]
@@ -433,6 +441,27 @@ fn on_iq_recording_stopped(ctx: &DspEventCtx) {
     }
 }
 
+/// Auto-open the WEFAX viewer when the user selects WEFAX demod mode.
+/// Split out of [`on_demod_mode_changed`] per the 50-NLOC gate (#817).
+///
+/// Without this, the viewer only ever opened via `Ctrl+Shift+F`
+/// (`app.wefax-open`) — and only that action sent
+/// `UiToDsp::SetWefaxImage`, which the decode tap needs to start
+/// pushing lines into the shared handle — so selecting WEFAX from the
+/// mode dropdown silently decoded nothing. Per whole-branch review
+/// (Critical). [`crate::wefax_viewer::open_wefax_viewer_if_needed`] is
+/// idempotent: it re-presents an already-open viewer rather than
+/// duplicating it. Deliberately NOT extended to any other mode.
+fn auto_open_wefax_viewer_on_mode_select(
+    new_mode: sdr_types::DemodMode,
+    parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,
+    state: &Rc<AppState>,
+) {
+    if new_mode == sdr_types::DemodMode::Wefax {
+        crate::wefax_viewer::open_wefax_viewer_if_needed(parent_provider, state);
+    }
+}
+
 /// `DspToUi::DemodModeChanged` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
 fn on_demod_mode_changed(ctx: &DspEventCtx, new_mode: sdr_types::DemodMode) {
@@ -442,6 +471,7 @@ fn on_demod_mode_changed(ctx: &DspEventCtx, new_mode: sdr_types::DemodMode) {
         toast_overlay_weak,
         radio_panel,
         transcription_enable_row,
+        wefax_parent_provider,
         ..
     } = ctx;
     #[cfg(feature = "sherpa")]
@@ -454,6 +484,8 @@ fn on_demod_mode_changed(ctx: &DspEventCtx, new_mode: sdr_types::DemodMode) {
         ..
     } = ctx;
     tracing::info!(?new_mode, "demod mode changed");
+
+    auto_open_wefax_viewer_on_mode_select(new_mode, wefax_parent_provider, state);
 
     // Re-run Auto Break row visibility rules with the new mode.
     // The row is only visible when the current mode is NFM AND an

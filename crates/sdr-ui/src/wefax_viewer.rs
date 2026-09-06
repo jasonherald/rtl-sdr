@@ -39,20 +39,25 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{cairo, gio, glib};
 use libadwaita as adw;
-use libadwaita::prelude::*;
 
 use sdr_dsp::wefax::WefaxState;
 use sdr_radio::wefax_image::{WefaxImageHandle, WefaxSnapshot};
 
-use crate::messages::UiToDsp;
-use crate::viewer::{ViewerError, plain_toast, show_toast_in};
+use crate::viewer::ViewerError;
+
+mod window;
+
+pub use window::{connect_wefax_action, open_wefax_viewer_if_needed, open_wefax_viewer_window};
 
 // ─── Constants ─────────────────────────────────────────────────────────────
 
 /// Default viewer window size. WEFAX charts are
 /// [`sdr_dsp::wefax::PIXELS_PER_LINE`] px wide (1809) and grow
-/// arbitrarily tall as lines arrive; the drawing area scales the
-/// chart to fit whatever size the window ends up.
+/// arbitrarily tall as lines arrive — well past a typical window's
+/// height for a full reception. The drawing area is wrapped in a
+/// `GtkScrolledWindow` (see `window::open_wefax_viewer_window`) that
+/// grows with the chart and auto-follows the newest line rather than
+/// shrinking the whole image to fit.
 const VIEWER_WINDOW_WIDTH: i32 = 900;
 const VIEWER_WINDOW_HEIGHT: i32 = 700;
 
@@ -63,6 +68,13 @@ const BACKGROUND_RGB: [f64; 3] = [0.05, 0.05, 0.06];
 /// Subtitle shown before the first `DspToUi::WefaxState` arrives (or
 /// after [`WefaxImageView::clear`]).
 const WEFAX_VIEWER_PLACEHOLDER_SUBTITLE: &str = "Idle";
+
+/// Pixel tolerance for the "scrolled to bottom" auto-follow check in
+/// [`WefaxImageView::follow_scroll_to_bottom`]. Mirrors
+/// `sidebar::orbcomm_panel::SCROLL_BOTTOM_TOLERANCE_PX` —
+/// `GtkAdjustment` values are fractional, so an exact compare against
+/// `upper() - page_size()` would miss sub-pixel rests.
+const SCROLL_BOTTOM_TOLERANCE_PX: f64 = 1.0;
 
 // ─── Pure pixel packing ─────────────────────────────────────────────────────
 
@@ -144,7 +156,18 @@ impl WefaxImageRenderer {
     /// `false` when nothing changed or on a surface error (logged,
     /// not propagated — a failed redraw shouldn't kill the UI).
     pub fn update_from_snapshot(&mut self, snap: WefaxSnapshot) -> bool {
-        if snap.height <= self.lines_written && snap.width == self.width {
+        if snap.height < self.lines_written {
+            // The shared buffer shrank — `WefaxImageHandle::take_completed`
+            // reset it to start a new chart (or `clear()` reset it
+            // directly). Drop the stale watermark + surface so the
+            // fresh/shorter chart repaints from the top instead of
+            // being silently swallowed by the `==` check below, which
+            // otherwise wouldn't fire again until the new chart's
+            // height happened to reach the old one's — the live-hit
+            // "new lines tile in at the bottom" bug from the
+            // whole-branch review.
+            self.clear();
+        } else if snap.height == self.lines_written && snap.width == self.width {
             self.last_snapshot = Some(snap);
             return false;
         }
@@ -381,6 +404,16 @@ pub struct WefaxImageView {
     /// [`Self::set_state_label`] can refresh the subtitle. `None`
     /// for tests / detached views that don't have a window.
     title_widget: Rc<RefCell<Option<adw::WindowTitle>>>,
+    /// Vertical `GtkAdjustment` of the wrapping `ScrolledWindow`, set
+    /// via [`Self::set_scroll_adjustment`] once
+    /// `window::open_wefax_viewer_window` builds it. `None` for tests
+    /// / detached views. A WEFAX chart has no fixed height and a long
+    /// reception runs well past the window's visible area —
+    /// [`Self::update_from_handle`] auto-follows this to the bottom
+    /// as new lines arrive, but only when the user was already there
+    /// (mirrors `sidebar::orbcomm_panel::OrbcommPanelHandles::append_log_entry`'s
+    /// "`was_at_bottom`" + deferred-idle pattern).
+    scroll_adjustment: Rc<RefCell<Option<gtk4::Adjustment>>>,
 }
 
 impl Default for WefaxImageView {
@@ -413,6 +446,7 @@ impl WefaxImageView {
             paused,
             handle: Rc::new(RefCell::new(None)),
             title_widget: Rc::new(RefCell::new(None)),
+            scroll_adjustment: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -427,6 +461,14 @@ impl WefaxImageView {
     /// Idempotent — replaces any previously-attached title.
     pub fn set_title_widget(&self, title: adw::WindowTitle) {
         *self.title_widget.borrow_mut() = Some(title);
+    }
+
+    /// Attach the vertical `GtkAdjustment` of the wrapping
+    /// `ScrolledWindow` so [`Self::update_from_handle`] can
+    /// auto-follow the newest line. Idempotent — replaces any
+    /// previously-attached adjustment.
+    pub fn set_scroll_adjustment(&self, adjustment: gtk4::Adjustment) {
+        *self.scroll_adjustment.borrow_mut() = Some(adjustment);
     }
 
     /// Update the viewer's window-title subtitle to reflect the
@@ -450,24 +492,76 @@ impl WefaxImageView {
     /// viewer is not paused. Always buffers data even when paused so
     /// nothing is lost while the user inspects the chart.
     pub fn update_from_handle(&self, handle: &WefaxImageHandle) {
-        if let Some(snap) = handle.snapshot() {
-            let changed = self.renderer.borrow_mut().update_from_snapshot(snap);
-            if changed && !self.paused.get() {
-                self.drawing_area.queue_draw();
-            }
+        let Some(snap) = handle.snapshot() else {
+            return;
+        };
+        let (width, height) = (snap.width, snap.height);
+        let changed = self.renderer.borrow_mut().update_from_snapshot(snap);
+        if !changed {
+            return;
         }
+        // Grow the drawing area's natural size to match the chart so
+        // the wrapping `ScrolledWindow` can scroll it — a WEFAX chart
+        // has no fixed height and easily outgrows the window over a
+        // full reception. `render()` still scale-fits defensively,
+        // but with the allocation tracking the surface 1:1 the chart
+        // paints at native resolution instead of shrinking away.
+        self.drawing_area
+            .set_content_width(i32::try_from(width).unwrap_or(i32::MAX));
+        self.drawing_area
+            .set_content_height(i32::try_from(height).unwrap_or(i32::MAX));
+        if !self.paused.get() {
+            self.drawing_area.queue_draw();
+            self.follow_scroll_to_bottom();
+        }
+    }
+
+    /// Auto-scroll the wrapping `ScrolledWindow` to the newest line,
+    /// but only when the user was already scrolled to the bottom —
+    /// mirrors
+    /// `sidebar::orbcomm_panel::OrbcommPanelHandles::append_log_entry`'s
+    /// "`was_at_bottom`" + deferred-idle pattern. The scroll is
+    /// deferred to the next main-loop idle because `GtkScrolledWindow`
+    /// recomputes its adjustment bounds on the next size-allocate
+    /// pass, not synchronously inside `set_content_height`. No-op if
+    /// no adjustment has been attached (test / detached views, or a
+    /// viewer window not yet built).
+    fn follow_scroll_to_bottom(&self) {
+        let Some(adj) = self.scroll_adjustment.borrow().clone() else {
+            return;
+        };
+        let was_at_bottom = (adj.value() + adj.page_size() - adj.upper()).abs()
+            < SCROLL_BOTTOM_TOLERANCE_PX
+            || adj.upper() <= adj.page_size();
+        if !was_at_bottom {
+            return;
+        }
+        let adj_weak = adj.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(adj) = adj_weak.upgrade() {
+                adj.set_value(adj.upper());
+            }
+        });
     }
 
     /// Wipe all buffered data and queue a redraw. Also clears the
     /// shared [`WefaxImageHandle`] (if attached via
     /// [`Self::set_handle`]) so the next [`Self::update_from_handle`]
     /// doesn't replay the rows we just cleared. Resets the
-    /// window-title subtitle to "Idle".
+    /// window-title subtitle to "Idle" and collapses the drawing
+    /// area's content size + scroll position back to the top so a
+    /// new chart starts fresh rather than leaving the old chart's
+    /// scrollbar / position behind.
     pub fn clear(&self) {
         if let Some(handle) = self.handle.borrow().as_ref() {
             handle.clear();
         }
         self.renderer.borrow_mut().clear();
+        self.drawing_area.set_content_width(0);
+        self.drawing_area.set_content_height(0);
+        if let Some(adj) = self.scroll_adjustment.borrow().as_ref() {
+            adj.set_value(0.0);
+        }
         self.drawing_area.queue_draw();
         self.set_state_label(WefaxState::Idle);
     }
@@ -533,227 +627,6 @@ impl WefaxImageView {
             on_complete(result);
         });
     }
-}
-
-// ─── Non-modal viewer window ─────────────────────────────────────────────────
-
-/// Build the header bar's Pause/Resume toggle. Split out of
-/// [`open_wefax_viewer_window`] per the 50-NLOC gate (#832).
-fn build_pause_button(view: &WefaxImageView) -> gtk4::ToggleButton {
-    let pause_btn = gtk4::ToggleButton::builder()
-        .icon_name("media-playback-pause-symbolic")
-        .tooltip_text("Pause / resume live chart update")
-        .build();
-    pause_btn.update_property(&[gtk4::accessible::Property::Label(
-        "Pause or resume live WEFAX chart update",
-    )]);
-    let pause_view = view.clone();
-    pause_btn.connect_toggled(move |btn| {
-        pause_view.set_paused(btn.is_active());
-    });
-    pause_btn
-}
-
-/// Build the header bar's Clear button. Split out of
-/// [`open_wefax_viewer_window`] per the 50-NLOC gate (#832).
-fn build_clear_button(view: &WefaxImageView) -> gtk4::Button {
-    let clear_btn = gtk4::Button::builder()
-        .icon_name("edit-clear-all-symbolic")
-        .tooltip_text("Clear the chart buffer and start fresh")
-        .build();
-    clear_btn.update_property(&[gtk4::accessible::Property::Label(
-        "Clear WEFAX chart buffer",
-    )]);
-    let clear_view = view.clone();
-    clear_btn.connect_clicked(move |_| {
-        clear_view.clear();
-    });
-    clear_btn
-}
-
-/// Build the header bar's Export PNG button. Split out of
-/// [`open_wefax_viewer_window`] per the 50-NLOC gate (#832).
-fn build_export_button(view: &WefaxImageView, window: &adw::Window) -> gtk4::Button {
-    let export_btn = gtk4::Button::builder()
-        .icon_name("document-save-symbolic")
-        .tooltip_text("Export the current WEFAX chart to PNG")
-        .build();
-    export_btn.update_property(&[gtk4::accessible::Property::Label(
-        "Export WEFAX chart to PNG",
-    )]);
-    let export_view = view.clone();
-    let window_for_export = window.downgrade();
-    let export_btn_weak = export_btn.downgrade();
-    export_btn.connect_clicked(move |_| {
-        let Some(window_for_export) = window_for_export.upgrade() else {
-            return;
-        };
-        let Some(btn) = export_btn_weak.upgrade() else {
-            return;
-        };
-        if !btn.is_sensitive() {
-            return;
-        }
-        btn.set_sensitive(false);
-        let btn_for_complete = btn.downgrade();
-        let path = default_export_path();
-        let path_for_msg = path.clone();
-        let window_weak = window_for_export.downgrade();
-        export_view.export_png_async(path, move |result| {
-            let toast = match result {
-                Ok(()) => plain_toast(&format!("Saved {}", path_for_msg.display())),
-                Err(e) => plain_toast(&format!("PNG export failed: {e}")),
-            };
-            if let Some(window) = window_weak.upgrade() {
-                show_toast_in(&window, toast);
-            }
-            if let Some(btn) = btn_for_complete.upgrade() {
-                btn.set_sensitive(true);
-            }
-        });
-    });
-    export_btn
-}
-
-/// Open the WEFAX viewer in a non-modal transient window. Returns the
-/// inner [`WefaxImageView`] so the caller can pump snapshots into it.
-///
-/// Non-modal so the user can keep tuning while the chart builds.
-pub fn open_wefax_viewer_window<W: gtk4::prelude::IsA<gtk4::Window>>(
-    parent: &W,
-    title: &str,
-) -> (WefaxImageView, adw::Window) {
-    let view = WefaxImageView::new();
-
-    let window = adw::Window::builder()
-        .title(title)
-        .default_width(VIEWER_WINDOW_WIDTH)
-        .default_height(VIEWER_WINDOW_HEIGHT)
-        .transient_for(parent)
-        .modal(false)
-        .build();
-    // Inherit the parent's GApplication so Wayland's
-    // `xdg_toplevel_set_app_id` carries `com.sdr.rs` and the WM can
-    // resolve our icon. See apt_viewer.rs for the full rationale.
-    window.set_application(parent.application().as_ref());
-
-    let header = adw::HeaderBar::new();
-    let title_widget = adw::WindowTitle::new(title, WEFAX_VIEWER_PLACEHOLDER_SUBTITLE);
-    header.set_title_widget(Some(&title_widget));
-    view.set_title_widget(title_widget);
-
-    header.pack_start(&build_pause_button(&view));
-    header.pack_start(&build_clear_button(&view));
-    header.pack_end(&build_export_button(&view, &window));
-
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(view.drawing_area()));
-
-    let toast_overlay = adw::ToastOverlay::new();
-    toast_overlay.set_child(Some(&toolbar));
-
-    window.set_content(Some(&toast_overlay));
-    window.present();
-
-    (view, window)
-}
-
-/// Default export path: `~/sdr-recordings/wefax-YYYY-MM-DD-HHMMSS.png`.
-///
-/// Mirrors [`crate::sstv_viewer`]'s `default_export_path` — probes
-/// for existing files and appends `-1`, `-2`, … so two manual
-/// exports inside the same wall-clock second don't collide.
-fn default_export_path() -> PathBuf {
-    let timestamp = glib::DateTime::now_local()
-        .and_then(|dt| dt.format("%Y-%m-%d-%H%M%S"))
-        .map_or_else(|_| "unknown".to_string(), |s| s.to_string());
-    let dir = glib::home_dir().join("sdr-recordings");
-    let stem = format!("wefax-{timestamp}");
-    let mut path = dir.join(format!("{stem}.png"));
-    let mut suffix = 1_u32;
-    while path.exists() {
-        path = dir.join(format!("{stem}-{suffix}.png"));
-        suffix += 1;
-    }
-    path
-}
-
-// ─── Live viewer action ──────────────────────────────────────────────────────
-
-/// Wire the `app.wefax-open` action onto `app`. Activating it (via
-/// the app menu or `Ctrl+Shift+F`) opens a non-modal WEFAX viewer
-/// window. If a viewer is already open, activating it presents
-/// (focuses) the existing window and re-sends the current
-/// `WefaxImageHandle` to the DSP so the viewer reflects the latest
-/// state — mirrors [`crate::sstv_viewer::connect_sstv_action`].
-pub fn connect_wefax_action(
-    app: &adw::Application,
-    parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,
-    state: &Rc<crate::state::AppState>,
-) {
-    let action = gio::SimpleAction::new("wefax-open", None);
-    let parent_provider = Rc::clone(parent_provider);
-    let state_for_action = Rc::clone(state);
-    action.connect_activate(move |_, _| {
-        open_wefax_viewer_if_needed(&parent_provider, &state_for_action);
-    });
-    app.add_action(&action);
-    app.set_accels_for_action("app.wefax-open", &["<Ctrl><Shift>f"]);
-}
-
-/// Open the WEFAX viewer window if it isn't already open, registering
-/// the new view in `state.wefax_viewer` and sending `SetWefaxImage` to
-/// the DSP so the decoder tap starts pushing lines into the handle.
-/// No-op if a viewer is already open (re-presents it instead).
-pub fn open_wefax_viewer_if_needed(
-    parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,
-    state: &Rc<crate::state::AppState>,
-) {
-    if state.wefax_viewer.borrow().is_some() {
-        // Re-send the image handle so the tap stays wired even if a
-        // future code path ever clears it (idempotent), then raise
-        // the existing window. Mirrors
-        // `sstv_viewer::open_sstv_viewer_if_needed`.
-        state.send_dsp(UiToDsp::SetWefaxImage(state.wefax_image.handle()));
-        if let Some(window) = state
-            .wefax_viewer_window
-            .borrow()
-            .as_ref()
-            .and_then(glib::WeakRef::upgrade)
-        {
-            window.present();
-        }
-        return;
-    }
-    let Some(parent) = parent_provider() else {
-        tracing::warn!("wefax-open invoked with no main window available");
-        return;
-    };
-    let (view, window) = open_wefax_viewer_window(&parent, "WEFAX Chart");
-    // Attach the shared handle to the view so the Clear button wipes
-    // the source-side pixel buffer too — otherwise the next
-    // `update_from_handle` replays the old rows.
-    view.set_handle(state.wefax_image.handle());
-    *state.wefax_viewer.borrow_mut() = Some(view);
-    *state.wefax_viewer_window.borrow_mut() = Some(window.downgrade());
-
-    // Hand the shared handle to the DSP so the decoder tap can push
-    // lines into it. The handle is a clone of the long-lived
-    // singleton in `AppState::wefax_image`.
-    state.send_dsp(UiToDsp::SetWefaxImage(state.wefax_image.handle()));
-
-    let state_for_close = Rc::clone(state);
-    window.connect_close_request(move |_| {
-        *state_for_close.wefax_viewer.borrow_mut() = None;
-        *state_for_close.wefax_viewer_window.borrow_mut() = None;
-        // Closing the viewer does NOT send `ClearWefaxImage` — the
-        // decoder keeps running and the shared handle keeps
-        // accumulating data, mirroring the SSTV/LRPT
-        // close-without-clear semantics so a future auto-save flow
-        // (Task 13) still sees completed charts.
-        glib::Propagation::Proceed
-    });
 }
 
 #[cfg(test)]
