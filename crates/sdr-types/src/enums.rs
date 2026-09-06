@@ -25,6 +25,15 @@ pub enum DemodMode {
     /// — there's no listenable signal mid-pass; the imagery is
     /// the artifact. Per epic #469 Task 7.
     Lrpt,
+    /// WEFAX / radiofax receive mode. USB-based with a locked,
+    /// narrow passband centered on the fax subcarrier band
+    /// (nominally ~1500-2300 Hz) so the user cannot detune off
+    /// the fax signal. The actual APT-style FM-subcarrier decode
+    /// (start tone → scan-line assembly → IOC framing) lives in
+    /// the DSP/controller decode tap, mirroring how `Lrpt` pins
+    /// the IF chain for its own decoder. Per epic (WEFAX
+    /// radiofax decoder) Task 9.
+    Wefax,
 }
 
 /// Network IQ sample format — matches SDR++ `SampleType` enum.

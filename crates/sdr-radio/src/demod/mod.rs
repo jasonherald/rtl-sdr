@@ -12,6 +12,7 @@ mod lsb;
 mod nfm;
 mod raw;
 mod usb;
+mod wefax;
 mod wfm;
 
 // Shared AGC profile for SSB modes (USB, LSB, DSB).
@@ -54,6 +55,7 @@ pub use lsb::LsbDemodulator;
 pub use nfm::NfmDemodulator;
 pub use raw::RawDemodulator;
 pub use usb::UsbDemodulator;
+pub use wefax::WefaxDemodulator;
 pub use wfm::WfmDemodulator;
 
 use sdr_types::{Complex, DspError, Stereo};
@@ -149,6 +151,7 @@ pub fn create_demodulator(
         DemodMode::Cw => Ok(Box::new(CwDemodulator::new()?)),
         DemodMode::Raw => Ok(Box::new(RawDemodulator::new())),
         DemodMode::Lrpt => Ok(Box::new(LrptDemodulator::new())),
+        DemodMode::Wefax => Ok(Box::new(WefaxDemodulator::new()?)),
     }
 }
 
@@ -224,6 +227,7 @@ mod tests {
             DemodMode::Cw,
             DemodMode::Raw,
             DemodMode::Lrpt,
+            DemodMode::Wefax,
         ];
         for mode in modes {
             let demod = create_demodulator(mode);
@@ -243,6 +247,7 @@ mod tests {
             DemodMode::Cw,
             DemodMode::Raw,
             DemodMode::Lrpt,
+            DemodMode::Wefax,
         ];
         for mode in modes {
             let demod = create_demodulator(mode).unwrap();
@@ -278,6 +283,7 @@ mod tests {
             DemodMode::Cw,
             DemodMode::Raw,
             DemodMode::Lrpt,
+            DemodMode::Wefax,
         ];
         for mode in modes {
             let demod = create_demodulator(mode).unwrap();
