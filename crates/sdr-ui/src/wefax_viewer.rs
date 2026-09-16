@@ -232,6 +232,17 @@ impl WefaxImageRenderer {
         self.last_snapshot = None;
     }
 
+    /// Current painted chart dimensions `(width, rows)` — the size the
+    /// wrapping drawing area's content should track. `(0, 0)` before the
+    /// first snapshot / after [`Self::clear`]. Uses `lines_written` (rows
+    /// actually painted) to match [`Self::render`]'s own height basis;
+    /// [`WefaxImageView::set_paused`] reads this to re-sync the canvas to
+    /// data accumulated while paused.
+    #[must_use]
+    pub fn content_dims(&self) -> (u32, u32) {
+        (self.width, self.lines_written)
+    }
+
     /// Paint the current surface into `cr`, scaled to fit `(width, height)`
     /// while preserving the chart's aspect ratio. Top-aligned so the
     /// live chart builds downward visually. No-op when no data has
@@ -500,20 +511,34 @@ impl WefaxImageView {
         if !changed {
             return;
         }
-        // Grow the drawing area's natural size to match the chart so
-        // the wrapping `ScrolledWindow` can scroll it — a WEFAX chart
-        // has no fixed height and easily outgrows the window over a
-        // full reception. `render()` still scale-fits defensively,
-        // but with the allocation tracking the surface 1:1 the chart
-        // paints at native resolution instead of shrinking away.
+        // While paused, the renderer keeps accumulating (above) but the
+        // visible canvas stays frozen — `set_paused` re-syncs it on
+        // resume. The size-growth MUST stay inside this gate: growing a
+        // `DrawingArea`'s content size forces GTK to repaint the surface
+        // even without an explicit `queue_draw`, so mutating it while
+        // paused defeats Pause (the regression fixed here — it used to
+        // run unconditionally before the gate).
+        if self.paused.get() {
+            return;
+        }
+        self.apply_to_canvas(width, height);
+    }
+
+    /// Grow the drawing area to the chart's current pixel size, queue a
+    /// repaint, and auto-follow to the newest line. The single choke
+    /// point for every visible-canvas mutation, so the `paused` gate has
+    /// one place to guard. A WEFAX chart has no fixed height and easily
+    /// outgrows the window over a full reception; `render()` still
+    /// scale-fits defensively, but with the allocation tracking the
+    /// surface 1:1 the chart paints at native resolution rather than
+    /// shrinking away.
+    fn apply_to_canvas(&self, width: u32, height: u32) {
         self.drawing_area
             .set_content_width(i32::try_from(width).unwrap_or(i32::MAX));
         self.drawing_area
             .set_content_height(i32::try_from(height).unwrap_or(i32::MAX));
-        if !self.paused.get() {
-            self.drawing_area.queue_draw();
-            self.follow_scroll_to_bottom();
-        }
+        self.drawing_area.queue_draw();
+        self.follow_scroll_to_bottom();
     }
 
     /// Auto-scroll the wrapping `ScrolledWindow` to the newest line,
@@ -572,7 +597,13 @@ impl WefaxImageView {
     pub fn set_paused(&self, paused: bool) {
         let was_paused = self.paused.replace(paused);
         if was_paused && !paused {
-            self.drawing_area.queue_draw();
+            // Resume: the canvas was frozen at its pre-pause size while
+            // updates accumulated in the renderer. Re-sync the drawing
+            // area to the renderer's current dimensions (grown while
+            // paused) and repaint, so the accumulated lines become
+            // visible instead of being clipped to the stale content size.
+            let (width, height) = self.renderer.borrow().content_dims();
+            self.apply_to_canvas(width, height);
         }
     }
 

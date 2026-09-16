@@ -133,6 +133,57 @@ fn renderer_clear_resets_to_empty() {
 }
 
 #[test]
+fn paused_update_freezes_canvas_and_resume_resyncs() {
+    // Regression for the Pause button breaking after the scroll-follow
+    // rework (commit f3eba3bb): that change moved the drawing area's
+    // `set_content_width/height` growth *outside* the `paused` gate, and
+    // growing a `DrawingArea`'s content size forces GTK to repaint the
+    // freshly-updated surface — so the "frozen" canvas kept advancing
+    // while paused. This asserts the visible canvas (content height)
+    // stays frozen while paused and re-syncs to the accumulated height
+    // on resume.
+    //
+    // GTK widget test: needs an initialized GTK toolkit + a display.
+    // Skips gracefully in headless CI (no display); runs on dev boxes.
+    if gtk4::init().is_err() {
+        return;
+    }
+    let view = WefaxImageView::new();
+    let image = sdr_radio::wefax_image::WefaxImage::new();
+    let handle = image.handle();
+
+    // First line, not paused → canvas grows to the chart's height.
+    handle.write_line(0, 1809, &vec![0x80; 1809]);
+    view.update_from_handle(&handle);
+    assert_eq!(
+        view.drawing_area().content_height(),
+        1,
+        "unpaused update should grow the canvas to the chart height"
+    );
+
+    // Pause, then accumulate more lines and pump an update. The frozen
+    // canvas must NOT track the new lines.
+    view.set_paused(true);
+    for row in 1..50 {
+        handle.write_line(row, 1809, &vec![0x80; 1809]);
+    }
+    view.update_from_handle(&handle);
+    assert_eq!(
+        view.drawing_area().content_height(),
+        1,
+        "paused canvas must stay frozen — content height must not track lines decoded while paused"
+    );
+
+    // Resume → canvas re-syncs to the height accumulated while paused.
+    view.set_paused(false);
+    assert_eq!(
+        view.drawing_area().content_height(),
+        50,
+        "resume must re-sync the canvas to the lines accumulated while paused"
+    );
+}
+
+#[test]
 fn wefax_state_label_maps_all_variants() {
     assert_eq!(wefax_state_label(WefaxState::Idle), "Idle");
     assert_eq!(wefax_state_label(WefaxState::Phasing), "Phasing");
