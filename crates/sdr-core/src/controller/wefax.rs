@@ -62,6 +62,13 @@ pub(super) fn wefax_decode_tap(
 /// retry (and warn-log) construction on every block. Mirrors
 /// `apt_decode_tap` / `sstv_decode_tap`'s init guard.
 fn init_wefax_decoder(state: &mut DspState) -> bool {
+    // The decoder is initialised at the RadioModule's *audio* output rate
+    // (48 kHz), which is exactly the rate `wefax_decode_tap` feeds it via
+    // `downmix_pre_gate_mono` (the post-`radio.process` audio block). Line
+    // geometry is therefore self-consistent. The WEFAX demod's 24 kHz IF
+    // rate is internal to the demod and is resampled up to the audio rate
+    // before the tap ever sees it — the two never touch, so 48 kHz here is
+    // correct, not a mismatch.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let rate_hz = state.radio.audio_sample_rate() as u32;
     if state.wefax_init_failed_at_rate == Some(rate_hz) {

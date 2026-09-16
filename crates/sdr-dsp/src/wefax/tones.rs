@@ -2,7 +2,9 @@
 //! tones. Reports "present" when the target bin dominates the block energy
 //! for several consecutive blocks (rejects the 1500-2300 Hz image band).
 
-/// Samples per Goertzel block (~23 ms at 44.1 kHz).
+/// Samples per Goertzel block — a fixed sample count, so the block
+/// duration scales with the decoder's configured input rate (~21 ms at
+/// the app's 48 kHz audio rate, ~43 ms at a 24 kHz IF rate).
 const BLOCK_LEN: usize = 1024;
 /// Target-bin power / total block power to count a block as "on-tone".
 const TONE_PRESENT_RATIO: f64 = 0.30;
