@@ -97,6 +97,12 @@ fn emit_lines(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, produced: us
             #[allow(clippy::cast_possible_truncation)]
             handle.write_line(line.line_index, PIXELS_PER_LINE as u32, &line.pixels);
         }
+        // Throttled progress log (every 100th line ≈ once per 50 s at
+        // 120 lpm) so a live reception is visible in the logs without
+        // flooding at the per-line rate.
+        if line.line_index % 100 == 0 {
+            tracing::debug!(line = line.line_index, "WEFAX line decoded");
+        }
         let _ = dsp_tx.send(DspToUi::WefaxLineDecoded(line.line_index));
     }
 }
@@ -110,6 +116,11 @@ fn emit_state_if_changed(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
     };
     let current = decoder.state();
     if state.wefax_last_state != Some(current) {
+        // Log the phase transition (Idle → Phasing → Imaging → Stopped).
+        // The `WefaxState` message only reaches the live viewer; this log
+        // is the sole record for headless / log-based debugging of a live
+        // reception.
+        tracing::debug!(from = ?state.wefax_last_state, to = ?current, "WEFAX decoder state changed");
         state.wefax_last_state = Some(current);
         let _ = dsp_tx.send(DspToUi::WefaxState(current));
     }
@@ -132,9 +143,11 @@ fn emit_complete_if_ready(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) 
     let Some(completed) = handle.take_completed() else {
         return;
     };
+    let (width, height) = (completed.width, completed.height);
+    tracing::info!(width, height, "WEFAX chart complete");
     let _ = dsp_tx.send(DspToUi::WefaxImageComplete {
-        width: completed.width,
-        height: completed.height,
+        width,
+        height,
         pixels: completed.pixels,
     });
 }
