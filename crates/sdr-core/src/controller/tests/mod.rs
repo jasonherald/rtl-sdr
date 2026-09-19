@@ -44,3 +44,4 @@ mod lrpt;
 mod orbcomm;
 mod recording_acars;
 mod sstv;
+mod wefax;

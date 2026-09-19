@@ -689,6 +689,11 @@ pub fn build_window(
         // symmetric. Per epic #469 task 7.5.
         crate::lrpt_viewer::connect_lrpt_action(app, &parent_provider, &state);
         crate::sstv_viewer::connect_sstv_action(app, &parent_provider, &state);
+        // WEFAX viewer wiring (`Ctrl+Shift+F` / `app.wefax-open`).
+        // No auto-record flow exists yet (Task 13), so this is the
+        // only way to open the viewer — mirrors the manual-only
+        // rationale for the APT viewer above. Issue #877.
+        crate::wefax_viewer::connect_wefax_action(app, &parent_provider, &state);
     }
 
     // Orbcomm wiring (`Ctrl+Shift+O` / `app.orbcomm-open`, epic #867):
@@ -1335,6 +1340,16 @@ pub fn build_window(
     #[cfg(feature = "sherpa")]
     let model_row_for_dsp = transcript_panel.model_row.clone();
     let engine_for_dsp = Rc::clone(&engine);
+    // Resolves the current main window for `on_demod_mode_changed`'s
+    // WEFAX auto-open (issue #877 whole-branch review, Critical).
+    // Same shape as the `parent_provider` built above for
+    // `app.wefax-open` — rebuilt here rather than shared because that
+    // one is scoped to the `{ }` block above, which has already
+    // closed by this point.
+    let wefax_parent_provider_for_dsp: Rc<dyn Fn() -> Option<gtk4::Window>> = {
+        let app_for_wefax_dsp = app.clone();
+        Rc::new(move || app_for_wefax_dsp.windows().into_iter().next())
+    };
     // We deliberately discard the SourceId returned by `timeout_add_local`:
     // the window-lifecycle gate at the top of the closure returns
     // `ControlFlow::Break` when the window is dropped, which is GLib's
@@ -1368,6 +1383,7 @@ pub fn build_window(
         pending_controller_busy_toasts: pending_controller_busy_toasts.clone(),
         network_sink_status_row_weak: network_sink_status_row_weak.clone(),
         transcription_enable_row: transcription_enable_for_dsp.clone(),
+        wefax_parent_provider: wefax_parent_provider_for_dsp.clone(),
         #[cfg(feature = "sherpa")]
         auto_break_row: auto_break_row_for_dsp.clone(),
         #[cfg(feature = "sherpa")]

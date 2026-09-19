@@ -5,6 +5,9 @@ use sdr_dsp::voice_squelch::VoiceSquelchMode;
 // variant can reach the payload type without taking a direct
 // `sdr-dsp` dep.
 pub use sdr_dsp::apt::AptLine;
+// Re-export so downstream crates that match on `DspToUi::WefaxState`
+// can reach the status enum without taking a direct `sdr-dsp` dep.
+pub use sdr_dsp::wefax::WefaxState;
 use sdr_radio::{DeemphasisMode, af_chain::CtcssMode};
 use sdr_types::{DemodMode, Protocol, RtlTcpConnectionState};
 
@@ -274,6 +277,36 @@ pub enum DspToUi {
     /// tap's own one-shot `DspToUi::Error` latch (mirrors the LRPT
     /// pattern). Issue #865.
     OrbcommEnabledChanged(bool),
+
+    // --- WEFAX decoder (#877) ---
+    /// One decoded WEFAX scan line. Emitted from the DSP thread
+    /// when `wefax_decode_tap` receives a new line from
+    /// `WefaxDecoder`. The UI handler uses this as a redraw
+    /// trigger for the live chart viewer — the actual pixels are
+    /// written into the shared `WefaxImageHandle` before this
+    /// message is sent, so the viewer only needs the index to
+    /// know a new row is ready. Mirrors `SstvLineDecoded`.
+    ///
+    /// `line_index` is 0-based. WEFAX has no fixed total-line-count
+    /// header (unlike SSTV modes); the image grows on demand.
+    WefaxLineDecoded(u32),
+    /// One complete WEFAX chart. Emitted from the DSP thread when
+    /// the decoder detects the stop tone and finalizes the image.
+    /// Mirrors `SstvImageComplete`, but WEFAX charts are
+    /// greyscale-only so `pixels` is a flat `Vec<u8>` (one byte
+    /// per pixel) instead of RGB triples.
+    WefaxImageComplete {
+        /// Width in pixels (`sdr_dsp::wefax::PIXELS_PER_LINE`).
+        width: u32,
+        /// Height in scan lines.
+        height: u32,
+        /// Row-major greyscale pixels, length = `width * height`.
+        pixels: Vec<u8>,
+    },
+    /// Decoder phase transition (Idle / Phasing / Imaging /
+    /// Stopped). UI surfaces this as a status label in the live
+    /// chart viewer.
+    WefaxState(WefaxState),
 }
 
 /// Available source types for IQ input.
@@ -545,6 +578,20 @@ pub enum UiToDsp {
     /// source-stop. Mirrors the LRPT `ClearLrptImage` pattern.
     /// Per epic #472.
     ClearSstvImage,
+    /// Hand the DSP thread a clone of the shared
+    /// `sdr_radio::wefax_image::WefaxImageHandle` the live WEFAX
+    /// chart viewer reads from. Sent by the wiring layer whenever
+    /// the user opens the WEFAX viewer (or a future auto-record
+    /// flow arms it). The DSP thread stores the handle and writes
+    /// decoded scan lines into it whenever the WEFAX decoder tap
+    /// runs. Mirrors `SetSstvImage`. Issue #877.
+    SetWefaxImage(sdr_radio::wefax_image::WefaxImageHandle),
+    /// Drop the shared WEFAX image handle. Reserved for explicit
+    /// teardown paths that must discard subsequent decoded lines.
+    /// Closing the live viewer does not send this command because
+    /// decoding and automatic chart saving continue in the background.
+    /// Mirrors `ClearSstvImage`. Issue #877.
+    ClearWefaxImage,
     /// Start sending audio to the transcription engine.
     EnableTranscription(std::sync::mpsc::SyncSender<sdr_transcription::TranscriptionInput>),
     /// Stop sending audio to the transcription engine.

@@ -43,6 +43,10 @@ fn demod_mode_roundtrip() {
         // bidirectionally so a future variant addition
         // can't silently demote LRPT bookmarks back to NFM.
         DemodMode::Lrpt,
+        // Same rationale for Wefax (Task 9, WEFAX radiofax
+        // decoder epic) — without both string arms this would
+        // silently demote a saved WEFAX bookmark to NFM on load.
+        DemodMode::Wefax,
     ];
     for mode in modes {
         let s = demod_mode_to_string(mode);

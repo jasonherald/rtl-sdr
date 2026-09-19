@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use sdr_dsp::apt::{AptDecoder, AptLine, READY_QUEUE_CAP};
 use sdr_dsp::channel::RxVfo;
+use sdr_dsp::wefax::{WefaxDecoder, WefaxLine, WefaxState};
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::source_manager::Source;
 use sdr_radio::lrpt_decoder::{LrptDecoder, LrptDownlink};
@@ -207,6 +208,7 @@ mod scanner;
 mod source;
 mod sstv;
 mod transcription;
+mod wefax;
 
 use acars::{
     AcarsHandlerOutcome, acars_decode_tap, acars_lock_rejects_geometry_change,
@@ -228,6 +230,7 @@ use source::{
 };
 use sstv::{SstvPassStats, sstv_decode_tap};
 use transcription::stop_transcription;
+use wefax::wefax_decode_tap;
 
 // Only the unit tests drive these helpers from the controller-root scope;
 // production callers live inside their own modules.
@@ -599,6 +602,39 @@ struct DspState {
     /// silent-but-harmless). Set at AOS by the auto-record wiring;
     /// cleared at LOS by `UiToDsp::ClearSstvImage`. Per epic #472.
     sstv_image: Option<sdr_radio::sstv_image::SstvImageHandle>,
+    /// HF radiofax (WEFAX) decoder. Lazy-init on first
+    /// `wefax_decode_tap` call at the `RadioModule`'s current audio
+    /// sample rate (typically 48 kHz). `None` means "not yet
+    /// built" — built once, kept across demod-mode toggles so
+    /// re-entering WEFAX mode during a session picks up where it
+    /// left off. Mirrors `sstv_decoder`. Issue #877.
+    wefax_decoder: Option<WefaxDecoder>,
+    /// Pre-allocated mono downmix buffer for the WEFAX decoder
+    /// input. Reused across DSP blocks, resized in place each call
+    /// so we don't alloc inside the hot loop. Mirrors
+    /// `sstv_mono_buf` / `apt_mono_buf`.
+    wefax_mono_buf: Vec<f32>,
+    /// Pre-allocated output buffer for `WefaxDecoder::process`.
+    /// Sized on first successful init. Mirrors `apt_lines_buf`.
+    wefax_lines_buf: Vec<WefaxLine>,
+    /// Most recent audio sample rate that `WefaxDecoder::new`
+    /// rejected, or `None` if every prior init succeeded / hasn't
+    /// been tried. Guards against the audio-block hot loop
+    /// retrying (and warn-logging) on a rate the decoder will
+    /// never accept. Mirrors `sstv_init_failed_at_rate` /
+    /// `apt_init_failed_at_rate`. Issue #877.
+    wefax_init_failed_at_rate: Option<u32>,
+    /// Shared WEFAX image handle. `None` until the UI side wires
+    /// it via `UiToDsp::SetWefaxImage`; when `None` the decode tap
+    /// still runs (so decoder state is preserved) but line writes
+    /// and chart-complete sends are silently skipped. Mirrors
+    /// `sstv_image`. Issue #877.
+    wefax_image: Option<sdr_radio::wefax_image::WefaxImageHandle>,
+    /// Last `WefaxState` reported to the UI. Used to edge-detect
+    /// phase transitions (Idle / Phasing / Imaging / Stopped) so
+    /// `DspToUi::WefaxState` is only sent on change rather than on
+    /// every audio block. Issue #877.
+    wefax_last_state: Option<WefaxState>,
     /// Live ACARS bank. May be temporarily `None` while ACARS
     /// is still engaged — specifically, the `Start` path
     /// invalidates this so `acars_decode_tap`'s lazy-init can
@@ -819,6 +855,12 @@ impl DspState {
             sstv_init_failed_at_rate: None,
             sstv_pass_stats: SstvPassStats::default(),
             sstv_image: None,
+            wefax_decoder: None,
+            wefax_mono_buf: Vec::new(),
+            wefax_lines_buf: Vec::new(),
+            wefax_init_failed_at_rate: None,
+            wefax_image: None,
+            wefax_last_state: None,
             acars_bank: None,
             acars_pre_lock: None,
             acars_init_failed: false,
@@ -1209,6 +1251,19 @@ fn handle_command(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, cmd: UiT
             // Per epic #472.
         }
 
+        UiToDsp::SetWefaxImage(handle) => {
+            tracing::info!("WEFAX image handle attached — decoder tap will push lines");
+            state.wefax_image = Some(handle);
+            // Decoder state intentionally NOT dropped here — same
+            // contract as `SetSstvImage`. Issue #877.
+        }
+
+        UiToDsp::ClearWefaxImage => {
+            tracing::info!("WEFAX image handle cleared — line writes silently discarded");
+            state.wefax_image = None;
+            // Decoder stays alive — mirrors `ClearSstvImage`. Issue #877.
+        }
+
         UiToDsp::ResetImagingDecoders => {
             // Between-pass reset for the auto-record flow when
             // the source stays open across pass boundaries
@@ -1540,6 +1595,28 @@ fn reset_imaging_decoders(state: &mut DspState) {
         );
     }
     state.sstv_pass_stats = SstvPassStats::default();
+
+    // WEFAX decoder reset: drop and re-init on next tap call so the
+    // next chart starts from a clean phasing-detection state.
+    // Mirrors the SSTV approach above — `WefaxDecoder` has no
+    // in-place `reset()`, so we reconstruct lazily. The
+    // `wefax_mono_buf` / `wefax_lines_buf` allocations are left in
+    // place (cleared/reused), and the `wefax_init_failed_at_rate`
+    // memo is cleared so the next source-start gets a fresh init
+    // attempt.
+    //
+    // Clear the shared image handle so stale rows from a mid-chart
+    // reset don't bleed into the next chart's live viewer. The
+    // handle itself survives (the DSP tap re-uses it if the user
+    // keeps the source running); only the in-flight buffer is
+    // wiped. Issue #877.
+    if let Some(handle) = state.wefax_image.as_ref() {
+        handle.clear();
+    }
+    state.wefax_decoder = None;
+    state.wefax_mono_buf.clear();
+    state.wefax_init_failed_at_rate = None;
+    state.wefax_last_state = None;
 }
 
 /// Read one block of IQ data from the source, process it, and send FFT data
@@ -1828,6 +1905,18 @@ fn process_iq_block(
                             // the active signal, so the other runs cheaply
                             // as a no-op pass through the correlator.
                             sstv_decode_tap(state, dsp_tx, audio_count);
+                        }
+
+                        // HF radiofax (WEFAX) decode tap (#877). WEFAX is
+                        // its own `DemodMode` (a locked-passband USB demod
+                        // over the 1500-2300 Hz fax subcarrier band) rather
+                        // than riding NFM like APT/SSTV, so this is a
+                        // separate gate rather than joining the NFM block
+                        // above.
+                        if audio_count > 0
+                            && state.radio.current_mode() == sdr_types::DemodMode::Wefax
+                        {
+                            wefax_decode_tap(state, dsp_tx, audio_count);
                         }
 
                         // Emit CTCSS sustained-gate edges for the UI

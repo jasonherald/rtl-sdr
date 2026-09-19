@@ -326,6 +326,27 @@ pub struct AppState {
     /// and `lrpt_recording_pass` — used by `is_recording()` and the
     /// LOS compare-and-clear guard. Per epic #472.
     pub sstv_recording_pass: RefCell<Option<(u32, chrono::DateTime<chrono::Utc>)>>,
+    /// Currently-open WEFAX chart viewer, or `None` when no viewer
+    /// is open. Same lifecycle pattern as `apt_viewer` / `sstv_viewer`.
+    /// Set by [`crate::wefax_viewer::open_wefax_viewer_if_needed`];
+    /// cleared by the window's `close-request` handler. Issue #877.
+    pub wefax_viewer: RefCell<Option<crate::wefax_viewer::WefaxImageView>>,
+    /// Weak handle to the open WEFAX viewer window. Cleared alongside
+    /// `wefax_viewer`. Weak so `AppState` doesn't keep the window
+    /// alive past its natural lifetime. Issue #877.
+    pub wefax_viewer_window: RefCell<Option<gtk4::glib::WeakRef<libadwaita::Window>>>,
+    /// Long-lived shared WEFAX image handle. Allocated once per
+    /// process; the DSP tap pushes decoded scan lines into it and
+    /// the viewer reads it. Cleared between charts by
+    /// `take_completed` inside the DSP tap. Issue #877.
+    pub wefax_image: sdr_radio::wefax_image::WefaxImage,
+    /// Completed WEFAX charts, pushed by the `DspToUi::WefaxImageComplete`
+    /// handler and drained by it in the same call to auto-save every
+    /// chart received during a session (Task 13) — mirrors
+    /// `sstv_completed_images` in shape, but WEFAX has no pass/AOS-LOS
+    /// concept to batch against, so this never holds more than the
+    /// just-arrived chart in practice. Issue #877.
+    pub wefax_completed_images: RefCell<Vec<sdr_radio::wefax_image::CompletedWefaxImage>>,
     /// ACARS toggle (mirrors persisted `acars_enabled`).
     pub acars_enabled: Cell<bool>,
     /// User-facing waterfall master toggle. Mirrors the persisted
@@ -572,6 +593,10 @@ impl AppState {
             sstv_completed_images: RefCell::new(Vec::new()),
             sstv_pending_export: RefCell::new(Vec::new()),
             sstv_recording_pass: RefCell::new(None),
+            wefax_viewer: RefCell::new(None),
+            wefax_viewer_window: RefCell::new(None),
+            wefax_image: sdr_radio::wefax_image::WefaxImage::new(),
+            wefax_completed_images: RefCell::new(Vec::new()),
             acars_enabled: Cell::new(false),
             // Default-on; loaded from config in `connect_display_panel`.
             waterfall_user_enabled: Cell::new(true),

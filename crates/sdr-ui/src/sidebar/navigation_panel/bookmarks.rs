@@ -246,6 +246,7 @@ pub fn demod_mode_to_string(mode: DemodMode) -> String {
         DemodMode::Cw => "CW",
         DemodMode::Raw => "RAW",
         DemodMode::Lrpt => "LRPT",
+        DemodMode::Wefax => "WEFAX",
     }
     .to_string()
 }
@@ -272,6 +273,10 @@ pub(super) fn string_to_demod_mode(s: &str) -> DemodMode {
         // user's catalog-driven LRPT tune. Mirrors the
         // serializer's `DemodMode::Lrpt => "LRPT"`.
         "LRPT" => DemodMode::Lrpt,
+        // Mirrors the LRPT fix above — a WEFAX bookmark must
+        // round-trip to `DemodMode::Wefax`, not fall through to
+        // the NFM default.
+        "WEFAX" => DemodMode::Wefax,
         // "NFM" and any unrecognized string default to NFM.
         _ => DemodMode::Nfm,
     }

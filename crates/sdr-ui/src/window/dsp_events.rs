@@ -17,7 +17,7 @@ use scanner_events::{
 };
 
 use super::{
-    AppState, DspToUi, Rc, RefCell, StatusBar, adw, apply_rtl_tcp_connection_state, glib,
+    AppState, DspToUi, Rc, RefCell, StatusBar, adw, apply_rtl_tcp_connection_state, gio, glib,
     handle_rtl_tcp_state_toast, header, plain_toast, sidebar, spectrum,
     update_bandwidth_reset_sensitivity, update_bandwidth_row_range_for_mode,
     update_vfo_reset_button_visibility,
@@ -55,6 +55,14 @@ pub(super) struct DspEventCtx {
     pub(super) pending_controller_busy_toasts: Rc<RefCell<Vec<glib::WeakRef<adw::Toast>>>>,
     pub(super) network_sink_status_row_weak: glib::WeakRef<adw::ActionRow>,
     pub(super) transcription_enable_row: adw::SwitchRow,
+    /// Resolves the current main window for
+    /// [`crate::wefax_viewer::open_wefax_viewer_if_needed`], called
+    /// from `on_demod_mode_changed` when the user selects WEFAX demod
+    /// mode. Same shape as the `parent_provider` closure `window.rs`
+    /// builds for the `app.wefax-open` action — rebuilt here rather
+    /// than shared because the action's copy is scoped to a `{ }`
+    /// block that ends before `DspEventCtx` is constructed.
+    pub(super) wefax_parent_provider: Rc<dyn Fn() -> Option<gtk4::Window>>,
     #[cfg(feature = "sherpa")]
     pub(super) auto_break_row: adw::SwitchRow,
     #[cfg(feature = "sherpa")]
@@ -130,6 +138,17 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
         DspToUi::OrbcommEvent(event) => on_orbcomm_event(ctx, &event),
         DspToUi::OrbcommChannelStats(ch_stats) => on_orbcomm_channel_stats(ctx, ch_stats),
         DspToUi::OrbcommEnabledChanged(enabled) => on_orbcomm_enabled_changed(ctx, enabled),
+        // WEFAX decode-tap plumbing (issue #877). Live viewer wiring
+        // landed in Task 12; chart auto-save landed in Task 13.
+        DspToUi::WefaxLineDecoded(line_index) => on_wefax_line_decoded(ctx, line_index),
+        DspToUi::WefaxImageComplete {
+            width,
+            height,
+            pixels,
+        } => {
+            on_wefax_image_complete(ctx, width, height, pixels);
+        }
+        DspToUi::WefaxState(wefax_state) => on_wefax_state(ctx, wefax_state),
     }
 }
 
@@ -422,6 +441,27 @@ fn on_iq_recording_stopped(ctx: &DspEventCtx) {
     }
 }
 
+/// Auto-open the WEFAX viewer when the user selects WEFAX demod mode.
+/// Split out of [`on_demod_mode_changed`] per the 50-NLOC gate (#817).
+///
+/// Without this, the viewer only ever opened via `Ctrl+Shift+F`
+/// (`app.wefax-open`) — and only that action sent
+/// `UiToDsp::SetWefaxImage`, which the decode tap needs to start
+/// pushing lines into the shared handle — so selecting WEFAX from the
+/// mode dropdown silently decoded nothing. Per whole-branch review
+/// (Critical). [`crate::wefax_viewer::open_wefax_viewer_if_needed`] is
+/// idempotent: it re-presents an already-open viewer rather than
+/// duplicating it. Deliberately NOT extended to any other mode.
+fn auto_open_wefax_viewer_on_mode_select(
+    new_mode: sdr_types::DemodMode,
+    parent_provider: &Rc<dyn Fn() -> Option<gtk4::Window>>,
+    state: &Rc<AppState>,
+) {
+    if new_mode == sdr_types::DemodMode::Wefax {
+        crate::wefax_viewer::open_wefax_viewer_if_needed(parent_provider, state);
+    }
+}
+
 /// `DspToUi::DemodModeChanged` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
 fn on_demod_mode_changed(ctx: &DspEventCtx, new_mode: sdr_types::DemodMode) {
@@ -431,6 +471,7 @@ fn on_demod_mode_changed(ctx: &DspEventCtx, new_mode: sdr_types::DemodMode) {
         toast_overlay_weak,
         radio_panel,
         transcription_enable_row,
+        wefax_parent_provider,
         ..
     } = ctx;
     #[cfg(feature = "sherpa")]
@@ -443,6 +484,8 @@ fn on_demod_mode_changed(ctx: &DspEventCtx, new_mode: sdr_types::DemodMode) {
         ..
     } = ctx;
     tracing::info!(?new_mode, "demod mode changed");
+
+    auto_open_wefax_viewer_on_mode_select(new_mode, wefax_parent_provider, state);
 
     // Re-run Auto Break row visibility rules with the new mode.
     // The row is only visible when the current mode is NFM AND an
@@ -721,6 +764,108 @@ fn on_sstv_image_complete(ctx: &DspEventCtx, width: u32, height: u32, pixels: Ve
         "SSTV image complete; {} in buffer",
         state.sstv_completed_images.borrow().len()
     );
+}
+
+/// `DspToUi::WefaxLineDecoded` arm of [`handle_dsp_message`], split
+/// out per the 50-NLOC gate (#817). Mirrors [`on_sstv_line_decoded`].
+fn on_wefax_line_decoded(ctx: &DspEventCtx, _line_index: u32) {
+    let DspEventCtx { state, .. } = ctx;
+    // A new WEFAX scan line has arrived — refresh the open viewer
+    // (if any) from the shared WefaxImage handle. When no viewer is
+    // open we silently drop, mirroring APT/SSTV semantics above.
+    if let Some(view) = state.wefax_viewer.borrow().as_ref() {
+        view.update_from_handle(&state.wefax_image.handle());
+    }
+}
+
+/// `DspToUi::WefaxImageComplete` arm of [`handle_dsp_message`], split
+/// out per the 50-NLOC gate (#817). Mirrors [`on_sstv_image_complete`].
+fn on_wefax_image_complete(ctx: &DspEventCtx, width: u32, height: u32, pixels: Vec<u8>) {
+    let DspEventCtx { state, .. } = ctx;
+    // The WEFAX decoder has closed out a full chart. We deliberately
+    // do NOT call `view.update_from_handle` here: by the time this
+    // message arrives the controller's tap has already called
+    // `WefaxImageHandle::take_completed`, which clears the in-flight
+    // pixel buffer for the next chart. The final row was already
+    // rendered by the previous `WefaxLineDecoded` refresh, so the
+    // viewer already shows the correct end state. Per CR round 3 on
+    // PR #599 (same rationale as the SSTV counterpart).
+    let completed = sdr_radio::wefax_image::CompletedWefaxImage {
+        width,
+        height,
+        pixels,
+    };
+    state.wefax_completed_images.borrow_mut().push(completed);
+    // Drain immediately and auto-save every accumulated chart (Task
+    // 13). WEFAX has no pass/AOS-LOS concept to batch against like
+    // APT/LRPT/SSTV, so each completed chart is saved as soon as it
+    // arrives — draining here is also what keeps
+    // `wefax_completed_images` from growing unbounded across a long
+    // session.
+    let pending: Vec<_> = state
+        .wefax_completed_images
+        .borrow_mut()
+        .drain(..)
+        .collect();
+    tracing::info!(
+        width,
+        height,
+        "WEFAX chart complete; auto-saving {} image(s)",
+        pending.len()
+    );
+    for image in pending {
+        save_wefax_png(image, chrono::Local::now());
+    }
+}
+
+/// Encode one completed WEFAX chart to PNG on a `gio::spawn_blocking`
+/// worker and log the outcome. Split out of [`on_wefax_image_complete`]
+/// to keep it under the 50-NLOC gate; mirrors how the SSTV auto-record
+/// path (`window::satellites::saves::save_sstv_batch`) keeps the
+/// CPU-heavy Cairo encode off the GTK main thread. Reuses the exact
+/// encoder the viewer's manual Export button calls
+/// ([`crate::wefax_viewer::write_wefax_gray_png`]) so the two save
+/// paths can never drift in pixel format.
+fn save_wefax_png(
+    image: sdr_radio::wefax_image::CompletedWefaxImage,
+    now: chrono::DateTime<chrono::Local>,
+) {
+    let path = sidebar::satellites_recorder::wefax_output_path(now);
+    gio::spawn_blocking(move || {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!("WEFAX auto-save: failed to create directory {parent:?}: {e}");
+            return;
+        }
+        match crate::wefax_viewer::write_wefax_gray_png(
+            &path,
+            &image.pixels,
+            image.width,
+            image.height,
+        ) {
+            Ok(()) => tracing::info!(
+                ?path,
+                width = image.width,
+                height = image.height,
+                "WEFAX chart auto-saved",
+            ),
+            Err(e) => tracing::warn!("WEFAX auto-save to {path:?} failed: {e}"),
+        }
+    });
+}
+
+/// `DspToUi::WefaxState` arm of [`handle_dsp_message`], split out
+/// per the 50-NLOC gate (#817).
+fn on_wefax_state(ctx: &DspEventCtx, wefax_state: sdr_dsp::wefax::WefaxState) {
+    let DspEventCtx { state, .. } = ctx;
+    // Decoder phase transition (Idle / Phasing / Imaging / Stopped).
+    // Surface it in the viewer's title subtitle so the user can see
+    // where the decoder is without reading `tracing::info!` in the
+    // journal. No-op when the viewer isn't open.
+    if let Some(view) = state.wefax_viewer.borrow().as_ref() {
+        view.set_state_label(wefax_state);
+    }
 }
 
 /// `DspToUi::SignalLevel` arm of [`handle_dsp_message`], split out per

@@ -6,7 +6,9 @@ use std::rc::Rc;
 use sdr_types::DemodMode;
 
 /// Display labels for each demodulation mode, in dropdown order.
-const DEMOD_LABELS: &[&str] = &["WFM", "NFM", "AM", "USB", "LSB", "DSB", "CW", "RAW", "LRPT"];
+const DEMOD_LABELS: &[&str] = &[
+    "WFM", "NFM", "AM", "USB", "LSB", "DSB", "CW", "RAW", "LRPT", "WEFAX",
+];
 
 /// Number of available demod modes.
 #[allow(clippy::cast_possible_truncation)]
@@ -23,6 +25,7 @@ const DEMOD_MODES: &[DemodMode] = &[
     DemodMode::Cw,
     DemodMode::Raw,
     DemodMode::Lrpt,
+    DemodMode::Wefax,
 ];
 
 /// Default demod mode index (WFM = 0).
@@ -59,7 +62,7 @@ pub fn build_demod_selector() -> (gtk4::DropDown, Rc<Cell<DemodMode>>) {
 /// Returns `None` if the mode is not in the list (should not happen).
 #[allow(clippy::cast_possible_truncation)]
 pub fn demod_mode_to_index(mode: DemodMode) -> Option<u32> {
-    // DEMOD_MODES has 8 entries — well within u32 range.
+    // DEMOD_MODES has a handful of entries — well within u32 range.
     DEMOD_MODES
         .iter()
         .position(|&m| m == mode)
@@ -125,5 +128,6 @@ mod tests {
         assert_eq!(demod_mode_label(DemodMode::Cw), "CW");
         assert_eq!(demod_mode_label(DemodMode::Raw), "RAW");
         assert_eq!(demod_mode_label(DemodMode::Lrpt), "LRPT");
+        assert_eq!(demod_mode_label(DemodMode::Wefax), "WEFAX");
     }
 }

@@ -26,4 +26,5 @@ pub mod stereo;
 pub mod taps;
 pub mod tone_detect;
 pub mod voice_squelch;
+pub mod wefax;
 pub mod window;

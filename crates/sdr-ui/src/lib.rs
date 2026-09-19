@@ -34,6 +34,7 @@ pub mod status_bar;
 pub(crate) mod test_util;
 pub mod ui_helpers;
 pub mod viewer;
+pub mod wefax_viewer;
 pub mod window;
 
 // Re-exports from sdr-core for backward compat with internal modules.
