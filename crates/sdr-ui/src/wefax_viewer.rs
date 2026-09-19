@@ -156,6 +156,12 @@ impl WefaxImageRenderer {
     /// `false` when nothing changed or on a surface error (logged,
     /// not propagated — a failed redraw shouldn't kill the UI).
     pub fn update_from_snapshot(&mut self, snap: WefaxSnapshot) -> bool {
+        if snap.width == 0 {
+            // `WefaxSnapshot` is public, so a caller could hand us a
+            // zero-width snapshot; `chunks_exact(0)` below would panic.
+            // There is nothing to render — drop it at the boundary.
+            return false;
+        }
         if snap.height < self.lines_written {
             // The shared buffer shrank — `WefaxImageHandle::take_completed`
             // reset it to start a new chart (or `clear()` reset it

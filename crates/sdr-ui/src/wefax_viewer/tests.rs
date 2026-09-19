@@ -184,6 +184,18 @@ fn paused_update_freezes_canvas_and_resume_resyncs() {
 }
 
 #[test]
+fn zero_width_snapshot_is_dropped_without_panic() {
+    // `WefaxSnapshot` is public, so a caller can supply width == 0.
+    // The renderer must drop it at the boundary rather than panic in
+    // `chunks_exact(0)`.
+    let mut r = WefaxImageRenderer::new();
+    let changed = r.update_from_snapshot(snap(0, 5));
+    assert!(!changed, "zero-width snapshot should be dropped, not rendered");
+    assert!(r.surface.is_none(), "no surface should be allocated for width 0");
+    assert_eq!(r.lines_written, 0);
+}
+
+#[test]
 fn wefax_state_label_maps_all_variants() {
     assert_eq!(wefax_state_label(WefaxState::Idle), "Idle");
     assert_eq!(wefax_state_label(WefaxState::Phasing), "Phasing");
