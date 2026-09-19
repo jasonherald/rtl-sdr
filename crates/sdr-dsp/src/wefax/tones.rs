@@ -11,9 +11,6 @@ const TONE_PRESENT_RATIO: f64 = 0.30;
 /// Consecutive on-tone blocks required to declare the tone present.
 const TONE_MIN_BLOCKS: u32 = 8;
 
-// Unused until Task 6 wires the sync state machine into `WefaxDecoder`;
-// exercised directly by the unit test below in the meantime.
-#[allow(dead_code)]
 pub(crate) struct ToneDetector {
     coeff: f64,
     q0: f64,
@@ -26,7 +23,7 @@ pub(crate) struct ToneDetector {
 
 // `BLOCK_LEN` (1024) is far below `f64`'s exact-integer range, so the
 // casts below never lose precision in practice.
-#[allow(dead_code, clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss)]
 impl ToneDetector {
     pub(crate) fn new(sr: f64, target_hz: f64) -> Self {
         let k = (target_hz / sr * BLOCK_LEN as f64).round();

@@ -37,5 +37,9 @@ fn free_running_line_geometry() {
         (lines as i64 - expected as i64).abs() <= 1,
         "≈{expected} lines, got {lines}"
     );
-    assert_eq!(out[0].pixels.len(), PIXELS_PER_LINE);
+    let bright = out[0].pixels.iter().filter(|&&p| p > 200).count();
+    assert!(
+        bright > PIXELS_PER_LINE / 2,
+        "white tone fills the scanline, got {bright} bright of {PIXELS_PER_LINE}"
+    );
 }

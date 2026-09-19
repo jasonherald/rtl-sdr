@@ -23,14 +23,10 @@ impl LineAssembler {
         }
     }
 
-    // Unused until the phasing/sync task wires phase correction and
-    // pixel-clock recovery into `WefaxDecoder`.
-    #[allow(dead_code)]
     pub(crate) fn set_column_offset(&mut self, cols: i32) {
         self.column_offset = cols;
     }
 
-    #[allow(dead_code)]
     pub(crate) fn set_samples_per_line(&mut self, spl: f64) {
         if spl > 1.0 {
             self.samples_per_line = spl;

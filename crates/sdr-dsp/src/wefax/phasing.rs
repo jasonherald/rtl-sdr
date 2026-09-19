@@ -7,13 +7,14 @@ use super::PIXELS_PER_LINE;
 /// Minimum phasing lines before the column offset is considered stable.
 const MIN_LINES_FOR_LOCK: usize = 6;
 
-/// Brightness threshold (0-255) above which a sample counts toward the
-/// phasing-pulse centroid; the pulse is near-white against a near-black line.
-const PULSE_BRIGHTNESS_THRESHOLD: u8 = 180;
+/// Brightness (0-255) at or above which a pixel counts as part of the
+/// phasing pulse; the pulse is near-white against a near-black line. Shared
+/// with `sync.rs` so the pulse-column search and the line-validity guard use
+/// one threshold and one (inclusive) comparison — otherwise a line whose
+/// brightest pixel is exactly this value passes the guard but finds no
+/// column, skewing the left-edge offset to column 0.
+pub(crate) const PULSE_BRIGHTNESS_THRESHOLD: u8 = 180;
 
-// Unused until Task 6 wires the sync state machine into `WefaxDecoder`;
-// exercised directly by the unit tests below in the meantime.
-#[allow(dead_code)]
 pub(crate) struct PhasingTracker {
     pulse_cols: Vec<f64>, // one detected pulse column per observed line
 }
@@ -23,7 +24,6 @@ pub(crate) struct PhasingTracker {
 // small non-negative pixel index, so these casts never lose precision or
 // sign in practice.
 #[allow(
-    dead_code,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
@@ -77,6 +77,6 @@ impl PhasingTracker {
 #[allow(clippy::cast_precision_loss, clippy::cast_lossless)]
 fn pulse_column(line: &[u8; PIXELS_PER_LINE]) -> f64 {
     line.iter()
-        .position(|&v| v > PULSE_BRIGHTNESS_THRESHOLD)
+        .position(|&v| v >= PULSE_BRIGHTNESS_THRESHOLD)
         .map_or(0.0, |c| c as f64)
 }

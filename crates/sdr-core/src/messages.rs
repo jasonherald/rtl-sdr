@@ -586,9 +586,10 @@ pub enum UiToDsp {
     /// decoded scan lines into it whenever the WEFAX decoder tap
     /// runs. Mirrors `SetSstvImage`. Issue #877.
     SetWefaxImage(sdr_radio::wefax_image::WefaxImageHandle),
-    /// Drop the shared WEFAX image handle. Sent when the live
-    /// viewer closes — the DSP decoder continues running (lines
-    /// are silently discarded) until the next source-stop.
+    /// Drop the shared WEFAX image handle. Reserved for explicit
+    /// teardown paths that must discard subsequent decoded lines.
+    /// Closing the live viewer does not send this command because
+    /// decoding and automatic chart saving continue in the background.
     /// Mirrors `ClearSstvImage`. Issue #877.
     ClearWefaxImage,
     /// Start sending audio to the transcription engine.

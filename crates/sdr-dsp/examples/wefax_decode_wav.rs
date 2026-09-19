@@ -1,10 +1,9 @@
 //! Offline WEFAX render harness (real-data gate): decode a WAV of USB fax
 //! audio into a greyscale PNG. Stereo is downmixed to mono.
 //!
-//! The decoder is free-running (no start-tone / phasing sync yet — that
-//! lands in a later task), so the rendered chart may be sheared or
-//! horizontally offset. This harness exists to prove the discriminator +
-//! line assembly produce recognizable chart structure from real audio.
+//! The decoder is free-running by default, so the rendered chart may be
+//! sheared or horizontally offset. Pass `--sync` for the sync-gated
+//! decoder, which locks the left edge and de-slants the chart.
 //!
 //! Usage:
 //!

@@ -27,6 +27,15 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tracing::warn;
 
+/// Hard cap on the number of scan lines a single WEFAX chart buffer may
+/// grow to. `SyncMachine` leaves the decoder in `Imaging` until it detects
+/// a stop tone; a chart that never receives one would otherwise grow the
+/// pixel buffer on every decoded line until allocation fails. A full NWS
+/// chart is ~1200 lines at 120 lpm, so 4000 lines (~33 min) is generous
+/// headroom while still bounding growth. Writes at or beyond this row index
+/// are dropped rather than reallocating the buffer.
+pub const MAX_WEFAX_LINES: u32 = 4000;
+
 /// Inner mutable state for the shared WEFAX image buffer.
 struct Inner {
     /// Pixel width of the current image (set on first `write_line`).
@@ -92,6 +101,11 @@ impl Inner {
     fn write_line(&mut self, line_index: u32, pixels: &[u8]) {
         if self.width == 0 {
             return; // `init_if_needed` wasn't called first; skip defensively.
+        }
+        if line_index >= MAX_WEFAX_LINES {
+            // Bound unbounded growth when a chart never receives a stop
+            // tone: drop the write rather than reallocating past the cap.
+            return;
         }
         self.grow_to(line_index);
         let w = self.width as usize;

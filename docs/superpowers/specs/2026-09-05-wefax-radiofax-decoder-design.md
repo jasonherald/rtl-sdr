@@ -194,7 +194,7 @@ New `DspState` fields (`wefax_decoder`, `wefax_mono_buf`,
 - `UiToDsp::SetWefaxImage(WefaxImageHandle)` / `UiToDsp::ClearWefaxImage`.
 - `DspToUi::WefaxLineDecoded(u32)`,
   `DspToUi::WefaxImageComplete { width: u32, height: u32, pixels: Vec<u8> }`,
-  `DspToUi::WefaxState(WefaxStateLabel)` for a status pill (Idle/Phasing/Imaging).
+  `DspToUi::WefaxState(WefaxState)` for a status pill (Idle/Phasing/Imaging).
 
 ### 6. `crates/sdr-ui/src/wefax_viewer.rs` — live viewer
 

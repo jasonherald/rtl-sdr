@@ -124,6 +124,26 @@ fn out_of_order_writes_grow_to_highest_row() {
     assert_eq!(snap.pixels[5 * W as usize], 1);
 }
 
+/// A write at or beyond `MAX_WEFAX_LINES` is dropped, so the buffer height
+/// never grows past the cap even when a chart never receives a stop tone.
+#[test]
+fn write_beyond_cap_does_not_grow_buffer() {
+    let img = WefaxImage::new();
+    let h = img.handle();
+    // A valid line just under the cap establishes width and grows the buffer.
+    h.write_line(MAX_WEFAX_LINES - 1, W, &row(50));
+    let before = h.snapshot().expect("snapshot after in-range write");
+    assert_eq!(before.height, MAX_WEFAX_LINES);
+    // A write at the cap (and beyond) must be dropped, leaving height capped.
+    h.write_line(MAX_WEFAX_LINES, W, &row(60));
+    h.write_line(MAX_WEFAX_LINES + 500, W, &row(70));
+    let after = h.snapshot().expect("snapshot after out-of-range writes");
+    assert_eq!(
+        after.height, MAX_WEFAX_LINES,
+        "height must not grow past MAX_WEFAX_LINES"
+    );
+}
+
 #[test]
 fn to_flat_gray_has_expected_length() {
     let img = WefaxImage::new();

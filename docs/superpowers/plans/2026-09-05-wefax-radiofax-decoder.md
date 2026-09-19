@@ -480,8 +480,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rate = spec.sample_rate;
     let raw: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => reader
-            .samples::<i32>()
-            .map(|s| s.map(|v| v as f32 / i32::MAX as f32))
+            .samples::<i16>()
+            .map(|s| s.map(|v| v as f32 / 32768.0))
             .collect::<Result<_, _>>()?,
         hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
     };
@@ -884,7 +884,7 @@ impl SyncMachine {
 }
 ```
 
-Wire into `WefaxDecoder`: replace the free-running body with the machine — call `sync.on_sample(b_f64)` each sample; on a finished line call `sync.on_line(&pixels, &mut assembler)` and only push to `out` when `Emit`, stamping `line.state = sync.state()`; add `pub fn take_chart_complete(&mut self) -> bool { self.sync.take_chart_complete() }`. Reset `line_index` to 0 when a chart completes.
+Wire into `WefaxDecoder`: replace the free-running body with the machine — call `sync.on_sample(sf)` each sample; on a finished line call `sync.on_line(&pixels, &mut assembler)` and only push to `out` when `Emit`, stamping `line.state = sync.state()`; add `pub fn take_chart_complete(&mut self) -> bool { self.sync.take_chart_complete() }`. Reset `line_index` to 0 when a chart completes.
 
 > **Robustness for the offline example:** add a `WefaxDecoder::new_free_running(rate)` constructor (state starts `Imaging`, no sync gating) so the example always renders even if a fixture lacks a clean preamble. The default `new` uses sync. Task 8 chooses per fixture.
 

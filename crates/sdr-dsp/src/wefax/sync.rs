@@ -3,14 +3,10 @@
 //! auto-segments charts on the stop tone.
 
 use super::assembly::LineAssembler;
-use super::phasing::PhasingTracker;
+use super::phasing::{PULSE_BRIGHTNESS_THRESHOLD, PhasingTracker};
 use super::tones::ToneDetector;
 use super::{START_TONE_HZ, STOP_TONE_HZ, WefaxState};
 
-/// Brightness (0-255) at or above which a pixel counts as part of the
-/// phasing pulse. A genuine phasing line is a narrow bright pulse against a
-/// near-black background.
-const PHASING_PULSE_BRIGHTNESS: u8 = 180;
 /// A phasing line is only observed when its bright-pixel count is nonzero
 /// but stays below this fraction of the line. A blank/silent line (no bright
 /// pixels) reports `pulse_column = 0.0`, and a saturated all-white line has
@@ -196,7 +192,7 @@ pub(crate) fn corrected_samples_per_line(sr: f64, slant_cols_per_line: f64) -> f
 fn is_phasing_pulse(line: &[u8; super::PIXELS_PER_LINE]) -> bool {
     let bright = line
         .iter()
-        .filter(|&&v| v >= PHASING_PULSE_BRIGHTNESS)
+        .filter(|&&v| v >= PULSE_BRIGHTNESS_THRESHOLD)
         .count();
     let max_bright = (super::PIXELS_PER_LINE as f64 * PHASING_MAX_BRIGHT_FRACTION) as usize;
     bright > 0 && bright < max_bright

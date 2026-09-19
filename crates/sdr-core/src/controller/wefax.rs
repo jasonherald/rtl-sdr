@@ -15,6 +15,11 @@ use sdr_dsp::wefax::PIXELS_PER_LINE;
 /// `sdr_dsp::apt::READY_QUEUE_CAP`.
 const WEFAX_LINES_BUF_CAP: usize = 8;
 
+/// Cadence, in decoded lines, of the throttled progress log. At 120 lpm
+/// this fires roughly once per 50 s so a live reception is visible in the
+/// logs without flooding at the per-line rate.
+const WEFAX_PROGRESS_LOG_INTERVAL_LINES: u32 = 100;
+
 /// HF radiofax decode tap. Lazy-inits the [`WefaxDecoder`] at the
 /// `RadioModule`'s current audio sample rate, downmixes the post-
 /// `radio.process` stereo audio block to mono, feeds the decoder,
@@ -104,10 +109,9 @@ fn emit_lines(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, produced: us
             #[allow(clippy::cast_possible_truncation)]
             handle.write_line(line.line_index, PIXELS_PER_LINE as u32, &line.pixels);
         }
-        // Throttled progress log (every 100th line ≈ once per 50 s at
-        // 120 lpm) so a live reception is visible in the logs without
-        // flooding at the per-line rate.
-        if line.line_index % 100 == 0 {
+        // Throttled progress log so a live reception is visible in the
+        // logs without flooding at the per-line rate.
+        if line.line_index % WEFAX_PROGRESS_LOG_INTERVAL_LINES == 0 {
             tracing::debug!(line = line.line_index, "WEFAX line decoded");
         }
         let _ = dsp_tx.send(DspToUi::WefaxLineDecoded(line.line_index));
