@@ -190,8 +190,14 @@ fn zero_width_snapshot_is_dropped_without_panic() {
     // `chunks_exact(0)`.
     let mut r = WefaxImageRenderer::new();
     let changed = r.update_from_snapshot(snap(0, 5));
-    assert!(!changed, "zero-width snapshot should be dropped, not rendered");
-    assert!(r.surface.is_none(), "no surface should be allocated for width 0");
+    assert!(
+        !changed,
+        "zero-width snapshot should be dropped, not rendered"
+    );
+    assert!(
+        r.surface.is_none(),
+        "no surface should be allocated for width 0"
+    );
     assert_eq!(r.lines_written, 0);
 }
 
