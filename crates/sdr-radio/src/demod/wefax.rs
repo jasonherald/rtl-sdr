@@ -189,20 +189,27 @@ mod tests {
 
     #[test]
     fn wefax_process_produces_audio() {
+        const AUDIO_PROBE_SAMPLES: usize = 1_000;
+        const AUDIO_SETTLE_SAMPLES: usize = 100;
+        const MIN_AUDIO_PEAK: f32 = 0.3;
+
         let mut demod = WefaxDemodulator::new().unwrap();
         // A tone at the tuned frequency (IF DC) — the published-frequency
         // case, which the +700 Hz offset maps to the 1900 Hz AF center
         // (in-passband). A 1900 Hz IF tone would map to 3800 Hz AF, outside
         // the locked 2400 Hz passband, so DC is the right probe.
-        let input = vec![Complex::new(1.0, 0.0); 1000];
-        let mut output = vec![Stereo::default(); 1000];
+        let input = vec![Complex::new(1.0, 0.0); AUDIO_PROBE_SAMPLES];
+        let mut output = vec![Stereo::default(); AUDIO_PROBE_SAMPLES];
         let count = demod.process(&input, &mut output).unwrap();
-        assert_eq!(count, 1000);
-        let peak = output[100..]
+        assert_eq!(count, AUDIO_PROBE_SAMPLES);
+        let peak = output[AUDIO_SETTLE_SAMPLES..]
             .iter()
             .map(|s| s.l.abs())
             .fold(0.0_f32, f32::max);
-        assert!(peak > 0.3, "WEFAX should produce audio, peak = {peak}");
+        assert!(
+            peak > MIN_AUDIO_PEAK,
+            "WEFAX should produce audio, peak = {peak}"
+        );
     }
 
     /// Estimate the dominant frequency of a real AF buffer by counting
