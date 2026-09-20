@@ -16,8 +16,10 @@
 //! tones the decoder depends on. Mirrors the `bandwidth_locked`
 //! pattern in `lrpt.rs`.
 
+use sdr_dsp::channel::FrequencyXlator;
 use sdr_dsp::demod::{SsbDemod, SsbMode};
 use sdr_dsp::loops::Agc;
+use sdr_dsp::wefax::SUBCARRIER_CENTER_HZ;
 use sdr_types::{Complex, DspError, Stereo};
 
 use super::{
@@ -41,9 +43,28 @@ const WEFAX_DEFAULT_BANDWIDTH: f64 = 2_400.0;
 /// dial frequencies.
 const WEFAX_SNAP_INTERVAL: f64 = 100.0;
 
+/// Pre-translation applied to the IF so tuning to the **published** fax
+/// frequency lands the subcarrier center at the decoder's expected
+/// [`SUBCARRIER_CENTER_HZ`] (1900 Hz), rather than requiring the operator
+/// to hand-tune the dial-offset convention (issue #911).
+///
+/// The published/assigned fax frequency is the subcarrier center in RF,
+/// so tuning to it places the subcarrier at IF DC (0 Hz). `SsbDemod(Usb)`
+/// then translates by `+bandwidth/2` (= `WEFAX_DEFAULT_BANDWIDTH/2` =
+/// 1200 Hz), which alone would leave the subcarrier at 1200 Hz AF — 700 Hz
+/// short of the decoder's 1900 Hz. This extra `+700 Hz` pre-shift closes
+/// that gap: IF DC → +700 (here) → +1900 (after the SSB translation). Any
+/// residual station/tuning error within a few hundred Hz is absorbed by
+/// the decoder's AFC.
+const WEFAX_SUBCARRIER_OFFSET: f64 = SUBCARRIER_CENTER_HZ - WEFAX_DEFAULT_BANDWIDTH / 2.0;
+
 /// WEFAX (radiofax) demodulator. A USB demod (`SsbDemod(Usb)`)
 /// with a locked passband sized to the fax subcarrier band.
 pub struct WefaxDemodulator {
+    /// Pre-translates the IF by [`WEFAX_SUBCARRIER_OFFSET`] so the
+    /// published-frequency subcarrier lands at 1900 Hz AF (#911).
+    xlator: FrequencyXlator,
+    xlator_buf: Vec<Complex>,
     demod: SsbDemod,
     agc: Agc,
     config: DemodConfig,
@@ -83,7 +104,10 @@ impl WefaxDemodulator {
             high_pass_allowed: false,
             squelch_allowed: false,
         };
+        let xlator = FrequencyXlator::from_hz(WEFAX_SUBCARRIER_OFFSET, WEFAX_IF_SAMPLE_RATE);
         Ok(Self {
+            xlator,
+            xlator_buf: Vec::new(),
             demod,
             agc,
             config,
@@ -101,8 +125,12 @@ impl Demodulator for WefaxDemodulator {
                 got: output.len(),
             });
         }
+        // Shift the IF so the published-frequency subcarrier (at IF DC)
+        // reaches the decoder's 1900 Hz center after the SSB demod (#911).
+        self.xlator_buf.resize(input.len(), Complex::default());
+        self.xlator.process(input, &mut self.xlator_buf)?;
         self.mono_buf.resize(input.len(), 0.0);
-        let count = self.demod.process(input, &mut self.mono_buf)?;
+        let count = self.demod.process(&self.xlator_buf, &mut self.mono_buf)?;
         super::process_with_agc_to_stereo(
             &mut self.agc,
             &self.mono_buf[..count],
@@ -169,5 +197,35 @@ mod tests {
             .map(|s| s.l.abs())
             .fold(0.0_f32, f32::max);
         assert!(peak > 0.3, "WEFAX should produce audio, peak = {peak}");
+    }
+
+    /// Estimate the dominant frequency of a real AF buffer by counting
+    /// zero crossings. Adequate for a clean single tone.
+    fn dominant_hz(af: &[f32], rate: f64) -> f64 {
+        let crossings = af
+            .windows(2)
+            .filter(|w| (w[0] <= 0.0 && w[1] > 0.0) || (w[0] >= 0.0 && w[1] < 0.0))
+            .count();
+        // full cycles = crossings / 2
+        (crossings as f64 / 2.0) / (af.len() as f64 / rate)
+    }
+
+    #[test]
+    fn subcarrier_at_published_freq_lands_at_1900hz() {
+        // The published/assigned fax frequency = the subcarrier CENTER in
+        // RF, so tuning to it puts the subcarrier at the IF DC (0 Hz). The
+        // decoder expects that center at SUBCARRIER_CENTER_HZ (1900 Hz), so
+        // the demod MUST map IF DC -> 1900 Hz AF. (Issue #911.)
+        let mut demod = WefaxDemodulator::new().unwrap();
+        // A DC complex input = a tone sitting exactly at the tuned freq.
+        let input = vec![Complex::new(1.0, 0.0); 24_000];
+        let mut output = vec![Stereo::default(); 24_000];
+        let count = demod.process(&input, &mut output).unwrap();
+        let af: Vec<f32> = output[2_000..count].iter().map(|s| s.l).collect();
+        let hz = dominant_hz(&af, WEFAX_AF_SAMPLE_RATE);
+        assert!(
+            (hz - 1_900.0).abs() < 120.0,
+            "IF-DC (published freq) must land at ~1900 Hz AF, got {hz:.0} Hz"
+        );
     }
 }
