@@ -112,14 +112,18 @@ pub fn next_window_start(station: &WefaxStation, now: DateTime<Utc>) -> Option<D
     let today = station
         .schedule
         .iter()
-        .map(|w| midnight + Duration::minutes(i64::from(w.start_min_utc)))
+        .filter_map(|w| midnight.checked_add_signed(Duration::minutes(i64::from(w.start_min_utc))))
         .filter(|&start| start >= now)
         .min();
     if let Some(start) = today {
         return Some(start);
     }
     let first = station.schedule.iter().map(|w| w.start_min_utc).min()?;
-    Some(midnight + Duration::days(1) + Duration::minutes(i64::from(first)))
+    // `checked_*` (not `+`): `DateTime + Duration` panics on range overflow,
+    // and this is a public fn over arbitrary `now`/`DailyWindow` inputs — a
+    // near-range-limit date must yield `None`, not panic. A candidate whose
+    // start overflows is likewise dropped by the `filter_map` above.
+    midnight.checked_add_signed(Duration::days(1) + Duration::minutes(i64::from(first)))
 }
 
 #[cfg(test)]
@@ -210,6 +214,28 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 9, 20, 6, 0, 1).unwrap();
         let next = next_window_start(&s, now).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 9, 21, 6, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn next_window_start_returns_none_at_range_limit_instead_of_panicking() {
+        // Public fn over arbitrary inputs: at chrono's last representable
+        // date the next-day wrap overflows. It must return None, not panic.
+        use chrono::NaiveDate;
+        let s = WefaxStation {
+            name: "TEST",
+            channels_hz: &[4_000_000],
+            lat_deg: 0.0,
+            lon_deg: 0.0,
+            schedule: &[DailyWindow {
+                start_min_utc: 0, // 0000Z — already past at noon, forcing the wrap
+                end_min_utc: 1,
+            }],
+        };
+        let now = NaiveDate::MAX.and_hms_opt(12, 0, 0).unwrap().and_utc();
+        assert!(
+            next_window_start(&s, now).is_none(),
+            "a range-limit wrap must return None rather than panic"
+        );
     }
 
     #[test]
