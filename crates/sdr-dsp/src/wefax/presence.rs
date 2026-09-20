@@ -2,7 +2,15 @@
 //!
 //! A Goertzel band-energy ratio over the 1500-2300 Hz subcarrier band vs
 //! out-of-band bins, with hysteresis. Used to pick a channel (auto-catch)
-//! and to keep static from ever starting an image. Pure; no I/O.
+//! and to reject broadband noise/static before starting an image. Pure; no
+//! I/O.
+//!
+//! This is a band-energy measure, not sweep-aware: it cannot distinguish a
+//! genuine FM-modulated fax subcarrier from a steady in-band tone/carrier, so
+//! a strong stationary carrier can still false-latch "present" in this v1.
+//! Sweep-aware discrimination, plus re-validating `PRESENT_RATIO`/`ON_BLOCKS`
+//! against more diverse real fixtures (the current constants were tuned
+//! against a single real NMF clip), are tracked in issue #914.
 
 use super::{SUBCARRIER_BLACK_HZ, SUBCARRIER_CENTER_HZ, SUBCARRIER_WHITE_HZ};
 
@@ -251,12 +259,28 @@ mod tests {
 
     #[test]
     fn brief_blip_does_not_trigger_but_sustained_does() {
-        let mut det = WefaxPresenceDetector::new(SR);
         // 0.1 s of fax then silence should NOT latch present (hysteresis).
+        let mut det = WefaxPresenceDetector::new(SR);
         let blip = drive(&mut det, 0.1, |i| {
             let t = i as f32 / SR as f32;
             (2.0 * PI * 1_900.0 * t).sin()
         });
         assert!(!blip, "a brief blip must not latch present");
+
+        // ~2 s of a valid in-band FM sweep (same corrected per-sample phase
+        // accumulator as `fax_subcarrier_sweep_is_present`) on a *fresh*
+        // detector SHOULD latch present, i.e. the "sustained does" half.
+        let mut det = WefaxPresenceDetector::new(SR);
+        let mut phase = 0.0f32;
+        let sustained = drive(&mut det, 2.0, |i| {
+            let t = i as f32 / SR as f32;
+            let inst = 1900.0 + 400.0 * (2.0 * PI * 2.0 * t).sin();
+            phase += 2.0 * PI * inst / SR as f32;
+            phase.sin()
+        });
+        assert!(
+            sustained,
+            "a sustained fax-band subcarrier must latch present"
+        );
     }
 }
