@@ -1639,7 +1639,7 @@ fn connect_sidebar_panels(
     connect_audio_panel(panels, state);
     connect_volume_persistence(panels, state, config, volume_button);
     connect_distance_estimator_persistence(panels, config);
-    connect_scanner_panel(panels, state, config, spectrum_handle);
+    connect_scanner_panel(panels, state, config, spectrum_handle, toast_overlay);
     let tune_to_satellite = build_tune_to_satellite(tune_ctx);
     register_tune_satellite_action(app, &tune_to_satellite);
 

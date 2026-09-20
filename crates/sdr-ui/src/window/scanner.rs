@@ -233,12 +233,53 @@ pub(super) fn connect_scanner_panel(
     state: &Rc<AppState>,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
+    toast_overlay: &adw::ToastOverlay,
 ) {
     let scanner = &panels.scanner;
 
-    wire_scanner_master_switch(panels, state, config, spectrum_handle, scanner);
+    wire_scanner_master_switch(
+        panels,
+        state,
+        config,
+        spectrum_handle,
+        scanner,
+        toast_overlay,
+    );
     wire_scanner_lockout_button(state, scanner);
     wire_scanner_timing_rows(panels, state, config, scanner);
+}
+
+/// Refuse to enable the scanner while WEFAX auto-catch is running:
+/// revert the switch and toast the user. Mirrors the other half of the
+/// mutex already enforced in `window::wefax::on_enable_toggled` (which
+/// refuses WEFAX-enable while the scanner is active) — that check alone
+/// left this direction unguarded, letting the scanner and WEFAX both
+/// drive the VFO at once. Per the final whole-branch review on #913.
+///
+/// Returns `true` when it refused (caller must return without
+/// dispatching `SetScannerEnabled` or touching the axis lock). The
+/// `suppress` guard is set around the programmatic `set_active(false)`
+/// so the resulting re-entrant `notify::active` is a no-op instead of
+/// recursing into a spurious disable dispatch — same idiom as
+/// `WefaxPanelHandles::suppress_switch_notify`.
+fn refuse_scanner_for_wefax(
+    sw: &gtk4::Switch,
+    state: &AppState,
+    toast_overlay: &adw::ToastOverlay,
+    suppress: &Rc<std::cell::Cell<bool>>,
+) -> bool {
+    if !state.wefax_enabled.get() {
+        return false;
+    }
+    suppress.set(true);
+    sw.set_active(false);
+    suppress.set(false);
+    let toast = adw::Toast::builder()
+        .title("Scanner is unavailable while WEFAX auto-catch is running")
+        .timeout(SCANNER_TOAST_TIMEOUT_SECS)
+        .build();
+    toast_overlay.add_toast(toast);
+    true
 }
 
 /// Master switch -> `SetScannerEnabled` (notify-driven so F8 / force-disable / DSP syncs all fire it).
@@ -249,6 +290,7 @@ fn wire_scanner_master_switch(
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     spectrum_handle: &Rc<spectrum::SpectrumHandle>,
     scanner: &sidebar::scanner_panel::ScannerPanel,
+    toast_overlay: &adw::ToastOverlay,
 ) {
     // Master switch → SetScannerEnabled. Using `connect_active_notify`
     // (not `connect_state_set`) so programmatic toggles fire too:
@@ -284,8 +326,23 @@ fn wire_scanner_master_switch(
     let config_for_switch = std::sync::Arc::clone(config);
     let spectrum_for_switch = Rc::clone(spectrum_handle);
     let display_axis_row = panels.display.scanner_axis_row.clone();
+    let toast_overlay_switch = toast_overlay.clone();
+    let suppress_wefax_conflict = Rc::new(std::cell::Cell::new(false));
     scanner.master_switch.connect_active_notify(move |sw| {
+        if suppress_wefax_conflict.get() {
+            return;
+        }
         let enabled = sw.is_active();
+        if enabled
+            && refuse_scanner_for_wefax(
+                sw,
+                &state_switch,
+                &toast_overlay_switch,
+                &suppress_wefax_conflict,
+            )
+        {
+            return;
+        }
         state_switch.send_dsp(UiToDsp::SetScannerEnabled(enabled));
         if enabled {
             // Compute envelope from the LIVE bookmark list so
