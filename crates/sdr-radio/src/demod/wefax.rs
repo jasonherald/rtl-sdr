@@ -155,7 +155,13 @@ impl Demodulator for WefaxDemodulator {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::cast_precision_loss, clippy::float_cmp)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
     use core::f32::consts::PI;
@@ -216,16 +222,20 @@ mod tests {
         // RF, so tuning to it puts the subcarrier at the IF DC (0 Hz). The
         // decoder expects that center at SUBCARRIER_CENTER_HZ (1900 Hz), so
         // the demod MUST map IF DC -> 1900 Hz AF. (Issue #911.)
+        // One second of samples, dropping the leading AGC/filter settling.
+        let samples = WEFAX_IF_SAMPLE_RATE as usize;
+        let settle = samples / 12; // ~2000 samples
+        let tolerance_hz = 120.0;
         let mut demod = WefaxDemodulator::new().unwrap();
         // A DC complex input = a tone sitting exactly at the tuned freq.
-        let input = vec![Complex::new(1.0, 0.0); 24_000];
-        let mut output = vec![Stereo::default(); 24_000];
+        let input = vec![Complex::new(1.0, 0.0); samples];
+        let mut output = vec![Stereo::default(); samples];
         let count = demod.process(&input, &mut output).unwrap();
-        let af: Vec<f32> = output[2_000..count].iter().map(|s| s.l).collect();
+        let af: Vec<f32> = output[settle..count].iter().map(|s| s.l).collect();
         let hz = dominant_hz(&af, WEFAX_AF_SAMPLE_RATE);
         assert!(
-            (hz - 1_900.0).abs() < 120.0,
-            "IF-DC (published freq) must land at ~1900 Hz AF, got {hz:.0} Hz"
+            (hz - SUBCARRIER_CENTER_HZ).abs() < tolerance_hz,
+            "IF-DC (published freq) must land at ~{SUBCARRIER_CENTER_HZ} Hz AF, got {hz:.0} Hz"
         );
     }
 }
