@@ -22,6 +22,7 @@ pub mod scanner_panel;
 pub mod server_panel;
 pub mod source_panel;
 pub mod transcript_panel;
+pub mod wefax_catcher;
 
 pub use activity_bar::{
     ActivityBar, ActivityBarEntry, ActivityBarSide, LEFT_ACTIVITIES, RIGHT_ACTIVITIES,
