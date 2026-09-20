@@ -50,17 +50,19 @@ const PRESENT_RATIO: f64 = 0.60;
 /// discriminator the ratio gate cannot provide once the SSB passband empties
 /// the out-of-band probes and drives the ratio to ~1.0 on any signal (#913).
 const PRESENT_PEAKINESS: f64 = 3.0;
-/// Consecutive on-blocks to latch present: ~1 s at 12 kHz
-/// (`BLOCK_LEN` / `SR` = 1024/12000 ≈ 85.3 ms/block, so 12 blocks ≈ 1.024 s).
-/// This is the primary noise-rejection mechanism (see `PRESENT_RATIO`): a
-/// real subcarrier holds a high ratio for many consecutive blocks, while
-/// noise's occasional high-ratio blocks essentially never chain to 12 in a
-/// row. This also keeps a brief blip (a birdie, a noise spike, a moment of
-/// another signal) from ever latching "present" on its own.
+/// Consecutive on-blocks to latch present. `BLOCK_LEN`/rate sets the wall
+/// time: ≈ 85 ms/block at the 12 kHz test rate (12 blocks ≈ 1.0 s), and
+/// ≈ 43 ms/block at the 24 kHz runtime AF rate ([`crate::wefax`] feeds the
+/// detector the WEFAX demod's 24 kHz audio), so 12 blocks ≈ 0.5 s live.
+/// This is a primary noise-rejection mechanism (with the tonality gate): a
+/// real subcarrier holds a high ratio + tonality for many consecutive
+/// blocks, while noise's occasional on-blocks essentially never chain to 12
+/// in a row. It also keeps a brief blip (a birdie, a noise spike, a moment
+/// of another signal) from ever latching "present" on its own.
 const ON_BLOCKS: u32 = 12;
-/// Consecutive off-blocks to drop present (~2 s at 12 kHz) — tolerates
-/// brief in-band dropouts (sync gaps, weak-signal fades) without
-/// unlatching a genuine fax signal.
+/// Consecutive off-blocks to drop present (≈ 1.9 s at 12 kHz, ≈ 0.9 s at the
+/// 24 kHz runtime rate) — tolerates brief in-band dropouts (sync gaps,
+/// weak-signal fades) without unlatching a genuine fax signal.
 const OFF_BLOCKS: u32 = 22;
 /// Out-of-band probes: below and above the fax band.
 const OUT_BAND_HZ: [f64; 2] = [700.0, 3_200.0];

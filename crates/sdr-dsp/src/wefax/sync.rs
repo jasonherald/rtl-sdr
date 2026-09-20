@@ -26,6 +26,14 @@ const PHASING_MAX_BRIGHT_FRACTION: f64 = 0.15;
 /// too-bright *and* a too-scattered line are excluded (#913).
 const PHASING_MIN_RUN_CONCENTRATION: f64 = 0.5;
 
+/// Absolute floor (pixels) on the longest contiguous bright run. Without it,
+/// a line with only 1-2 stray bright pixels trivially satisfies the
+/// [`PHASING_MIN_RUN_CONCENTRATION`] ratio (`longest_run ≥ 0.5·bright` holds
+/// for any run when `bright ≤ 2`) and would count as a pulse. A real phasing
+/// bar is ~90 px (~5% of the 1809-px line), so an 8-px floor rejects stray
+/// specks while leaving an enormous margin below any genuine bar (#913).
+const PHASING_MIN_RUN_PX: usize = 8;
+
 /// Consecutive phasing-pulse lines that, seen while Idle, enter Phasing
 /// without an audio start tone. Real WEFAX carries no 300 Hz audio start
 /// tone — the "300 Hz start" is the black/white keying rate of the
@@ -221,7 +229,8 @@ fn is_phasing_pulse(line: &[u8; super::PIXELS_PER_LINE]) -> bool {
     if fraction >= PHASING_MAX_BRIGHT_FRACTION {
         return false;
     }
-    longest_run as f64 >= PHASING_MIN_RUN_CONCENTRATION * bright as f64
+    longest_run >= PHASING_MIN_RUN_PX
+        && longest_run as f64 >= PHASING_MIN_RUN_CONCENTRATION * bright as f64
 }
 
 #[cfg(test)]
@@ -273,6 +282,16 @@ mod tests {
     #[test]
     fn flooded_white_line_is_not_a_phasing_pulse() {
         assert!(!is_phasing_pulse(&[250u8; PIXELS_PER_LINE]));
+    }
+
+    #[test]
+    fn tiny_stray_bright_run_is_not_a_phasing_pulse() {
+        // A 2-px bright run trivially passes the concentration ratio
+        // (longest_run ≥ 0.5·bright), so the absolute min-run floor is what
+        // rejects it. Real phasing bars are ~90 px.
+        assert!(!is_phasing_pulse(&dark_with_pulse(300, 2)));
+        // ...and a bar at the floor is accepted.
+        assert!(is_phasing_pulse(&dark_with_pulse(300, PHASING_MIN_RUN_PX)));
     }
 
     #[test]
