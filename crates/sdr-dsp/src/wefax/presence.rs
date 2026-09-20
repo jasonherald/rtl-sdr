@@ -12,18 +12,29 @@ const BLOCK_LEN: usize = 1024;
 /// The ratio is computed from *mean* power per probe bin (see
 /// `mean_power`), not summed, so a flat/noise spectrum centers near 0.5
 /// rather than being biased toward "in-band" purely by having more
-/// in-band probes (5) than out-of-band ones (2). 0.80 was chosen against
-/// real recorded white noise (`tests/wefax_presence.rs`): a single
-/// Goertzel block's power estimate is noisy even for true white noise
-/// (occasional blocks exceed 0.75), so the threshold needs enough margin
-/// that two *consecutive* blocks (`ON_BLOCKS`) essentially never both
-/// clear it by chance, while a real subcarrier clears it repeatedly.
-const PRESENT_RATIO: f64 = 0.80;
-/// Consecutive on-blocks to latch present. Kept low (2 blocks, ~170 ms at
-/// 12 kHz) because `PRESENT_RATIO` already does the heavy discrimination;
-/// a real subcarrier holds this ratio for many consecutive blocks, while
-/// noise essentially never clears it twice in a row.
-const ON_BLOCKS: u32 = 2;
+/// in-band probes (5) than out-of-band ones (2).
+///
+/// 0.60 was picked empirically against real recorded audio
+/// (`tests/wefax_presence.rs`), by scanning per-block ratio traces from a
+/// real ~12 s NMF fax capture and a real ~12 s recorded white-noise clip and
+/// choosing the threshold that maximizes the joint margin between (a) the
+/// longest run of consecutive on-ratio blocks in the noise trace and (b) the
+/// longest such run in the fax trace, relative to `ON_BLOCKS`: at 0.60 the
+/// real fax audio sustains a 20-block run (vs. the 12 required), while real
+/// and synthetic noise never exceed a 6-block run — an 8-block and 6-block
+/// margin respectively. A single 1024-sample Goertzel block's power estimate
+/// is noisy even for true white noise (any individual block can spike high),
+/// but real FM-modulated fax content holds a high ratio far more
+/// consistently than noise's occasional spikes can chain together.
+const PRESENT_RATIO: f64 = 0.60;
+/// Consecutive on-blocks to latch present: ~1 s at 12 kHz
+/// (`BLOCK_LEN` / `SR` = 1024/12000 ≈ 85.3 ms/block, so 12 blocks ≈ 1.024 s).
+/// This is the primary noise-rejection mechanism (see `PRESENT_RATIO`): a
+/// real subcarrier holds a high ratio for many consecutive blocks, while
+/// noise's occasional high-ratio blocks essentially never chain to 12 in a
+/// row. This also keeps a brief blip (a birdie, a noise spike, a moment of
+/// another signal) from ever latching "present" on its own.
+const ON_BLOCKS: u32 = 12;
 /// Consecutive off-blocks to drop present (~2 s at 12 kHz) — tolerates
 /// brief in-band dropouts (sync gaps, weak-signal fades) without
 /// unlatching a genuine fax signal.
@@ -201,11 +212,18 @@ mod tests {
     #[test]
     fn fax_subcarrier_sweep_is_present() {
         // FM sweep between black(1500) and white(2300), the fax subcarrier.
+        // Phase is accumulated per-sample (phase += 2*pi*inst/SR) rather than
+        // computed as `2*pi*inst*t`, which is NOT a valid FM integral: the
+        // instantaneous frequency of sin(2*pi*inst(t)*t) is inst + t*inst'(t),
+        // not inst(t), so it drifts increasingly out of band as t grows. The
+        // accumulator form's instantaneous frequency is exactly `inst`.
         let mut det = WefaxPresenceDetector::new(SR);
+        let mut phase = 0.0f32;
         let present = drive(&mut det, 3.0, |i| {
             let t = i as f32 / SR as f32;
             let inst = 1900.0 + 400.0 * (2.0 * PI * 2.0 * t).sin(); // sweeps 1500..2300
-            (2.0 * PI * inst * t).sin()
+            phase += 2.0 * PI * inst / SR as f32;
+            phase.sin()
         });
         assert!(present, "a fax-band FM subcarrier must read as present");
     }
