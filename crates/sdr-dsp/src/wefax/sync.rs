@@ -7,12 +7,24 @@ use super::phasing::{PULSE_BRIGHTNESS_THRESHOLD, PhasingTracker};
 use super::tones::ToneDetector;
 use super::{START_TONE_HZ, STOP_TONE_HZ, WefaxState};
 
-/// A phasing line is only observed when its bright-pixel count is nonzero
-/// but stays below this fraction of the line. A blank/silent line (no bright
-/// pixels) reports `pulse_column = 0.0`, and a saturated all-white line has
-/// its leading bright edge at column 0 — either would drag the median column
-/// offset and slant lock toward the left edge, so both are skipped.
-const PHASING_MAX_BRIGHT_FRACTION: f64 = 0.5;
+/// A phasing line's bright-pixel count must stay below this fraction of the
+/// line. A blank/silent line (no bright pixels) reports `pulse_column = 0.0`,
+/// and a saturated all-white line has its leading bright edge at column 0 —
+/// either would drag the median column offset and slant lock toward the left
+/// edge. Tightened from the original 0.5 to reject a *noise* line: broadband
+/// noise leaves ~30-50% of the line bright, well above a real phasing pulse's
+/// ~5% narrow white bar, so the old `< 50%` guard let noise masquerade as
+/// phasing and lock imaging onto static (#913 no-static hardening).
+const PHASING_MAX_BRIGHT_FRACTION: f64 = 0.15;
+
+/// The single longest contiguous bright run must hold at least this fraction
+/// of *all* the line's bright pixels for it to count as a phasing pulse. A
+/// real pulse is one contiguous white bar (ratio ≈ 1.0); broadband noise
+/// scatters its bright pixels into many 1-2 px runs (ratio ≈ 0), so this
+/// rejects noise even on the rare block whose bright fraction dips below
+/// [`PHASING_MAX_BRIGHT_FRACTION`]. Paired with the fraction guard so both a
+/// too-bright *and* a too-scattered line are excluded (#913).
+const PHASING_MIN_RUN_CONCENTRATION: f64 = 0.5;
 
 /// Consecutive phasing-pulse lines that, seen while Idle, enter Phasing
 /// without an audio start tone. Real WEFAX carries no 300 Hz audio start
@@ -181,19 +193,90 @@ pub(crate) fn corrected_samples_per_line(sr: f64, slant_cols_per_line: f64) -> f
     base - slant * (base / super::PIXELS_PER_LINE as f64)
 }
 
-/// True when a line looks like a genuine phasing pulse: at least one bright
-/// pixel, but fewer than half the line bright (rejecting a flooded/white
-/// line whose leading edge would falsely lock the offset at column 0).
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
+/// True when a line looks like a genuine phasing pulse: a *narrow*
+/// ([`PHASING_MAX_BRIGHT_FRACTION`]) run of bright pixels *concentrated* in a
+/// single contiguous bar ([`PHASING_MIN_RUN_CONCENTRATION`]). The narrowness
+/// guard rejects a flooded/white line and a half-bright noise line; the
+/// concentration guard rejects a sparse-but-scattered noise line whose bright
+/// pixels never form a dominant run. Together they keep the phasing lock from
+/// ever engaging on broadband noise (#913 no-static hardening).
+#[allow(clippy::cast_precision_loss)]
 fn is_phasing_pulse(line: &[u8; super::PIXELS_PER_LINE]) -> bool {
-    let bright = line
-        .iter()
-        .filter(|&&v| v >= PULSE_BRIGHTNESS_THRESHOLD)
-        .count();
-    let max_bright = (super::PIXELS_PER_LINE as f64 * PHASING_MAX_BRIGHT_FRACTION) as usize;
-    bright > 0 && bright < max_bright
+    let mut bright = 0usize;
+    let mut longest_run = 0usize;
+    let mut run = 0usize;
+    for &v in line {
+        if v >= PULSE_BRIGHTNESS_THRESHOLD {
+            bright += 1;
+            run += 1;
+            longest_run = longest_run.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    if bright == 0 {
+        return false;
+    }
+    let fraction = bright as f64 / super::PIXELS_PER_LINE as f64;
+    if fraction >= PHASING_MAX_BRIGHT_FRACTION {
+        return false;
+    }
+    longest_run as f64 >= PHASING_MIN_RUN_CONCENTRATION * bright as f64
+}
+
+#[cfg(test)]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+mod tests {
+    use super::*;
+    use crate::wefax::PIXELS_PER_LINE;
+
+    /// A mostly-dark line with one contiguous bright run — a real pulse.
+    fn dark_with_pulse(start: usize, width: usize) -> [u8; PIXELS_PER_LINE] {
+        let mut l = [10u8; PIXELS_PER_LINE];
+        for px in l.iter_mut().skip(start).take(width) {
+            *px = 250;
+        }
+        l
+    }
+
+    /// Bright pixels scattered every `step` columns (1-px runs) — a noise line.
+    fn scattered_bright(step: usize) -> [u8; PIXELS_PER_LINE] {
+        let mut l = [10u8; PIXELS_PER_LINE];
+        for (i, px) in l.iter_mut().enumerate() {
+            if i % step == 0 {
+                *px = 250;
+            }
+        }
+        l
+    }
+
+    #[test]
+    fn narrow_contiguous_pulse_is_a_phasing_pulse() {
+        // The canonical WEFAX phasing pulse: ~5% of the line, one run.
+        assert!(is_phasing_pulse(&dark_with_pulse(300, 90)));
+    }
+
+    #[test]
+    fn half_bright_scattered_noise_is_not_a_phasing_pulse() {
+        // ~33% bright, scattered into 1-px runs. The old `< 50%` guard passed
+        // this; it must not lock imaging onto noise.
+        assert!(!is_phasing_pulse(&scattered_bright(3)));
+    }
+
+    #[test]
+    fn sparse_scattered_bright_is_not_a_phasing_pulse() {
+        // ~10% bright — below any narrowness fraction — but with no dominant
+        // contiguous run, so the concentration gate still rejects it.
+        assert!(!is_phasing_pulse(&scattered_bright(10)));
+    }
+
+    #[test]
+    fn flooded_white_line_is_not_a_phasing_pulse() {
+        assert!(!is_phasing_pulse(&[250u8; PIXELS_PER_LINE]));
+    }
+
+    #[test]
+    fn blank_line_is_not_a_phasing_pulse() {
+        assert!(!is_phasing_pulse(&[10u8; PIXELS_PER_LINE]));
+    }
 }
