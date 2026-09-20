@@ -202,11 +202,24 @@ struct Pipeline {
     demod: WefaxDemodulator,
     free_dec: WefaxDecoder,
     sync_dec: WefaxDecoder,
+    source_rate: u32,
     iq_chunk: Vec<Complex>,
     if_buf: Vec<Complex>,
     stereo_buf: Vec<Stereo>,
     mono: Vec<f32>,
     line_buf: Vec<WefaxLine>,
+}
+
+/// Output capacity the resampler can produce from `input_len` complex input
+/// samples at `source_rate`, targeting [`WEFAX_IF_RATE`]. Ceil division plus
+/// one: when `source_rate < WEFAX_IF_RATE` the resampler up-samples (output
+/// larger than input), so sizing `if_buf` to the input length would overrun
+/// with `DspError::BufferTooSmall`. For the intended 2.5/10 MHz captures this
+/// down-samples and stays well under `CHUNK_FRAMES`, but the harness accepts
+/// any rate.
+fn if_capacity(input_len: usize, source_rate: u32) -> usize {
+    let num = input_len as u64 * u64::from(WEFAX_IF_RATE);
+    num.div_ceil(u64::from(source_rate)) as usize + 1
 }
 
 impl Pipeline {
@@ -220,8 +233,9 @@ impl Pipeline {
             demod: WefaxDemodulator::new()?,
             free_dec: WefaxDecoder::new_free_running(WEFAX_IF_RATE),
             sync_dec: WefaxDecoder::new(WEFAX_IF_RATE)?,
+            source_rate,
             iq_chunk: Vec::with_capacity(CHUNK_FRAMES),
-            if_buf: vec![Complex::default(); CHUNK_FRAMES],
+            if_buf: vec![Complex::default(); if_capacity(CHUNK_FRAMES, source_rate)],
             stereo_buf: vec![Stereo::default(); CHUNK_FRAMES],
             mono: Vec::with_capacity(CHUNK_FRAMES),
             line_buf: vec![WefaxLine::default(); READY_QUEUE_CAP],
@@ -270,8 +284,9 @@ impl Pipeline {
     /// frames (resampler internal buffering) is a no-op, not an error.
     fn process_chunk(&mut self, accum: &mut DecodeAccum) -> Result<(), Box<dyn std::error::Error>> {
         let iq_len = self.iq_chunk.len();
-        if self.if_buf.len() < iq_len {
-            self.if_buf.resize(iq_len, Complex::default());
+        let need = if_capacity(iq_len, self.source_rate);
+        if self.if_buf.len() < need {
+            self.if_buf.resize(need, Complex::default());
         }
         let if_n = self.resampler.process(&self.iq_chunk, &mut self.if_buf)?;
         if if_n == 0 {
