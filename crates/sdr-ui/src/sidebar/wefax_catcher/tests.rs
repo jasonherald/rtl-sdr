@@ -39,6 +39,11 @@ const TEST_INACTIVE_WINDOW: WefaxStation = WefaxStation {
     }],
 };
 
+/// Margin (in ticks) beyond `IDLE_LOCK_TIMEOUT_TICKS` used to prove a
+/// phasing-seen lock holds well past that short timeout. Arbitrary — just
+/// needs to be > 0 and clear of the timeout boundary itself.
+const POST_IDLE_TIMEOUT_MARGIN_TICKS: u32 = 4;
+
 #[test]
 fn enable_snapshots_tune_and_starts_scanning() {
     let mut c = WefaxCatcher::new();
@@ -315,9 +320,11 @@ fn default_impl_matches_new() {
 /// hang in `Locked` forever. Since the decoder never reaches `Phasing`
 /// either, the much shorter `IDLE_LOCK_TIMEOUT_TICKS` timeout resumes
 /// scanning at the NEXT candidate, rather than the full `LOCK_MAX_TICKS`
-/// ceiling.
+/// ceiling. (This exercises the never-phasing / `IDLE_LOCK_TIMEOUT_TICKS`
+/// path specifically — see `locked_holds_to_lock_max_ticks_boundary_once_phasing_seen`
+/// for the phasing-seen / `LOCK_MAX_TICKS` boundary.)
 #[test]
-fn locked_hard_ceiling_resumes_at_next_candidate() {
+fn locked_never_phasing_resumes_at_idle_timeout() {
     let mut c = WefaxCatcher::new();
     c.tick(ctx(true, false, WefaxState::Idle)); // Scanning idx0
     c.tick(ctx(true, true, WefaxState::Idle)); // Locked idx0, waited0
@@ -423,12 +430,61 @@ fn locked_holds_past_idle_timeout_once_phasing_seen() {
     // Then back to Idle (e.g. a brief re-detect gap) for well past
     // IDLE_LOCK_TIMEOUT_TICKS more ticks — must still be Locked, holding
     // toward LOCK_MAX_TICKS instead.
-    for _ in 0..(IDLE_LOCK_TIMEOUT_TICKS + 4) {
+    for _ in 0..(IDLE_LOCK_TIMEOUT_TICKS + POST_IDLE_TIMEOUT_MARGIN_TICKS) {
         c.tick(ctx(true, true, WefaxState::Idle));
     }
     assert!(
         matches!(c.state(), CatcherState::Locked { .. }),
         "must hold toward LOCK_MAX_TICKS once phasing has been observed"
+    );
+}
+
+/// #914: once phasing has been observed, the lock holds toward the full
+/// `LOCK_MAX_TICKS` ceiling and rescans at EXACTLY that boundary tick — not
+/// one tick early or late. Counterpart to
+/// `locked_never_phasing_resumes_at_idle_timeout`, which pins the same
+/// exact-boundary behavior for the shorter `IDLE_LOCK_TIMEOUT_TICKS` path.
+#[test]
+fn locked_holds_to_lock_max_ticks_boundary_once_phasing_seen() {
+    let mut c = WefaxCatcher::new();
+    c.tick(ctx(true, false, WefaxState::Idle)); // Scanning idx0
+    c.tick(ctx(true, true, WefaxState::Idle)); // Locked idx0, waited=0
+    let (start_idx, next) = match c.state() {
+        CatcherState::Locked {
+            candidates, idx, ..
+        } => (*idx, candidates[(idx + 1) % candidates.len()].clone()),
+        other => panic!("expected Locked, got {other:?}"),
+    };
+
+    // One tick actually phasing: sets `saw_phasing`, switching the ceiling
+    // to LOCK_MAX_TICKS starting with this very tick (waited 0 -> 1).
+    c.tick(ctx(true, true, WefaxState::Phasing));
+
+    // Drop back to Idle (carrier holds, no further phasing) for the rest of
+    // the ceiling: must stay Locked through tick LOCK_MAX_TICKS - 1.
+    for _ in 0..(LOCK_MAX_TICKS - 2) {
+        c.tick(ctx(true, true, WefaxState::Idle));
+        assert!(
+            matches!(c.state(), CatcherState::Locked { .. }),
+            "must not rescan before LOCK_MAX_TICKS"
+        );
+    }
+    match c.state() {
+        CatcherState::Locked { idx, .. } => assert_eq!(*idx, start_idx),
+        other => panic!("expected Locked, got {other:?}"),
+    }
+
+    // The tick that reaches LOCK_MAX_TICKS rescans to the NEXT candidate,
+    // not index 0.
+    let acts = c.tick(ctx(true, true, WefaxState::Idle));
+    assert!(matches!(c.state(), CatcherState::Scanning { .. }));
+    assert_eq!(
+        acts,
+        vec![
+            Action::ResetDecoder,
+            Action::Tune(next.freq_hz),
+            Action::SetDemodMode,
+        ]
     );
 }
 
