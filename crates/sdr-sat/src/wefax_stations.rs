@@ -99,23 +99,24 @@ pub fn is_active(station: &WefaxStation, now: DateTime<Utc>) -> bool {
         .any(|w| m >= w.start_min_utc && m < w.end_min_utc)
 }
 
-/// The next window START at or after `now` (wrapping to tomorrow). A
-/// window starting at exactly the current minute counts as "now" and is
-/// returned, rather than skipped to tomorrow.
+/// The next window START at or after `now` (wrapping to tomorrow). The
+/// comparison is against the full `now` instant, not just its minute: a
+/// window whose start is at or after `now` to the second is returned; one
+/// whose minute has already begun this second (e.g. a 0600 start when
+/// `now` is 06:00:01) is treated as past and skipped.
 #[must_use]
 pub fn next_window_start(station: &WefaxStation, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let m = minute_of_day(now);
     let midnight = Utc
         .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
         .single()?;
     let today = station
         .schedule
         .iter()
-        .map(|w| w.start_min_utc)
-        .filter(|&s| s >= m)
+        .map(|w| midnight + Duration::minutes(i64::from(w.start_min_utc)))
+        .filter(|&start| start >= now)
         .min();
-    if let Some(s) = today {
-        return Some(midnight + Duration::minutes(i64::from(s)));
+    if let Some(start) = today {
+        return Some(start);
     }
     let first = station.schedule.iter().map(|w| w.start_min_utc).min()?;
     Some(midnight + Duration::days(1) + Duration::minutes(i64::from(first)))
@@ -189,6 +190,26 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 9, 20, 6, 0, 0).unwrap();
         let next = next_window_start(&s, now).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 9, 20, 6, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn next_window_start_skips_a_start_already_past_this_minute() {
+        // One second past a 0600Z start: the minute has begun, so that
+        // window is past and the next start is tomorrow's 0600Z — proves
+        // the comparison is second-accurate, not minute-granular.
+        let s = WefaxStation {
+            name: "TEST",
+            channels_hz: &[4_000_000],
+            lat_deg: 0.0,
+            lon_deg: 0.0,
+            schedule: &[DailyWindow {
+                start_min_utc: 360, // 0600Z
+                end_min_utc: 720,
+            }],
+        };
+        let now = Utc.with_ymd_and_hms(2026, 9, 20, 6, 0, 1).unwrap();
+        let next = next_window_start(&s, now).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 9, 21, 6, 0, 0).unwrap());
     }
 
     #[test]
