@@ -347,6 +347,39 @@ pub struct AppState {
     /// concept to batch against, so this never holds more than the
     /// just-arrived chart in practice. Issue #877.
     pub wefax_completed_images: RefCell<Vec<sdr_radio::wefax_image::CompletedWefaxImage>>,
+    /// Pure WEFAX auto-catch state machine (epic #913, Task 6). Ticked
+    /// by `window::wefax::spawn_wefax_tick` every ~500 ms while
+    /// `wefax_enabled` is set; each `Action` it returns is run through
+    /// `window::wefax::interpret_wefax_action`.
+    pub wefax_catcher: RefCell<crate::sidebar::wefax_catcher::WefaxCatcher>,
+    /// Whether WEFAX auto-catch is toggled on. Mirrors the panel's
+    /// Decode switch; the tick driver reads this each tick and, on
+    /// the on-to-off edge, lets the catcher's `go_idle` restore the
+    /// snapshotted tune before the driver's timer breaks.
+    pub wefax_enabled: Cell<bool>,
+    /// Guards against spawning a second `glib::timeout_add_local` tick
+    /// loop if the enable switch is flipped off and back on before the
+    /// prior loop's final (restore) tick has run.
+    pub wefax_tick_armed: Cell<bool>,
+    /// Latest decoder phase from `DspToUi::WefaxState`, fed into the
+    /// next `TickCtx` so the catcher can see the `Locked -> Imaging`
+    /// and `Imaging -> Stopped` transitions it drives off of.
+    pub wefax_last_state: Cell<sdr_core::messages::WefaxState>,
+    /// Latest edge-triggered fax-subcarrier presence from
+    /// `DspToUi::WefaxPresence`, fed into the next `TickCtx`.
+    pub wefax_present: Cell<bool>,
+    /// The user's tune snapshotted at auto-catch enable time. Held
+    /// constant while enabled and handed to every `TickCtx` — the
+    /// catcher's own `go_idle`/false-lock/presence-loss paths restore
+    /// from their own captured copy, but this is the value a fresh
+    /// `Idle -> Scanning` transition snapshots from.
+    pub wefax_saved_tune: RefCell<crate::sidebar::wefax_catcher::SavedTune>,
+    /// Runtime handles for the docked WEFAX activity panel (epic
+    /// #913). Stashed by `crate::window::wefax::connect_wefax_panel`
+    /// so the `DspToUi::WefaxState` handler and the tick driver can
+    /// update the status label / read the station combo without
+    /// re-walking the widget tree. Mirrors `orbcomm_panel_handles`.
+    pub wefax_panel_handles: RefCell<Option<Rc<crate::sidebar::wefax_panel::WefaxPanelHandles>>>,
     /// ACARS toggle (mirrors persisted `acars_enabled`).
     pub acars_enabled: Cell<bool>,
     /// User-facing waterfall master toggle. Mirrors the persisted
@@ -597,6 +630,13 @@ impl AppState {
             wefax_viewer_window: RefCell::new(None),
             wefax_image: sdr_radio::wefax_image::WefaxImage::new(),
             wefax_completed_images: RefCell::new(Vec::new()),
+            wefax_catcher: RefCell::new(crate::sidebar::wefax_catcher::WefaxCatcher::new()),
+            wefax_enabled: Cell::new(false),
+            wefax_tick_armed: Cell::new(false),
+            wefax_last_state: Cell::new(sdr_core::messages::WefaxState::Idle),
+            wefax_present: Cell::new(false),
+            wefax_saved_tune: RefCell::new(crate::sidebar::wefax_catcher::SavedTune::default()),
+            wefax_panel_handles: RefCell::new(None),
             acars_enabled: Cell::new(false),
             // Default-on; loaded from config in `connect_display_panel`.
             waterfall_user_enabled: Cell::new(true),

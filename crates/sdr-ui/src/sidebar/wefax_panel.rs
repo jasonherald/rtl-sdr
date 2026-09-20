@@ -44,6 +44,9 @@ fn build_enable_group() -> (adw::PreferencesGroup, gtk4::Switch) {
         .subtitle("Scan receivable stations and decode a chart automatically")
         .build();
     enable_row.add_suffix(&enable_switch);
+    // Clicking anywhere on the row toggles the switch, not just the
+    // switch itself. Per Task 5 minor / Task 6 fold-in (epic #913).
+    enable_row.set_activatable_widget(Some(&enable_switch));
     let enable_group = adw::PreferencesGroup::new();
     enable_group.add(&enable_row);
     (enable_group, enable_switch)
