@@ -10,7 +10,7 @@
 //! Idle ──(enable)──▶ Scanning ──(fax_present)──▶ Locked ──(Imaging)──▶ Imaging
 //!   ▲                   ▲                            │                    │
 //!   │                   └──(false-lock timeout)───────┘                    │
-//!   │                   └──(presence loss mid-image)────────────────────────┘
+//!   │                   └──(sustained presence loss mid-image)─────────────┘
 //!   └──(disable, from any state)
 //! ```
 //!
@@ -27,6 +27,12 @@ use std::path::PathBuf;
 pub const SCAN_DWELL_TICKS: u32 = 3;
 /// Ticks a Locked channel may go without imaging before it's a false lock.
 pub const LOCK_TIMEOUT_TICKS: u32 = 10;
+/// Ticks of *continuous* presence loss during `Imaging` before it's treated
+/// as a real signal loss rather than a brief subcarrier dip (e.g. over a
+/// blank/white image region) and falls back to `Scanning`. A single missed
+/// tick must NOT abort an in-progress chart — that's the exact output this
+/// feature exists to produce.
+pub const IMAGING_LOSS_TICKS: u32 = 5;
 
 /// Which station(s) to scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -129,6 +135,9 @@ pub enum CatcherState {
         cand: Candidate,
         /// The user's tune, to restore on disable.
         saved: SavedTune,
+        /// Ticks of continuous presence loss seen so far (debounced against
+        /// [`IMAGING_LOSS_TICKS`] before falling back to `Scanning`).
+        lost: u32,
     },
 }
 
@@ -162,7 +171,7 @@ impl WefaxCatcher {
     pub fn tick(&mut self, ctx: TickCtx) -> Vec<Action> {
         // Disable from any active state -> restore + Idle.
         if !ctx.enabled {
-            return self.go_idle(&ctx);
+            return self.go_idle();
         }
         match std::mem::replace(&mut self.state, CatcherState::Idle) {
             CatcherState::Idle => self.on_idle(&ctx),
@@ -177,19 +186,33 @@ impl WefaxCatcher {
                 waited,
                 saved,
             } => self.on_locked(&ctx, cand, waited, saved),
-            CatcherState::Imaging { cand, saved } => self.on_imaging(&ctx, cand, saved),
+            CatcherState::Imaging { cand, saved, lost } => self.on_imaging(&ctx, cand, saved, lost),
         }
     }
 
     // --- per-state helpers (each ≤ ~44 NLOC) ---
 
-    fn go_idle(&mut self, ctx: &TickCtx) -> Vec<Action> {
-        let was_active = !matches!(self.state, CatcherState::Idle);
+    /// The tune snapshot captured when auto-catch entered its current
+    /// active state (if any). Restoring from this — rather than from
+    /// whatever `TickCtx::saved_tune` happens to carry on the disabling
+    /// tick — keeps the machine self-contained: it always restores the
+    /// tune it captured at enable time, not a value the caller must
+    /// remember to keep supplying unchanged.
+    fn captured_saved(state: &CatcherState) -> Option<SavedTune> {
+        match state {
+            CatcherState::Idle => None,
+            CatcherState::Scanning { saved, .. }
+            | CatcherState::Locked { saved, .. }
+            | CatcherState::Imaging { saved, .. } => Some(saved.clone()),
+        }
+    }
+
+    fn go_idle(&mut self) -> Vec<Action> {
+        let captured = Self::captured_saved(&self.state);
         self.state = CatcherState::Idle;
-        if was_active {
-            vec![Action::RestoreTune(ctx.saved_tune.clone())]
-        } else {
-            Vec::new()
+        match captured {
+            Some(saved) => vec![Action::RestoreTune(saved)],
+            None => Vec::new(),
         }
     }
 
@@ -208,11 +231,18 @@ impl WefaxCatcher {
             .map(|(s, _)| *s)
             .filter(matches_choice)
             .collect();
-        stations.sort_by_key(|s| !Self::is_active_now(s, ctx.now_min));
+        Self::sort_schedule_active_first(&mut stations, ctx.now_min);
         stations
             .into_iter()
             .flat_map(Self::station_candidates)
             .collect()
+    }
+
+    /// Stable-sort so schedule-active-at-`now_min` stations come first;
+    /// inactive stations stay in the rotation (stable order preserved among
+    /// ties) as fallback rather than being dropped.
+    fn sort_schedule_active_first(stations: &mut [&'static WefaxStation], now_min: u16) {
+        stations.sort_by_key(|s| !Self::is_active_now(s, now_min));
     }
 
     /// Whether `s` is broadcasting at `now_min` (minute-of-day UTC).
@@ -237,7 +267,23 @@ impl WefaxCatcher {
             .collect()
     }
 
+    /// Enter `Scanning` fresh, snapshotting `ctx.saved_tune` as the tune to
+    /// restore later. Only called when the *previous* state was `Idle`
+    /// (i.e. a real user-facing enable) — internal resume-scanning paths
+    /// use [`Self::resume_scanning`] instead, to preserve the tune already
+    /// captured at the original enable.
     fn on_idle(&mut self, ctx: &TickCtx) -> Vec<Action> {
+        self.start_scanning(ctx, ctx.saved_tune.clone())
+    }
+
+    /// Resume scanning from a fresh candidate rotation, preserving a
+    /// `saved` tune already captured by an earlier state (false-lock
+    /// timeout, or presence loss during `Imaging`).
+    fn resume_scanning(&mut self, ctx: &TickCtx, saved: SavedTune) -> Vec<Action> {
+        self.start_scanning(ctx, saved)
+    }
+
+    fn start_scanning(&mut self, ctx: &TickCtx, saved: SavedTune) -> Vec<Action> {
         let candidates = Self::build_candidates(ctx);
         if candidates.is_empty() {
             self.state = CatcherState::Idle;
@@ -248,7 +294,7 @@ impl WefaxCatcher {
             candidates,
             idx: 0,
             dwell: 0,
-            saved: ctx.saved_tune.clone(),
+            saved,
         };
         Self::tune_actions(&first)
     }
@@ -306,12 +352,17 @@ impl WefaxCatcher {
         saved: SavedTune,
     ) -> Vec<Action> {
         if matches!(ctx.wefax_state, WefaxState::Imaging) {
-            self.state = CatcherState::Imaging { cand, saved };
+            self.state = CatcherState::Imaging {
+                cand,
+                saved,
+                lost: 0,
+            };
             return vec![Action::OpenViewer];
         }
         if !ctx.fax_present && waited + 1 >= LOCK_TIMEOUT_TICKS {
-            // False lock — resume scanning from a fresh rotation.
-            return self.on_idle(ctx);
+            // False lock — resume scanning, preserving the originally
+            // captured tune.
+            return self.resume_scanning(ctx, saved);
         }
         self.state = CatcherState::Locked {
             cand,
@@ -321,7 +372,13 @@ impl WefaxCatcher {
         Vec::new()
     }
 
-    fn on_imaging(&mut self, ctx: &TickCtx, cand: Candidate, saved: SavedTune) -> Vec<Action> {
+    fn on_imaging(
+        &mut self,
+        ctx: &TickCtx,
+        cand: Candidate,
+        saved: SavedTune,
+        lost: u32,
+    ) -> Vec<Action> {
         if matches!(ctx.wefax_state, WefaxState::Stopped) {
             // Chart complete: save; STAY on this working channel (->
             // Locked, waiting for the next chart on the same frequency).
@@ -333,10 +390,24 @@ impl WefaxCatcher {
             return vec![Action::SavePng(PathBuf::new())];
         }
         if !ctx.fax_present {
-            // Signal loss mid-image -> back to scanning.
-            return self.on_idle(ctx);
+            // Debounce: a brief subcarrier dip (e.g. over a blank/white
+            // image region) must not abort an in-progress chart. Only a
+            // *sustained* loss falls back to scanning.
+            if lost + 1 >= IMAGING_LOSS_TICKS {
+                return self.resume_scanning(ctx, saved);
+            }
+            self.state = CatcherState::Imaging {
+                cand,
+                saved,
+                lost: lost + 1,
+            };
+            return Vec::new();
         }
-        self.state = CatcherState::Imaging { cand, saved };
+        self.state = CatcherState::Imaging {
+            cand,
+            saved,
+            lost: 0,
+        };
         Vec::new()
     }
 }
@@ -349,191 +420,4 @@ impl Default for WefaxCatcher {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    fn ctx(enabled: bool, present: bool, wefax: WefaxState) -> TickCtx {
-        TickCtx {
-            enabled,
-            choice: StationChoice::Auto,
-            user_lat: 30.0,
-            user_lon: -90.0,
-            now_min: 0, // ticks are sample-free; monotone counter
-            wefax_state: wefax,
-            fax_present: present,
-            saved_tune: SavedTune::default(),
-        }
-    }
-
-    #[test]
-    fn enable_snapshots_tune_and_starts_scanning() {
-        let mut c = WefaxCatcher::new();
-        let acts = c.tick(ctx(true, false, WefaxState::Idle));
-        assert!(matches!(c.state(), CatcherState::Scanning { .. }));
-        // first candidate tuned + mode set + decoder reset
-        assert!(acts.iter().any(|a| matches!(a, Action::Tune(_))));
-        assert!(acts.iter().any(|a| matches!(a, Action::SetDemodMode)));
-        assert!(acts.iter().any(|a| matches!(a, Action::ResetDecoder)));
-    }
-
-    #[test]
-    fn presence_on_a_channel_locks_it() {
-        let mut c = WefaxCatcher::new();
-        c.tick(ctx(true, false, WefaxState::Idle)); // -> Scanning
-        // let the dwell elapse with no signal would advance; now signal appears
-        let _ = c.tick(ctx(true, true, WefaxState::Idle));
-        assert!(matches!(c.state(), CatcherState::Locked { .. }));
-    }
-
-    #[test]
-    fn locked_transitions_to_imaging_and_opens_viewer() {
-        let mut c = WefaxCatcher::new();
-        c.tick(ctx(true, false, WefaxState::Idle));
-        c.tick(ctx(true, true, WefaxState::Idle)); // Locked
-        let acts = c.tick(ctx(true, true, WefaxState::Imaging));
-        assert!(matches!(c.state(), CatcherState::Imaging { .. }));
-        assert!(acts.iter().any(|a| matches!(a, Action::OpenViewer)));
-    }
-
-    #[test]
-    fn imaging_then_complete_saves_and_stays() {
-        let mut c = WefaxCatcher::new();
-        c.tick(ctx(true, false, WefaxState::Idle));
-        c.tick(ctx(true, true, WefaxState::Idle)); // Locked
-        c.tick(ctx(true, true, WefaxState::Imaging)); // Imaging (viewer opens)
-        let acts = c.tick(ctx(true, true, WefaxState::Stopped)); // complete
-        assert!(acts.iter().any(|a| matches!(a, Action::SavePng(_))));
-        // stays on the working channel (not back to a fresh scan rotation)
-        assert!(matches!(
-            c.state(),
-            CatcherState::Locked { .. } | CatcherState::Imaging { .. }
-        ));
-    }
-
-    #[test]
-    fn disable_restores_tune_and_idles() {
-        let mut c = WefaxCatcher::new();
-        c.tick(ctx(true, false, WefaxState::Idle));
-        let acts = c.tick(ctx(false, false, WefaxState::Idle));
-        assert!(acts.iter().any(|a| matches!(a, Action::RestoreTune(_))));
-        assert!(matches!(c.state(), CatcherState::Idle));
-    }
-
-    #[test]
-    fn disable_while_already_idle_is_a_noop() {
-        let mut c = WefaxCatcher::new();
-        let acts = c.tick(ctx(false, false, WefaxState::Idle));
-        assert!(acts.is_empty());
-        assert!(matches!(c.state(), CatcherState::Idle));
-    }
-
-    #[test]
-    fn false_lock_times_out_back_to_scanning() {
-        let mut c = WefaxCatcher::new();
-        c.tick(ctx(true, false, WefaxState::Idle));
-        c.tick(ctx(true, true, WefaxState::Idle)); // Locked
-        // presence drops and stays down past the lock timeout, no imaging
-        for _ in 0..=LOCK_TIMEOUT_TICKS {
-            c.tick(ctx(true, false, WefaxState::Idle));
-        }
-        assert!(matches!(c.state(), CatcherState::Scanning { .. }));
-    }
-
-    #[test]
-    fn locked_without_presence_increments_waited_before_timeout() {
-        let mut c = WefaxCatcher::new();
-        c.tick(ctx(true, false, WefaxState::Idle));
-        c.tick(ctx(true, true, WefaxState::Idle)); // Locked, waited=0
-        c.tick(ctx(true, false, WefaxState::Idle)); // waited=1
-        match c.state() {
-            CatcherState::Locked { waited, .. } => assert_eq!(*waited, 1),
-            other => panic!("expected Locked, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn presence_loss_mid_imaging_returns_to_scanning() {
-        let mut c = WefaxCatcher::new();
-        c.tick(ctx(true, false, WefaxState::Idle));
-        c.tick(ctx(true, true, WefaxState::Idle)); // Locked
-        c.tick(ctx(true, true, WefaxState::Imaging)); // Imaging
-        let acts = c.tick(ctx(true, false, WefaxState::Imaging)); // signal drops mid-image
-        assert!(matches!(c.state(), CatcherState::Scanning { .. }));
-        assert!(acts.iter().any(|a| matches!(a, Action::Tune(_))));
-    }
-
-    #[test]
-    fn dwell_advances_to_next_candidate_after_dwell_ticks() {
-        let mut c = WefaxCatcher::new();
-        c.tick(ctx(true, false, WefaxState::Idle)); // enable -> Scanning idx0
-        let first_freq = match c.state() {
-            CatcherState::Scanning {
-                candidates, idx, ..
-            } => candidates[*idx].freq_hz,
-            other => panic!("expected Scanning, got {other:?}"),
-        };
-        let mut acts = Vec::new();
-        for _ in 0..SCAN_DWELL_TICKS {
-            acts = c.tick(ctx(true, false, WefaxState::Idle));
-        }
-        match c.state() {
-            CatcherState::Scanning {
-                candidates,
-                idx,
-                dwell,
-                ..
-            } => {
-                assert_eq!(*dwell, 0);
-                assert_ne!(candidates[*idx].freq_hz, first_freq);
-            }
-            other => panic!("expected Scanning, got {other:?}"),
-        }
-        assert!(acts.iter().any(|a| matches!(a, Action::Tune(_))));
-    }
-
-    #[test]
-    fn scanning_dwell_increments_without_retune_before_elapsed() {
-        let mut c = WefaxCatcher::new();
-        c.tick(ctx(true, false, WefaxState::Idle)); // -> Scanning idx0 dwell0
-        let acts = c.tick(ctx(true, false, WefaxState::Idle)); // dwell1, no retune (SCAN_DWELL_TICKS=3)
-        assert!(!acts.iter().any(|a| matches!(a, Action::Tune(_))));
-        match c.state() {
-            CatcherState::Scanning { idx, dwell, .. } => {
-                assert_eq!(*idx, 0);
-                assert_eq!(*dwell, 1);
-            }
-            other => panic!("expected Scanning, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn empty_rotation_no_candidates_toasts_and_stays_idle() {
-        let mut c = WefaxCatcher::new();
-        let mut tctx = ctx(true, false, WefaxState::Idle);
-        tctx.choice = StationChoice::Pinned("Nonexistent Station");
-        let acts = c.tick(tctx);
-        assert!(matches!(c.state(), CatcherState::Idle));
-        assert!(acts.iter().any(|a| matches!(a, Action::Toast(_))));
-    }
-
-    #[test]
-    fn pinned_choice_filters_candidates_to_one_station() {
-        let mut c = WefaxCatcher::new();
-        let mut tctx = ctx(true, false, WefaxState::Idle);
-        tctx.choice = StationChoice::Pinned("NMG New Orleans");
-        c.tick(tctx);
-        match c.state() {
-            CatcherState::Scanning { candidates, .. } => {
-                assert!(!candidates.is_empty());
-                assert!(candidates.iter().all(|c| c.station == "NMG New Orleans"));
-            }
-            other => panic!("expected Scanning, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn default_impl_matches_new() {
-        let c = WefaxCatcher::default();
-        assert!(matches!(c.state(), CatcherState::Idle));
-    }
-}
+mod tests;
