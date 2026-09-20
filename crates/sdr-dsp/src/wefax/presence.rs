@@ -1,16 +1,19 @@
 //! Fax-subcarrier presence detector: is a WEFAX signal on this channel?
 //!
-//! A Goertzel band-energy ratio over the 1500-2300 Hz subcarrier band vs
-//! out-of-band bins, with hysteresis. Used to pick a channel (auto-catch)
-//! and to reject broadband noise/static before starting an image. Pure; no
-//! I/O.
+//! Two Goertzel measures over the 1500-2300 Hz subcarrier band, both gated by
+//! hysteresis: an in-band/out-of-band **energy ratio**, and a **tonality**
+//! (peakiness) test. Used to pick a channel (auto-catch) and to reject
+//! broadband *and* SSB-passband-shaped noise/static before starting an image.
+//! Pure; no I/O.
 //!
-//! This is a band-energy measure, not sweep-aware: it cannot distinguish a
-//! genuine FM-modulated fax subcarrier from a steady in-band tone/carrier, so
-//! a strong stationary carrier can still false-latch "present" in this v1.
-//! Sweep-aware discrimination, plus re-validating `PRESENT_RATIO`/`ON_BLOCKS`
-//! against more diverse real fixtures (the current constants were tuned
-//! against a single real NMF clip), are tracked in issue #914.
+//! The ratio alone is not enough on a live channel: the WEFAX SSB passband
+//! empties the out-of-band probes, so the ratio reads ~1.0 on *anything* in
+//! the band, including flat noise. The tonality test (see [`PRESENT_PEAKINESS`])
+//! is what actually separates a real FM fax subcarrier — a single tone whose
+//! energy concentrates at one probe — from flat band noise, which spreads
+//! energy evenly. The one case tonality does *not* reject is a steady in-band
+//! carrier/birdie (also tonal); that remains a v1 limitation tracked in #914,
+//! along with re-validating the constants against more diverse real fixtures.
 
 use super::{SUBCARRIER_BLACK_HZ, SUBCARRIER_CENTER_HZ, SUBCARRIER_WHITE_HZ};
 
@@ -35,6 +38,18 @@ const BLOCK_LEN: usize = 1024;
 /// but real FM-modulated fax content holds a high ratio far more
 /// consistently than noise's occasional spikes can chain together.
 const PRESENT_RATIO: f64 = 0.60;
+/// Minimum spectral peakiness (strongest in-band probe ÷ mean in-band probe)
+/// for a block to count as "fax". A real FM fax subcarrier puts nearly all
+/// its energy at one instantaneous frequency, so one of the five in-band
+/// probes dominates (peakiness ~3.5+ on real NMF audio); flat band noise
+/// spreads energy evenly across the probes, so its peakiness sits at the
+/// flat-spectrum statistical baseline (~2.3 for five bins, and lower for
+/// evenly band-limited noise). 3.0 sits in the gap: real NMF fax clears it on
+/// 40-60% of blocks (enough to chain [`ON_BLOCKS`]), while broadband *and*
+/// SSB-passband-shaped noise clear it on <10%, never chaining. This is the
+/// discriminator the ratio gate cannot provide once the SSB passband empties
+/// the out-of-band probes and drives the ratio to ~1.0 on any signal (#913).
+const PRESENT_PEAKINESS: f64 = 3.0;
 /// Consecutive on-blocks to latch present: ~1 s at 12 kHz
 /// (`BLOCK_LEN` / `SR` = 1024/12000 ≈ 85.3 ms/block, so 12 blocks ≈ 1.024 s).
 /// This is the primary noise-rejection mechanism (see `PRESENT_RATIO`): a
@@ -102,6 +117,21 @@ impl Goertzel {
 fn mean_power(bins: &mut [Goertzel]) -> f64 {
     let sum: f64 = bins.iter_mut().map(Goertzel::take_power).sum();
     sum / bins.len() as f64
+}
+
+/// Mean *and* max per-bin power across a probe group, draining each bin's
+/// accumulator. The max/mean ratio is the block's spectral peakiness (see
+/// [`PRESENT_PEAKINESS`]).
+#[allow(clippy::cast_precision_loss)]
+fn mean_and_max_power(bins: &mut [Goertzel]) -> (f64, f64) {
+    let mut sum = 0.0;
+    let mut max = 0.0_f64;
+    for b in bins.iter_mut() {
+        let p = b.take_power();
+        sum += p;
+        max = max.max(p);
+    }
+    (sum / bins.len() as f64, max)
 }
 
 /// Hysteresis-gated fax-subcarrier presence detector.
@@ -174,11 +204,20 @@ impl WefaxPresenceDetector {
         // Mean power per probe bin, not summed: an unweighted sum would bias
         // the ratio toward "in-band" purely from having more in-band probes
         // (5) than out-of-band probes (2), even for a flat (noise) spectrum.
-        let in_mean: f64 = mean_power(&mut self.in_band);
+        let (in_mean, in_max) = mean_and_max_power(&mut self.in_band);
         let out_mean: f64 = mean_power(&mut self.out_band);
         let total = in_mean + out_mean;
         let ratio = if total > 1e-12 { in_mean / total } else { 0.0 };
-        if ratio >= PRESENT_RATIO {
+        // Tonality gate: a real fax subcarrier is a single moving tone (one
+        // probe dominates), flat noise is not. Required on top of the ratio
+        // because the SSB passband empties the out-of-band probes on a live
+        // channel, so the ratio alone reads ~1.0 on passband-shaped noise.
+        let peakiness = if in_mean > 1e-12 {
+            in_max / in_mean
+        } else {
+            0.0
+        };
+        if ratio >= PRESENT_RATIO && peakiness >= PRESENT_PEAKINESS {
             self.on_streak += 1;
             self.off_streak = 0;
             if self.on_streak >= ON_BLOCKS {
@@ -220,6 +259,12 @@ mod tests {
     #[test]
     fn fax_subcarrier_sweep_is_present() {
         // FM sweep between black(1500) and white(2300), the fax subcarrier.
+        // The sweep is slow (0.2 Hz) so the tone is quasi-stationary over one
+        // ~85 ms Goertzel block — matching real fax, which dwells at black/
+        // white across large image regions and so reads as a coherent tone
+        // (high tonality) per block. A fast sweep would smear the tone across
+        // several probes within a single block and under-read the tonality
+        // gate ([`PRESENT_PEAKINESS`]), which real fax does not.
         // Phase is accumulated per-sample (phase += 2*pi*inst/SR) rather than
         // computed as `2*pi*inst*t`, which is NOT a valid FM integral: the
         // instantaneous frequency of sin(2*pi*inst(t)*t) is inst + t*inst'(t),
@@ -229,7 +274,7 @@ mod tests {
         let mut phase = 0.0f32;
         let present = drive(&mut det, 3.0, |i| {
             let t = i as f32 / SR as f32;
-            let inst = 1900.0 + 400.0 * (2.0 * PI * 2.0 * t).sin(); // sweeps 1500..2300
+            let inst = 1900.0 + 400.0 * (2.0 * PI * 0.2 * t).sin(); // sweeps 1500..2300
             phase += 2.0 * PI * inst / SR as f32;
             phase.sin()
         });
@@ -258,6 +303,40 @@ mod tests {
     }
 
     #[test]
+    fn passband_shaped_noise_is_absent() {
+        // Band-limited *flat* noise that fills the fax subcarrier band: its
+        // in/out energy ratio reads ~1.0 (the out-of-band probes see nothing),
+        // so it sails through the ratio-only gate — this is exactly the live
+        // "SSB passband noise" that made the catcher hang on "Signal found"
+        // with nothing to draw. It is spectrally flat across the band (no
+        // dominant tone), so the tonality gate must read it ABSENT. Modeled as
+        // ~60 closely-spaced, random-phase sinusoids spanning 1450-2350 Hz.
+        const N_TONES: usize = 60;
+        let freqs: [f32; N_TONES] =
+            std::array::from_fn(|k| 1450.0 + 900.0 * k as f32 / (N_TONES as f32 - 1.0));
+        let mut seed = 0x9E37_79B9u32;
+        let phases: [f32; N_TONES] = std::array::from_fn(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 23) as f32 * PI
+        });
+        let scale = (N_TONES as f32).sqrt();
+        let mut det = WefaxPresenceDetector::new(SR);
+        let present = drive(&mut det, 3.0, |i| {
+            let t = i as f32 / SR as f32;
+            let s: f32 = freqs
+                .iter()
+                .zip(&phases)
+                .map(|(&f, &p)| (2.0 * PI * f * t + p).sin())
+                .sum();
+            s / scale
+        });
+        assert!(
+            !present,
+            "flat band-limited (passband-shaped) noise must read absent"
+        );
+    }
+
+    #[test]
     fn brief_blip_does_not_trigger_but_sustained_does() {
         // 0.1 s of fax then silence should NOT latch present (hysteresis).
         let mut det = WefaxPresenceDetector::new(SR);
@@ -274,7 +353,7 @@ mod tests {
         let mut phase = 0.0f32;
         let sustained = drive(&mut det, 2.0, |i| {
             let t = i as f32 / SR as f32;
-            let inst = 1900.0 + 400.0 * (2.0 * PI * 2.0 * t).sin();
+            let inst = 1900.0 + 400.0 * (2.0 * PI * 0.2 * t).sin();
             phase += 2.0 * PI * inst / SR as f32;
             phase.sin()
         });
