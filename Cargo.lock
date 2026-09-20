@@ -1981,9 +1981,9 @@ dependencies = [
 
 [[package]]
 name = "libairspy-rs"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c24bbecff324f88debafe6c6430b8e80f5e75ff6c2177425d6834a07f012a2c"
+checksum = "495e8ed980a292d9f3d69d91e9036acbb8cc00bedb698bc6fc1b44c9abdbe8f0"
 dependencies = [
  "nusb",
  "thiserror 2.0.20",
