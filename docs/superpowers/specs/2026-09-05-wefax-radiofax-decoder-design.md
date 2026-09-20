@@ -26,8 +26,13 @@ surfaces — the eventual home for a dedicated WEFAX activity).
   120 lpm / IOC 576; a **phasing** interval (~20–30 s) of mostly-black lines
   each carrying a short **white pulse** at a fixed position sets the left-edge
   (column-0) alignment; **stop tone ~450 Hz** (~5 s) ends the chart.
-- **Tuning convention:** dial frequency = assigned − 1.9 kHz in USB (so the
-  1900 Hz center sits where the transmitter intends).
+- **Tuning convention:** tune the demod to the **published/assigned** fax
+  frequency. WEFAX mode applies its own subcarrier pre-offset
+  (`WEFAX_SUBCARRIER_OFFSET`) so the 1900 Hz center lands in the decoder
+  window automatically — the operator does **not** hand-apply the classic
+  "dial = assigned − 1.9 kHz" USB offset (issue #911). (The bare SSB demod
+  translates by +bandwidth/2 = +1200 Hz; the extra +700 Hz pre-shift makes
+  a published-frequency tune land the subcarrier at 1900 Hz.)
 - **Stations (all one decoder):** NMG New Orleans (4317.9 / 8503.9 /
   12789.9 kHz — easy, near-continuous), NMC Pt. Reyes / Boston (US alternates),
   JMH Tokyo (3622.5 / 7795 / 13988.5 kHz — DX).
