@@ -128,9 +128,11 @@ impl Demodulator for WefaxDemodulator {
         // Shift the IF so the published-frequency subcarrier (at IF DC)
         // reaches the decoder's 1900 Hz center after the SSB demod (#911).
         self.xlator_buf.resize(input.len(), Complex::default());
-        self.xlator.process(input, &mut self.xlator_buf)?;
-        self.mono_buf.resize(input.len(), 0.0);
-        let count = self.demod.process(&self.xlator_buf, &mut self.mono_buf)?;
+        let shifted = self.xlator.process(input, &mut self.xlator_buf)?;
+        self.mono_buf.resize(shifted, 0.0);
+        let count = self
+            .demod
+            .process(&self.xlator_buf[..shifted], &mut self.mono_buf)?;
         super::process_with_agc_to_stereo(
             &mut self.agc,
             &self.mono_buf[..count],
@@ -164,7 +166,6 @@ impl Demodulator for WefaxDemodulator {
 )]
 mod tests {
     use super::*;
-    use core::f32::consts::PI;
 
     #[test]
     fn wefax_mode_uses_locked_usb_passband() {
@@ -189,12 +190,11 @@ mod tests {
     #[test]
     fn wefax_process_produces_audio() {
         let mut demod = WefaxDemodulator::new().unwrap();
-        let input: Vec<Complex> = (0..1000)
-            .map(|i| {
-                let phase = 2.0 * PI * 1900.0 * (i as f32) / 24_000.0;
-                Complex::new(phase.cos(), phase.sin())
-            })
-            .collect();
+        // A tone at the tuned frequency (IF DC) — the published-frequency
+        // case, which the +700 Hz offset maps to the 1900 Hz AF center
+        // (in-passband). A 1900 Hz IF tone would map to 3800 Hz AF, outside
+        // the locked 2400 Hz passband, so DC is the right probe.
+        let input = vec![Complex::new(1.0, 0.0); 1000];
         let mut output = vec![Stereo::default(); 1000];
         let count = demod.process(&input, &mut output).unwrap();
         assert_eq!(count, 1000);
