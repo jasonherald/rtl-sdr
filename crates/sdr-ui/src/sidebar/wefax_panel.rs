@@ -8,7 +8,7 @@
 //! label to the catcher state machine (`sidebar::wefax_catcher`) and the
 //! DSP presence events lands in a later task.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use libadwaita as adw;
@@ -21,6 +21,13 @@ pub struct WefaxPanelHandles {
     pub enable_switch: gtk4::Switch,
     pub station_row: adw::ComboRow,
     pub status_label: gtk4::Label,
+    /// The station names shown in `station_row`, in row order AFTER the
+    /// row-0 "Auto" entry (so row `i` maps to `station_names[i - 1]`).
+    /// Captured once when the combo model is populated so
+    /// `current_station_choice` resolves the selection against the exact
+    /// rows displayed, rather than re-ranking `stations_by_distance` live
+    /// (which would desync if the ground-station coordinates changed).
+    pub station_names: RefCell<Vec<&'static str>>,
     /// Re-entrancy guard around an ack-driven `set_active` call so the
     /// switch's own `active` notify handler doesn't re-dispatch a
     /// `SetWefaxEnabled`-style message for a state change the wiring
@@ -94,6 +101,7 @@ pub fn build_wefax_panel() -> WefaxPanel {
             enable_switch,
             station_row,
             status_label,
+            station_names: RefCell::new(Vec::new()),
             suppress_switch_notify: Cell::new(false),
         }),
     }

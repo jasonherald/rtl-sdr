@@ -9,7 +9,6 @@ use gtk4::glib;
 use libadwaita as adw;
 use sdr_types::DemodMode;
 
-use crate::header::demod_selector;
 use crate::messages::UiToDsp;
 use crate::sidebar::wefax_catcher::{Action, SavedTune};
 use crate::state::AppState;
@@ -64,11 +63,15 @@ pub(super) fn interpret_wefax_action(deps: &WefaxDeps, action: Action) {
 /// auto-catch scan, so there is nothing to restore there either).
 fn restore_tune(deps: &WefaxDeps, saved: &SavedTune) {
     deps.state.send_dsp(UiToDsp::Tune(saved.center_hz));
-    let mode =
-        demod_selector::index_to_demod_mode(u32::from(saved.demod_mode)).unwrap_or(DemodMode::Wfm);
-    deps.state.send_dsp(UiToDsp::SetDemodMode(mode));
+    deps.state.send_dsp(UiToDsp::SetDemodMode(saved.demod_mode));
+    // Bandwidth MUST land after SetDemodMode: the DSP's SetDemodMode
+    // handler resets the channel bandwidth to the mode's default, which
+    // would otherwise clobber the user's restored width. Mirrors the
+    // load-bearing order in `window::tune_to_target`.
+    deps.state
+        .send_dsp(UiToDsp::SetBandwidth(saved.bandwidth_hz));
     deps.state.center_frequency.set(saved.center_hz);
-    deps.state.demod_mode.set(mode);
+    deps.state.demod_mode.set(saved.demod_mode);
 }
 
 fn post_toast(deps: &WefaxDeps, msg: &str) {

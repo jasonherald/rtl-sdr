@@ -100,7 +100,8 @@ fn disable_restores_the_tune_captured_at_enable_not_the_disable_ticks_ctx() {
     let mut c = WefaxCatcher::new();
     let enable_saved = SavedTune {
         center_hz: 14_346_000.0,
-        demod_mode: 7,
+        demod_mode: sdr_types::DemodMode::Usb,
+        bandwidth_hz: 3_000.0,
         was_wefax: false,
     };
     let mut enable_ctx = ctx(true, false, WefaxState::Idle);
@@ -114,7 +115,8 @@ fn disable_restores_the_tune_captured_at_enable_not_the_disable_ticks_ctx() {
     let mut disable_ctx = ctx(false, false, WefaxState::Idle);
     disable_ctx.saved_tune = SavedTune {
         center_hz: 999.0,
-        demod_mode: 9,
+        demod_mode: sdr_types::DemodMode::Nfm,
+        bandwidth_hz: 12_500.0,
         was_wefax: true,
     };
     let acts = c.tick(disable_ctx);
@@ -306,4 +308,121 @@ fn schedule_active_station_sorts_ahead_of_inactive_one() {
 fn default_impl_matches_new() {
     let c = WefaxCatcher::default();
     assert!(matches!(c.state(), CatcherState::Idle));
+}
+
+/// FIX 1(a): a channel that keeps presence true but never reaches
+/// `Imaging` (a birdie, or an in-band carrier with no chart) must NOT
+/// hang in `Locked` forever — the `LOCK_MAX_TICKS` hard ceiling resumes
+/// scanning at the NEXT candidate.
+#[test]
+fn locked_hard_ceiling_resumes_at_next_candidate() {
+    let mut c = WefaxCatcher::new();
+    c.tick(ctx(true, false, WefaxState::Idle)); // Scanning idx0
+    c.tick(ctx(true, true, WefaxState::Idle)); // Locked idx0, waited0
+    let next = match c.state() {
+        CatcherState::Locked {
+            candidates, idx, ..
+        } => {
+            assert_eq!(*idx, 0);
+            candidates[(idx + 1) % candidates.len()].clone()
+        }
+        other => panic!("expected Locked, got {other:?}"),
+    };
+
+    // Presence STAYS true but the decoder never reaches Imaging.
+    let mut acts = Vec::new();
+    for _ in 0..LOCK_MAX_TICKS {
+        acts = c.tick(ctx(true, true, WefaxState::Idle));
+        if matches!(c.state(), CatcherState::Scanning { .. }) {
+            break;
+        }
+    }
+    assert!(
+        matches!(c.state(), CatcherState::Scanning { .. }),
+        "present-but-never-imaging must not hang in Locked"
+    );
+    assert_eq!(
+        acts,
+        vec![
+            Action::ResetDecoder,
+            Action::Tune(next.freq_hz),
+            Action::SetDemodMode,
+        ],
+        "resumes on the NEXT candidate, not index 0"
+    );
+    match c.state() {
+        CatcherState::Scanning {
+            candidates, idx, ..
+        } => {
+            assert_ne!(*idx, 0, "must have advanced past candidate 0");
+            assert_eq!(candidates[*idx].freq_hz, next.freq_hz);
+        }
+        other => panic!("expected Scanning, got {other:?}"),
+    }
+}
+
+/// FIX 1(b): a false lock via a presence DROP must resume at the next
+/// candidate too, not restart the rotation at index 0.
+#[test]
+fn false_lock_presence_drop_resumes_at_next_candidate() {
+    let mut c = WefaxCatcher::new();
+    c.tick(ctx(true, false, WefaxState::Idle)); // Scanning idx0
+    c.tick(ctx(true, true, WefaxState::Idle)); // Locked idx0
+    let next = match c.state() {
+        CatcherState::Locked {
+            candidates, idx, ..
+        } => candidates[(idx + 1) % candidates.len()].clone(),
+        other => panic!("expected Locked, got {other:?}"),
+    };
+
+    let mut acts = Vec::new();
+    for _ in 0..LOCK_TIMEOUT_TICKS {
+        acts = c.tick(ctx(true, false, WefaxState::Idle));
+        if matches!(c.state(), CatcherState::Scanning { .. }) {
+            break;
+        }
+    }
+    assert!(matches!(c.state(), CatcherState::Scanning { .. }));
+    assert_eq!(
+        acts,
+        vec![
+            Action::ResetDecoder,
+            Action::Tune(next.freq_hz),
+            Action::SetDemodMode,
+        ],
+        "false lock resumes on the NEXT candidate, not index 0"
+    );
+}
+
+/// FIX 1(b): a candidate 0 that persistently trips presence but never
+/// images must not starve later candidates — each hard-ceiling timeout
+/// advances the rotation (0 -> 1 -> 2 ...), never resetting to 0.
+#[test]
+fn persistent_false_lock_does_not_starve_later_candidates() {
+    let mut c = WefaxCatcher::new();
+    c.tick(ctx(true, false, WefaxState::Idle));
+    c.tick(ctx(true, true, WefaxState::Idle)); // Locked idx0
+
+    let mut resumed_indices = Vec::new();
+    // Drive well past two hard ceilings; presence stays true, no imaging.
+    for _ in 0..(LOCK_MAX_TICKS * 2 + 10) {
+        c.tick(ctx(true, true, WefaxState::Idle));
+        if let CatcherState::Scanning { idx, dwell, .. } = c.state()
+            && *dwell == 0
+        {
+            resumed_indices.push(*idx);
+        }
+    }
+    assert!(
+        resumed_indices.contains(&1),
+        "must resume at candidate 1, not restart at 0: {resumed_indices:?}"
+    );
+    assert!(
+        resumed_indices.contains(&2),
+        "must keep advancing past 1 to 2: {resumed_indices:?}"
+    );
+    assert!(
+        !resumed_indices.iter().all(|&i| i == 0),
+        "must never be stuck on candidate 0: {resumed_indices:?}"
+    );
 }

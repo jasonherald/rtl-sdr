@@ -99,7 +99,9 @@ pub fn is_active(station: &WefaxStation, now: DateTime<Utc>) -> bool {
         .any(|w| m >= w.start_min_utc && m < w.end_min_utc)
 }
 
-/// The next window START at or after `now` (wrapping to tomorrow).
+/// The next window START at or after `now` (wrapping to tomorrow). A
+/// window starting at exactly the current minute counts as "now" and is
+/// returned, rather than skipped to tomorrow.
 #[must_use]
 pub fn next_window_start(station: &WefaxStation, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let m = minute_of_day(now);
@@ -110,7 +112,7 @@ pub fn next_window_start(station: &WefaxStation, now: DateTime<Utc>) -> Option<D
         .schedule
         .iter()
         .map(|w| w.start_min_utc)
-        .filter(|&s| s > m)
+        .filter(|&s| s >= m)
         .min();
     if let Some(s) = today {
         return Some(midnight + Duration::minutes(i64::from(s)));
@@ -166,6 +168,27 @@ mod tests {
             &s,
             Utc.with_ymd_and_hms(2026, 9, 20, 7, 0, 0).unwrap()
         ));
+    }
+
+    #[test]
+    fn next_window_start_includes_a_window_starting_exactly_now() {
+        // A window that starts at exactly the current minute must be
+        // returned as the next start (boundary: `s == m`), not skipped to
+        // tomorrow's first window.
+        let s = WefaxStation {
+            name: "TEST",
+            channels_hz: &[4_000_000],
+            lat_deg: 0.0,
+            lon_deg: 0.0,
+            schedule: &[DailyWindow {
+                start_min_utc: 360, // 0600Z
+                end_min_utc: 720,
+            }],
+        };
+        // now == 0600Z, exactly the window start.
+        let now = Utc.with_ymd_and_hms(2026, 9, 20, 6, 0, 0).unwrap();
+        let next = next_window_start(&s, now).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 9, 20, 6, 0, 0).unwrap());
     }
 
     #[test]

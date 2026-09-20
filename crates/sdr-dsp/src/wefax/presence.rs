@@ -27,13 +27,13 @@ const BLOCK_LEN: usize = 1024;
 ///
 /// 0.60 was picked empirically against real recorded audio
 /// (`tests/wefax_presence.rs`), by scanning per-block ratio traces from a
-/// real ~12 s NMF fax capture and a real ~12 s recorded white-noise clip and
+/// real ~12 s NMF fax capture and a synthetic ~12 s white-noise clip and
 /// choosing the threshold that maximizes the joint margin between (a) the
 /// longest run of consecutive on-ratio blocks in the noise trace and (b) the
 /// longest such run in the fax trace, relative to `ON_BLOCKS`: at 0.60 the
-/// real fax audio sustains a 20-block run (vs. the 12 required), while real
-/// and synthetic noise never exceed a 6-block run — an 8-block and 6-block
-/// margin respectively. A single 1024-sample Goertzel block's power estimate
+/// real fax audio sustains a 20-block run (vs. the 12 required), while the
+/// synthetic white-noise clip and an in-test LCG generator never exceed a
+/// 6-block run — an 8-block and 6-block margin respectively. A single 1024-sample Goertzel block's power estimate
 /// is noisy even for true white noise (any individual block can spike high),
 /// but real FM-modulated fax content holds a high ratio far more
 /// consistently than noise's occasional spikes can chain together.
@@ -51,18 +51,22 @@ const PRESENT_RATIO: f64 = 0.60;
 /// the out-of-band probes and drives the ratio to ~1.0 on any signal (#913).
 const PRESENT_PEAKINESS: f64 = 3.0;
 /// Consecutive on-blocks to latch present. `BLOCK_LEN`/rate sets the wall
-/// time: ≈ 85 ms/block at the 12 kHz test rate (12 blocks ≈ 1.0 s), and
-/// ≈ 43 ms/block at the 24 kHz runtime AF rate ([`crate::wefax`] feeds the
-/// detector the WEFAX demod's 24 kHz audio), so 12 blocks ≈ 0.5 s live.
+/// time: at the 48 kHz production AF rate a 1024-sample block is ≈ 21.3 ms,
+/// so 12 blocks ≈ 0.26 s. The detector is built with the radio audio rate;
+/// the WEFAX demod's 24 kHz output is resampled to 48 kHz before the
+/// presence tap (live log: "WEFAX decoder initialised at 48000 Hz").
+/// Secondary: at the 12 kHz test rate a block is ≈ 85 ms, so 12 blocks
+/// ≈ 1.0 s there (`tests/wefax_presence.rs` runs at 12 kHz).
 /// This is a primary noise-rejection mechanism (with the tonality gate): a
 /// real subcarrier holds a high ratio + tonality for many consecutive
 /// blocks, while noise's occasional on-blocks essentially never chain to 12
 /// in a row. It also keeps a brief blip (a birdie, a noise spike, a moment
 /// of another signal) from ever latching "present" on its own.
 const ON_BLOCKS: u32 = 12;
-/// Consecutive off-blocks to drop present (≈ 1.9 s at 12 kHz, ≈ 0.9 s at the
-/// 24 kHz runtime rate) — tolerates brief in-band dropouts (sync gaps,
-/// weak-signal fades) without unlatching a genuine fax signal.
+/// Consecutive off-blocks to drop present (≈ 0.47 s at the 48 kHz production
+/// rate; ≈ 1.9 s at the 12 kHz test rate) — tolerates brief in-band
+/// dropouts (sync gaps, weak-signal fades) without unlatching a genuine
+/// fax signal.
 const OFF_BLOCKS: u32 = 22;
 /// Out-of-band probes: below and above the fax band.
 const OUT_BAND_HZ: [f64; 2] = [700.0, 3_200.0];
@@ -335,6 +339,37 @@ mod tests {
         assert!(
             !present,
             "flat band-limited (passband-shaped) noise must read absent"
+        );
+    }
+
+    #[test]
+    fn reset_clears_latched_presence_and_streaks() {
+        // Drive to latched-present via the same slow FM sweep as
+        // `fax_subcarrier_sweep_is_present`.
+        let mut det = WefaxPresenceDetector::new(SR);
+        let mut phase = 0.0f32;
+        let present = drive(&mut det, 3.0, |i| {
+            let t = i as f32 / SR as f32;
+            let inst = 1900.0 + 400.0 * (2.0 * PI * 0.2 * t).sin();
+            phase += 2.0 * PI * inst / SR as f32;
+            phase.sin()
+        });
+        assert!(present, "precondition: the sweep must latch present");
+
+        det.reset();
+        assert!(!det.is_present(), "reset must clear latched presence");
+
+        // A brief blip after reset must NOT immediately re-latch. This
+        // only holds if `reset` cleared the on-streak too: had the streak
+        // survived (already >= ON_BLOCKS from the sweep), a single on-block
+        // would re-latch instantly.
+        let blip = drive(&mut det, 0.1, |i| {
+            let t = i as f32 / SR as f32;
+            (2.0 * PI * 1_900.0 * t).sin()
+        });
+        assert!(
+            !blip,
+            "a short blip after reset must not re-latch present (streaks cleared)"
         );
     }
 

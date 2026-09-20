@@ -693,7 +693,9 @@ impl AppState {
     /// `true` if the app is actively writing pass artifacts to disk
     /// OR holds in-memory imagery that hasn't been flushed yet — any
     /// APT pass, LRPT pass, SSTV pass, audio recording, IQ recording,
-    /// or queued [`PendingSstvExport`] retry batches.
+    /// queued [`PendingSstvExport`] retry batches, or a WEFAX chart
+    /// currently imaging under auto-catch (whose in-flight lines would
+    /// be lost on a silent Quit).
     /// Used to gate the tray-Quit confirmation modal.
     ///
     /// Maintenance contract: every new "we're writing pass artifacts"
@@ -712,6 +714,10 @@ impl AppState {
             || !self.sstv_pending_export.borrow().is_empty()
             || self.audio_recording_active.get()
             || self.iq_recording_active.get()
+            || matches!(
+                self.wefax_catcher.borrow().state(),
+                crate::sidebar::wefax_catcher::CatcherState::Imaging { .. }
+            )
     }
 
     /// Dispatch `UiToDsp::SetVfoOffset(hz)` AND synchronously

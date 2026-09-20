@@ -20,10 +20,16 @@ fn nmf_fax_audio_reads_present() {
 
 #[test]
 fn static_reads_absent() {
+    // Negative control: `wefax_static_12k.wav` is a SYNTHETIC white-noise
+    // clip (`sox -n synth whitenoise`, per `tests/data/README.md`), not a
+    // real off-air recording. A real static fixture is deferred (#914).
     let (sr, s) = read_mono_f32("tests/data/wefax_static_12k.wav");
     let mut det = WefaxPresenceDetector::new(sr);
     for b in s.chunks(1024) {
         det.update(b);
     }
-    assert!(!det.is_present(), "static must read absent");
+    assert!(
+        !det.is_present(),
+        "synthetic white-noise static must read absent"
+    );
 }

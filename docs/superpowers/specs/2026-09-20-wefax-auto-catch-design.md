@@ -35,7 +35,7 @@ Three user-facing wins, one cohesive mechanism:
 The core is a **pure state machine** mirroring the satellite auto-recorder
 (`crates/sdr-ui/src/sidebar/satellites_recorder.rs`):
 
-```
+```text
 WefaxCatcher::tick(now, wefax_state, fax_present, schedule_ctx, saved_tune)
     -> Vec<Action>
 ```
@@ -54,7 +54,7 @@ detector** be the keeper signal directly.
 
 ### Flow
 
-```
+```text
 Idle       — Decode toggle off, or on with nothing to do
 Scanning   — rotate candidate channels (geo + schedule prioritized):
              Tune + SetDemodMode(Wefax), dwell ~2-3 s each, watch the detector
@@ -178,7 +178,7 @@ turn-on-and-forget path layered on top.
 
 ## Data flow
 
-```
+```text
 DSP thread:  WEFAX decode tap (existing) + NEW fax-presence detector on the
              mono audio -> DspToUi::WefaxState (existing) + WefaxPresence (new)
 UI thread:   glib timer -> WefaxCatcher.tick(...) -> Vec<Action>

@@ -1,8 +1,11 @@
-//! Real-data gate: real recorded HF static must NOT drive the sync-gated
+//! Negative-control gate: broadband static must NOT drive the sync-gated
 //! WEFAX decoder into imaging. Before the #913 no-static hardening the
 //! phasing detector locked onto broadband noise within ~2 s and painted a
-//! full page of static; this proves it no longer does, against a real
-//! recorded static clip (not a synthetic one).
+//! full page of static; this proves it no longer does. The fixture
+//! (`tests/data/wefax_static_12k.wav`) is a SYNTHETIC white-noise clip
+//! (`sox -n synth whitenoise`, per `tests/data/README.md`), used here as a
+//! synthetic negative control; a real off-air static fixture is deferred
+//! (#914).
 use sdr_dsp::wefax::{WefaxDecoder, WefaxLine, WefaxState};
 
 fn read_mono_f32(path: &str) -> (u32, Vec<f32>) {
@@ -13,7 +16,7 @@ fn read_mono_f32(path: &str) -> (u32, Vec<f32>) {
 }
 
 #[test]
-fn real_static_never_locks_the_gated_decoder() {
+fn synthetic_static_never_locks_the_gated_decoder() {
     let (sr, samples) = read_mono_f32("tests/data/wefax_static_12k.wav");
     let mut dec = WefaxDecoder::new(sr).expect("build decoder");
     let mut out = vec![WefaxLine::default(); 64];
@@ -27,10 +30,10 @@ fn real_static_never_locks_the_gated_decoder() {
 
     assert!(
         !ever_imaging,
-        "real recorded static must never lock the decoder into Imaging"
+        "synthetic white-noise static must never lock the decoder into Imaging"
     );
     assert_eq!(
         lines_emitted, 0,
-        "real static must paint zero image lines, got {lines_emitted}"
+        "synthetic static must paint zero image lines, got {lines_emitted}"
     );
 }

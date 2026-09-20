@@ -21,12 +21,20 @@
 use chrono::TimeZone;
 use sdr_core::messages::WefaxState;
 use sdr_sat::{WefaxStation, is_active, stations_by_distance};
+use sdr_types::DemodMode;
 use std::path::PathBuf;
 
 /// Dwell (in ticks) per candidate channel while scanning.
 pub const SCAN_DWELL_TICKS: u32 = 3;
 /// Ticks a Locked channel may go without imaging before it's a false lock.
 pub const LOCK_TIMEOUT_TICKS: u32 = 10;
+/// Hard ceiling on ticks a channel may stay `Locked` without reaching
+/// `Imaging`, *regardless* of whether presence still reads true. ~60 s at
+/// the ~500 ms tick — comfortably longer than a ~20 s WEFAX phasing
+/// sequence, so a genuinely-phasing chart still reaches `Imaging` first,
+/// but a present-but-never-imaging lock (a steady birdie, or an in-band
+/// carrier with no chart) can't hang the rotation forever.
+pub const LOCK_MAX_TICKS: u32 = 120;
 /// Ticks of *continuous* presence loss during `Imaging` before it's treated
 /// as a real signal loss rather than a brief subcarrier dip (e.g. over a
 /// blank/white image region) and falls back to `Scanning`. A single missed
@@ -45,14 +53,30 @@ pub enum StationChoice {
 }
 
 /// A snapshot of the user's tune, restored when the catcher stops.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SavedTune {
     /// The RF center frequency the user was tuned to before auto-catch.
     pub center_hz: f64,
-    /// The demod mode encoded as a small integer; the interpret layer maps it.
-    pub demod_mode: u8,
+    /// The user's demod mode, stored as the domain enum directly so the
+    /// pure state machine stays decoupled from the header dropdown's
+    /// index presentation.
+    pub demod_mode: DemodMode,
+    /// The user's channel bandwidth (Hz), restored after the demod mode
+    /// so `SetDemodMode`'s default-bandwidth reset doesn't clobber it.
+    pub bandwidth_hz: f64,
     /// Whether the user's own tune was already WEFAX before auto-catch ran.
     pub was_wefax: bool,
+}
+
+impl Default for SavedTune {
+    fn default() -> Self {
+        Self {
+            center_hz: 0.0,
+            demod_mode: DemodMode::Wfm,
+            bandwidth_hz: 0.0,
+            was_wefax: false,
+        }
+    }
 }
 
 /// One scan candidate = a station's single channel.
@@ -122,7 +146,12 @@ pub enum CatcherState {
     },
     /// Presence detected on a channel; waiting to confirm it's a real chart.
     Locked {
-        /// The channel that's locked.
+        /// The scan rotation, carried through so a false lock can resume
+        /// at the NEXT candidate rather than restarting at index 0.
+        candidates: Vec<Candidate>,
+        /// Index (into `candidates`) of the locked channel.
+        idx: usize,
+        /// The channel that's locked (== `candidates[idx]`).
         cand: Candidate,
         /// Ticks spent locked without entering `Imaging`.
         waited: u32,
@@ -131,7 +160,12 @@ pub enum CatcherState {
     },
     /// The decoder is actively assembling a chart.
     Imaging {
-        /// The channel being imaged.
+        /// The scan rotation, carried through so a sustained presence loss
+        /// mid-image can resume at the NEXT candidate, not index 0.
+        candidates: Vec<Candidate>,
+        /// Index (into `candidates`) of the channel being imaged.
+        idx: usize,
+        /// The channel being imaged (== `candidates[idx]`).
         cand: Candidate,
         /// The user's tune, to restore on disable.
         saved: SavedTune,
@@ -161,6 +195,24 @@ impl WefaxCatcher {
         &self.state
     }
 
+    /// Test-only: drive the catcher directly into `Imaging` so callers
+    /// (e.g. `AppState::is_recording`'s table test) can exercise the
+    /// "chart in flight" branch without replaying a full tick sequence.
+    #[cfg(test)]
+    pub(crate) fn force_imaging_for_test(&mut self) {
+        let cand = Candidate {
+            station: "TEST",
+            freq_hz: 4_000_000,
+        };
+        self.state = CatcherState::Imaging {
+            candidates: vec![cand.clone()],
+            idx: 0,
+            cand,
+            saved: SavedTune::default(),
+            lost: 0,
+        };
+    }
+
     /// Advance the state machine by one tick, returning the actions the
     /// caller should interpret.
     // `ctx` is taken by value per the documented public interface (Task 6
@@ -182,11 +234,19 @@ impl WefaxCatcher {
                 saved,
             } => self.on_scanning(&ctx, candidates, idx, dwell, saved),
             CatcherState::Locked {
+                candidates,
+                idx,
                 cand,
                 waited,
                 saved,
-            } => self.on_locked(&ctx, cand, waited, saved),
-            CatcherState::Imaging { cand, saved, lost } => self.on_imaging(&ctx, cand, saved, lost),
+            } => self.on_locked(&ctx, candidates, idx, cand, waited, saved),
+            CatcherState::Imaging {
+                candidates,
+                idx,
+                cand,
+                saved,
+                lost,
+            } => self.on_imaging(&ctx, candidates, idx, cand, saved, lost),
         }
     }
 
@@ -276,11 +336,28 @@ impl WefaxCatcher {
         self.start_scanning(ctx, ctx.saved_tune.clone())
     }
 
-    /// Resume scanning from a fresh candidate rotation, preserving a
-    /// `saved` tune already captured by an earlier state (false-lock
-    /// timeout, or presence loss during `Imaging`).
-    fn resume_scanning(&mut self, ctx: &TickCtx, saved: SavedTune) -> Vec<Action> {
-        self.start_scanning(ctx, saved)
+    /// Resume scanning at the NEXT candidate in the SAME rotation,
+    /// preserving a `saved` tune already captured by an earlier state
+    /// (false-lock timeout, lock hard-ceiling, or presence loss during
+    /// `Imaging`). Advancing past the offending channel — rather than
+    /// rebuilding from index 0 via [`Self::start_scanning`] — stops a
+    /// persistently-interfering early candidate from starving all later
+    /// ones by re-locking itself every rotation.
+    fn resume_next_candidate(
+        &mut self,
+        candidates: Vec<Candidate>,
+        idx: usize,
+        saved: SavedTune,
+    ) -> Vec<Action> {
+        let next = (idx + 1) % candidates.len();
+        let cand = candidates[next].clone();
+        self.state = CatcherState::Scanning {
+            candidates,
+            idx: next,
+            dwell: 0,
+            saved,
+        };
+        Self::tune_actions(&cand)
     }
 
     fn start_scanning(&mut self, ctx: &TickCtx, saved: SavedTune) -> Vec<Action> {
@@ -318,6 +395,8 @@ impl WefaxCatcher {
         if ctx.fax_present {
             let cand = candidates[idx].clone();
             self.state = CatcherState::Locked {
+                candidates,
+                idx,
                 cand,
                 waited: 0,
                 saved,
@@ -347,24 +426,35 @@ impl WefaxCatcher {
     fn on_locked(
         &mut self,
         ctx: &TickCtx,
+        candidates: Vec<Candidate>,
+        idx: usize,
         cand: Candidate,
         waited: u32,
         saved: SavedTune,
     ) -> Vec<Action> {
         if matches!(ctx.wefax_state, WefaxState::Imaging) {
             self.state = CatcherState::Imaging {
+                candidates,
+                idx,
                 cand,
                 saved,
                 lost: 0,
             };
             return vec![Action::OpenViewer];
         }
+        if waited + 1 >= LOCK_MAX_TICKS {
+            // Hard ceiling: present-but-never-imaging (birdie / carrier
+            // with no chart). Advance past it so it can't hang forever.
+            return self.resume_next_candidate(candidates, idx, saved);
+        }
         if !ctx.fax_present && waited + 1 >= LOCK_TIMEOUT_TICKS {
-            // False lock — resume scanning, preserving the originally
-            // captured tune.
-            return self.resume_scanning(ctx, saved);
+            // Fast false-lock rescan: presence simply dropped. Advance to
+            // the next candidate, preserving the originally captured tune.
+            return self.resume_next_candidate(candidates, idx, saved);
         }
         self.state = CatcherState::Locked {
+            candidates,
+            idx,
             cand,
             waited: waited + 1,
             saved,
@@ -375,6 +465,8 @@ impl WefaxCatcher {
     fn on_imaging(
         &mut self,
         ctx: &TickCtx,
+        candidates: Vec<Candidate>,
+        idx: usize,
         cand: Candidate,
         saved: SavedTune,
         lost: u32,
@@ -383,6 +475,8 @@ impl WefaxCatcher {
             // Chart complete: save; STAY on this working channel (->
             // Locked, waiting for the next chart on the same frequency).
             self.state = CatcherState::Locked {
+                candidates,
+                idx,
                 cand,
                 waited: 0,
                 saved,
@@ -392,11 +486,14 @@ impl WefaxCatcher {
         if !ctx.fax_present {
             // Debounce: a brief subcarrier dip (e.g. over a blank/white
             // image region) must not abort an in-progress chart. Only a
-            // *sustained* loss falls back to scanning.
+            // *sustained* loss falls back to scanning — at the NEXT
+            // candidate, not a fresh index-0 rotation.
             if lost + 1 >= IMAGING_LOSS_TICKS {
-                return self.resume_scanning(ctx, saved);
+                return self.resume_next_candidate(candidates, idx, saved);
             }
             self.state = CatcherState::Imaging {
+                candidates,
+                idx,
                 cand,
                 saved,
                 lost: lost + 1,
@@ -404,6 +501,8 @@ impl WefaxCatcher {
             return Vec::new();
         }
         self.state = CatcherState::Imaging {
+            candidates,
+            idx,
             cand,
             saved,
             lost: 0,

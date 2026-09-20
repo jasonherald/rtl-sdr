@@ -25,7 +25,7 @@ our APT decoder against real, known-good NOAA 19 audio.
 
 | File | Source | Description |
 |---|---|---|
-| `wefax_nmf_present_12k.wav` | Real off-air capture, station NMF (US Coast Guard, New Orleans) HF radiofax, 4235 kHz | 12 s excerpt (12 kHz mono 32-bit float) of a recovered NMF fax subcarrier, used by `tests/wefax_presence.rs` to assert `WefaxPresenceDetector` reads a real signal as present. NMF is a US Coast Guard (US Government) broadcast; per 17 U.S.C. §105 US Government works are not subject to domestic copyright, and a faithful mechanical radio capture adds no new copyrightable authorship, so the recording is treated as public domain (same rationale as the WEFAX surface-chart fixture above). |
+| `wefax_nmf_present_12k.wav` | Real off-air capture, station NMF (US Coast Guard, Boston) HF radiofax, 4235 kHz | 12 s excerpt (12 kHz mono 32-bit float) of a recovered NMF fax subcarrier, used by `tests/wefax_presence.rs` to assert `WefaxPresenceDetector` reads a real signal as present. NMF is a US Coast Guard (US Government) broadcast; per 17 U.S.C. §105 US Government works are not subject to domestic copyright, and a faithful mechanical radio capture adds no new copyrightable authorship, so the recording is treated as public domain (same rationale as the WEFAX surface-chart fixture above). |
 | `wefax_static_12k.wav` | Synthetic (`sox -n synth whitenoise`) | 12 s of synthesized white noise (12 kHz mono 32-bit float), used as the negative control in `tests/wefax_presence.rs`. |
 
 ## License
