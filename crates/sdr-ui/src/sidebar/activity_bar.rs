@@ -184,6 +184,13 @@ pub const LEFT_ACTIVITIES: &[ActivityBarEntry] = &[
         shortcut_label: "Ctrl+9",
         accelerator: "<Ctrl>9",
     },
+    ActivityBarEntry {
+        name: "wefax",
+        icon_name: "image-x-generic-symbolic",
+        display_name: "WEFAX",
+        shortcut_label: "Ctrl+0",
+        accelerator: "<Ctrl>0",
+    },
 ];
 
 /// Canonical right-activity-bar entries — Transcript + Bookmarks.

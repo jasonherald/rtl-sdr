@@ -23,6 +23,7 @@ pub mod server_panel;
 pub mod source_panel;
 pub mod transcript_panel;
 pub mod wefax_catcher;
+pub mod wefax_panel;
 
 pub use activity_bar::{
     ActivityBar, ActivityBarEntry, ActivityBarSide, LEFT_ACTIVITIES, RIGHT_ACTIVITIES,
@@ -44,6 +45,7 @@ pub use scanner_panel::{ScannerPanel, build_scanner_panel};
 pub use server_panel::{ServerPanel, build_server_panel};
 pub use source_panel::{SourcePanel, build_source_panel};
 pub use transcript_panel::{TranscriptPanel, build_transcript_panel};
+pub use wefax_panel::{WefaxPanel, build_wefax_panel};
 
 /// All sidebar panels, for DSP bridge wiring.
 pub struct SidebarPanels {
@@ -92,6 +94,10 @@ pub struct SidebarPanels {
     /// By-Spacecraft list, packet-type breakdown, and packet/message
     /// log. Drives the "Orbcomm" left activity (epic #867).
     pub orbcomm: OrbcommPanel,
+    /// WEFAX auto-catch activity panel — Decode toggle, station
+    /// picker, and status row. Drives the "WEFAX" left activity
+    /// (epic #913).
+    pub wefax: WefaxPanel,
 }
 
 /// Build every sidebar panel. Activity-bar migration: each panel
@@ -115,6 +121,7 @@ pub fn build_panels() -> SidebarPanels {
     // initial widget at the predefined width.
     let aviation = build_aviation_panel(sdr_core::acars_airband_lock::ACARS_CHANNEL_COUNT);
     let orbcomm = build_orbcomm_panel();
+    let wefax = build_wefax_panel();
     // Flyout is built after navigation because it borrows the
     // left-sidebar `name_entry` — its row actions (recall,
     // delete-of-active) sync the entry field.
@@ -141,5 +148,6 @@ pub fn build_panels() -> SidebarPanels {
         satellites,
         aviation,
         orbcomm,
+        wefax,
     }
 }
