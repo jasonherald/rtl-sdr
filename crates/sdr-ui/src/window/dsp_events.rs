@@ -149,6 +149,10 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
             on_wefax_image_complete(ctx, width, height, pixels);
         }
         DspToUi::WefaxState(wefax_state) => on_wefax_state(ctx, wefax_state),
+        // Fax-subcarrier presence detector plumbing (#913). Stub arm
+        // keeps the match exhaustive; UI wiring (status indicator) is
+        // a later task.
+        DspToUi::WefaxPresence(_present) => {}
     }
 }
 

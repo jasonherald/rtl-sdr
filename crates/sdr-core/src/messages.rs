@@ -307,6 +307,8 @@ pub enum DspToUi {
     /// Stopped). UI surfaces this as a status label in the live
     /// chart viewer.
     WefaxState(WefaxState),
+    /// Edge-triggered fax-subcarrier presence on the tuned WEFAX channel.
+    WefaxPresence(bool),
 }
 
 /// Available source types for IQ input.
