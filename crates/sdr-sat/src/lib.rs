@@ -29,6 +29,7 @@ pub mod passes;
 pub mod postal_lookup;
 pub mod sgp4_core;
 pub mod tle_cache;
+pub mod wefax_stations;
 
 pub use elevation::{ElevationLookupError, lookup_elevation_m};
 pub use identify::{
@@ -40,6 +41,10 @@ pub use sgp4_core::{Satellite, SatelliteError, TLE_MAX_AGE, TLE_WARN_AGE, TleFre
 pub use tle_cache::{
     GroupFetcher, ORBCOMM_TLE_GROUP, TleCache, TleCacheError, celestrak_gp_url,
     celestrak_group_url, parse_group_tles,
+};
+pub use wefax_stations::{
+    DailyWindow, KNOWN_WEFAX_STATIONS, WefaxStation, great_circle_km, is_active, next_window_start,
+    stations_by_distance,
 };
 
 mod catalog;

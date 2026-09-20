@@ -173,34 +173,42 @@ fn is_recording_is_false_when_idle() {
     assert!(!s.is_recording());
 }
 
+// NORAD IDs used by `is_recording_table`. Per repo rule on named
+// constants for magic numbers (`crates/CLAUDE.md`); per CR round 6 on
+// PR #599. Module-scoped so the test body stays within the Codacy NLOC
+// budget.
+const ISS_NORAD_ID: u32 = 25_544;
+const NOAA_19_NORAD_ID: u32 = 33_591;
+const NOAA_LRPT_PLACEHOLDER_ID: u32 = 33_592;
+
 #[test]
 fn is_recording_table() {
-    // Per repo rule on named constants for magic numbers
-    // (`crates/CLAUDE.md`). Per CR round 6 on PR #599.
-    const ISS_NORAD_ID: u32 = 25_544;
-    const NOAA_19_NORAD_ID: u32 = 33_591;
-    const NOAA_LRPT_PLACEHOLDER_ID: u32 = 33_592;
-    // Each row: (apt, lrpt, sstv, audio, iq, sstv_pending, expected)
+    // Each row: (apt, lrpt, sstv, audio, iq, sstv_pending, wefax, expected)
     // The `sstv_pending` column covers in-memory retry batches
     // queued by an LOS save failure (or a late-tail post-success
     // move). Without OR-ing this into `is_recording()` the tray
     // Quit path would treat the app as idle and silently drop the
     // pending imagery. Per CR round 9 #28 on PR #599.
+    // The `wefax` column drives the WEFAX auto-catch catcher into
+    // `Imaging`; without OR-ing it in, a tray Quit mid-chart would
+    // silently discard the in-flight radiofax lines. Per PR #917 CR.
     let cases = [
-        (false, false, false, false, false, false, false),
-        (true, false, false, false, false, false, true),
-        (false, true, false, false, false, false, true),
-        (false, false, true, false, false, false, true),
-        (false, false, false, true, false, false, true),
-        (false, false, false, false, true, false, true),
-        (false, false, false, false, false, true, true),
-        (true, true, true, true, true, true, true),
-        (true, false, false, false, true, false, true),
-        (false, true, false, true, false, false, true),
-        (false, false, true, false, true, false, true),
-        (false, false, false, false, false, true, true),
+        (false, false, false, false, false, false, false, false),
+        (true, false, false, false, false, false, false, true),
+        (false, true, false, false, false, false, false, true),
+        (false, false, true, false, false, false, false, true),
+        (false, false, false, true, false, false, false, true),
+        (false, false, false, false, true, false, false, true),
+        (false, false, false, false, false, true, false, true),
+        (false, false, false, false, false, false, true, true),
+        (true, true, true, true, true, true, true, true),
+        (true, false, false, false, true, false, false, true),
+        (false, true, false, true, false, false, false, true),
+        (false, false, true, false, true, false, false, true),
+        (false, false, false, false, false, true, false, true),
+        (false, false, false, false, false, false, true, true),
     ];
-    for (apt, lrpt, sstv, audio, iq, sstv_pending, expected) in cases {
+    for (apt, lrpt, sstv, audio, iq, sstv_pending, wefax, expected) in cases {
         let s = make_test_state();
         if apt {
             *s.apt_recording_pass.borrow_mut() = Some((NOAA_19_NORAD_ID, chrono::Utc::now()));
@@ -219,6 +227,9 @@ fn is_recording_table() {
         }
         s.audio_recording_active.set(audio);
         s.iq_recording_active.set(iq);
+        if wefax {
+            s.wefax_catcher.borrow_mut().force_imaging_for_test();
+        }
         if sstv_pending {
             // Single empty placeholder batch is enough — the
             // guard checks `is_empty()`, not image count.
@@ -231,7 +242,7 @@ fn is_recording_table() {
         assert_eq!(
             s.is_recording(),
             expected,
-            "row apt={apt} lrpt={lrpt} sstv={sstv} audio={audio} iq={iq} sstv_pending={sstv_pending}",
+            "row apt={apt} lrpt={lrpt} sstv={sstv} audio={audio} iq={iq} sstv_pending={sstv_pending} wefax={wefax}",
         );
     }
 }

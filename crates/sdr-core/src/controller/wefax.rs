@@ -5,7 +5,7 @@
 //! two decoders' APIs allow. Issue #877.
 
 use super::{DspState, DspToUi, WefaxDecoder, WefaxLine, mpsc};
-use sdr_dsp::wefax::PIXELS_PER_LINE;
+use sdr_dsp::wefax::{PIXELS_PER_LINE, WefaxPresenceDetector};
 
 /// Max scan lines a single [`WefaxDecoder::process`] call can emit
 /// into `wefax_lines_buf`. WEFAX runs at 120 lines/minute (2 lines
@@ -60,6 +60,7 @@ pub(super) fn wefax_decode_tap(
     emit_lines(state, dsp_tx, produced);
     emit_state_if_changed(state, dsp_tx);
     emit_complete_if_ready(state, dsp_tx);
+    emit_presence_if_changed(state, dsp_tx);
 }
 
 /// Lazy-init `state.wefax_decoder`. Caches a failing rate in
@@ -87,6 +88,11 @@ fn init_wefax_decoder(state: &mut DspState) -> bool {
             state
                 .wefax_lines_buf
                 .resize(WEFAX_LINES_BUF_CAP, WefaxLine::default());
+            // Presence detector shares the decoder's rate and lifecycle —
+            // rebuilt alongside it so the two never observe different
+            // sample rates. Per #913.
+            state.wefax_presence = Some(WefaxPresenceDetector::new(f64::from(rate_hz)));
+            state.wefax_presence_last = None;
             true
         }
         Err(e) => {
@@ -161,4 +167,43 @@ fn emit_complete_if_ready(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) 
         height,
         pixels: completed.pixels,
     });
+}
+
+/// Feed the presence detector the same pre-gate mono buffer the
+/// decoder just processed, and emit `DspToUi::WefaxPresence` only on
+/// a hysteresis-gated presence change. Extracted from `wefax_decode_tap`
+/// to keep that function under the NLOC gate. Per #913.
+fn emit_presence_if_changed(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
+    let Some(presence) = state.wefax_presence.as_mut() else {
+        return;
+    };
+    let current = presence.update(&state.wefax_mono_buf);
+    if let Some(edge) = presence_edge(&mut state.wefax_presence_last, current) {
+        let _ = dsp_tx.send(DspToUi::WefaxPresence(edge));
+    }
+}
+
+/// Emit only when presence changed. Pure; unit-tested.
+fn presence_edge(last: &mut Option<bool>, current: bool) -> Option<bool> {
+    if *last == Some(current) {
+        None
+    } else {
+        *last = Some(current);
+        Some(current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::presence_edge;
+
+    #[test]
+    fn presence_edge_only_fires_on_change() {
+        let mut last = None;
+        assert_eq!(presence_edge(&mut last, false), Some(false)); // first observation emits
+        assert_eq!(presence_edge(&mut last, false), None); // unchanged
+        assert_eq!(presence_edge(&mut last, true), Some(true)); // rising edge
+        assert_eq!(presence_edge(&mut last, true), None);
+        assert_eq!(presence_edge(&mut last, false), Some(false)); // falling edge
+    }
 }

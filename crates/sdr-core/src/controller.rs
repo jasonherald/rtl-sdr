@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use sdr_dsp::apt::{AptDecoder, AptLine, READY_QUEUE_CAP};
 use sdr_dsp::channel::RxVfo;
-use sdr_dsp::wefax::{WefaxDecoder, WefaxLine, WefaxState};
+use sdr_dsp::wefax::{WefaxDecoder, WefaxLine, WefaxPresenceDetector, WefaxState};
 use sdr_pipeline::iq_frontend::{FftWindow, IqFrontend};
 use sdr_pipeline::source_manager::Source;
 use sdr_radio::lrpt_decoder::{LrptDecoder, LrptDownlink};
@@ -635,6 +635,15 @@ struct DspState {
     /// `DspToUi::WefaxState` is only sent on change rather than on
     /// every audio block. Issue #877.
     wefax_last_state: Option<WefaxState>,
+    /// Fax-subcarrier presence detector, fed the same pre-gate mono
+    /// buffer as `wefax_decoder`. Lazy-init alongside the decoder
+    /// (same audio sample rate) so the two never disagree on rate.
+    /// `None` means "not yet built". Per #913.
+    wefax_presence: Option<WefaxPresenceDetector>,
+    /// Last presence value reported to the UI. Used to edge-detect
+    /// `DspToUi::WefaxPresence` sends, mirroring `wefax_last_state`.
+    /// Per #913.
+    wefax_presence_last: Option<bool>,
     /// Live ACARS bank. May be temporarily `None` while ACARS
     /// is still engaged — specifically, the `Start` path
     /// invalidates this so `acars_decode_tap`'s lazy-init can
@@ -861,6 +870,8 @@ impl DspState {
             wefax_init_failed_at_rate: None,
             wefax_image: None,
             wefax_last_state: None,
+            wefax_presence: None,
+            wefax_presence_last: None,
             acars_bank: None,
             acars_pre_lock: None,
             acars_init_failed: false,
@@ -1617,6 +1628,12 @@ fn reset_imaging_decoders(state: &mut DspState) {
     state.wefax_mono_buf.clear();
     state.wefax_init_failed_at_rate = None;
     state.wefax_last_state = None;
+    // Presence detector shares the decoder's lifecycle (both are
+    // lazily rebuilt at the same rate in `init_wefax_decoder`) so a
+    // stale presence reading never carries across passes/channels.
+    // Per #913.
+    state.wefax_presence = None;
+    state.wefax_presence_last = None;
 }
 
 /// Read one block of IQ data from the source, process it, and send FFT data

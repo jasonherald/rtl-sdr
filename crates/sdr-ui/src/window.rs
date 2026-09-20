@@ -61,6 +61,7 @@ mod scanner;
 mod share;
 mod source;
 mod transcript;
+mod wefax;
 
 use audio::{connect_audio_panel, connect_volume_persistence};
 use aviation::{connect_aviation_panel, try_collapse_into_existing};
@@ -90,6 +91,7 @@ use source::{
     connect_source_rtlsdr_probe, handle_rtl_tcp_state_toast,
 };
 use transcript::connect_transcript_panel;
+use wefax::connect_wefax_panel;
 
 /// Interval in milliseconds for polling the DSP→UI channel.
 const DSP_POLL_INTERVAL_MS: u64 = 16;
@@ -1637,7 +1639,7 @@ fn connect_sidebar_panels(
     connect_audio_panel(panels, state);
     connect_volume_persistence(panels, state, config, volume_button);
     connect_distance_estimator_persistence(panels, config);
-    connect_scanner_panel(panels, state, config, spectrum_handle);
+    connect_scanner_panel(panels, state, config, spectrum_handle, toast_overlay);
     let tune_to_satellite = build_tune_to_satellite(tune_ctx);
     register_tune_satellite_action(app, &tune_to_satellite);
 
@@ -1651,6 +1653,7 @@ fn connect_sidebar_panels(
     );
     connect_aviation_panel(&panels.aviation, state, config, toast_overlay);
     crate::sidebar::orbcomm_panel::connect_orbcomm_panel(panels, state, orbcomm_tle_cache);
+    connect_wefax_panel(panels, state, toast_overlay);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(panels, tune_ctx, volume_button);
 

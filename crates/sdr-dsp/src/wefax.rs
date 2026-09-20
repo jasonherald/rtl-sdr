@@ -6,12 +6,14 @@ mod afc;
 mod assembly;
 mod discriminator;
 mod phasing;
+mod presence;
 mod sync;
 mod tones;
 
 use afc::AfcMapper;
 use assembly::LineAssembler;
 use discriminator::Discriminator;
+pub use presence::WefaxPresenceDetector;
 use sdr_types::DspError;
 use sync::{LineDisposition, SyncMachine};
 

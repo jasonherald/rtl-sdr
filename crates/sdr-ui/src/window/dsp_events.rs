@@ -149,6 +149,10 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
             on_wefax_image_complete(ctx, width, height, pixels);
         }
         DspToUi::WefaxState(wefax_state) => on_wefax_state(ctx, wefax_state),
+        // Fax-subcarrier presence detector plumbing (#913): feeds the
+        // auto-catch tick driver (`window::wefax`), which reads
+        // `state.wefax_present` on its next ~500 ms tick.
+        DspToUi::WefaxPresence(present) => on_wefax_presence(ctx, present),
     }
 }
 
@@ -866,6 +870,18 @@ fn on_wefax_state(ctx: &DspEventCtx, wefax_state: sdr_dsp::wefax::WefaxState) {
     if let Some(view) = state.wefax_viewer.borrow().as_ref() {
         view.set_state_label(wefax_state);
     }
+    // Cache for the next auto-catch `TickCtx` (epic #913, Task 6) and
+    // refresh the WEFAX panel's status row immediately rather than
+    // waiting up to the tick driver's ~500 ms cadence.
+    state.wefax_last_state.set(wefax_state);
+    super::wefax::on_decoder_state_changed(state);
+}
+
+/// `DspToUi::WefaxPresence` arm of [`handle_dsp_message`] (epic #913,
+/// Task 6): cache the edge-triggered fax-subcarrier presence flag for
+/// the auto-catch tick driver's next `TickCtx`.
+fn on_wefax_presence(ctx: &DspEventCtx, present: bool) {
+    ctx.state.wefax_present.set(present);
 }
 
 /// `DspToUi::SignalLevel` arm of [`handle_dsp_message`], split out per

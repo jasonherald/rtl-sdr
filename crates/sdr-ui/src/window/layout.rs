@@ -615,6 +615,7 @@ fn build_panel_stacks(
     left_stack.add_named(&panels.satellites.widget, Some("satellites"));
     left_stack.add_named(&panels.aviation.widget, Some("aviation"));
     left_stack.add_named(&panels.orbcomm.widget, Some("orbcomm"));
+    left_stack.add_named(&panels.wefax.widget, Some("wefax"));
 
     // Right panel stack — single child today, hosts the real
     // transcript widget (not a placeholder) so transcription keeps

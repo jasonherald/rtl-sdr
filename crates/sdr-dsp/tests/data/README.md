@@ -21,6 +21,13 @@ our APT decoder against real, known-good NOAA 19 audio.
 |---|---|---|
 | `wefax_surface_48hr_11025hz.wav` | [2bsailing.ca](https://www.2bsailing.ca/info/Weatherfax_and_shortwave_radio.php) — `wefax/48HrSurface_Valid201302011200.wav` | ~10 minutes of a NOAA/NWS **48-hour surface-analysis** radiofax, received on 17151 kHz at Victoria BC on 2013-01-30 (chart valid 2013-02-01 1200Z). 11025 Hz mono 16-bit PCM. Decodes to a fully legible surface chart (date header, isobars, pressure centres, GALE/STORM annotations, NOAA logo) via `cargo run -p sdr-dsp --example wefax_decode_wav -- <this> out.png --sync`. |
 
+## WEFAX fax-presence detector fixtures
+
+| File | Source | Description |
+|---|---|---|
+| `wefax_nmf_present_12k.wav` | Off-air capture of station NMF (US Coast Guard, Boston) HF radiofax, 4235 kHz USB | **Provenance:** captured off-air by the repository author (Jason Herald) with an Airspy R2 + SpyVerter R2 on 2026-09-19, then demodulated and down-sampled to a 12 s excerpt (12 kHz mono 32-bit float) of the NMF fax subcarrier. Used by `tests/wefax_presence.rs` to assert `WefaxPresenceDetector` reads a real signal as present. **Rights:** NMF is a US Coast Guard (US Government) broadcast; per 17 U.S.C. §105 US Government works are not subject to domestic copyright, and a faithful mechanical radio capture adds no new copyrightable authorship, so the recording carries no separate copyright — it is contributed to this repository by its author under the repository's own license, and treated as public domain (same rationale as the WEFAX surface-chart fixture above). |
+| `wefax_static_12k.wav` | Synthetic (`sox -n synth whitenoise`) | 12 s of synthesized white noise (12 kHz mono 32-bit float), used as the negative control in `tests/wefax_presence.rs`. |
+
 ## License
 
 ### APT fixtures
