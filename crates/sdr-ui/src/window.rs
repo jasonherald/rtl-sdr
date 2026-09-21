@@ -1653,7 +1653,7 @@ fn connect_sidebar_panels(
     );
     connect_aviation_panel(&panels.aviation, state, config, toast_overlay);
     crate::sidebar::orbcomm_panel::connect_orbcomm_panel(panels, state, orbcomm_tle_cache);
-    connect_wefax_panel(panels, state, toast_overlay);
+    connect_wefax_panel(panels, state, tune_ctx, toast_overlay);
     // Transcript panel is wired separately (not in SidebarPanels).
     connect_navigation_panel(panels, tune_ctx, volume_button);
 

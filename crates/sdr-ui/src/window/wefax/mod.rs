@@ -22,6 +22,18 @@ use crate::sidebar::satellites_panel::{load_station_lat_deg, load_station_lon_de
 use crate::sidebar::wefax_catcher::{Action, CatcherState, SavedTune, StationChoice, TickCtx};
 use crate::sidebar::wefax_panel::WefaxPanelHandles;
 use crate::state::AppState;
+use sdr_types::DemodMode;
+
+use super::{TuneCtx, tune_to_target};
+
+/// Channel bandwidth to mirror when tuning to a station picked from the
+/// "Fax stations" list (#919). WEFAX's passband is locked
+/// (`WefaxDemodulator`'s `bandwidth_locked` config in `sdr-radio`), so
+/// this only matters for the UI mirror (bandwidth row + status bar) —
+/// the DSP clamps any `SetBandwidth` to the demod's fixed min==max==
+/// default range regardless. Matches `sdr-radio`'s private
+/// `WEFAX_DEFAULT_BANDWIDTH`.
+const WEFAX_TUNE_BANDWIDTH_HZ: f64 = 2_400.0;
 
 /// Tick interval for the auto-catch driver (ms). Fast enough that a
 /// user watching the status row sees the Scanning -> Signal found ->
@@ -37,6 +49,7 @@ const WEFAX_TICK_INTERVAL_MS: u64 = 500;
 pub(super) fn connect_wefax_panel(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
+    tune_ctx: &TuneCtx,
     toast_overlay: &adw::ToastOverlay,
 ) {
     let handles = Rc::clone(&panels.wefax.handles);
@@ -49,6 +62,8 @@ pub(super) fn connect_wefax_panel(
         parent_provider: build_parent_provider(panels),
         toast_overlay: toast_overlay.downgrade(),
     });
+
+    populate_stations_group(&handles, state, tune_ctx, &deps);
 
     let scanner_switch = panels.scanner.master_switch.clone();
     let bandwidth_row = panels.radio.bandwidth_row.clone();
@@ -114,6 +129,100 @@ fn populate_station_combo(handles: &WefaxPanelHandles, state: &Rc<AppState>) {
         .station_row
         .set_model(Some(&gtk4::StringList::new(&refs)));
     handles.station_row.set_selected(0);
+}
+
+/// Populate the "Fax stations" group: one activatable row per
+/// station+channel from `sdr_sat::channels_by_distance`, nearest-first,
+/// ranked from the persisted ground-station coordinates at connect
+/// time (mirrors `populate_station_combo` — not re-derived on later
+/// coordinate changes). Each row's `(station, freq_hz)` identity is
+/// baked directly into its own `connect_activated` closure, so the
+/// click handler never needs to re-rank or look the row up by index.
+fn populate_stations_group(
+    handles: &Rc<WefaxPanelHandles>,
+    state: &Rc<AppState>,
+    tune_ctx: &TuneCtx,
+    deps: &Rc<WefaxDeps>,
+) {
+    let lat = load_station_lat_deg(&state.config);
+    let lon = load_station_lon_deg(&state.config);
+    for (station, freq_hz, distance_km) in sdr_sat::channels_by_distance(lat, lon) {
+        let row = build_station_row(station, freq_hz, distance_km);
+        handles.stations_group.add(&row);
+        let state = Rc::clone(state);
+        let handles = Rc::clone(handles);
+        let deps = Rc::clone(deps);
+        let tune_ctx = tune_ctx.clone();
+        row.connect_activated(move |_| {
+            tune_and_camp(&state, &handles, &deps, &tune_ctx, station, freq_hz);
+        });
+    }
+}
+
+/// Build one "Fax stations" row: title = station + channel frequency,
+/// subtitle = distance + rough propagation-vs-time band hint.
+fn build_station_row(station: &str, freq_hz: u64, distance_km: f64) -> adw::ActionRow {
+    let title = format!("{station} — {}", sdr_sat::format_channel_khz(freq_hz));
+    let subtitle = format!("{distance_km:.0} km · {} band", sdr_sat::band_hint(freq_hz));
+    adw::ActionRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .activatable(true)
+        .build()
+}
+
+/// A "Fax stations" row was clicked: turn auto-catch off first (a
+/// manual pick and the scan rotation are mutually exclusive), then
+/// tune-and-camp on the exact channel shown, through the same full
+/// tune path (`tune_to_target`) bookmark recall and satellite play
+/// use — header, spectrum, demod dropdown, bandwidth, and status bar
+/// all mirror the pick, unlike auto-catch's raw `UiToDsp::Tune`.
+fn tune_and_camp(
+    state: &Rc<AppState>,
+    handles: &Rc<WefaxPanelHandles>,
+    deps: &Rc<WefaxDeps>,
+    tune_ctx: &TuneCtx,
+    station: &'static str,
+    freq_hz: u64,
+) {
+    stop_auto_catch_before_manual_tune(state, handles, deps);
+    tracing::info!(
+        target: "wefax_station_picker",
+        station,
+        freq_hz,
+        "STATION_ROW_TUNE"
+    );
+    tune_to_target(
+        tune_ctx,
+        freq_hz,
+        DemodMode::Wefax,
+        WEFAX_TUNE_BANDWIDTH_HZ,
+        "WEFAX station picker",
+    );
+}
+
+/// If auto-catch is enabled, turn it off and force its pending
+/// restore-tune to land NOW rather than on the next scheduled ~500 ms
+/// tick. Without this, the armed tick loop's `Action::RestoreTune`
+/// (queued for whenever it next fires) would race the manual tune
+/// `tune_and_camp` is about to send and could clobber it — the two
+/// paths must never fight over the receiver.
+fn stop_auto_catch_before_manual_tune(
+    state: &Rc<AppState>,
+    handles: &Rc<WefaxPanelHandles>,
+    deps: &Rc<WefaxDeps>,
+) {
+    if !state.wefax_enabled.get() {
+        return;
+    }
+    handles.suppress_switch_notify.set(true);
+    handles.enable_switch.set_active(false);
+    handles.suppress_switch_notify.set(false);
+    state.wefax_enabled.set(false);
+    // Drive the catcher's own disable-tick synchronously so its
+    // `RestoreTune` action is interpreted (and thus fully sent to the
+    // DSP) before this function returns.
+    tick_once(state, deps);
 }
 
 /// Enable-switch handler: refuse (toast + revert) while the scanner
