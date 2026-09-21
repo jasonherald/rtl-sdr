@@ -35,6 +35,13 @@ pub const LOCK_TIMEOUT_TICKS: u32 = 10;
 /// but a present-but-never-imaging lock (a steady birdie, or an in-band
 /// carrier with no chart) can't hang the rotation forever.
 pub const LOCK_MAX_TICKS: u32 = 120;
+/// Ticks a Locked channel may stay without the decoder ever reaching
+/// Phasing before it's treated as a carrier / non-preamble and the scan
+/// advances. ~8 s at the ~500 ms tick — long enough for a real chart's
+/// phasing preamble to drive the decoder to Phasing (it enters Phasing
+/// after ~4 pulse lines ≈ 2 s), short enough not to camp on a steady
+/// carrier for the full `LOCK_MAX_TICKS` ceiling (#914).
+pub const IDLE_LOCK_TIMEOUT_TICKS: u32 = 16;
 /// Ticks of *continuous* presence loss during `Imaging` before it's treated
 /// as a real signal loss rather than a brief subcarrier dip (e.g. over a
 /// blank/white image region) and falls back to `Scanning`. A single missed
@@ -157,6 +164,13 @@ pub enum CatcherState {
         waited: u32,
         /// The user's tune, to restore on disable.
         saved: SavedTune,
+        /// Whether the decoder has reached `WefaxState::Phasing` at any
+        /// point since this lock began. A real chart's phasing preamble
+        /// drives the decoder there within a few seconds; a steady carrier
+        /// or a mid-chart tune with no preamble never does. Once true, the
+        /// lock is held toward [`LOCK_MAX_TICKS`] instead of the much
+        /// shorter [`IDLE_LOCK_TIMEOUT_TICKS`] (#914).
+        saw_phasing: bool,
     },
     /// The decoder is actively assembling a chart.
     Imaging {
@@ -173,6 +187,18 @@ pub enum CatcherState {
         /// [`IMAGING_LOSS_TICKS`] before falling back to `Scanning`).
         lost: u32,
     },
+}
+
+/// Bundles `Locked`'s two progress fields into one `on_locked` parameter,
+/// keeping the method under clippy's `too_many_arguments` limit.
+#[derive(Clone, Copy)]
+struct LockProgress {
+    /// Ticks spent locked without entering `Imaging`.
+    waited: u32,
+    /// Whether the decoder has reached `WefaxState::Phasing` since this
+    /// lock began (mirrors `CatcherState::Locked`'s field of the same
+    /// name).
+    saw_phasing: bool,
 }
 
 /// The pure WEFAX auto-catch state machine.
@@ -239,7 +265,18 @@ impl WefaxCatcher {
                 cand,
                 waited,
                 saved,
-            } => self.on_locked(&ctx, candidates, idx, cand, waited, saved),
+                saw_phasing,
+            } => self.on_locked(
+                &ctx,
+                candidates,
+                idx,
+                cand,
+                saved,
+                LockProgress {
+                    waited,
+                    saw_phasing,
+                },
+            ),
             CatcherState::Imaging {
                 candidates,
                 idx,
@@ -400,6 +437,7 @@ impl WefaxCatcher {
                 cand,
                 waited: 0,
                 saved,
+                saw_phasing: false,
             };
             return Vec::new();
         }
@@ -429,9 +467,13 @@ impl WefaxCatcher {
         candidates: Vec<Candidate>,
         idx: usize,
         cand: Candidate,
-        waited: u32,
         saved: SavedTune,
+        progress: LockProgress,
     ) -> Vec<Action> {
+        let LockProgress {
+            waited,
+            saw_phasing,
+        } = progress;
         if matches!(ctx.wefax_state, WefaxState::Imaging) {
             self.state = CatcherState::Imaging {
                 candidates,
@@ -442,14 +484,19 @@ impl WefaxCatcher {
             };
             return vec![Action::OpenViewer];
         }
-        if waited + 1 >= LOCK_MAX_TICKS {
-            // Hard ceiling: present-but-never-imaging (birdie / carrier
-            // with no chart). Advance past it so it can't hang forever.
-            return self.resume_next_candidate(candidates, idx, saved);
-        }
-        if !ctx.fax_present && waited + 1 >= LOCK_TIMEOUT_TICKS {
-            // Fast false-lock rescan: presence simply dropped. Advance to
-            // the next candidate, preserving the originally captured tune.
+        let saw_phasing = saw_phasing || matches!(ctx.wefax_state, WefaxState::Phasing);
+        // A real chart's phasing preamble drives the decoder to Phasing
+        // within a few seconds; hold toward the full LOCK_MAX_TICKS ceiling
+        // once that's been observed. Otherwise (steady carrier, or a
+        // mid-chart tune with no preamble) rescan much faster.
+        let limit = if saw_phasing {
+            LOCK_MAX_TICKS
+        } else {
+            IDLE_LOCK_TIMEOUT_TICKS
+        };
+        if waited + 1 >= limit || (!ctx.fax_present && waited + 1 >= LOCK_TIMEOUT_TICKS) {
+            // Advance past it so it can't hang forever, preserving the
+            // originally captured tune.
             return self.resume_next_candidate(candidates, idx, saved);
         }
         self.state = CatcherState::Locked {
@@ -458,6 +505,7 @@ impl WefaxCatcher {
             cand,
             waited: waited + 1,
             saved,
+            saw_phasing,
         };
         Vec::new()
     }
@@ -474,12 +522,16 @@ impl WefaxCatcher {
         if matches!(ctx.wefax_state, WefaxState::Stopped) {
             // Chart complete: save; STAY on this working channel (->
             // Locked, waiting for the next chart on the same frequency).
+            // This channel already proved itself real (a chart just
+            // finished), so hold it toward the full LOCK_MAX_TICKS ceiling
+            // for the next chart rather than the short idle timeout.
             self.state = CatcherState::Locked {
                 candidates,
                 idx,
                 cand,
                 waited: 0,
                 saved,
+                saw_phasing: true,
             };
             return vec![Action::SavePng(PathBuf::new())];
         }

@@ -3309,6 +3309,7 @@ dependencies = [
 name = "sdr-radio"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "sdr-dsp",
  "sdr-lrpt",
  "sdr-pipeline",
