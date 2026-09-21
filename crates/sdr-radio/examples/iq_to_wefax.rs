@@ -58,6 +58,12 @@ const WEFAX_IF_RATE: u32 = 24_000;
 /// streaming path exercised and per-chunk allocations bounded (~2 MB of
 /// complex data per chunk).
 const CHUNK_FRAMES: usize = 1 << 18;
+/// Ceiling on the resampler output buffer. The buffer grows as
+/// `WEFAX_IF_RATE / source_rate` for below-24 kHz inputs, so an absurd
+/// header rate (a 1 Hz WAV → ~6.3 billion samples ≈ 47 GiB) is rejected up
+/// front rather than OOM'ing on allocation. 64 chunks (~16.8M samples,
+/// ~128 MB) is far above any real SDR IQ rate's need.
+const MAX_IF_BUF_SAMPLES: usize = 64 * CHUNK_FRAMES;
 /// Completed-line drain buffer capacity per `process` call.
 const READY_QUEUE_CAP: usize = 256;
 
@@ -228,6 +234,14 @@ impl Pipeline {
     /// smaller of in/out Nyquist = 12 kHz) before decimating, so no separate
     /// LPF is needed to avoid aliasing into the 24 kHz IF.
     fn new(source_rate: u32) -> Result<Self, Box<dyn std::error::Error>> {
+        let if_cap = if_capacity(CHUNK_FRAMES, source_rate);
+        if if_cap > MAX_IF_BUF_SAMPLES {
+            return Err(format!(
+                "source rate {source_rate} Hz is too low for this harness: it would need a \
+                 {if_cap}-sample resampler output buffer (cap {MAX_IF_BUF_SAMPLES})"
+            )
+            .into());
+        }
         Ok(Self {
             resampler: RationalResampler::new(f64::from(source_rate), f64::from(WEFAX_IF_RATE))?,
             demod: WefaxDemodulator::new()?,
@@ -235,7 +249,7 @@ impl Pipeline {
             sync_dec: WefaxDecoder::new(WEFAX_IF_RATE)?,
             source_rate,
             iq_chunk: Vec::with_capacity(CHUNK_FRAMES),
-            if_buf: vec![Complex::default(); if_capacity(CHUNK_FRAMES, source_rate)],
+            if_buf: vec![Complex::default(); if_cap],
             stereo_buf: vec![Stereo::default(); CHUNK_FRAMES],
             mono: Vec::with_capacity(CHUNK_FRAMES),
             line_buf: vec![WefaxLine::default(); READY_QUEUE_CAP],
