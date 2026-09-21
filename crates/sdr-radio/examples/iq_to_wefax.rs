@@ -63,7 +63,8 @@ const CHUNK_FRAMES: usize = 1 << 18;
 /// header rate (a 1 Hz WAV → ~6.3 billion samples ≈ 47 GiB) is rejected up
 /// front rather than OOM'ing on allocation. 64 chunks (~16.8M samples,
 /// ~128 MB) is far above any real SDR IQ rate's need.
-const MAX_IF_BUF_SAMPLES: usize = 64 * CHUNK_FRAMES;
+const MAX_IF_BUF_CHUNKS: usize = 64;
+const MAX_IF_BUF_SAMPLES: usize = MAX_IF_BUF_CHUNKS * CHUNK_FRAMES;
 /// Completed-line drain buffer capacity per `process` call.
 const READY_QUEUE_CAP: usize = 256;
 
@@ -185,6 +186,11 @@ fn read_and_validate_header(
             spec.bits_per_sample, spec.sample_format
         )
         .into());
+    }
+    // A zero sample rate would make `if_capacity`'s `div_ceil` denominator
+    // zero and panic before the resampler could reject it.
+    if spec.sample_rate == 0 {
+        return Err("WAV header reports a 0 Hz sample rate".into());
     }
     Ok(spec.sample_rate)
 }
