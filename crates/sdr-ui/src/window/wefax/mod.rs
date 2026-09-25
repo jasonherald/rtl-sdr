@@ -201,27 +201,28 @@ fn tune_and_camp(
     );
 }
 
-/// If auto-catch is enabled, turn it off and force its pending
-/// restore-tune to land NOW rather than on the next scheduled ~500 ms
-/// tick. Without this, the armed tick loop's `Action::RestoreTune`
-/// (queued for whenever it next fires) would race the manual tune
-/// `tune_and_camp` is about to send and could clobber it — the two
-/// paths must never fight over the receiver.
+/// Turn auto-catch off (if on) and force any pending restore-tune to
+/// land NOW rather than on the next scheduled ~500 ms tick. Without
+/// this, the tick loop's `Action::RestoreTune` (queued for whenever it
+/// next fires) would race the manual tune `tune_and_camp` is about to
+/// send and could clobber it — the two paths must never fight over the
+/// receiver.
 fn stop_auto_catch_before_manual_tune(
     state: &Rc<AppState>,
     handles: &Rc<WefaxPanelHandles>,
     deps: &Rc<WefaxDeps>,
 ) {
-    if !state.wefax_enabled.get() {
-        return;
+    if state.wefax_enabled.get() {
+        handles.suppress_switch_notify.set(true);
+        handles.enable_switch.set_active(false);
+        handles.suppress_switch_notify.set(false);
+        state.wefax_enabled.set(false);
     }
-    handles.suppress_switch_notify.set(true);
-    handles.enable_switch.set_active(false);
-    handles.suppress_switch_notify.set(false);
-    state.wefax_enabled.set(false);
-    // Drive the catcher's own disable-tick synchronously so its
-    // `RestoreTune` action is interpreted (and thus fully sent to the
-    // DSP) before this function returns.
+    // Always drive the catcher's disable tick synchronously — including
+    // when the user already switched auto-catch off and the timer hasn't
+    // ticked since — so a still-pending `RestoreTune` is interpreted (and
+    // sent to the DSP) before the manual tune. A disabled tick on an idle
+    // catcher emits nothing, so this is a no-op when nothing is pending.
     tick_once(state, deps);
 }
 

@@ -103,24 +103,32 @@ pub fn channels_by_distance(user_lat: f64, user_lon: f64) -> Vec<(&'static str, 
         .collect()
 }
 
+/// Lowest frequency of the "transitional" [`band_hint`] band; below it a
+/// channel is a night band.
+const TRANSITIONAL_BAND_MIN_HZ: u64 = 6_000_000;
+
+/// Lowest frequency of the "day" [`band_hint`] band.
+const DAY_BAND_MIN_HZ: u64 = 10_000_000;
+
 /// Rough HF-propagation-vs-time-of-day guide for a fax channel's
-/// frequency. Lower HF bands (< 6 MHz) propagate best at night; the
-/// highest bands (>= 10 MHz) favor daylight; the band in between is
-/// "transitional" (dawn/dusk, or either depending on solar conditions).
-/// A coarse heuristic only — real propagation depends on season, solar
-/// activity, and path — but enough to hint "try this one after dark."
+/// frequency. Lower HF bands (below [`TRANSITIONAL_BAND_MIN_HZ`]) propagate
+/// best at night; the highest bands (from [`DAY_BAND_MIN_HZ`] up) favor
+/// daylight; the band in between is "transitional" (dawn/dusk, or either
+/// depending on solar conditions). A coarse heuristic only — real
+/// propagation depends on season, solar activity, and path — but enough to
+/// hint "try this one after dark."
 #[must_use]
 pub fn band_hint(freq_hz: u64) -> &'static str {
     match freq_hz {
-        0..=5_999_999 => "night",
-        6_000_000..=9_999_999 => "transitional",
+        f if f < TRANSITIONAL_BAND_MIN_HZ => "night",
+        f if f < DAY_BAND_MIN_HZ => "transitional",
         _ => "day",
     }
 }
 
 /// Format a channel frequency for display, e.g. `4235 kHz` or
 /// `6340.5 kHz` (trailing `.0` trimmed). All catalog frequencies are
-/// round to the nearest 100 Hz, so one decimal digit is always enough.
+/// rounded to the nearest 100 Hz, so one decimal digit is always enough.
 #[must_use]
 #[allow(
     clippy::cast_precision_loss,
@@ -321,6 +329,11 @@ mod tests {
         assert_eq!(band_hint(6_000_000), "transitional");
         assert_eq!(band_hint(9_900_000), "transitional");
         assert_eq!(band_hint(10_000_000), "day");
+        // Exact edges: each named threshold is the first Hz of its band.
+        assert_eq!(band_hint(TRANSITIONAL_BAND_MIN_HZ - 1), "night");
+        assert_eq!(band_hint(TRANSITIONAL_BAND_MIN_HZ), "transitional");
+        assert_eq!(band_hint(DAY_BAND_MIN_HZ - 1), "transitional");
+        assert_eq!(band_hint(DAY_BAND_MIN_HZ), "day");
     }
 
     #[test]
