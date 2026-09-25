@@ -8,6 +8,8 @@ mod discriminator;
 mod phasing;
 mod presence;
 mod sync;
+#[cfg(test)]
+mod test_fixtures;
 mod tones;
 
 use afc::AfcMapper;
@@ -149,10 +151,24 @@ impl WefaxDecoder {
         }
     }
 
-    /// Take and clear the "a chart just finished" flag, set when a stop tone
-    /// finalizes a chart. Always `false` for free-running decoders.
+    /// Take and clear the "a chart just finished" flag — set when a chart
+    /// ends on the stop tone, the next chart's phasing preamble, or a
+    /// sustained loss of fax presence. Always `false` for free-running
+    /// decoders.
     pub fn take_chart_complete(&mut self) -> bool {
         self.sync.take_chart_complete()
+    }
+
+    /// Feed the fax-presence verdict (e.g. from a
+    /// [`WefaxPresenceDetector`]) for the `samples` most recently processed.
+    /// Presence frames charts: a sustained absence ends the chart being
+    /// imaged, and sustained presence with no phasing lock starts imaging
+    /// unaligned so a missed preamble doesn't lose the chart. No-op for
+    /// free-running decoders.
+    pub fn observe_presence(&mut self, present: bool, samples: usize) {
+        if self.gated {
+            self.sync.on_presence(present, samples);
+        }
     }
 
     /// Feed audio; append completed lines to `out`, returning the count

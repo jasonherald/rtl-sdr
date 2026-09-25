@@ -1,56 +1,36 @@
-//! WEFAX line-sync state machine: start tone → phasing lock → imaging →
-//! stop tone. Gates line emission until the left edge is locked and
-//! auto-segments charts on the stop tone.
+//! WEFAX line-sync state machine: phasing lock → imaging → chart end.
+//! Gates line emission until the left edge is locked and segments the
+//! stream into one image per chart.
+//!
+//! A chart ends on any of: the 450 Hz stop tone; the *next* chart's phasing
+//! preamble (after a hold-off); or a sustained loss of fax presence (the
+//! silent gap between transmissions). Real overnight HF showed the stop tone
+//! alone is too fragile — back-to-back charts piled up into single images
+//! (#921).
 
 use super::assembly::LineAssembler;
-use super::phasing::{PULSE_BRIGHTNESS_THRESHOLD, PhasingTracker};
+use super::phasing::{PhasingVote, VOTE_EVIDENCE_LINES, pulse_column};
 use super::tones::ToneDetector;
 use super::{START_TONE_HZ, STOP_TONE_HZ, WefaxState};
 
-/// A phasing line's bright-pixel count must stay below this fraction of the
-/// line. A blank/silent line (no bright pixels) reports `pulse_column = 0.0`,
-/// and a saturated all-white line has its leading bright edge at column 0 —
-/// either would drag the median column offset and slant lock toward the left
-/// edge. Tightened from the original 0.5 to reject a *noise* line: broadband
-/// noise leaves ~30-50% of the line bright, well above a real phasing pulse's
-/// ~5% narrow white bar, so the old `< 50%` guard let noise masquerade as
-/// phasing and lock imaging onto static (#913 no-static hardening).
-const PHASING_MAX_BRIGHT_FRACTION: f64 = 0.15;
+/// Lines after entering Imaging during which a phasing vote can NOT end the
+/// chart. The vote locks early in a preamble (~6 pulse lines in), so the
+/// rest of that same preamble is emitted as the chart's top rows; the
+/// hold-off (60 s at 120 lpm) outlasts any real preamble (~30-35 s measured)
+/// so a chart's own preamble tail can't immediately split it.
+const IMAGING_RESTART_HOLDOFF_LINES: usize = 120;
 
-/// The single longest contiguous bright run must hold at least this fraction
-/// of *all* the line's bright pixels for it to count as a phasing pulse. A
-/// real pulse is one contiguous white bar (ratio ≈ 1.0); broadband noise
-/// scatters its bright pixels into many 1-2 px runs (ratio ≈ 0), so this
-/// rejects noise even on the rare block whose bright fraction dips below
-/// [`PHASING_MAX_BRIGHT_FRACTION`]. Paired with the fraction guard so both a
-/// too-bright *and* a too-scattered line are excluded (#913).
-const PHASING_MIN_RUN_CONCENTRATION: f64 = 0.5;
+/// Continuous seconds of fax absence that end the chart being imaged. Real
+/// inter-chart gaps measured 160-250 s; the longest mid-chart fade measured
+/// ~50 s. 90 s sits between them with margin on both sides.
+const CHART_GAP_SECS: f64 = 90.0;
 
-/// Absolute floor (pixels) on the longest contiguous bright run. Without it,
-/// a line with only 1-2 stray bright pixels trivially satisfies the
-/// [`PHASING_MIN_RUN_CONCENTRATION`] ratio (`longest_run ≥ 0.5·bright` holds
-/// for any run when `bright ≤ 2`) and would count as a pulse. A real phasing
-/// bar is ~90 px (~5% of the 1809-px line), so an 8-px floor rejects stray
-/// specks while leaving an enormous margin below any genuine bar (#913).
-const PHASING_MIN_RUN_PX: usize = 8;
-
-/// Consecutive phasing-pulse lines that, seen while Idle, enter Phasing
-/// without an audio start tone. Real WEFAX carries no 300 Hz audio start
-/// tone — the "300 Hz start" is the black/white keying rate of the
-/// subcarrier — so the sync machine must recognize the phasing interval
-/// directly from line content. A short run keeps false starts unlikely while
-/// still catching the interval near its beginning.
-const PHASING_ENTRY_LINES: usize = 4;
-
-/// Largest slant estimate (pulse-column drift per line) still treated as
-/// physically plausible. A real TX/RX sample-clock mismatch is well under one
-/// column per line; the least-squares fit over noisy real pulse columns can
-/// instead produce a slope of hundreds of columns/line. Any estimate beyond
-/// this bound is rejected (slant → 0, nominal `samples_per_line = sr/2`)
-/// rather than applied, because even a clamped-but-nonzero drift accumulates
-/// into a diagonal shear across the whole chart. A genuinely small slant
-/// within the bound is applied as-is and de-slants correctly.
-pub(crate) const SLANT_PLAUSIBLE_MAX_COLS_PER_LINE: f64 = 1.0;
+/// Continuous seconds of fax presence without a phasing lock after which
+/// imaging starts anyway, at the current alignment. A missed phasing band
+/// (weak signal) must not cost the whole chart — the image is merely not
+/// left-edge aligned, as before #921. Also catches a chart already under way
+/// when reception starts. A real preamble locks well inside this (~5-12 s).
+const UNALIGNED_START_SECS: f64 = 40.0;
 
 pub(crate) enum LineDisposition {
     Drop,
@@ -61,13 +41,14 @@ pub(crate) struct SyncMachine {
     sr: f64,
     start: ToneDetector,
     stop: ToneDetector,
-    phasing: PhasingTracker,
+    vote: PhasingVote,
     state: WefaxState,
     chart_complete: bool,
-    /// Consecutive phasing-pulse lines seen while Idle, buffered so the run
-    /// that triggers entry can be replayed into the fresh tracker (the lock
-    /// needs those samples). Cleared whenever a non-pulse line breaks the run.
-    idle_pulse_run: Vec<[u8; super::PIXELS_PER_LINE]>,
+    /// Lines emitted since entering Imaging (restart hold-off).
+    imaging_lines: usize,
+    /// Consecutive samples with fax present / absent (presence framing).
+    present_samples: u64,
+    absent_samples: u64,
 }
 
 impl SyncMachine {
@@ -76,10 +57,12 @@ impl SyncMachine {
             sr,
             start: ToneDetector::new(sr, START_TONE_HZ),
             stop: ToneDetector::new(sr, STOP_TONE_HZ),
-            phasing: PhasingTracker::new(),
+            vote: PhasingVote::new(),
             state: WefaxState::Idle,
             chart_complete: false,
-            idle_pulse_run: Vec::new(),
+            imaging_lines: 0,
+            present_samples: 0,
+            absent_samples: 0,
         }
     }
 
@@ -96,206 +79,295 @@ impl SyncMachine {
         let start_on = self.start.push(s);
         let stop_on = self.stop.push(s);
         match self.state {
-            WefaxState::Idle if start_on => {
-                self.state = WefaxState::Phasing;
-                self.phasing = PhasingTracker::new();
-            }
-            WefaxState::Phasing | WefaxState::Imaging if stop_on => {
-                self.state = WefaxState::Stopped;
-                self.chart_complete = true;
-            }
+            WefaxState::Idle if start_on => self.state = WefaxState::Phasing,
+            WefaxState::Phasing | WefaxState::Imaging if stop_on => self.finish_chart(),
             _ => {}
         }
     }
 
-    /// Per-completed-line handling: build the phasing lock, then emit.
+    /// Per-completed-line handling: vote on the phasing pulse, lock, emit.
     pub(crate) fn on_line(
         &mut self,
         line: &[u8; super::PIXELS_PER_LINE],
         assembler: &mut LineAssembler,
     ) -> LineDisposition {
+        self.vote.push(pulse_column(line));
         match self.state {
-            WefaxState::Phasing => {
-                self.observe_phasing_line(line, assembler);
+            WefaxState::Idle | WefaxState::Phasing => {
+                self.try_lock(assembler);
                 LineDisposition::Drop
             }
-            WefaxState::Imaging => LineDisposition::Emit,
+            WefaxState::Imaging => self.on_imaging_line(),
             WefaxState::Stopped => {
+                // Keep the vote window: if the next chart's preamble ended
+                // this one, the very next line can lock on it.
                 self.state = WefaxState::Idle;
                 LineDisposition::Drop
             }
-            WefaxState::Idle => {
-                self.observe_idle_line(line, assembler);
-                LineDisposition::Drop
-            }
         }
     }
 
-    /// While Idle, detect the phasing interval directly from line content: a
-    /// run of [`PHASING_ENTRY_LINES`] consecutive phasing-pulse lines enters
-    /// Phasing without needing an audio start tone (real WEFAX has none). The
-    /// buffered run is replayed into the fresh tracker so the subsequent lock
-    /// has those lines' samples; imaging then proceeds via the normal
-    /// Phasing→Imaging lock.
-    fn observe_idle_line(
-        &mut self,
-        line: &[u8; super::PIXELS_PER_LINE],
-        assembler: &mut LineAssembler,
-    ) {
-        if !is_phasing_pulse(line) {
-            self.idle_pulse_run.clear();
-            return;
-        }
-        self.idle_pulse_run.push(*line);
-        if self.idle_pulse_run.len() < PHASING_ENTRY_LINES {
-            return;
-        }
-        self.state = WefaxState::Phasing;
-        self.phasing = PhasingTracker::new();
-        let run = std::mem::take(&mut self.idle_pulse_run);
-        for l in &run {
-            self.observe_phasing_line(l, assembler);
-        }
-    }
-
-    /// Feed one phasing line to the tracker (only if it carries a genuine
-    /// bright pulse) and, once locked, program the assembler and advance to
-    /// [`WefaxState::Imaging`].
-    fn observe_phasing_line(
-        &mut self,
-        line: &[u8; super::PIXELS_PER_LINE],
-        assembler: &mut LineAssembler,
-    ) {
-        if !is_phasing_pulse(line) {
-            return; // blank or saturated line — would skew the median/slant lock
-        }
-        self.phasing.observe_line(line);
-        if let Some(off) = self.phasing.column_offset() {
-            assembler.set_column_offset(off);
-            let spl = corrected_samples_per_line(self.sr, self.phasing.slant_columns_per_line());
-            assembler.set_samples_per_line(spl);
-            self.state = WefaxState::Imaging;
-        }
-    }
-}
-
-/// Corrected samples-per-line from the phasing slant, with an implausible
-/// estimate *rejected* (not clamped) to zero. On real captures the
-/// leading-edge pulse-column measurement is jumpy, so the least-squares slope
-/// can come out hundreds of columns/line; even clamped to a small nonzero
-/// bound it would accumulate into a diagonal shear across the chart. When the
-/// raw slant exceeds [`SLANT_PLAUSIBLE_MAX_COLS_PER_LINE`] it is treated as
-/// unreliable and dropped to `0.0`, so `samples_per_line == sr/2` and the
-/// image stays straight. A genuinely small, plausible slant is applied as-is.
-///
-/// `PIXELS_PER_LINE` (1809) is far below `f64`'s exact-integer range, so the
-/// cast never loses precision in practice.
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn corrected_samples_per_line(sr: f64, slant_cols_per_line: f64) -> f64 {
-    let slant = if slant_cols_per_line.abs() > SLANT_PLAUSIBLE_MAX_COLS_PER_LINE {
-        0.0 // unreliable noisy estimate — nominal rate, no shear
-    } else {
-        slant_cols_per_line
-    };
-    let base = sr / 2.0;
-    base - slant * (base / super::PIXELS_PER_LINE as f64)
-}
-
-/// True when a line looks like a genuine phasing pulse: a *narrow*
-/// ([`PHASING_MAX_BRIGHT_FRACTION`]) run of bright pixels *concentrated* in a
-/// single contiguous bar ([`PHASING_MIN_RUN_CONCENTRATION`]). The narrowness
-/// guard rejects a flooded/white line and a half-bright noise line; the
-/// concentration guard rejects a sparse-but-scattered noise line whose bright
-/// pixels never form a dominant run. Together they keep the phasing lock from
-/// ever engaging on broadband noise (#913 no-static hardening).
-#[allow(clippy::cast_precision_loss)]
-fn is_phasing_pulse(line: &[u8; super::PIXELS_PER_LINE]) -> bool {
-    let mut bright = 0usize;
-    let mut longest_run = 0usize;
-    let mut run = 0usize;
-    for &v in line {
-        if v >= PULSE_BRIGHTNESS_THRESHOLD {
-            bright += 1;
-            run += 1;
-            longest_run = longest_run.max(run);
+    /// Feed the fax-presence verdict covering the last `samples` samples.
+    /// A sustained absence ([`CHART_GAP_SECS`]) ends the chart being imaged;
+    /// sustained presence with no lock ([`UNALIGNED_START_SECS`]) starts
+    /// imaging unaligned.
+    pub(crate) fn on_presence(&mut self, present: bool, samples: usize) {
+        let n = samples as u64;
+        if present {
+            self.present_samples = self.present_samples.saturating_add(n);
+            self.absent_samples = 0;
         } else {
-            run = 0;
+            self.absent_samples = self.absent_samples.saturating_add(n);
+            self.present_samples = 0;
+        }
+        match self.state {
+            WefaxState::Imaging if self.absent_samples >= self.secs_to_samples(CHART_GAP_SECS) => {
+                self.finish_chart();
+            }
+            WefaxState::Idle | WefaxState::Phasing
+                if self.present_samples >= self.secs_to_samples(UNALIGNED_START_SECS) =>
+            {
+                self.enter_imaging();
+            }
+            _ => {}
         }
     }
-    if bright == 0 {
-        return false;
+
+    /// Lock the left edge once the vote agrees; show Phasing on evidence.
+    fn try_lock(&mut self, assembler: &mut LineAssembler) {
+        if let Some(col) = self.vote.lock() {
+            assembler.align_to_pulse(col);
+            self.vote.clear(); // columns were measured under the old offset
+            self.enter_imaging();
+        } else if self.state == WefaxState::Idle && self.vote.evidence() >= VOTE_EVIDENCE_LINES {
+            self.state = WefaxState::Phasing;
+        }
     }
-    let fraction = bright as f64 / super::PIXELS_PER_LINE as f64;
-    if fraction >= PHASING_MAX_BRIGHT_FRACTION {
-        return false;
+
+    /// While Imaging, a phasing vote after the hold-off is the *next*
+    /// chart's preamble: finish this chart (dropping the line) so the next
+    /// one locks and aligns on it.
+    fn on_imaging_line(&mut self) -> LineDisposition {
+        self.imaging_lines = self.imaging_lines.saturating_add(1);
+        if self.imaging_lines > IMAGING_RESTART_HOLDOFF_LINES && self.vote.lock().is_some() {
+            self.finish_chart();
+            return LineDisposition::Drop;
+        }
+        LineDisposition::Emit
     }
-    longest_run >= PHASING_MIN_RUN_PX
-        && longest_run as f64 >= PHASING_MIN_RUN_CONCENTRATION * bright as f64
+
+    fn enter_imaging(&mut self) {
+        self.state = WefaxState::Imaging;
+        self.imaging_lines = 0;
+    }
+
+    fn finish_chart(&mut self) {
+        self.state = WefaxState::Stopped;
+        self.chart_complete = true;
+    }
+
+    /// Whole samples in `secs` at this machine's rate (always small and
+    /// non-negative, so the cast is exact in practice).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn secs_to_samples(&self, secs: f64) -> u64 {
+        (self.sr * secs) as u64
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 mod tests {
     use super::*;
     use crate::wefax::PIXELS_PER_LINE;
+    use crate::wefax::test_fixtures as fx;
 
-    /// A mostly-dark line with one contiguous bright run — a real pulse.
-    fn dark_with_pulse(start: usize, width: usize) -> [u8; PIXELS_PER_LINE] {
+    const SR: f64 = 24_000.0;
+
+    /// A mostly-dark line with one contiguous ~90 px bright pulse.
+    fn pulse_line(start: usize) -> [u8; PIXELS_PER_LINE] {
         let mut l = [10u8; PIXELS_PER_LINE];
-        for px in l.iter_mut().skip(start).take(width) {
+        for px in l.iter_mut().skip(start).take(90) {
             *px = 250;
         }
         l
     }
 
-    /// Bright pixels scattered every `step` columns (1-px runs) — a noise line.
-    fn scattered_bright(step: usize) -> [u8; PIXELS_PER_LINE] {
-        let mut l = [10u8; PIXELS_PER_LINE];
-        for (i, px) in l.iter_mut().enumerate() {
-            if i % step == 0 {
-                *px = 250;
-            }
+    /// Ordinary mid-grey chart content (no pulse).
+    fn content_line() -> [u8; PIXELS_PER_LINE] {
+        [128u8; PIXELS_PER_LINE]
+    }
+
+    fn machine() -> (SyncMachine, LineAssembler) {
+        (SyncMachine::new(SR), LineAssembler::new(SR / 2.0))
+    }
+
+    /// Feed lines; return how many were emitted.
+    fn feed(
+        sm: &mut SyncMachine,
+        asm: &mut LineAssembler,
+        lines: &[[u8; PIXELS_PER_LINE]],
+    ) -> usize {
+        lines
+            .iter()
+            .filter(|l| matches!(sm.on_line(l, asm), LineDisposition::Emit))
+            .count()
+    }
+
+    /// A machine locked on a synthetic preamble, past the restart hold-off.
+    fn imaging_past_holdoff() -> (SyncMachine, LineAssembler) {
+        let (mut sm, mut asm) = machine();
+        feed(&mut sm, &mut asm, &vec![pulse_line(300); 12]);
+        assert_eq!(sm.state(), WefaxState::Imaging, "synthetic preamble locks");
+        feed(
+            &mut sm,
+            &mut asm,
+            &vec![content_line(); IMAGING_RESTART_HOLDOFF_LINES + 5],
+        );
+        assert!(!sm.take_chart_complete());
+        (sm, asm)
+    }
+
+    /// Feed real rows to a fresh machine; report whether it ever imaged.
+    fn locks_from_idle(bytes: &[u8]) -> bool {
+        let (mut sm, mut asm) = machine();
+        fx::lines(bytes).iter().any(|l| {
+            sm.on_line(l, &mut asm);
+            sm.state() == WefaxState::Imaging
+        })
+    }
+
+    #[test]
+    fn real_strong_phasing_band_locks() {
+        assert!(locks_from_idle(fx::PHASING_STRONG));
+    }
+
+    #[test]
+    fn real_weak_phasing_band_locks() {
+        // Speckle breaks the pulse up on most lines of this band (bright
+        // fraction up to ~23%, pulse only ~25-45% of the bright pixels), yet
+        // a ~90 px bar at a steady column is plainly present.
+        assert!(locks_from_idle(fx::PHASING_WEAK));
+    }
+
+    #[test]
+    fn real_chart_content_never_locks_from_idle() {
+        for (i, bytes) in fx::CONTENT.iter().enumerate() {
+            assert!(
+                !locks_from_idle(bytes),
+                "content fixture {i} falsely locked"
+            );
         }
-        l
     }
 
     #[test]
-    fn narrow_contiguous_pulse_is_a_phasing_pulse() {
-        // The canonical WEFAX phasing pulse: ~5% of the line, one run.
-        assert!(is_phasing_pulse(&dark_with_pulse(300, 90)));
+    fn real_chart_content_never_splits_an_imaging_chart() {
+        let (mut sm, mut asm) = imaging_past_holdoff();
+        for bytes in fx::CONTENT {
+            feed(&mut sm, &mut asm, &fx::lines(bytes));
+        }
+        assert!(
+            !sm.take_chart_complete(),
+            "real content must not end the chart"
+        );
+        assert_eq!(sm.state(), WefaxState::Imaging);
     }
 
     #[test]
-    fn half_bright_scattered_noise_is_not_a_phasing_pulse() {
-        // ~33% bright, scattered into 1-px runs. The old `< 50%` guard passed
-        // this; it must not lock imaging onto noise.
-        assert!(!is_phasing_pulse(&scattered_bright(3)));
+    fn evidence_shows_phasing_before_the_lock() {
+        let (mut sm, mut asm) = machine();
+        feed(&mut sm, &mut asm, &vec![pulse_line(300); 3]);
+        assert_eq!(sm.state(), WefaxState::Phasing);
+        feed(&mut sm, &mut asm, &vec![pulse_line(300); 3]);
+        assert_eq!(sm.state(), WefaxState::Imaging);
     }
 
     #[test]
-    fn sparse_scattered_bright_is_not_a_phasing_pulse() {
-        // ~10% bright — below any narrowness fraction — but with no dominant
-        // contiguous run, so the concentration gate still rejects it.
-        assert!(!is_phasing_pulse(&scattered_bright(10)));
+    fn next_preamble_after_holdoff_finishes_the_chart_and_relocks() {
+        let (mut sm, mut asm) = imaging_past_holdoff();
+        let emitted = feed(&mut sm, &mut asm, &vec![pulse_line(700); 6]);
+        assert!(
+            sm.take_chart_complete(),
+            "next chart's preamble finishes this one"
+        );
+        assert_eq!(emitted, 5, "the finishing line itself is dropped");
+        // The retained vote window re-locks on the new preamble at once.
+        feed(&mut sm, &mut asm, &vec![pulse_line(700); 2]);
+        assert_eq!(
+            sm.state(),
+            WefaxState::Imaging,
+            "next chart locks immediately"
+        );
     }
 
     #[test]
-    fn flooded_white_line_is_not_a_phasing_pulse() {
-        assert!(!is_phasing_pulse(&[250u8; PIXELS_PER_LINE]));
+    fn own_preamble_tail_within_holdoff_does_not_split() {
+        let (mut sm, mut asm) = machine();
+        feed(&mut sm, &mut asm, &vec![pulse_line(300); 6]);
+        assert_eq!(sm.state(), WefaxState::Imaging);
+        // The rest of a long (~50 s) preamble keeps coming after the lock.
+        feed(&mut sm, &mut asm, &vec![pulse_line(300); 100]);
+        assert!(
+            !sm.take_chart_complete(),
+            "own preamble tail must not split the chart"
+        );
+        assert_eq!(sm.state(), WefaxState::Imaging);
+    }
+
+    /// Present/absent in 1 s steps.
+    fn presence_for(sm: &mut SyncMachine, present: bool, secs: usize) {
+        for _ in 0..secs {
+            sm.on_presence(present, SR as usize);
+        }
     }
 
     #[test]
-    fn tiny_stray_bright_run_is_not_a_phasing_pulse() {
-        // A 2-px bright run trivially passes the concentration ratio
-        // (longest_run ≥ 0.5·bright), so the absolute min-run floor is what
-        // rejects it. Real phasing bars are ~90 px.
-        assert!(!is_phasing_pulse(&dark_with_pulse(300, 2)));
-        // ...and a bar at the floor is accepted.
-        assert!(is_phasing_pulse(&dark_with_pulse(300, PHASING_MIN_RUN_PX)));
+    fn sustained_absence_ends_the_chart() {
+        let (mut sm, _asm) = imaging_past_holdoff();
+        presence_for(&mut sm, false, CHART_GAP_SECS as usize - 1);
+        assert!(!sm.take_chart_complete(), "shorter than the gap threshold");
+        presence_for(&mut sm, false, 1);
+        assert!(sm.take_chart_complete(), "a full gap ends the chart");
+        assert_eq!(sm.state(), WefaxState::Stopped);
     }
 
     #[test]
-    fn blank_line_is_not_a_phasing_pulse() {
-        assert!(!is_phasing_pulse(&[10u8; PIXELS_PER_LINE]));
+    fn a_fade_shorter_than_the_gap_does_not_end_the_chart() {
+        let (mut sm, _asm) = imaging_past_holdoff();
+        for _ in 0..5 {
+            presence_for(&mut sm, false, 60); // long fade…
+            presence_for(&mut sm, true, 1); // …then the fax is back
+        }
+        assert!(!sm.take_chart_complete());
+        assert_eq!(sm.state(), WefaxState::Imaging);
+    }
+
+    #[test]
+    fn absence_while_idle_never_completes_a_chart() {
+        let (mut sm, _asm) = machine();
+        presence_for(&mut sm, false, 600);
+        assert!(!sm.take_chart_complete());
+        assert_eq!(sm.state(), WefaxState::Idle);
+    }
+
+    #[test]
+    fn sustained_presence_without_a_lock_starts_imaging_unaligned() {
+        let (mut sm, _asm) = machine();
+        presence_for(&mut sm, true, UNALIGNED_START_SECS as usize - 1);
+        assert_eq!(sm.state(), WefaxState::Idle, "still hunting for phasing");
+        presence_for(&mut sm, true, 1);
+        assert_eq!(sm.state(), WefaxState::Imaging, "fallback: image unaligned");
+    }
+
+    #[test]
+    fn interrupted_presence_restarts_the_unaligned_countdown() {
+        let (mut sm, _asm) = machine();
+        presence_for(&mut sm, true, 30);
+        presence_for(&mut sm, false, 1);
+        presence_for(&mut sm, true, 30);
+        assert_eq!(sm.state(), WefaxState::Idle);
     }
 }

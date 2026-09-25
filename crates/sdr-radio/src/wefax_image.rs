@@ -33,7 +33,9 @@ use tracing::warn;
 /// pixel buffer on every decoded line until allocation fails. A full NWS
 /// chart is ~1200 lines at 120 lpm, so 4000 lines (~33 min) is generous
 /// headroom while still bounding growth. Writes at or beyond this row index
-/// are dropped rather than reallocating the buffer.
+/// are dropped rather than reallocating the buffer; the controller's decode
+/// tap never issues them — it saves the image and starts a fresh one at the
+/// cap, so an unending chart is kept in cap-sized parts (#921).
 pub const MAX_WEFAX_LINES: u32 = 4000;
 
 /// Inner mutable state for the shared WEFAX image buffer.

@@ -6,6 +6,7 @@
 
 use super::{DspState, DspToUi, WefaxDecoder, WefaxLine, mpsc};
 use sdr_dsp::wefax::{PIXELS_PER_LINE, WefaxPresenceDetector};
+use sdr_radio::wefax_image::{MAX_WEFAX_LINES, WefaxImageHandle};
 
 /// Max scan lines a single [`WefaxDecoder::process`] call can emit
 /// into `wefax_lines_buf`. WEFAX runs at 120 lines/minute (2 lines
@@ -57,10 +58,26 @@ pub(super) fn wefax_decode_tap(
         }
     };
 
+    // Presence is judged on the block just decoded and fed back to the
+    // decoder, which frames charts on it (#921). Lines this block produced
+    // belong to the chart that was imaging, so they're written before any
+    // completion the presence verdict triggers is flushed.
+    let present = update_presence(state);
     emit_lines(state, dsp_tx, produced);
     emit_state_if_changed(state, dsp_tx);
     emit_complete_if_ready(state, dsp_tx);
-    emit_presence_if_changed(state, dsp_tx);
+    emit_presence_if_changed(state, dsp_tx, present);
+}
+
+/// Run the presence detector over the pre-gate mono block the decoder
+/// just processed and hand the verdict to the decoder. `None` before the
+/// detector is initialised.
+fn update_presence(state: &mut DspState) -> Option<bool> {
+    let present = state.wefax_presence.as_mut()?.update(&state.wefax_mono_buf);
+    if let Some(decoder) = state.wefax_decoder.as_mut() {
+        decoder.observe_presence(present, state.wefax_mono_buf.len());
+    }
+    Some(present)
 }
 
 /// Lazy-init `state.wefax_decoder`. Caches a failing rate in
@@ -112,8 +129,12 @@ fn emit_lines(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>, produced: us
     for slot in state.wefax_lines_buf.iter_mut().take(produced) {
         let line = std::mem::take(slot);
         if let Some(handle) = state.wefax_image.as_ref() {
+            let (row, starts_new_image) = image_row(line.line_index);
+            if starts_new_image {
+                flush_completed(handle, dsp_tx);
+            }
             #[allow(clippy::cast_possible_truncation)]
-            handle.write_line(line.line_index, PIXELS_PER_LINE as u32, &line.pixels);
+            handle.write_line(row, PIXELS_PER_LINE as u32, &line.pixels);
         }
         // Throttled progress log so a live reception is visible in the
         // logs without flooding at the per-line rate.
@@ -154,9 +175,24 @@ fn emit_complete_if_ready(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) 
     if !decoder.take_chart_complete() {
         return;
     }
-    let Some(handle) = state.wefax_image.as_ref() else {
-        return;
-    };
+    if let Some(handle) = state.wefax_image.as_ref() {
+        flush_completed(handle, dsp_tx);
+    }
+}
+
+/// Row for `line_index` in the image buffer, which is capped at
+/// [`MAX_WEFAX_LINES`], and whether the line starts a fresh image. A chart
+/// running past the cap (no end ever detected) is saved in cap-sized parts
+/// instead of having everything past the cap silently dropped (#921).
+/// Pure; unit-tested.
+fn image_row(line_index: u32) -> (u32, bool) {
+    let row = line_index % MAX_WEFAX_LINES;
+    (row, row == 0 && line_index > 0)
+}
+
+/// Hand the finished in-flight image (if any) to the UI for saving,
+/// resetting the buffer for the next one.
+fn flush_completed(handle: &WefaxImageHandle, dsp_tx: &mpsc::Sender<DspToUi>) {
     let Some(completed) = handle.take_completed() else {
         return;
     };
@@ -169,15 +205,16 @@ fn emit_complete_if_ready(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) 
     });
 }
 
-/// Feed the presence detector the same pre-gate mono buffer the
-/// decoder just processed, and emit `DspToUi::WefaxPresence` only on
-/// a hysteresis-gated presence change. Extracted from `wefax_decode_tap`
-/// to keep that function under the NLOC gate. Per #913.
-fn emit_presence_if_changed(state: &mut DspState, dsp_tx: &mpsc::Sender<DspToUi>) {
-    let Some(presence) = state.wefax_presence.as_mut() else {
+/// Emit `DspToUi::WefaxPresence` only on a hysteresis-gated presence
+/// change (`present` comes from [`update_presence`]). Per #913.
+fn emit_presence_if_changed(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    present: Option<bool>,
+) {
+    let Some(current) = present else {
         return;
     };
-    let current = presence.update(&state.wefax_mono_buf);
     if let Some(edge) = presence_edge(&mut state.wefax_presence_last, current) {
         let _ = dsp_tx.send(DspToUi::WefaxPresence(edge));
     }
@@ -195,7 +232,24 @@ fn presence_edge(last: &mut Option<bool>, current: bool) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::presence_edge;
+    use super::{MAX_WEFAX_LINES, image_row, presence_edge};
+
+    #[test]
+    fn image_row_rolls_over_into_a_fresh_image_at_the_cap() {
+        assert_eq!(
+            image_row(0),
+            (0, false),
+            "a chart's first line is not a rollover"
+        );
+        assert_eq!(image_row(MAX_WEFAX_LINES - 1), (MAX_WEFAX_LINES - 1, false));
+        assert_eq!(
+            image_row(MAX_WEFAX_LINES),
+            (0, true),
+            "cap reached → new image"
+        );
+        assert_eq!(image_row(MAX_WEFAX_LINES + 7), (7, false));
+        assert_eq!(image_row(2 * MAX_WEFAX_LINES), (0, true));
+    }
 
     #[test]
     fn presence_edge_only_fires_on_change() {
