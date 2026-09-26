@@ -34,6 +34,12 @@ pub struct WefaxPanelHandles {
     /// layer just made itself. Mirrors
     /// `OrbcommPanelHandles::suppress_switch_notify`.
     pub suppress_switch_notify: Cell<bool>,
+    /// The "Fax stations" group (issue #919): one activatable
+    /// `AdwActionRow` per station+channel, populated by the wiring
+    /// layer from `sdr_sat::channels_by_distance` once it has the
+    /// persisted ground-station coordinates and the tune path. Empty
+    /// at construction time, same split as `station_row`'s model.
+    pub stations_group: adw::PreferencesGroup,
 }
 
 pub struct WefaxPanel {
@@ -70,6 +76,18 @@ fn build_station_group() -> (adw::PreferencesGroup, adw::ComboRow) {
     (station_group, station_row)
 }
 
+/// Build the "Fax stations" group. Empty at construction time — rows
+/// are added by the wiring layer (`connect_wefax_panel`), which has
+/// access to the persisted ground-station coordinates and the tune
+/// path that a picked row needs to dispatch. Flat `AdwActionRow`s per
+/// the panel-layout convention (no `AdwExpanderRow`).
+fn build_fax_stations_group() -> adw::PreferencesGroup {
+    adw::PreferencesGroup::builder()
+        .title("Fax stations")
+        .description("Pick a channel to tune and camp on it (no scanning).")
+        .build()
+}
+
 /// Build the "Status" group holding the catcher state-machine label.
 fn build_status_group() -> (adw::PreferencesGroup, gtk4::Label) {
     let status_group = adw::PreferencesGroup::builder().title("Status").build();
@@ -95,6 +113,9 @@ pub fn build_wefax_panel() -> WefaxPanel {
     let (status_group, status_label) = build_status_group();
     page.add(&status_group);
 
+    let fax_stations_group = build_fax_stations_group();
+    page.add(&fax_stations_group);
+
     WefaxPanel {
         widget: page,
         handles: Rc::new(WefaxPanelHandles {
@@ -103,6 +124,7 @@ pub fn build_wefax_panel() -> WefaxPanel {
             status_label,
             station_names: RefCell::new(Vec::new()),
             suppress_switch_notify: Cell::new(false),
+            stations_group: fax_stations_group,
         }),
     }
 }

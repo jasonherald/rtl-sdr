@@ -84,6 +84,63 @@ pub fn stations_by_distance(user_lat: f64, user_lon: f64) -> Vec<(&'static Wefax
     v
 }
 
+/// Every catalog station+channel flattened into one row per channel,
+/// ordered by station distance (nearest first via [`stations_by_distance`])
+/// then by channel in catalog order within each station. Feeds the
+/// "Fax stations" picker (issue #919): one activatable row per
+/// station+channel, so a user can tune-and-camp on a specific frequency
+/// rather than auto-scanning.
+#[must_use]
+pub fn channels_by_distance(user_lat: f64, user_lon: f64) -> Vec<(&'static str, u64, f64)> {
+    stations_by_distance(user_lat, user_lon)
+        .into_iter()
+        .flat_map(|(station, km)| {
+            station
+                .channels_hz
+                .iter()
+                .map(move |&freq_hz| (station.name, freq_hz, km))
+        })
+        .collect()
+}
+
+/// Lowest frequency of the "transitional" [`band_hint`] band; below it a
+/// channel is a night band.
+const TRANSITIONAL_BAND_MIN_HZ: u64 = 6_000_000;
+
+/// Lowest frequency of the "day" [`band_hint`] band.
+const DAY_BAND_MIN_HZ: u64 = 10_000_000;
+
+/// Rough HF-propagation-vs-time-of-day guide for a fax channel's
+/// frequency. Lower HF bands (below [`TRANSITIONAL_BAND_MIN_HZ`]) propagate
+/// best at night; the highest bands (from [`DAY_BAND_MIN_HZ`] up) favor
+/// daylight; the band in between is "transitional" (dawn/dusk, or either
+/// depending on solar conditions). A coarse heuristic only — real
+/// propagation depends on season, solar activity, and path — but enough to
+/// hint "try this one after dark."
+#[must_use]
+pub fn band_hint(freq_hz: u64) -> &'static str {
+    match freq_hz {
+        f if f < TRANSITIONAL_BAND_MIN_HZ => "night",
+        f if f < DAY_BAND_MIN_HZ => "transitional",
+        _ => "day",
+    }
+}
+
+/// Format a channel frequency for display, e.g. `4235 kHz` or
+/// `6340.5 kHz` (trailing `.0` trimmed). All catalog frequencies are
+/// rounded to the nearest 100 Hz, so one decimal digit is always enough.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "freq_hz is a WEFAX HF channel (<=30 MHz), well below f64's 2^53 mantissa ceiling"
+)]
+pub fn format_channel_khz(freq_hz: u64) -> String {
+    let khz = freq_hz as f64 / 1_000.0;
+    let formatted = format!("{khz:.1}");
+    let trimmed = formatted.strip_suffix(".0").unwrap_or(&formatted);
+    format!("{trimmed} kHz")
+}
+
 /// Minutes past 0000Z for a UTC instant.
 fn minute_of_day(now: DateTime<Utc>) -> u16 {
     u16::try_from(now.hour() * 60 + now.minute()).unwrap_or(u16::MAX)
@@ -264,5 +321,43 @@ mod tests {
                 assert!((2_000_000..25_000_000).contains(&f), "{}: {f} Hz", s.name);
             }
         }
+    }
+
+    #[test]
+    fn band_hint_boundaries() {
+        assert_eq!(band_hint(5_900_000), "night");
+        assert_eq!(band_hint(6_000_000), "transitional");
+        assert_eq!(band_hint(9_900_000), "transitional");
+        assert_eq!(band_hint(10_000_000), "day");
+        // Exact edges: each named threshold is the first Hz of its band.
+        assert_eq!(band_hint(TRANSITIONAL_BAND_MIN_HZ - 1), "night");
+        assert_eq!(band_hint(TRANSITIONAL_BAND_MIN_HZ), "transitional");
+        assert_eq!(band_hint(DAY_BAND_MIN_HZ - 1), "transitional");
+        assert_eq!(band_hint(DAY_BAND_MIN_HZ), "day");
+    }
+
+    #[test]
+    fn channels_by_distance_is_nonempty_and_station_ordered() {
+        let rows = channels_by_distance(30.0, -90.0);
+        let total_channels: usize = KNOWN_WEFAX_STATIONS
+            .iter()
+            .map(|s| s.channels_hz.len())
+            .sum();
+        assert_eq!(rows.len(), total_channels);
+        assert!(!rows.is_empty());
+        // First row must belong to the nearest station (NMG from New
+        // Orleans), matching `stations_by_distance`'s own ranking test.
+        assert_eq!(rows[0].0, "NMG New Orleans");
+
+        // Station distance is non-decreasing as rows progress (channels
+        // within a station share its distance, so this holds across the
+        // whole flattened list, not just at station boundaries).
+        assert!(rows.windows(2).all(|w| w[0].2 <= w[1].2));
+    }
+
+    #[test]
+    fn format_channel_khz_trims_trailing_zero() {
+        assert_eq!(format_channel_khz(4_235_000), "4235 kHz");
+        assert_eq!(format_channel_khz(6_340_500), "6340.5 kHz");
     }
 }

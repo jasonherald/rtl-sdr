@@ -43,8 +43,8 @@ pub use tle_cache::{
     celestrak_group_url, parse_group_tles,
 };
 pub use wefax_stations::{
-    DailyWindow, KNOWN_WEFAX_STATIONS, WefaxStation, great_circle_km, is_active, next_window_start,
-    stations_by_distance,
+    DailyWindow, KNOWN_WEFAX_STATIONS, WefaxStation, band_hint, channels_by_distance,
+    format_channel_khz, great_circle_km, is_active, next_window_start, stations_by_distance,
 };
 
 mod catalog;
