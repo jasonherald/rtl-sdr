@@ -21,6 +21,17 @@ use crate::types::{ImagingProtocol, KnownSatellite, LrptModulation};
 /// the same number doesn't get pasted into every catalog row.
 pub const DEFAULT_SATELLITE_BANDWIDTH_HZ: u32 = 38_000;
 
+/// ISS SSTV channel filter bandwidth (Hz). Sized for a Doppler-TRACKED
+/// signal — SSTV passes force the tracker on
+/// ([`ImagingProtocol::wants_doppler_tracking`]): the FM signal occupied
+/// ±6.5 kHz on a live 2026-10-02 pass and the SGP4 prediction matched the
+/// measured carrier to within 0.3 kHz, so 18 kHz leaves ~±2 kHz of
+/// margin. Narrower than [`DEFAULT_SATELLITE_BANDWIDTH_HZ`] (38 kHz,
+/// sized to absorb untracked Doppler) for ~3 dB less noise into the FM
+/// demod on weak passes. Untracked, the ±10 kHz UHF Doppler would push
+/// the signal out of this filter near the horizons.
+pub const ISS_SSTV_BANDWIDTH_HZ: u32 = 18_000;
+
 /// Current ARISS SSTV operational downlink (Hz). 437.550 MHz UHF
 /// 70 cm. Pinned by `iss_catalog_targets_current_ariss_uhf_frequency`
 /// — if a future ARISS series moves the frequency, the test FAILS
@@ -286,7 +297,7 @@ pub const KNOWN_SATELLITES: &[KnownSatellite] = &[
         // this catalog entry is specifically for SSTV auto-record.
         downlink_hz: ISS_SSTV_DOWNLINK_HZ,
         demod_mode: sdr_types::DemodMode::Nfm,
-        bandwidth_hz: DEFAULT_SATELLITE_BANDWIDTH_HZ,
+        bandwidth_hz: ISS_SSTV_BANDWIDTH_HZ,
         imaging_protocol: Some(ImagingProtocol::Sstv),
         // ISS SSTV is a single FM audio channel, not a multi-APID
         // LRPT broadcast — the per-pass expected-APID set doesn't

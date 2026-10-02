@@ -246,9 +246,12 @@ passthrough and audio recording is suppressed).
 - Tunes to 437.550 MHz
 - Switches the demod to NFM (you'll hear the SSTV warble through
   your speakers)
-- Sets the channel bandwidth to 38 kHz (covers Doppler swing at UHF
-  with headroom)
-- Zeros the VFO offset
+- Sets the channel bandwidth to 18 kHz — just wider than the FM
+  signal itself, for less noise on weak passes
+- Zeros the VFO offset, then turns **Doppler tracking on** for the
+  pass (your own setting is restored at LOS). The UHF Doppler shift
+  swings about ±10 kHz across a pass, so the narrow channel relies on
+  the tracker following it — the status bar shows the live correction
 - Opens a non-modal **ISS SSTV** viewer window alongside the main
   radio window
 - Clears the canvas so back-to-back passes start fresh
@@ -340,13 +343,14 @@ completed during the pass. Most common causes, in order:
    the 137 MHz V-dipole used flat for APT) nulls vertically-
    polarised UHF signals. Lay the antenna vertical, or use a 70 cm
    vertical purpose-built for the band.
-4. **Wrong frequency due to Doppler.** The recorder doesn't apply
-   Doppler correction for SSTV (as of May 2026); on UHF 437.550 MHz
-   the shift is roughly **±10 kHz** (3× larger than on the legacy
-   2 m frequency). At the catalog's 38 kHz bandwidth that fits, but
-   if you've narrowed the channel bandwidth, the Doppler can walk
-   the signal out of the passband near AOS / LOS. Restore bandwidth
-   to 38 kHz.
+4. **Doppler correction not running.** On UHF 437.550 MHz the shift
+   is roughly **±10 kHz** (3× larger than on the legacy 2 m
+   frequency), and the 18 kHz SSTV channel only keeps the signal
+   while the recorder's Doppler tracking follows it. During the pass
+   the status bar should show a Doppler offset sweeping from about
+   +10 kHz to −10 kHz. If it doesn't, the tracker has no usable TLE
+   for the ISS: refresh TLEs in the Satellites panel and check the
+   ground-station coordinates.
 
 If the directory is created but empty, you'll see a toast
 "Pass complete, but no SSTV images decoded — nothing saved to {dir}".

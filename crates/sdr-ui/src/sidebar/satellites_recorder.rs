@@ -247,19 +247,19 @@ pub struct SavedTune {
     /// APT subcarrier. Per silent-fail investigation following
     /// the NOAA 15 pass.
     pub notch_enabled: bool,
-    /// Pre-AOS Doppler-tracker master switch. Forced OFF at
-    /// AOS for the duration of an imaging-protocol pass,
-    /// restored at LOS. The Doppler shift on a NOAA / Meteor /
-    /// ISS pass is ±3.5 kHz worst case at 137 MHz / 145 MHz —
-    /// well inside the channel filters of all three imaging
-    /// protocols (APT 38 kHz, LRPT 144 kHz, SSTV 12.5 kHz).
-    /// During a pass the tracker's 4 Hz tick re-dispatches
-    /// `SetVfoOffset(predicted_doppler)` which can disrupt
-    /// QPSK Costas lock (LRPT) and the APT line-rate clock.
-    /// Disabling for the pass duration loses no functional
-    /// value (channel filters absorb the shift) and removes
-    /// a known disruption source. Per silent-fail investigation
-    /// following the NOAA 15 pass.
+    /// Pre-AOS Doppler-tracker master switch, restored at LOS.
+    /// For the pass itself the switch is set per protocol by
+    /// `sdr_sat::ImagingProtocol::wants_doppler_tracking`:
+    /// - **APT / LRPT** (137 MHz): forced OFF. Doppler is
+    ///   ±3.5 kHz, well inside their channel filters (APT 38 kHz,
+    ///   LRPT 144 kHz), while the tracker's 4 Hz
+    ///   `SetVfoOffset(predicted_doppler)` ticks can disrupt the
+    ///   QPSK Costas lock (LRPT) and the APT line-rate clock. Per
+    ///   the silent-fail investigation following the NOAA 15 pass.
+    /// - **SSTV** (ISS, 437.55 MHz): forced ON. UHF Doppler is
+    ///   ±10 kHz and the ISS channel (`ISS_SSTV_BANDWIDTH_HZ`,
+    ///   18 kHz) is deliberately narrower, so the signal only
+    ///   stays in-channel while tracked.
     pub doppler_enabled: bool,
 }
 

@@ -114,6 +114,21 @@ impl ImagingProtocol {
             Self::Sstv => &[SSTV_VHF_2M_BAND_HZ, SSTV_UHF_70CM_BAND_HZ],
         }
     }
+
+    /// Whether an auto-recorded pass of this protocol runs with Doppler
+    /// tracking on.
+    ///
+    /// - **SSTV** (ISS, 437.55 MHz): yes. UHF Doppler swings ±10 kHz, and
+    ///   the ISS channel (`ISS_SSTV_BANDWIDTH_HZ`) is deliberately narrower
+    ///   than that, so the signal only stays in-channel while tracked.
+    /// - **APT / LRPT** (137 MHz): no. The tracker's 4 Hz VFO steps can
+    ///   disrupt the LRPT QPSK Costas lock and the APT line-rate clock,
+    ///   and their wide filters already absorb the ±3.5 kHz 137 MHz
+    ///   Doppler.
+    #[must_use]
+    pub const fn wants_doppler_tracking(&self) -> bool {
+        matches!(self, Self::Sstv)
+    }
 }
 
 /// A satellite the user-facing scheduler ships with by default. The list

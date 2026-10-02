@@ -557,3 +557,39 @@ fn known_satellites_have_expected_protocol_assignments() {
         "ISS should be Some(Sstv) after epic #472"
     );
 }
+
+#[test]
+fn iss_sstv_channel_fits_the_fm_signal_but_not_untracked_doppler() {
+    // The ISS SSTV filter is sized for a Doppler-TRACKED signal: wide
+    // enough for the FM signal itself (measured ±6.5 kHz occupied on a
+    // live 2026-10-02 pass) plus tracking residual (measured ≤0.3 kHz),
+    // but well under the ±10 kHz untracked UHF Doppler swing — that
+    // narrowing is the SNR win over the 38 kHz default, and it is why
+    // SSTV passes force Doppler tracking on.
+    let iss = KNOWN_SATELLITES
+        .iter()
+        .find(|s| s.norad_id == ISS_NORAD_ID)
+        .expect("ISS catalog entry (NORAD 25544)");
+    assert_eq!(iss.bandwidth_hz, ISS_SSTV_BANDWIDTH_HZ);
+    let measured_occupied_half_hz = 6_500;
+    let tracking_margin_hz = 1_000;
+    assert!(
+        iss.bandwidth_hz / 2 >= measured_occupied_half_hz + tracking_margin_hz,
+        "filter must pass the tracked FM signal with margin"
+    );
+    assert!(
+        iss.bandwidth_hz < DEFAULT_SATELLITE_BANDWIDTH_HZ,
+        "narrower than the untracked default, or there is no SNR gain"
+    );
+}
+
+#[test]
+fn only_sstv_passes_want_doppler_tracking() {
+    // SSTV (ISS, ±10 kHz at 437.55 MHz) relies on tracking to stay in
+    // its narrow channel; APT/LRPT keep tracking off for the pass (its
+    // VFO steps disrupt the LRPT Costas lock and the APT line clock, and
+    // their wide filters absorb the ±3.5 kHz 137 MHz Doppler).
+    assert!(ImagingProtocol::Sstv.wants_doppler_tracking());
+    assert!(!ImagingProtocol::Apt.wants_doppler_tracking());
+    assert!(!ImagingProtocol::Lrpt.wants_doppler_tracking());
+}
