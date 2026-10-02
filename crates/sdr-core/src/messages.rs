@@ -290,9 +290,11 @@ pub enum DspToUi {
     /// `line_index` is 0-based. WEFAX has no fixed total-line-count
     /// header (unlike SSTV modes); the image grows on demand.
     WefaxLineDecoded(u32),
-    /// One complete WEFAX chart. Emitted from the DSP thread when
-    /// the decoder detects the stop tone and finalizes the image.
-    /// Mirrors `SstvImageComplete`, but WEFAX charts are
+    /// One complete WEFAX chart. Emitted from the DSP thread when a
+    /// chart ends — on the stop tone, the next chart's phasing
+    /// preamble, or a sustained loss of fax presence — or when an
+    /// unending chart reaches the image-height cap and is saved in
+    /// parts (#921). Mirrors `SstvImageComplete`, but WEFAX charts are
     /// greyscale-only so `pixels` is a flat `Vec<u8>` (one byte
     /// per pixel) instead of RGB triples.
     WefaxImageComplete {

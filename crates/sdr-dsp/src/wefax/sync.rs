@@ -159,11 +159,17 @@ impl SyncMachine {
     fn enter_imaging(&mut self) {
         self.state = WefaxState::Imaging;
         self.imaging_lines = 0;
+        // The chart-gap timer measures absence *during* this chart: an
+        // absence that preceded the lock must not cut the new chart short.
+        self.absent_samples = 0;
     }
 
     fn finish_chart(&mut self) {
         self.state = WefaxState::Stopped;
         self.chart_complete = true;
+        // The unaligned-start countdown belongs to the next chart: presence
+        // counted during this one must not skip the next chart's phasing.
+        self.present_samples = 0;
     }
 
     /// Whole samples in `secs` at this machine's rate (always small and
@@ -360,6 +366,45 @@ mod tests {
         assert_eq!(sm.state(), WefaxState::Idle, "still hunting for phasing");
         presence_for(&mut sm, true, 1);
         assert_eq!(sm.state(), WefaxState::Imaging, "fallback: image unaligned");
+    }
+
+    #[test]
+    fn a_finished_chart_restarts_the_unaligned_countdown() {
+        // Fax present throughout: imaging starts on the fallback and the
+        // next chart's preamble ends it. The presence already counted must
+        // not carry over, or the next chart would start unaligned instead
+        // of waiting for its own phasing.
+        let (mut sm, mut asm) = machine();
+        presence_for(&mut sm, true, UNALIGNED_START_SECS as usize);
+        assert_eq!(sm.state(), WefaxState::Imaging);
+        feed(
+            &mut sm,
+            &mut asm,
+            &vec![content_line(); IMAGING_RESTART_HOLDOFF_LINES + 5],
+        );
+        feed(&mut sm, &mut asm, &vec![pulse_line(700); 6]);
+        assert!(sm.take_chart_complete());
+        feed(&mut sm, &mut asm, &[content_line()]); // Stopped → Idle
+        presence_for(&mut sm, true, 1);
+        assert_eq!(
+            sm.state(),
+            WefaxState::Idle,
+            "the next chart waits for phasing, not the fallback"
+        );
+    }
+
+    #[test]
+    fn absence_before_a_lock_does_not_count_against_the_new_chart() {
+        let (mut sm, mut asm) = machine();
+        presence_for(&mut sm, false, 300);
+        feed(&mut sm, &mut asm, &vec![pulse_line(300); 6]);
+        assert_eq!(sm.state(), WefaxState::Imaging);
+        presence_for(&mut sm, false, 1);
+        assert_eq!(
+            sm.state(),
+            WefaxState::Imaging,
+            "the chart-gap timer starts at the lock"
+        );
     }
 
     #[test]

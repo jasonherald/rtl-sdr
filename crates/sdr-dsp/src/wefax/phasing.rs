@@ -266,6 +266,23 @@ mod tests {
     }
 
     #[test]
+    fn vote_handles_a_straddling_cluster_centered_on_the_high_side() {
+        // Mirror of the case above: the cluster centre lands on the
+        // high side (the last-listed member of a tie), so low columns
+        // unwrap upward (`d < -w/2` → `d + w`).
+        let cols = [
+            Some(2),
+            Some(1805),
+            Some(4),
+            Some(1807),
+            Some(1),
+            Some(1806),
+        ];
+        let col = vote_over(&cols).lock().expect("wrap-around cluster locks");
+        assert!(circular_distance(col, 0) <= 5, "near the edge, got {col}");
+    }
+
+    #[test]
     fn old_lines_fall_out_of_the_window() {
         let mut v = vote_over(&[Some(500); VOTE_LOCK_LINES]);
         assert!(v.lock().is_some());
