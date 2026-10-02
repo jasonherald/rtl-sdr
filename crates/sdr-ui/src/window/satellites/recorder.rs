@@ -248,6 +248,7 @@ fn aos_apt(
     // before the demod even sees them. Per
     // CR round 1 on PR #557.
     force_audio_chain_off(deps);
+    apply_pass_doppler_policy(deps, sdr_sat::ImagingProtocol::Apt);
     // Drive Start through the header play
     // button — its `connect_toggled` handler
     // is the single place that updates
@@ -396,6 +397,7 @@ fn aos_lrpt(
     // see APT arm above for the full
     // rationale.
     force_audio_chain_off(deps);
+    apply_pass_doppler_policy(deps, sdr_sat::ImagingProtocol::Lrpt);
     // Now safe to start playback + retune;
     // any decoded rows from this point
     // forward land in the cleared image.
@@ -457,19 +459,34 @@ fn aos_sstv(
     (deps.set_playing)(true);
     (deps.tune)(freq_hz, mode, bandwidth_hz);
     deps.state.dispatch_vfo_offset(0.0);
+    // After the tune + offset reset: the tracker engages on its next
+    // 1 Hz trigger tick (now tuned to the ISS) and replaces the 0 Hz
+    // offset with the live Doppler correction the narrow ISS channel
+    // depends on.
+    apply_pass_doppler_policy(deps, sdr_sat::ImagingProtocol::Sstv);
     let aos = chrono::Utc::now();
     *deps.state.sstv_recording_pass.borrow_mut() = Some((norad_id, aos));
 }
 
-/// Force every audio-chain gate off for an imaging pass: squelch,
-/// auto-squelch, CTCSS, FM IF NR, de-emphasis, notch, and the Doppler
-/// tracker — each through the widget's own notify chain so LOS
-/// restore replays the persisted values the same way a user flip
-/// would. De-emphasis (US 75 µs cutoff ~2122 Hz / EU 50 µs
-/// ~3183 Hz) and an audio-band notch would both attenuate the
-/// 2400 Hz APT subcarrier; the Doppler tracker's 4 Hz `SetVfoOffset`
-/// ticks can disrupt QPSK Costas lock and the APT line-rate clock
-/// (per the NOAA 15 silent-fail investigation).
+/// Set the Doppler-tracker master switch for an imaging pass per
+/// [`sdr_sat::ImagingProtocol::wants_doppler_tracking`] — OFF for APT /
+/// LRPT, ON for SSTV — through the widget's own notify chain, so the
+/// tracker model follows and LOS restore (`on_restore_tune`) replays the
+/// user's pre-AOS value the same way a user flip would.
+fn apply_pass_doppler_policy(deps: &RecorderDeps, protocol: sdr_sat::ImagingProtocol) {
+    let want = protocol.wants_doppler_tracking();
+    if deps.doppler_switch.is_active() != want {
+        deps.doppler_switch.set_active(want);
+    }
+}
+
+/// Force every audio-chain gate off for an APT / LRPT pass: squelch,
+/// auto-squelch, CTCSS, FM IF NR, de-emphasis and notch — each through
+/// the widget's own notify chain so LOS restore replays the persisted
+/// values the same way a user flip would. De-emphasis (US 75 µs cutoff
+/// ~2122 Hz / EU 50 µs ~3183 Hz) and an audio-band notch would both
+/// attenuate the 2400 Hz APT subcarrier. (The Doppler tracker is set
+/// separately, per protocol, by [`apply_pass_doppler_policy`].)
 fn force_audio_chain_off(deps: &RecorderDeps) {
     if deps.radio.squelch_enabled_row.is_active() {
         deps.radio.squelch_enabled_row.set_active(false);
@@ -503,17 +520,6 @@ fn force_audio_chain_off(deps: &RecorderDeps) {
     // value via the same notify chain.
     if deps.radio.notch_enabled_row.is_active() {
         deps.radio.notch_enabled_row.set_active(false);
-    }
-    // Doppler tracker: 4 Hz `SetVfoOffset` ticks can
-    // disrupt QPSK Costas lock and the APT line-rate
-    // clock. The ±3.5 kHz worst-case shift fits
-    // inside every imaging-protocol channel filter,
-    // so disabling for the pass loses no functional
-    // value and removes a known disruption source.
-    // Per silent-fail investigation following the
-    // NOAA 15 pass.
-    if deps.doppler_switch.is_active() {
-        deps.doppler_switch.set_active(false);
     }
 }
 
