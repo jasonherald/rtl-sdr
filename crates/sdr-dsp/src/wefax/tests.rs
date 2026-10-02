@@ -1,10 +1,7 @@
 use super::afc::AfcMapper;
 use super::assembly::LineAssembler;
 use super::discriminator::Discriminator;
-use super::phasing::PhasingTracker;
-use super::sync::{
-    LineDisposition, SLANT_PLAUSIBLE_MAX_COLS_PER_LINE, SyncMachine, corrected_samples_per_line,
-};
+use super::sync::{LineDisposition, SyncMachine};
 use super::tones::ToneDetector;
 use super::*;
 
@@ -207,31 +204,6 @@ fn phasing_line(pulse_col: usize) -> [u8; PIXELS_PER_LINE] {
     l
 }
 
-#[test]
-fn phasing_tracker_recovers_pulse_column() {
-    let mut t = PhasingTracker::new();
-    for _ in 0..12 {
-        t.observe_line(&phasing_line(300));
-    }
-    let off = t.column_offset().expect("offset locked after enough lines");
-    assert!(
-        (off - 300).abs() <= 5,
-        "recovered pulse column ~300, got {off}"
-    );
-}
-
-#[test]
-fn phasing_tracker_estimates_slant() {
-    let mut t = PhasingTracker::new();
-    for k in 0..20 {
-        t.observe_line(&phasing_line(300 + k));
-    } // +1 col/line drift
-    assert!(
-        (t.slant_columns_per_line() - 1.0).abs() < 0.3,
-        "≈1 col/line slant"
-    );
-}
-
 /// Real WEFAX has no audio start tone — the "300 Hz start" is the black/white
 /// keying rate, not a 300 Hz audio sine — so sync must enter Phasing directly
 /// from line content. Feed a run of mostly-dark-with-pulse lines (no tone at
@@ -265,34 +237,6 @@ fn phasing_entry_locks_without_start_tone() {
     assert!(
         emitted >= 1,
         "lines emit once imaging starts, got {emitted}"
-    );
-}
-
-/// A garbage least-squares slant (like the ~400 cols/line seen on real noisy
-/// phasing) must be *rejected* to zero — using the nominal `sr/2` rate — not
-/// clamped-and-applied, since even a small constant drift accumulates into a
-/// diagonal shear across the chart. A small, plausible slant is still applied.
-#[test]
-fn slant_rejects_implausible_estimate_and_applies_small_one() {
-    let sr = 44_100.0;
-    let base = sr / 2.0;
-
-    // Implausible slants (beyond the plausibility bound) → nominal sr/2 exactly.
-    for garbage in [400.0, -400.0, 1e6, SLANT_PLAUSIBLE_MAX_COLS_PER_LINE + 0.01] {
-        let spl = corrected_samples_per_line(sr, garbage);
-        assert!(
-            (spl - base).abs() < 1e-6,
-            "implausible slant {garbage} rejected → samples_per_line == sr/2, got {spl}"
-        );
-    }
-
-    // A small, physically plausible slant is applied as-is.
-    let small = corrected_samples_per_line(sr, 0.5);
-    let expected = base - 0.5 * (base / PIXELS_PER_LINE as f64);
-    assert!((small - expected).abs() < 1e-6, "plausible slant applied");
-    assert!(
-        (small - base).abs() > 1e-6,
-        "a genuine small slant does move samples_per_line off nominal"
     );
 }
 
@@ -341,5 +285,86 @@ fn sync_gates_emission_and_flags_chart_complete() {
         dec.state(),
         WefaxState::Imaging,
         "chart finalized — no longer imaging"
+    );
+}
+
+/// Continuous-phase FM audio for `lines` phasing lines whose white pulse
+/// (the 2300 Hz tone) starts at time-column `pulse_col` and spans ~5% of the
+/// line; the rest of each line is black (1500 Hz). Continuous phase across
+/// tone switches, as a real FM subcarrier is.
+fn phasing_audio(sr: f64, lines: usize, pulse_col: usize) -> Vec<f32> {
+    let spl = (sr / 2.0) as usize; // 120 lpm
+    let pulse_end = pulse_col + PIXELS_PER_LINE / 20;
+    let mut phase = 0.0f64;
+    let mut out = Vec::with_capacity(lines * spl);
+    for _ in 0..lines {
+        for i in 0..spl {
+            let col = i * PIXELS_PER_LINE / spl;
+            let f = if (pulse_col..pulse_end).contains(&col) {
+                SUBCARRIER_WHITE_HZ
+            } else {
+                SUBCARRIER_BLACK_HZ
+            };
+            phase += 2.0 * std::f64::consts::PI * f / sr;
+            out.push(phase.sin() as f32);
+        }
+    }
+    out
+}
+
+/// Leading edge of the longest ≥180 run — the test's own independent
+/// measurement of where a line's white pulse sits.
+fn longest_bright_run_start(line: &[u8; PIXELS_PER_LINE]) -> Option<usize> {
+    let (mut best, mut best_start, mut run) = (0usize, None, 0usize);
+    for (i, &v) in line.iter().enumerate() {
+        if v >= 180 {
+            run += 1;
+            if run > best {
+                best = run;
+                best_start = Some(i + 1 - run);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    best_start
+}
+
+/// End-to-end left-edge alignment: once the gated decoder locks on the
+/// phasing preamble, the pulse must land at the left edge (column ≈ 0) of
+/// every emitted line — that is what "phasing" means. The pulse is placed
+/// mid-line (time-column 500) so a wrong-signed offset shows up as a pulse
+/// at ~2×500 instead of ~0.
+#[test]
+fn phasing_lock_puts_the_pulse_at_the_left_edge() {
+    let sr = 24_000u32;
+    let mut dec = WefaxDecoder::new(sr).unwrap();
+    let mut out = vec![WefaxLine::default(); 64];
+    let audio = phasing_audio(f64::from(sr), 60, 500);
+    let mut emitted = Vec::new();
+    for chunk in audio.chunks(4096) {
+        let n = dec.process(chunk, &mut out).unwrap();
+        emitted.extend(out.iter().take(n).map(|l| l.pixels));
+    }
+    assert_eq!(dec.state(), WefaxState::Imaging, "phasing preamble locks");
+    assert!(
+        emitted.len() >= 20,
+        "post-lock phasing lines emitted, got {}",
+        emitted.len()
+    );
+    // Skip the first few post-lock lines (assembler mid-line at the switch).
+    let cols: Vec<usize> = emitted[5..]
+        .iter()
+        .filter_map(longest_bright_run_start)
+        .collect();
+    assert!(!cols.is_empty(), "pulse visible in emitted lines");
+    let mut sorted = cols.clone();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    // Circular distance to column 0 (a few px of filter group delay is fine).
+    let dist = median.min(PIXELS_PER_LINE - median);
+    assert!(
+        dist <= 20,
+        "pulse should sit at the left edge after lock, got median column {median}"
     );
 }

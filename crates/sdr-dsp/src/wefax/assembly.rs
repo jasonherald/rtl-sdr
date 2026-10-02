@@ -23,14 +23,18 @@ impl LineAssembler {
         }
     }
 
-    pub(crate) fn set_column_offset(&mut self, cols: i32) {
-        self.column_offset = cols;
-    }
-
-    pub(crate) fn set_samples_per_line(&mut self, spl: f64) {
-        if spl > 1.0 {
-            self.samples_per_line = spl;
-        }
+    /// Shift the left edge so a phasing pulse currently landing at output
+    /// column `pulse_col` lands at column 0 on later lines. `push` places a
+    /// sample at `time_column + column_offset`, so the pulse's time-column
+    /// is `pulse_col - column_offset` and the new offset is its negation.
+    /// (Setting the offset *to* `pulse_col` — the pre-#921 behaviour —
+    /// moved the pulse to `2·pulse_col` instead of the left edge.)
+    ///
+    /// `PIXELS_PER_LINE` (1809) fits `i32` exactly, so the casts are lossless.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub(crate) fn align_to_pulse(&mut self, pulse_col: usize) {
+        let w = PIXELS_PER_LINE as i32;
+        self.column_offset = (self.column_offset - pulse_col as i32).rem_euclid(w);
     }
 
     /// Accumulate one brightness sample; return a finished line when the

@@ -2,8 +2,9 @@
 //! audio into a greyscale PNG. Stereo is downmixed to mono.
 //!
 //! The decoder is free-running by default, so the rendered chart may be
-//! sheared or horizontally offset. Pass `--sync` for the sync-gated
-//! decoder, which locks the left edge and de-slants the chart.
+//! horizontally offset. Pass `--sync` for the sync-gated decoder, which
+//! locks the left edge on the phasing preamble. (Neither mode corrects
+//! slant.)
 //!
 //! Usage:
 //!

@@ -56,6 +56,23 @@ so the recording is treated as public domain. It was published by 2bsailing.ca
 expressly to help test radiofax-decoding software, and is kept here solely as
 input to the manual `wefax_decode_wav` example / decoder regression checks.
 
+### WEFAX decoded-row fixtures (`wefax_*.u8`)
+
+Raw decoded scanlines: 1809 bytes per row, one greyscale byte per pixel,
+rows concatenated with no header. They were cut from charts this project
+decoded off-air from NOAA NMF Boston (4235 kHz) on the nights of
+2026-09-23/24 (public-domain US Government broadcasts, as above) and are
+used by the phasing / sync unit tests via `src/wefax/test_fixtures.rs`
+(#921):
+
+| file | source image, rows | what it is |
+|---|---|---|
+| `wefax_phasing_strong.u8` | `wefax-2026-09-23-083900`, 1280–1349 | strong phasing band, pulse edge ~1411–1417, stray specks left of the pulse |
+| `wefax_phasing_weak.u8` | `wefax-2026-09-24-052514`, 1178–1231 | weak, heavily speckled phasing band, pulse edge ~1591–1598 |
+| `wefax_content_surface.u8` | `wefax-2026-09-24-052514`, 120–519 | surface forecast chart content, no phasing |
+| `wefax_content_satellite.u8` | `wefax-2026-09-24-083706`, 3200–3599 | satellite IR imagery content, no phasing |
+| `wefax_content_analysis.u8` | `wefax-2026-09-23-083900`, 1500–1899 | analysis chart content, no phasing |
+
 ### SDR-RS source
 
 The SDR-RS source code itself remains MIT-licensed. If the noaa-apt maintainer
