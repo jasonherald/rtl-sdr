@@ -129,6 +129,49 @@ pub(super) fn wire_tle_refresh_button(
     });
 }
 
+/// How often the running app re-checks whether the TLEs are stale.
+const TLE_AUTO_REFRESH_CHECK: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Refresh the TLEs automatically once they are more than a day old:
+/// checked at launch and hourly while running. Previously they were only
+/// refreshed by hand, so pass predictions and the Doppler tracker (which
+/// reads cached TLEs only) could run on elements weeks out of date. This
+/// drives the Refresh button's own handler — spinner, timestamp, pass
+/// recompute, Orbcomm group — so a manual and an automatic refresh can't
+/// diverge, and skips a check while a refresh is already running (the
+/// handler makes the button insensitive). Wired only with a TLE cache.
+pub(super) fn schedule_tle_auto_refresh(
+    panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
+    has_cache: bool,
+) {
+    if !has_cache {
+        return;
+    }
+    let check = {
+        let panel_weak = panel_weak.clone();
+        let config = std::sync::Arc::clone(config);
+        move || {
+            let Some(panel) = panel_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let last = sidebar::satellites_panel::load_tle_last_refresh(&config);
+            if panel.refresh_button.is_sensitive()
+                && sidebar::satellites_panel::tle_refresh_due(last, chrono::Utc::now())
+            {
+                tracing::info!(?last, "TLEs are stale — refreshing automatically");
+                panel.refresh_button.emit_clicked();
+            }
+            glib::ControlFlow::Continue
+        }
+    };
+    let at_launch = check.clone();
+    glib::idle_add_local_once(move || {
+        let _ = at_launch();
+    });
+    glib::timeout_add_local(TLE_AUTO_REFRESH_CHECK, check);
+}
+
 /// ZIP code → lat/lon shortcut. Both `apply` (apply-button click /
 /// Enter when the apply button is sensitive) and `entry_activated`
 /// (Enter, unconditional) are wired to the same closure, deduped by

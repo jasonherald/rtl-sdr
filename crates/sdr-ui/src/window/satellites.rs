@@ -6,7 +6,10 @@ use libadwaita::prelude::*;
 
 mod doppler;
 mod passes;
-use passes::{DisplayedPass, build_recompute, wire_tle_refresh_button, wire_zip_lookup};
+use passes::{
+    DisplayedPass, build_recompute, schedule_tle_auto_refresh, wire_tle_refresh_button,
+    wire_zip_lookup,
+};
 mod saves;
 mod saves_lrpt;
 pub(super) use saves::{compute_apt_rotate_180_for_pass, on_save_apt_png, on_save_sstv_pass};
@@ -393,6 +396,8 @@ fn wire_satellites_behaviors(
         &recompute,
         state,
     );
+
+    schedule_tle_auto_refresh(&panel_weak, config, cache.is_some());
 
     wire_zip_lookup(panel, &panel_weak);
 

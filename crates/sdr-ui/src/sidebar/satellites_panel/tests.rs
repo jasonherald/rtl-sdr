@@ -575,3 +575,34 @@ fn auto_record_composites_save_load_round_trips() {
     save_auto_record_composites(&config, false);
     assert!(!load_auto_record_composites(&config));
 }
+
+#[test]
+fn tle_refresh_is_due_when_never_refreshed_or_a_day_old() {
+    use chrono::{Duration, TimeZone, Utc};
+    let now = Utc.with_ymd_and_hms(2026, 10, 21, 12, 0, 0).unwrap();
+    assert!(tle_refresh_due(None, now), "never refreshed");
+    assert!(!tle_refresh_due(Some(now - Duration::hours(23)), now));
+    assert!(tle_refresh_due(
+        Some(now - Duration::hours(TLE_AUTO_REFRESH_MAX_AGE_HOURS)),
+        now
+    ));
+    assert!(tle_refresh_due(Some(now - Duration::days(16)), now));
+    assert!(
+        !tle_refresh_due(Some(now + Duration::hours(2)), now),
+        "a future stamp (clock change) is not stale"
+    );
+}
+
+#[test]
+fn load_tle_last_refresh_round_trips_and_tolerates_garbage() {
+    use chrono::{TimeZone, Utc};
+    let cfg = Arc::new(ConfigManager::in_memory(&serde_json::json!({})));
+    assert_eq!(load_tle_last_refresh(&cfg), None);
+    let when = Utc.with_ymd_and_hms(2026, 10, 21, 9, 30, 0).unwrap();
+    save_tle_last_refresh(&cfg, when);
+    assert_eq!(load_tle_last_refresh(&cfg), Some(when));
+    let bad = Arc::new(ConfigManager::in_memory(
+        &serde_json::json!({ KEY_TLE_LAST_REFRESH: "not a date" }),
+    ));
+    assert_eq!(load_tle_last_refresh(&bad), None);
+}

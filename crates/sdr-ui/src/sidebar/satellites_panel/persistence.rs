@@ -215,6 +215,34 @@ pub fn save_tle_last_refresh(config: &Arc<ConfigManager>, when: DateTime<Utc>) {
     });
 }
 
+/// The last successful TLE refresh, if one is recorded and parseable.
+#[must_use]
+pub fn load_tle_last_refresh(config: &Arc<ConfigManager>) -> Option<DateTime<Utc>> {
+    config.read(|v| {
+        v.get(KEY_TLE_LAST_REFRESH)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+    })
+}
+
+/// Age (hours) after which cached TLEs are refreshed automatically —
+/// the TLE cache's own 24 h freshness window. A day-old ISS TLE predicts
+/// Doppler within a few hundred Hz; a 16-day-old one was measured up to
+/// ~4 kHz off on a high pass, too much for the 18 kHz ISS SSTV channel
+/// that relies on Doppler tracking.
+pub const TLE_AUTO_REFRESH_MAX_AGE_HOURS: i64 = 24;
+
+/// Whether the TLEs are due an automatic refresh: never refreshed, or
+/// last refreshed at least [`TLE_AUTO_REFRESH_MAX_AGE_HOURS`] ago. A
+/// timestamp in the future (clock change) counts as fresh.
+#[must_use]
+pub fn tle_refresh_due(last: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    last.is_none_or(|t| {
+        now.signed_duration_since(t) >= chrono::Duration::hours(TLE_AUTO_REFRESH_MAX_AGE_HOURS)
+    })
+}
+
 pub(super) fn read_f64_or(config: &Arc<ConfigManager>, key: &str, default: f64) -> f64 {
     config.read(|v| {
         v.get(key)
