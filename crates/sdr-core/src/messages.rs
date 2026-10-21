@@ -195,6 +195,9 @@ pub enum DspToUi {
     SstvVisDetected {
         /// Human-readable mode name (e.g. `"PD120"`).
         mode_label: &'static str,
+        /// `true` when the header's VIS bits were lost and the decoder
+        /// assumed the last mode it decoded (slowrx's lost-VIS fallback).
+        assumed: bool,
     },
     /// One decoded SSTV scan line. Emitted from the DSP thread when
     /// `sstv_decode_tap` receives a `slowrx::SstvEvent::LineDecoded`.

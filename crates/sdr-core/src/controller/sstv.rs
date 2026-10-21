@@ -27,6 +27,11 @@ pub(super) struct SstvPassStats {
     /// images that ran out of audio mid-frame don't count here
     /// (use `lines_decoded` to see if any imagery was captured).
     pub(super) image_complete_count: u32,
+    /// Images started from the lost-VIS fallback (`VisFallback`): the
+    /// header's leaders arrived but its VIS bits didn't, so the decoder
+    /// assumed the last mode it decoded. Counted separately from
+    /// `vis_count` so the pass summary shows how often it saved an image.
+    pub(super) vis_fallback_count: u32,
     /// Total scan lines decoded across all images this pass
     /// (complete + partial). A pass with `vis_count > 0`,
     /// `image_complete_count == 0`, and `lines_decoded > 0` got
@@ -42,7 +47,10 @@ impl SstvPassStats {
     /// — a no-op reset (e.g. between two non-SSTV passes) shouldn't
     /// emit a "0 / 0 / 0" log line and clutter the trace.
     pub(super) fn saw_any_event(&self) -> bool {
-        self.vis_count > 0 || self.image_complete_count > 0 || self.lines_decoded > 0
+        self.vis_count > 0
+            || self.vis_fallback_count > 0
+            || self.image_complete_count > 0
+            || self.lines_decoded > 0
     }
 
     /// Mutate counters for one [`slowrx::SstvEvent`]. Extracted from
@@ -55,6 +63,9 @@ impl SstvPassStats {
         match event {
             slowrx::SstvEvent::VisDetected { .. } => {
                 self.vis_count += 1;
+            }
+            slowrx::SstvEvent::VisFallback { .. } => {
+                self.vis_fallback_count += 1;
             }
             slowrx::SstvEvent::LineDecoded { .. } => {
                 self.lines_decoded += 1;
@@ -105,8 +116,11 @@ pub(super) fn sstv_decode_tap(
             return;
         }
         match SstvDecoder::new(rate_hz) {
-            Ok(decoder) => {
+            Ok(mut decoder) => {
                 tracing::info!("SSTV decoder initialised at {rate_hz} Hz");
+                // Carry the last decoded mode across passes as the
+                // lost-VIS fallback (see `sstv_last_vis_mode`).
+                decoder.set_fallback_mode(state.sstv_last_vis_mode);
                 state.sstv_decoder = Some(decoder);
                 state.sstv_init_failed_at_rate = None;
             }
@@ -153,30 +167,19 @@ pub(super) fn handle_sstv_event(
                 mode,
                 sample_offset,
                 hedr_shift_hz,
+            } => on_vis_detected(state, dsp_tx, mode, sample_offset, hedr_shift_hz),
+            slowrx::SstvEvent::VisFallback {
+                mode,
+                sample_offset,
+                hedr_shift_hz,
             } => {
                 tracing::info!(
                     ?mode,
                     sample_offset,
                     hedr_shift_hz,
-                    "SSTV VIS detected — new image starting"
+                    "SSTV VIS lost — decoding in the last-seen mode"
                 );
-                // A new VIS is a new image. The shared buffer latches
-                // its geometry on the first row and only resets on
-                // `take_completed` / `clear`, so an incomplete image
-                // (fade-out mid-pass) followed by a different mode
-                // would have every row of the new image silently
-                // dropped and the old rows saved as it (#736).
-                if let Some(handle) = state.sstv_image.as_ref() {
-                    handle.clear();
-                }
-                // Surface the mode in the viewer's header so the
-                // user can see which PD-family variant is being
-                // decoded. `&'static str` because the slowrx mode
-                // name list is bounded and stable. Per epic #472
-                // mode-display follow-up.
-                let _ = dsp_tx.send(DspToUi::SstvVisDetected {
-                    mode_label: sstv_mode_label(mode),
-                });
+                start_sstv_image(state, dsp_tx, mode, true);
             }
             slowrx::SstvEvent::LineDecoded {
                 mode,
@@ -206,6 +209,57 @@ pub(super) fn handle_sstv_event(
             }
         }
     }
+}
+
+/// A decoded VIS: log it, remember its mode as the lost-VIS fallback, and
+/// start the image. Split out of [`handle_sstv_event`] per the 50-NLOC
+/// gate.
+fn on_vis_detected(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    mode: slowrx::SstvMode,
+    sample_offset: u64,
+    hedr_shift_hz: f64,
+) {
+    tracing::info!(
+        ?mode,
+        sample_offset,
+        hedr_shift_hz,
+        "SSTV VIS detected — new image starting"
+    );
+    // Remember the mode as the lost-VIS fallback for the rest of this
+    // pass and later ones: a station keeps its mode through an event, so
+    // if a fade later wipes out a header's VIS bits, the decoder can
+    // still start that image in this mode instead of losing it.
+    state.sstv_last_vis_mode = Some(mode);
+    if let Some(decoder) = state.sstv_decoder.as_mut() {
+        decoder.set_fallback_mode(Some(mode));
+    }
+    start_sstv_image(state, dsp_tx, mode, false);
+}
+
+/// Start a new SSTV image: clear the shared buffer and surface the mode
+/// in the viewer. A new VIS (or an assumed one) is a new image. The
+/// shared buffer latches its geometry on the first row and only resets
+/// on `take_completed` / `clear`, so an incomplete image (fade-out
+/// mid-pass) followed by a different mode would otherwise have every row
+/// of the new image silently dropped and the old rows saved as it (#736).
+/// `assumed` marks a lost-VIS fallback start so the viewer can say so.
+fn start_sstv_image(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    mode: slowrx::SstvMode,
+    assumed: bool,
+) {
+    if let Some(handle) = state.sstv_image.as_ref() {
+        handle.clear();
+    }
+    // `&'static str` because the slowrx mode name list is bounded and
+    // stable. Per epic #472 mode-display follow-up.
+    let _ = dsp_tx.send(DspToUi::SstvVisDetected {
+        mode_label: sstv_mode_label(mode),
+        assumed,
+    });
 }
 
 /// Finish one decoded SSTV frame: drain the completed image out of

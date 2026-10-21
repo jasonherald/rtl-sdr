@@ -175,3 +175,75 @@ fn sstv_vis_detected_resets_the_in_flight_image() {
         "the VIS notification must still reach the UI, got {events:?}"
     );
 }
+
+/// A `VisFallback` event (slowrx's lost-VIS fallback).
+fn fake_vis_fallback_event() -> slowrx::SstvEvent {
+    slowrx::SstvEvent::VisFallback {
+        mode: slowrx::SstvMode::Robot36,
+        sample_offset: 0,
+        hedr_shift_hz: 0.0,
+    }
+}
+
+#[test]
+fn sstv_pass_stats_counts_fallback_starts_separately() {
+    let mut stats = SstvPassStats::default();
+    stats.record_event(&fake_vis_fallback_event());
+    assert_eq!(stats.vis_fallback_count, 1);
+    assert_eq!(stats.vis_count, 0, "an assumed header is not a decoded VIS");
+    assert!(
+        stats.saw_any_event(),
+        "a fallback start alone is a pass event"
+    );
+}
+
+/// A decoded VIS remembers its mode as the lost-VIS fallback for the
+/// live decoder and for decoders built in later passes.
+#[test]
+fn sstv_vis_detected_sets_the_lost_vis_fallback() {
+    let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    state.sstv_decoder = Some(slowrx::SstvDecoder::new(48_000).unwrap());
+    assert_eq!(state.sstv_last_vis_mode, None, "no guess before a VIS");
+
+    handle_sstv_event(&mut state, &dsp_tx, fake_vis_event());
+
+    assert_eq!(state.sstv_last_vis_mode, Some(slowrx::SstvMode::Robot36));
+    assert_eq!(
+        state.sstv_decoder.as_ref().unwrap().fallback_mode(),
+        Some(slowrx::SstvMode::Robot36),
+        "the live decoder picks it up immediately"
+    );
+    // Survives the per-pass reset; the next pass's decoder is built with it.
+    reset_imaging_decoders(&mut state);
+    assert!(state.sstv_decoder.is_none());
+    assert_eq!(state.sstv_last_vis_mode, Some(slowrx::SstvMode::Robot36));
+}
+
+/// An assumed start resets the in-flight image like a decoded VIS and
+/// tells the UI the mode was assumed.
+#[test]
+fn sstv_vis_fallback_starts_an_image_flagged_as_assumed() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let image = sdr_radio::sstv_image::SstvImage::new();
+    let handle = image.handle();
+    handle.write_line(0, 320, 240, &[[1, 2, 3]; 320]);
+    state.sstv_image = Some(handle.clone());
+    let _ = drain(&dsp_rx);
+
+    handle_sstv_event(&mut state, &dsp_tx, fake_vis_fallback_event());
+
+    assert!(handle.snapshot().is_none(), "in-flight image reset");
+    let events = drain(&dsp_rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DspToUi::SstvVisDetected {
+                mode_label: "Robot 36",
+                assumed: true
+            }
+        )),
+        "UI told the mode was assumed, got {events:?}"
+    );
+}

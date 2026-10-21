@@ -58,6 +58,17 @@ const BACKGROUND_RGB: [f64; 3] = [0.05, 0.05, 0.06];
 /// [`crate::messages::DspToUi::SstvVisDetected`] event.
 const SSTV_VIEWER_PLACEHOLDER_SUBTITLE: &str = "Waiting for VIS";
 
+/// Viewer subtitle for a newly started image: the mode name, flagged
+/// when the decoder assumed it because the VIS header's bits were lost
+/// (slowrx's lost-VIS fallback) so a garbled image is explainable.
+pub(crate) fn sstv_mode_subtitle(mode_label: &str, assumed: bool) -> std::borrow::Cow<'_, str> {
+    if assumed {
+        std::borrow::Cow::Owned(format!("{mode_label} (VIS lost, assumed)"))
+    } else {
+        std::borrow::Cow::Borrowed(mode_label)
+    }
+}
+
 // ─── Pure Cairo renderer ────────────────────────────────────────────────────
 
 /// Pure Cairo renderer for a live SSTV image.

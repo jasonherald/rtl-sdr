@@ -111,8 +111,11 @@ pub(super) fn handle_dsp_message(msg: DspToUi, ctx: &DspEventCtx) {
         DspToUi::ScannerStateChanged(scanner_state) => on_scanner_state_changed(ctx, scanner_state),
         DspToUi::ScannerEmptyRotation => on_scanner_empty_rotation(ctx),
         DspToUi::AptLine(line) => on_apt_line(ctx, &line),
-        DspToUi::SstvVisDetected { mode_label } => {
-            on_sstv_vis_detected(ctx, mode_label);
+        DspToUi::SstvVisDetected {
+            mode_label,
+            assumed,
+        } => {
+            on_sstv_vis_detected(ctx, mode_label, assumed);
         }
         DspToUi::SstvLineDecoded(line_index) => on_sstv_line_decoded(ctx, line_index),
         DspToUi::SstvImageComplete {
@@ -708,7 +711,7 @@ fn on_apt_line(ctx: &DspEventCtx, line: &sdr_core::messages::AptLine) {
 
 /// `DspToUi::SstvVisDetected` arm of [`handle_dsp_message`], split out per
 /// the 50-NLOC gate (#817).
-fn on_sstv_vis_detected(ctx: &DspEventCtx, mode_label: &'static str) {
+fn on_sstv_vis_detected(ctx: &DspEventCtx, mode_label: &'static str, assumed: bool) {
     let DspEventCtx { state, .. } = ctx;
     // The decoder identified an SSTV mode from a fresh VIS
     // header. Surface it in the viewer's title so the user
@@ -718,7 +721,7 @@ fn on_sstv_vis_detected(ctx: &DspEventCtx, mode_label: &'static str) {
     // viewer isn't open. Per epic #472 mode-display
     // follow-up.
     if let Some(view) = state.sstv_viewer.borrow().as_ref() {
-        view.set_mode_label(mode_label);
+        view.set_mode_label(&crate::sstv_viewer::sstv_mode_subtitle(mode_label, assumed));
     }
 }
 

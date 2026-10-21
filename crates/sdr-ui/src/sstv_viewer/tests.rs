@@ -101,3 +101,12 @@ fn renderer_clear_resets_to_empty() {
     assert_eq!(r.lines_written, 0);
     assert!(r.last_snapshot.is_none());
 }
+
+#[test]
+fn mode_subtitle_flags_an_assumed_mode() {
+    assert_eq!(sstv_mode_subtitle("Robot 36", false), "Robot 36");
+    assert_eq!(
+        sstv_mode_subtitle("Robot 36", true),
+        "Robot 36 (VIS lost, assumed)"
+    );
+}
