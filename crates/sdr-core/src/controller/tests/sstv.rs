@@ -322,3 +322,100 @@ fn sstv_image_that_looks_like_noise_is_not_saved() {
     );
     assert_eq!(state.sstv_pass_stats.noise_images_dropped, 1);
 }
+
+/// The modes slowrx 0.8.0 added get real names in the viewer header
+/// instead of the generic "SSTV".
+#[test]
+fn sstv_mode_label_names_the_bw_and_wraase_modes() {
+    for (mode, label) in [
+        (slowrx::SstvMode::Robot24Bw, "Robot 24 B/W"),
+        (slowrx::SstvMode::Robot12Bw, "Robot 12 B/W"),
+        (slowrx::SstvMode::Robot8Bw, "Robot 8 B/W"),
+        (slowrx::SstvMode::Wraase120, "Wraase SC-2 120"),
+        (slowrx::SstvMode::Wraase180, "Wraase SC-2 180"),
+    ] {
+        assert_eq!(crate::controller::sstv::sstv_mode_label(mode), label);
+    }
+}
+
+/// The tap's decoder demodulates the analytic signal (slowrx #71), which
+/// removes the diagonal cross-hatch slowrx's real-signal demod draws in
+/// dark areas.
+#[test]
+fn sstv_decoder_uses_the_analytic_demod() {
+    let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    sstv_decode_tap(&mut state, &dsp_tx, 0);
+    let decoder = state.sstv_decoder.as_ref().expect("decoder initialised");
+    assert!(decoder.analytic_demod());
+}
+
+/// A row of `width` pixels all set to `value`.
+fn grey_row(width: u32, value: u8) -> Vec<[u8; 3]> {
+    vec![[value; 3]; width as usize]
+}
+
+/// Robot 12 B/W sends 120 lines that slowrx shows two rows tall
+/// (`ModeSpec::line_height`): each decoded line fills both rows of a
+/// 320×240 image, as slowrx's saved images do.
+#[test]
+fn a_double_height_line_fills_two_rows_of_the_image() {
+    let (dsp_tx, _dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let handle = sdr_radio::sstv_image::SstvImage::new().handle();
+    state.sstv_image = Some(handle.clone());
+    for line_index in 0..2 {
+        let event = slowrx::SstvEvent::LineDecoded {
+            mode: slowrx::SstvMode::Robot12Bw,
+            line_index,
+            pixels: grey_row(320, 10 + u8::try_from(line_index).unwrap()),
+        };
+        handle_sstv_event(&mut state, &dsp_tx, event);
+    }
+    let snap = handle.snapshot().expect("rows written");
+    assert_eq!((snap.width, snap.height), (320, 240));
+    assert_eq!(snap.lines_written, 4);
+    let row = |r: usize| snap.pixels[r * 320];
+    assert_eq!([row(0), row(1), row(2), row(3)], [[10; 3], [10; 3], [11; 3], [11; 3]]);
+}
+
+/// The image handed to the UI for saving is the double-height one, both
+/// from the shared handle and from slowrx's own buffer when no viewer
+/// handle is wired.
+#[test]
+fn a_double_height_image_is_saved_at_display_height() {
+    for wired in [true, false] {
+        let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+        let mut state = DspState::new(dsp_tx.clone()).unwrap();
+        if wired {
+            state.sstv_image = Some(sdr_radio::sstv_image::SstvImage::new().handle());
+        }
+        let mut image = slowrx::SstvImage::new(slowrx::SstvMode::Robot12Bw, 320, 120);
+        for (row, chunk) in image.pixels.chunks_mut(320).enumerate() {
+            chunk.fill([u8::try_from(row).unwrap(); 3]);
+            let event = slowrx::SstvEvent::LineDecoded {
+                mode: slowrx::SstvMode::Robot12Bw,
+                line_index: u32::try_from(row).unwrap(),
+                pixels: chunk.to_vec(),
+            };
+            handle_sstv_event(&mut state, &dsp_tx, event);
+        }
+        let complete = slowrx::SstvEvent::ImageComplete {
+            image,
+            sync_quality: slowrx::SyncQuality::new(0.9),
+            partial: false,
+        };
+        handle_sstv_event(&mut state, &dsp_tx, complete);
+        let saved = drain(&dsp_rx).into_iter().find_map(|e| match e {
+            DspToUi::SstvImageComplete {
+                width,
+                height,
+                pixels,
+            } => Some((width, height, pixels)),
+            _ => None,
+        });
+        let (width, height, pixels) = saved.expect("image queued for saving");
+        assert_eq!((width, height, pixels.len()), (320, 240, 320 * 240), "wired={wired}");
+        assert_eq!(pixels[239 * 320], [119; 3], "wired={wired}");
+    }
+}

@@ -133,6 +133,10 @@ pub(super) fn sstv_decode_tap(
                 // Carry the last decoded mode across passes as the
                 // lost-VIS fallback (see `sstv_last_vis_mode`).
                 decoder.set_fallback_mode(state.sstv_last_vis_mode);
+                // Demodulate the analytic signal: slowrx's real-signal
+                // demod draws a diagonal cross-hatch in dark areas
+                // (slowrx #71). Opt-in in the library, always on here.
+                decoder.set_analytic_demod(true);
                 state.sstv_decoder = Some(decoder);
                 state.sstv_init_failed_at_rate = None;
             }
@@ -247,9 +251,15 @@ fn on_sstv_line_decoded(
         // Derive width/height from the mode spec. The PD family (PD120 /
         // PD180 / PD240) is all 640 px wide; other modes vary.
         // `SstvMode` is `#[non_exhaustive]` so we use the spec helper
-        // (`slowrx::for_mode`, re-exported at the crate root).
+        // (`slowrx::for_mode`, re-exported at the crate root). Modes
+        // slowrx shows taller than they're sent (Robot 12 / 8 B/W,
+        // `line_height` 2) write each line into `line_height` rows.
         let spec = slowrx::for_mode(mode);
-        handle.write_line(line_index, spec.line_pixels, spec.image_lines, pixels);
+        let line_height = spec.line_height.max(1);
+        let height = spec.image_lines * line_height;
+        for row in line_index * line_height..(line_index + 1) * line_height {
+            handle.write_line(row, spec.line_pixels, height, pixels);
+        }
     }
     let _ = dsp_tx.send(DspToUi::SstvLineDecoded(line_index));
 }
@@ -329,13 +339,12 @@ fn handle_sstv_image_complete(
         .sstv_image
         .as_ref()
         .and_then(sdr_radio::sstv_image::SstvImageHandle::take_completed);
-    let width = image.width;
-    let height = image.height;
-    // `map_or` consumes `image.pixels` directly in the
-    // `None` arm, avoiding the `.clone()` the
-    // `map_or_else` call had. The `Some` arm returns
-    // the handle's buffer — both arms are owned moves.
-    let pixels = completed.map_or(image.pixels, |c| c.pixels);
+    // Both arms are owned moves. The handle's buffer is already at
+    // display height; slowrx's own image gets its rows repeated.
+    let (width, height, pixels) = match completed {
+        Some(c) => (c.width, c.height, c.pixels),
+        None => at_display_height(image),
+    };
     if sync_quality.looks_like_noise() {
         tracing::info!(
             sync_quality = sync_quality.value(),
@@ -349,6 +358,23 @@ fn handle_sstv_image_complete(
         height,
         pixels,
     });
+}
+
+/// `image` as `(width, height, pixels)` at the height slowrx shows it:
+/// each row repeated `line_height` times (twice for Robot 12 / 8 B/W,
+/// once for every other mode).
+fn at_display_height(image: slowrx::SstvImage) -> (u32, u32, Vec<[u8; 3]>) {
+    let line_height = slowrx::for_mode(image.mode).line_height.max(1);
+    if line_height == 1 || image.width == 0 {
+        return (image.width, image.height, image.pixels);
+    }
+    let pixels = image
+        .pixels
+        .chunks(image.width as usize)
+        .flat_map(|row| std::iter::repeat_n(row, line_height as usize).flatten())
+        .copied()
+        .collect();
+    (image.width, image.height * line_height, pixels)
 }
 
 /// Map a [`slowrx::SstvMode`] to a `&'static str` mode name for
@@ -374,6 +400,11 @@ pub(super) fn sstv_mode_label(mode: slowrx::SstvMode) -> &'static str {
         slowrx::SstvMode::ScottieDx => "Scottie DX",
         slowrx::SstvMode::Martin1 => "Martin 1",
         slowrx::SstvMode::Martin2 => "Martin 2",
+        slowrx::SstvMode::Robot24Bw => "Robot 24 B/W",
+        slowrx::SstvMode::Robot12Bw => "Robot 12 B/W",
+        slowrx::SstvMode::Robot8Bw => "Robot 8 B/W",
+        slowrx::SstvMode::Wraase120 => "Wraase SC-2 120",
+        slowrx::SstvMode::Wraase180 => "Wraase SC-2 180",
         _ => "SSTV",
     }
 }

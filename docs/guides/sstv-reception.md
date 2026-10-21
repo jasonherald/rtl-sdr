@@ -38,7 +38,10 @@ Modes vary per event. Recent series have used **PD120** /
 **Robot 36** (320×240 colour) for tighter event schedules — the
 May 2026 Series 32 ("Cooperation in Space") is Robot 36. The
 viewer's window-title subtitle shows which mode the current image
-is being decoded as.
+is being decoded as. The decoder also handles the other common
+amateur modes — Robot 24 / 72, Robot 24 / 12 / 8 B/W, Scottie 1 / 2
+/ DX, Martin 1 / 2 and Wraase SC-2 120 / 180 — if you point it at a
+terrestrial SSTV net.
 
 > **TODO:** hero screenshot — a real ISS SSTV image we received
 > during an ARISS event, ideally showing the mode subtitle in the
@@ -267,6 +270,16 @@ native cadence:
 - PD180: ~1.4 lines/sec for ~180 seconds
 - PD240: ~1 line/sec for ~240 seconds
 
+A fade can wipe out an image's VIS header. Once the decoder has
+heard one VIS (this pass or an earlier one since the app started),
+it keeps going in that mode instead of losing the image, and the
+subtitle says how it started:
+
+- **"PD120 (VIS lost, assumed)"** — a header was heard but its mode
+  bits were unreadable
+- **"PD120 (no VIS, from sync)"** — no header was heard at all; the
+  image was found from the rhythm of its line-sync pulses
+
 Each ARISS image takes a substantial fraction of an ISS pass to
 transmit, so a typical pass produces 1-3 complete images depending
 on the mode and pass duration. The **Pause** and **Clear** buttons
@@ -365,6 +378,11 @@ slight carrier offset — slowrx automatically compensates for this
 during decode, so persistent hue shifts mean the carrier drifted
 mid-image faster than HEDR detection could track.
 
+An "image" whose line-sync pulses never lined up at all — a VIS
+followed by a transmission that faded or ended — is pure noise and
+isn't saved. The LOS summary in the log counts those as
+`noise_images_dropped`.
+
 ### Image is striped with horizontal jumps
 
 Sync lost mid-image. The decoder doesn't recover from sync loss
@@ -381,6 +399,12 @@ The detector is bandlimited to the standard 1100 / 1300 / 1900 /
 2300 Hz tones — if the satellite's audio chain has shifted those
 tones (rare but possible during onboard equipment swaps), VIS
 won't detect.
+
+The decoder can only start an image without a VIS once it has heard
+one, because it needs a mode to assume. It remembers that mode
+until the app is closed, so leave the app running across an event's
+passes: once any pass decodes a VIS, images whose headers fade are
+recovered from then on.
 
 ### Pass scheduled but nothing happens
 
