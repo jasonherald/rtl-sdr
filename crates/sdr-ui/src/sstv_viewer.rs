@@ -59,13 +59,21 @@ const BACKGROUND_RGB: [f64; 3] = [0.05, 0.05, 0.06];
 const SSTV_VIEWER_PLACEHOLDER_SUBTITLE: &str = "Waiting for VIS";
 
 /// Viewer subtitle for a newly started image: the mode name, flagged
-/// when the decoder assumed it because the VIS header's bits were lost
-/// (slowrx's lost-VIS fallback) so a garbled image is explainable.
-pub(crate) fn sstv_mode_subtitle(mode_label: &str, assumed: bool) -> std::borrow::Cow<'_, str> {
-    if assumed {
-        std::borrow::Cow::Owned(format!("{mode_label} (VIS lost, assumed)"))
-    } else {
-        std::borrow::Cow::Borrowed(mode_label)
+/// when no decoded VIS header named it (slowrx's lost-VIS fallback or
+/// sync-rhythm start) so a garbled or mid-image picture is explainable.
+pub(crate) fn sstv_mode_subtitle(
+    mode_label: &str,
+    start: sdr_core::messages::SstvImageStart,
+) -> std::borrow::Cow<'_, str> {
+    use sdr_core::messages::SstvImageStart;
+    match start {
+        SstvImageStart::Vis => std::borrow::Cow::Borrowed(mode_label),
+        SstvImageStart::LostVis => {
+            std::borrow::Cow::Owned(format!("{mode_label} (VIS lost, assumed)"))
+        }
+        SstvImageStart::SyncRhythm => {
+            std::borrow::Cow::Owned(format!("{mode_label} (no VIS, from sync)"))
+        }
     }
 }
 

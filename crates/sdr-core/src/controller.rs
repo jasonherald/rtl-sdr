@@ -1609,7 +1609,9 @@ fn reset_imaging_decoders(state: &mut DspState) {
         tracing::info!(
             vis_count = pass_stats.vis_count,
             vis_fallback_count = pass_stats.vis_fallback_count,
+            sync_start_count = pass_stats.sync_start_count,
             image_complete_count = pass_stats.image_complete_count,
+            noise_images_dropped = pass_stats.noise_images_dropped,
             lines_decoded = pass_stats.lines_decoded,
             "SSTV pass summary"
         );

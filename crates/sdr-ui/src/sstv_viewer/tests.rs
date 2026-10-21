@@ -103,10 +103,18 @@ fn renderer_clear_resets_to_empty() {
 }
 
 #[test]
-fn mode_subtitle_flags_an_assumed_mode() {
-    assert_eq!(sstv_mode_subtitle("Robot 36", false), "Robot 36");
+fn mode_subtitle_says_how_the_image_started() {
+    use sdr_core::messages::SstvImageStart;
     assert_eq!(
-        sstv_mode_subtitle("Robot 36", true),
+        sstv_mode_subtitle("Robot 36", SstvImageStart::Vis),
+        "Robot 36"
+    );
+    assert_eq!(
+        sstv_mode_subtitle("Robot 36", SstvImageStart::LostVis),
         "Robot 36 (VIS lost, assumed)"
+    );
+    assert_eq!(
+        sstv_mode_subtitle("Robot 36", SstvImageStart::SyncRhythm),
+        "Robot 36 (no VIS, from sync)"
     );
 }

@@ -2,6 +2,7 @@
 //! SSTV event handling.
 
 use super::{DspState, DspToUi, SstvDecoder, mpsc};
+use crate::messages::SstvImageStart;
 
 /// Per-SSTV-pass diagnostic counters. Reset between passes by
 /// [`reset_imaging_decoders`] (which logs a summary first). Lets
@@ -32,6 +33,13 @@ pub(super) struct SstvPassStats {
     /// assumed the last mode it decoded. Counted separately from
     /// `vis_count` so the pass summary shows how often it saved an image.
     pub(super) vis_fallback_count: u32,
+    /// Images started from the mode's line-sync rhythm (`SyncStart`): no
+    /// header was heard at all (a fully faded header, or AOS mid-image).
+    pub(super) sync_start_count: u32,
+    /// Completed images not saved because their line-sync pulses never
+    /// lined up (`SyncQuality::looks_like_noise`) — a VIS followed by a
+    /// faded or ended transmission. Included in `image_complete_count`.
+    pub(super) noise_images_dropped: u32,
     /// Total scan lines decoded across all images this pass
     /// (complete + partial). A pass with `vis_count > 0`,
     /// `image_complete_count == 0`, and `lines_decoded > 0` got
@@ -49,6 +57,7 @@ impl SstvPassStats {
     pub(super) fn saw_any_event(&self) -> bool {
         self.vis_count > 0
             || self.vis_fallback_count > 0
+            || self.sync_start_count > 0
             || self.image_complete_count > 0
             || self.lines_decoded > 0
     }
@@ -66,6 +75,9 @@ impl SstvPassStats {
             }
             slowrx::SstvEvent::VisFallback { .. } => {
                 self.vis_fallback_count += 1;
+            }
+            slowrx::SstvEvent::SyncStart { .. } => {
+                self.sync_start_count += 1;
             }
             slowrx::SstvEvent::LineDecoded { .. } => {
                 self.lines_decoded += 1;
@@ -161,54 +173,85 @@ pub(super) fn handle_sstv_event(
     // many images completed, and how many lines decoded across
     // all (complete + partial) images. Per #648.
     state.sstv_pass_stats.record_event(&event);
-    {
-        match event {
-            slowrx::SstvEvent::VisDetected {
-                mode,
-                sample_offset,
-                hedr_shift_hz,
-            } => on_vis_detected(state, dsp_tx, mode, sample_offset, hedr_shift_hz),
-            slowrx::SstvEvent::VisFallback {
-                mode,
-                sample_offset,
-                hedr_shift_hz,
-            } => {
-                tracing::info!(
-                    ?mode,
-                    sample_offset,
-                    hedr_shift_hz,
-                    "SSTV VIS lost — decoding in the last-seen mode"
-                );
-                start_sstv_image(state, dsp_tx, mode, true);
-            }
-            slowrx::SstvEvent::LineDecoded {
-                mode,
-                line_index,
-                ref pixels,
-            } => {
-                // Write into the shared image handle (if the UI wired one).
-                if let Some(ref handle) = state.sstv_image {
-                    // Derive width/height from the mode spec. The PD
-                    // family (PD120 / PD180 / PD240) is all 640 px
-                    // wide; other modes vary. `SstvMode` is
-                    // `#[non_exhaustive]` so we use the spec helper
-                    // (`slowrx::for_mode` — the free function in
-                    // `slowrx::modespec`, re-exported at the crate root).
-                    let spec = slowrx::for_mode(mode);
-                    handle.write_line(line_index, spec.line_pixels, spec.image_lines, pixels);
-                }
-                let _ = dsp_tx.send(DspToUi::SstvLineDecoded(line_index));
-            }
-            slowrx::SstvEvent::ImageComplete { image, .. } => {
-                handle_sstv_image_complete(state, dsp_tx, image);
-            }
-            _ => {
-                // `SstvEvent` is `#[non_exhaustive]` — silently
-                // ignore future variants so a slowrx update doesn't
-                // require a source change here.
-            }
+    match event {
+        slowrx::SstvEvent::VisDetected {
+            mode,
+            sample_offset,
+            hedr_shift_hz,
+        } => on_vis_detected(state, dsp_tx, mode, sample_offset, hedr_shift_hz),
+        ref e @ (slowrx::SstvEvent::VisFallback { .. } | slowrx::SstvEvent::SyncStart { .. }) => {
+            on_headerless_start(state, dsp_tx, e);
         }
+        slowrx::SstvEvent::LineDecoded {
+            mode,
+            line_index,
+            ref pixels,
+        } => on_sstv_line_decoded(state, dsp_tx, mode, line_index, pixels),
+        slowrx::SstvEvent::ImageComplete {
+            image,
+            sync_quality,
+            ..
+        } => handle_sstv_image_complete(state, dsp_tx, image, sync_quality),
+        // `SstvEvent` is `#[non_exhaustive]` — silently ignore future
+        // variants so a slowrx update doesn't require a source change here.
+        _ => {}
     }
+}
+
+/// An image started without a decoded VIS — the header's bits were lost
+/// (`VisFallback`, with the leader's mistuning) or no header was heard at
+/// all (`SyncStart`): log it and start the image in the last-seen mode.
+fn on_headerless_start(
+    state: &mut DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    event: &slowrx::SstvEvent,
+) {
+    let (mode, sample_offset, start, hedr_shift_hz) = match *event {
+        slowrx::SstvEvent::VisFallback {
+            mode,
+            sample_offset,
+            hedr_shift_hz,
+        } => (
+            mode,
+            sample_offset,
+            SstvImageStart::LostVis,
+            Some(hedr_shift_hz),
+        ),
+        slowrx::SstvEvent::SyncStart {
+            mode,
+            sample_offset,
+        } => (mode, sample_offset, SstvImageStart::SyncRhythm, None),
+        _ => return,
+    };
+    tracing::info!(
+        ?mode,
+        ?start,
+        sample_offset,
+        ?hedr_shift_hz,
+        "SSTV image started without a decoded VIS — decoding in the last-seen mode"
+    );
+    start_sstv_image(state, dsp_tx, mode, start);
+}
+
+/// One decoded scan line: write it into the shared image handle (if the
+/// UI wired one) and nudge the viewer to redraw. Split out of
+/// [`handle_sstv_event`] per the 50-NLOC gate.
+fn on_sstv_line_decoded(
+    state: &DspState,
+    dsp_tx: &mpsc::Sender<DspToUi>,
+    mode: slowrx::SstvMode,
+    line_index: u32,
+    pixels: &[[u8; 3]],
+) {
+    if let Some(ref handle) = state.sstv_image {
+        // Derive width/height from the mode spec. The PD family (PD120 /
+        // PD180 / PD240) is all 640 px wide; other modes vary.
+        // `SstvMode` is `#[non_exhaustive]` so we use the spec helper
+        // (`slowrx::for_mode`, re-exported at the crate root).
+        let spec = slowrx::for_mode(mode);
+        handle.write_line(line_index, spec.line_pixels, spec.image_lines, pixels);
+    }
+    let _ = dsp_tx.send(DspToUi::SstvLineDecoded(line_index));
 }
 
 /// A decoded VIS: log it, remember its mode as the lost-VIS fallback, and
@@ -235,7 +278,7 @@ fn on_vis_detected(
     if let Some(decoder) = state.sstv_decoder.as_mut() {
         decoder.set_fallback_mode(Some(mode));
     }
-    start_sstv_image(state, dsp_tx, mode, false);
+    start_sstv_image(state, dsp_tx, mode, SstvImageStart::Vis);
 }
 
 /// Start a new SSTV image: clear the shared buffer and surface the mode
@@ -244,12 +287,13 @@ fn on_vis_detected(
 /// on `take_completed` / `clear`, so an incomplete image (fade-out
 /// mid-pass) followed by a different mode would otherwise have every row
 /// of the new image silently dropped and the old rows saved as it (#736).
-/// `assumed` marks a lost-VIS fallback start so the viewer can say so.
+/// `start` says how the image was found so the viewer can flag a mode
+/// no header named.
 fn start_sstv_image(
     state: &mut DspState,
     dsp_tx: &mpsc::Sender<DspToUi>,
     mode: slowrx::SstvMode,
-    assumed: bool,
+    start: SstvImageStart,
 ) {
     if let Some(handle) = state.sstv_image.as_ref() {
         handle.clear();
@@ -258,18 +302,22 @@ fn start_sstv_image(
     // stable. Per epic #472 mode-display follow-up.
     let _ = dsp_tx.send(DspToUi::SstvVisDetected {
         mode_label: sstv_mode_label(mode),
-        assumed,
+        start,
     });
 }
 
 /// Finish one decoded SSTV frame: drain the completed image out of
 /// the shared handle (or fall back to the slowrx-owned buffer when no
-/// handle is wired) and hand it to the UI for the LOS save. Split out
-/// of [`handle_sstv_event`] per CR on PR #841.
+/// handle is wired) and hand it to the UI for the LOS save — unless its
+/// line-sync pulses never lined up, in which case the "image" is noise
+/// (a VIS whose transmission faded or ended) and is dropped instead of
+/// saved (slowrx #116). Split out of [`handle_sstv_event`] per CR on PR
+/// #841.
 fn handle_sstv_image_complete(
     state: &mut DspState,
     dsp_tx: &mpsc::Sender<DspToUi>,
     image: slowrx::SstvImage,
+    sync_quality: slowrx::SyncQuality,
 ) {
     // `take_completed` atomically swaps out the in-flight
     // pixel buffer and resets for the next VIS detection.
@@ -288,6 +336,14 @@ fn handle_sstv_image_complete(
     // `map_or_else` call had. The `Some` arm returns
     // the handle's buffer — both arms are owned moves.
     let pixels = completed.map_or(image.pixels, |c| c.pixels);
+    if sync_quality.looks_like_noise() {
+        tracing::info!(
+            sync_quality = sync_quality.value(),
+            "SSTV image looks like noise — not saving it"
+        );
+        state.sstv_pass_stats.noise_images_dropped += 1;
+        return;
+    }
     let _ = dsp_tx.send(DspToUi::SstvImageComplete {
         width,
         height,

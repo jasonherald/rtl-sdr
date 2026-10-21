@@ -1,4 +1,5 @@
 use super::*;
+use crate::messages::SstvImageStart;
 
 /// Synthesize a `SstvEvent::VisDetected` for tests. The
 /// inner field values don't matter for counter-update tests
@@ -31,8 +32,14 @@ fn fake_line_event() -> slowrx::SstvEvent {
 /// the V1 slowrx contract (only the final clean image surface
 /// emits this event).
 fn fake_image_complete_event() -> slowrx::SstvEvent {
+    image_complete_with_quality(0.9)
+}
+
+/// `ImageComplete` with a given line-sync quality score.
+fn image_complete_with_quality(quality: f32) -> slowrx::SstvEvent {
     slowrx::SstvEvent::ImageComplete {
         image: slowrx::SstvImage::new(slowrx::SstvMode::Robot36, 1, 1),
+        sync_quality: slowrx::SyncQuality::new(quality),
         partial: false,
     }
 }
@@ -241,9 +248,77 @@ fn sstv_vis_fallback_starts_an_image_flagged_as_assumed() {
             e,
             DspToUi::SstvVisDetected {
                 mode_label: "Robot 36",
-                assumed: true
+                start: SstvImageStart::LostVis
             }
         )),
         "UI told the mode was assumed, got {events:?}"
     );
+}
+
+/// A `SyncStart` event (slowrx started an image from its sync rhythm).
+fn fake_sync_start_event() -> slowrx::SstvEvent {
+    slowrx::SstvEvent::SyncStart {
+        mode: slowrx::SstvMode::Robot36,
+        sample_offset: 0,
+    }
+}
+
+/// An image started from its sync rhythm (no header heard) resets the
+/// in-flight image, is counted, and tells the UI how it started.
+#[test]
+fn sstv_sync_start_starts_an_image_flagged_as_sync_rhythm() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let image = sdr_radio::sstv_image::SstvImage::new();
+    let handle = image.handle();
+    handle.write_line(0, 320, 240, &[[1, 2, 3]; 320]);
+    state.sstv_image = Some(handle.clone());
+    let _ = drain(&dsp_rx);
+
+    handle_sstv_event(&mut state, &dsp_tx, fake_sync_start_event());
+
+    assert!(handle.snapshot().is_none(), "in-flight image reset");
+    assert_eq!(state.sstv_pass_stats.sync_start_count, 1);
+    assert_eq!(state.sstv_pass_stats.vis_count, 0);
+    assert!(state.sstv_pass_stats.saw_any_event());
+    let events = drain(&dsp_rx);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            DspToUi::SstvVisDetected {
+                mode_label: "Robot 36",
+                start: SstvImageStart::SyncRhythm
+            }
+        )),
+        "UI told the image started from its sync rhythm, got {events:?}"
+    );
+}
+
+/// An "image" whose sync pulses never lined up is noise (a VIS whose
+/// transmission faded or ended): it is not handed to the UI for the LOS
+/// save, and the pass summary counts it.
+#[test]
+fn sstv_image_that_looks_like_noise_is_not_saved() {
+    let (dsp_tx, dsp_rx) = mpsc::channel::<DspToUi>();
+    let mut state = DspState::new(dsp_tx.clone()).unwrap();
+    let _ = drain(&dsp_rx);
+
+    handle_sstv_event(&mut state, &dsp_tx, image_complete_with_quality(0.05));
+    assert!(
+        !drain(&dsp_rx)
+            .iter()
+            .any(|e| matches!(e, DspToUi::SstvImageComplete { .. })),
+        "a noise image must not be queued for saving"
+    );
+    assert_eq!(state.sstv_pass_stats.noise_images_dropped, 1);
+    assert_eq!(state.sstv_pass_stats.image_complete_count, 1);
+
+    handle_sstv_event(&mut state, &dsp_tx, image_complete_with_quality(0.45));
+    assert!(
+        drain(&dsp_rx)
+            .iter()
+            .any(|e| matches!(e, DspToUi::SstvImageComplete { .. })),
+        "a weak but real image is still saved"
+    );
+    assert_eq!(state.sstv_pass_stats.noise_images_dropped, 1);
 }

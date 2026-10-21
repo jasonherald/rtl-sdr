@@ -31,6 +31,21 @@ pub enum ScannerMutexReason {
     ScannerStoppedForRecording,
 }
 
+/// How the SSTV decoder found an image's start — and so how sure it is
+/// of the mode. Carried by [`DspToUi::SstvVisDetected`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SstvImageStart {
+    /// A decoded VIS header named the mode.
+    Vis,
+    /// The header's leaders arrived but its VIS bits were lost; the
+    /// decoder assumed the last mode it decoded (slowrx `VisFallback`).
+    LostVis,
+    /// No header was heard; the decoder recognised the last mode's
+    /// line-sync rhythm (slowrx `SyncStart`) — a fully faded header, or a
+    /// transmission joined mid-image.
+    SyncRhythm,
+}
+
 /// Messages sent from the DSP pipeline thread to the UI main loop.
 #[derive(Debug)]
 pub enum DspToUi {
@@ -195,9 +210,9 @@ pub enum DspToUi {
     SstvVisDetected {
         /// Human-readable mode name (e.g. `"PD120"`).
         mode_label: &'static str,
-        /// `true` when the header's VIS bits were lost and the decoder
-        /// assumed the last mode it decoded (slowrx's lost-VIS fallback).
-        assumed: bool,
+        /// How the decoder found the image's start (and so how sure it
+        /// is of the mode).
+        start: SstvImageStart,
     },
     /// One decoded SSTV scan line. Emitted from the DSP thread when
     /// `sstv_decode_tap` receives a `slowrx::SstvEvent::LineDecoded`.
