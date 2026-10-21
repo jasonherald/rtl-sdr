@@ -318,7 +318,7 @@ fn empty_input_is_a_no_op() {
     let mut demod = SdpskDemod::new();
     let mut out = Vec::new();
     demod.process(&[], &mut out);
-    assert!(out.is_empty());
+    assert_eq!(out, [] as [bool; 0]);
 }
 
 #[test]

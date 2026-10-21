@@ -344,7 +344,7 @@ mod tests {
             .map(|s| s.channels_hz.len())
             .sum();
         assert_eq!(rows.len(), total_channels);
-        assert!(!rows.is_empty());
+        assert_ne!(rows, [] as [(&str, u64, f64); 0]);
         // First row must belong to the nearest station (NMG from New
         // Orleans), matching `stations_by_distance`'s own ranking test.
         assert_eq!(rows[0].0, "NMG New Orleans");

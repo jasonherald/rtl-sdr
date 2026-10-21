@@ -80,7 +80,10 @@ fn log_ring_caps_at_max_entries() {
 fn push_log_ring_returns_evicted_entry() {
     let mut ring: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     for i in 0..MAX_LOG_ENTRIES {
-        assert!(push_log_ring(&mut ring, format!("line {i}")).is_empty());
+        assert_eq!(
+            push_log_ring(&mut ring, format!("line {i}")),
+            [] as [std::string::String; 0]
+        );
     }
     // At cap: one more push evicts exactly the oldest entry, returned whole.
     let evicted = push_log_ring(&mut ring, "newest".to_string());
@@ -96,9 +99,15 @@ fn evicted_multiline_entry_is_returned_intact_for_full_line_deletion() {
     // (not just the first) — this is the buffer/ring-desync regression.
     let mut ring: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let multiline = "Message complete\n00000000  DE AD BE EF |....|".to_string();
-    assert!(push_log_ring(&mut ring, multiline.clone()).is_empty()); // front entry
+    assert_eq!(
+        push_log_ring(&mut ring, multiline.clone()),
+        [] as [std::string::String; 0]
+    ); // front entry
     for i in 0..(MAX_LOG_ENTRIES - 1) {
-        assert!(push_log_ring(&mut ring, format!("line {i}")).is_empty());
+        assert_eq!(
+            push_log_ring(&mut ring, format!("line {i}")),
+            [] as [std::string::String; 0]
+        );
     }
     assert_eq!(ring.len(), MAX_LOG_ENTRIES);
     // One more push evicts the multi-line front entry, returned intact.

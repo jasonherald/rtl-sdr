@@ -389,7 +389,7 @@ fn rotate_180_per_channel_handles_zero_height() {
     // off-by-one risk in the original implementation).
     let mut image = Vec::<u8>::new();
     rotate_180_per_channel(&mut image, 0);
-    assert!(image.is_empty());
+    assert_eq!(image, [] as [u8; 0]);
 }
 
 #[test]

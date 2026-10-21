@@ -215,6 +215,6 @@ mod tests {
     #[test]
     fn test_send_buf_initially_empty() {
         let sink = NetworkSink::new("localhost", 7355, Protocol::Udp);
-        assert!(sink.send_buf.is_empty());
+        assert_eq!(sink.send_buf, [] as [u8; 0]);
     }
 }

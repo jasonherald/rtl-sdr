@@ -466,8 +466,8 @@ mod tests {
         vad.accept(&synthetic_voice(30));
         vad.reset();
         assert_eq!(vad.state, State::Idle);
-        assert!(vad.partial_frame.is_empty());
-        assert!(vad.current_segment.is_empty());
+        assert_eq!(vad.partial_frame, [] as [f32; 0]);
+        assert_eq!(vad.current_segment, [] as [f32; 0]);
         assert_eq!(vad.speech_frames_in_segment, 0);
         assert_eq!(vad.silence_frames_in_holdoff, 0);
         assert!(vad.lookback.is_empty());
@@ -572,7 +572,7 @@ mod tests {
         // precondition that makes the assertion meaningful.
         assert_eq!(vad.state, State::Speaking);
         assert_eq!(vad.speech_frames_in_segment, voiced_count);
-        assert!(!vad.current_segment.is_empty());
+        assert_ne!(vad.current_segment, [] as [f32; 0]);
 
         // Feed enough silence to drive HoldingOff → finalize.
         vad.accept(&silence_frames(DEFAULT_MIN_SILENCE_FRAMES + 5));
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(vad.state, State::Idle, "finalize_segment → Idle");
         assert_eq!(vad.speech_frames_in_segment, 0);
         assert_eq!(vad.silence_frames_in_holdoff, 0);
-        assert!(vad.current_segment.is_empty());
+        assert_eq!(vad.current_segment, [] as [f32; 0]);
     }
 
     #[test]
@@ -714,7 +714,7 @@ mod tests {
             );
         }
         // Partial frame should have been consumed.
-        assert!(vad.partial_frame.is_empty());
+        assert_eq!(vad.partial_frame, [] as [f32; 0]);
     }
 
     #[test]
@@ -725,7 +725,7 @@ mod tests {
         vad.partial_frame
             .extend(std::iter::repeat_n(0.42_f32, FRAME_SIZE / 2));
         vad.flush();
-        assert!(vad.partial_frame.is_empty());
+        assert_eq!(vad.partial_frame, [] as [f32; 0]);
         assert!(vad.completed.is_empty());
     }
 

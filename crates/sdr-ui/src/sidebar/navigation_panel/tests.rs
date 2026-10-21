@@ -58,7 +58,7 @@ fn demod_mode_roundtrip() {
 #[test]
 fn band_presets_have_valid_data() {
     for preset in BAND_PRESETS {
-        assert!(!preset.name.is_empty());
+        assert_ne!(preset.name, "");
         assert!(preset.frequency > 0);
         assert!(preset.bandwidth > 0.0);
     }

@@ -52,10 +52,10 @@ fn expiry_drops_old_entries() {
     assert_eq!(model.rows(just_inside).len(), 1);
 
     let at_boundary = t0 + Duration::from_secs(HEARD_EXPIRY_SECS);
-    assert!(model.rows(at_boundary).is_empty());
+    assert_eq!(model.rows(at_boundary), [] as [HeardRow; 0]);
 
     let well_past = t0 + Duration::from_secs(HEARD_EXPIRY_SECS + 60);
-    assert!(model.rows(well_past).is_empty());
+    assert_eq!(model.rows(well_past), [] as [HeardRow; 0]);
 }
 
 #[test]

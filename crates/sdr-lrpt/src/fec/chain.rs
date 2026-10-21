@@ -719,7 +719,10 @@ mod tests {
         // ASM + uncorrectable payload: syncs, RS fails every time.
         let garbage = synthesise_garbage_cadu_soft();
         for _ in 0..REHUNT_AFTER_FAILED_CADUS {
-            assert!(push_rotated(&mut chain, &garbage, 0).is_empty());
+            assert_eq!(
+                push_rotated(&mut chain, &garbage, 0),
+                [] as [std::vec::Vec<u8>; 0]
+            );
         }
         let st = chain.stats();
         assert_eq!(

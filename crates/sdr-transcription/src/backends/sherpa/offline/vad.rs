@@ -16,14 +16,14 @@ use crate::{denoise, resampler};
 
 use super::super::host::{AUDIO_RECV_TIMEOUT, SessionParams};
 use super::super::silero_vad::SherpaSileroVad;
-use super::decode::{DecodeRequest, decoder_service_loop};
+use super::decode::DecodeRequest;
 
 /// Initial capacity for the per-session resampled-mono scratch buffer.
 const SESSION_MONO_BUFFER_CAPACITY: usize = 16_000;
 
 /// VAD-driven offline session. Spawns a session I/O thread that builds
 /// its own Silero and runs the VAD state machine; the current (host)
-/// thread runs [`decoder_service_loop`] and performs the actual
+/// thread runs [`decoder_service_loop`](super::decode::decoder_service_loop) and performs the actual
 /// `OfflineRecognizer::decode` calls for each segment the I/O thread
 /// forwards.
 ///

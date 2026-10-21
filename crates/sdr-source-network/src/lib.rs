@@ -689,14 +689,14 @@ mod tests {
         let mut source = NetworkSource::new("localhost", 1234, Protocol::TcpClient);
         source.carry_buf.extend_from_slice(&[1, 2, 3]);
         source.set_sample_format(SampleFormat::Float32);
-        assert!(source.carry_buf.is_empty());
+        assert_eq!(source.carry_buf, [] as [u8; 0]);
     }
 
     #[test]
     fn test_new() {
         let source = NetworkSource::new("localhost", 1234, Protocol::Udp);
         assert_eq!(source.name(), "Network");
-        assert!(source.carry_buf.is_empty());
+        assert_eq!(source.carry_buf, [] as [u8; 0]);
     }
 
     #[test]
@@ -705,6 +705,6 @@ mod tests {
         source.carry_buf.push(0x42);
         // Stop clears carry buffer
         source.stop().unwrap();
-        assert!(source.carry_buf.is_empty());
+        assert_eq!(source.carry_buf, [] as [u8; 0]);
     }
 }

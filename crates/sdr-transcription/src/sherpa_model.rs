@@ -852,4 +852,5 @@ pub fn extract_sherpa_archive(
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests;

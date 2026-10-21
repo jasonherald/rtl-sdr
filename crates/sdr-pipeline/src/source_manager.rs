@@ -458,7 +458,7 @@ mod tests {
         mgr.select("Test").unwrap();
         mgr.unregister("Test");
         assert!(mgr.selected().is_none());
-        assert!(mgr.source_names().is_empty());
+        assert_eq!(mgr.source_names(), [] as [&str; 0]);
     }
 
     #[test]

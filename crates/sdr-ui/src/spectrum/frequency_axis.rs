@@ -154,20 +154,20 @@ mod tests {
     #[test]
     fn grid_lines_empty_on_zero_max() {
         let lines = compute_grid_lines(0.0, 1_000_000.0, 0);
-        assert!(lines.is_empty());
+        assert_eq!(lines, [] as [(f64, std::string::String); 0]);
     }
 
     #[test]
     fn grid_lines_empty_on_inverted_range() {
         let lines = compute_grid_lines(1_000_000.0, 0.0, 10);
-        assert!(lines.is_empty());
+        assert_eq!(lines, [] as [(f64, std::string::String); 0]);
     }
 
     #[test]
     fn grid_lines_reasonable_count() {
         // 2 MHz span, up to 10 lines
         let lines = compute_grid_lines(99_000_000.0, 101_000_000.0, 10);
-        assert!(!lines.is_empty());
+        assert_ne!(lines, [] as [(f64, std::string::String); 0]);
         assert!(
             lines.len() <= 10,
             "expected at most 10 lines, got {}",

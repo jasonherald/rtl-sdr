@@ -511,7 +511,7 @@ mod tests {
         let pkt = valid_sync_packet();
         let mut d = Deframer::new();
         let got = feed(&mut d, bits_lsb_first(&pkt));
-        assert!(got.is_empty());
+        assert_eq!(got, [] as [DeframedPacket; 0]);
 
         let mut corrupted: Vec<bool> = bits_lsb_first(&pkt).collect();
         corrupted[40] = !corrupted[40];

@@ -290,6 +290,7 @@ fn finalize_session(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -338,7 +339,7 @@ mod tests {
 
         assert_eq!(outcome, DrainOutcome::default());
         assert!(rx.try_recv().is_err(), "channel fully drained");
-        assert!(!mono.is_empty());
+        assert_ne!(mono, [] as [f32; 0]);
     }
 
     #[test]

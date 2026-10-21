@@ -5,7 +5,7 @@ fn renderer_starts_empty_with_no_active_channel() {
     let r = LrptImageRenderer::new();
     assert!(r.is_empty());
     assert!(r.active_apid().is_none());
-    assert!(r.known_apids().is_empty());
+    assert_eq!(r.known_apids(), [] as [u16; 0]);
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn push_line_with_wrong_width_is_dropped() {
     );
     // No surface allocated, no line counted.
     assert_eq!(r.n_lines(APID_TEST), 0);
-    assert!(r.known_apids().is_empty());
+    assert_eq!(r.known_apids(), [] as [u16; 0]);
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn clear_drops_all_channels_and_active_selection() {
     r.clear();
     assert!(r.is_empty());
     assert!(r.active_apid().is_none());
-    assert!(r.known_apids().is_empty());
+    assert_eq!(r.known_apids(), [] as [u16; 0]);
 }
 
 #[test]
