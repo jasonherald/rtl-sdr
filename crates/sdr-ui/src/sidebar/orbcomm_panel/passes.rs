@@ -206,14 +206,15 @@ pub(crate) fn wire_orbcomm_passes(handles: &Rc<OrbcommPanelHandles>, state: &Rc<
 /// * `true` — always fetches, bypassing the staleness check. The
 ///   manual "Refresh TLEs" button uses this: a user-initiated refresh
 ///   means "do the network round trip now", matching how that same
-///   button force-refreshes the per-NORAD TLEs
-///   (`force_refresh_all_tles`) regardless of their cache age.
+///   button force-refreshes the per-NORAD TLEs (`refresh_all_tles`)
+///   regardless of their cache age.
 ///
 /// Armed from two call sites: `on_orbcomm_enabled_changed`'s enabled
-/// path (`force=false`), and the satellites-panel TLE-refresh button
-/// (`window/satellites/passes.rs::finish_tle_refresh`, `force=true`)
-/// — both reuse this single implementation rather than duplicating
-/// the spawn/parse/repaint sequence.
+/// path (`force=false`), and the satellites-panel TLE refresh
+/// (`window/satellites/passes.rs::start_tle_refresh`: `force=true` for
+/// a button click, `force=false` for the hourly automatic check) —
+/// both reuse this single implementation rather than duplicating the
+/// spawn/parse/repaint sequence.
 pub(crate) fn refresh_orbcomm_tles(state: &Rc<AppState>, force: bool) {
     let Some(cache) = state.orbcomm_tle_cache.borrow().clone() else {
         return;

@@ -488,9 +488,9 @@ fn aos_sstv(
 fn apply_pass_doppler_policy(deps: &RecorderDeps, protocol: sdr_sat::ImagingProtocol) {
     let want = protocol.wants_doppler_tracking();
     let previous = deps.doppler_switch.is_active();
-    if previous != want {
+    if let Some(keep) = sidebar::satellites_panel::doppler_pref_to_keep(previous, want) {
         deps.doppler_switch.set_active(want);
-        sidebar::satellites_panel::save_doppler_tracking_enabled(&deps.config, previous);
+        sidebar::satellites_panel::save_doppler_tracking_enabled(&deps.config, keep);
     }
 }
 

@@ -69,12 +69,25 @@ pub(super) fn build_recompute(
     recompute
 }
 
-// Refresh button — re-download every known satellite's TLE on
-// a worker thread, update the timestamp row, and rebuild the
-// pass list. Same `spawn_future_local` + `spawn_blocking`
-// pattern as the RadioReference search button. Wired only
-// when the cache is available; otherwise the button was
-// already disabled above.
+/// Starts one TLE refresh. `true` forces every satellite (a manual
+/// Refresh click); `false` refetches only the ones whose cache file is
+/// stale (an automatic check).
+pub(super) type StartTleRefresh = Rc<dyn Fn(bool)>;
+
+/// What a TLE refresh needs, shared by the manual and automatic paths.
+struct TleRefreshDeps {
+    cache: std::sync::Arc<sdr_sat::TleCache>,
+    config: std::sync::Arc<sdr_config::ConfigManager>,
+    panel_weak: sidebar::satellites_panel::SatellitesPanelWeak,
+    recompute: Rc<dyn Fn()>,
+    state: Rc<crate::state::AppState>,
+}
+
+/// Refresh button — re-download every known satellite's TLE on a worker
+/// thread, update the timestamp row, and rebuild the pass list. Returns
+/// the refresh starter so [`schedule_tle_auto_refresh`] runs the very
+/// same code; `None` without a TLE cache (the button was already
+/// disabled by `init_tle_cache`, so there is nothing to wire).
 pub(super) fn wire_tle_refresh_button(
     panel: &sidebar::satellites_panel::SatellitesPanel,
     cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
@@ -82,50 +95,54 @@ pub(super) fn wire_tle_refresh_button(
     panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
     recompute: &Rc<dyn Fn()>,
     state: &Rc<crate::state::AppState>,
-) {
-    let Some(cache_outer) = cache else {
-        // No cache — the button was already disabled by
-        // `init_tle_cache`; nothing to wire.
+) -> Option<StartTleRefresh> {
+    let deps = Rc::new(TleRefreshDeps {
+        cache: std::sync::Arc::clone(cache?),
+        config: std::sync::Arc::clone(config),
+        panel_weak: panel_weak.clone(),
+        recompute: Rc::clone(recompute),
+        state: Rc::clone(state),
+    });
+    let start: StartTleRefresh = Rc::new(move |force| start_tle_refresh(&deps, force));
+    let on_click = Rc::clone(&start);
+    // A click always means "do the network round trip now".
+    panel
+        .refresh_button
+        .connect_clicked(move |_| on_click(true));
+    Some(start)
+}
+
+/// Run one TLE refresh: spinner on and button insensitive for its
+/// length, the sweep on the blocking pool, then the completion side.
+/// Same `spawn_future_local` + `spawn_blocking` pattern as the
+/// `RadioReference` search button.
+fn start_tle_refresh(deps: &Rc<TleRefreshDeps>, force: bool) {
+    let Some(panel) = deps.panel_weak.upgrade() else {
         return;
     };
-    let cache_refresh = std::sync::Arc::clone(cache_outer);
-    let config_refresh = std::sync::Arc::clone(config);
-    let panel_weak_refresh = panel_weak.clone();
-    let recompute_refresh = Rc::clone(recompute);
-    let state_refresh = Rc::clone(state);
-    panel.refresh_button.connect_clicked(move |_| {
-        let Some(panel) = panel_weak_refresh.upgrade() else {
+    panel.refresh_spinner.set_visible(true);
+    panel.refresh_spinner.start();
+    panel.refresh_button.set_sensitive(false);
+
+    let cache_task = std::sync::Arc::clone(&deps.cache);
+    let deps = Rc::clone(deps);
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || refresh_all_tles(&cache_task, force)).await;
+
+        let Some(panel) = deps.panel_weak.upgrade() else {
             return;
         };
-        panel.refresh_spinner.set_visible(true);
-        panel.refresh_spinner.start();
-        panel.refresh_button.set_sensitive(false);
+        panel.refresh_spinner.stop();
+        panel.refresh_spinner.set_visible(false);
+        panel.refresh_button.set_sensitive(true);
 
-        let cache_task = std::sync::Arc::clone(&cache_refresh);
-        let config_done = std::sync::Arc::clone(&config_refresh);
-        let panel_weak_done = panel_weak_refresh.clone();
-        let recompute_done = Rc::clone(&recompute_refresh);
-        let state_done = Rc::clone(&state_refresh);
-
-        glib::spawn_future_local(async move {
-            let result = gio::spawn_blocking(move || force_refresh_all_tles(&cache_task)).await;
-
-            let Some(panel) = panel_weak_done.upgrade() else {
-                return;
-            };
-            panel.refresh_spinner.stop();
-            panel.refresh_spinner.set_visible(false);
-            panel.refresh_button.set_sensitive(true);
-
-            finish_tle_refresh(&panel, &config_done, &recompute_done, result);
-            // Also refresh the Orbcomm TLE group — same button, same
-            // "the user asked for fresh elements" intent. Off the GTK
-            // thread; a no-op if the platform never gave us a cache.
-            // force=true: a manual refresh click must always hit the
-            // network, matching how this same button force-refreshes
-            // the per-NORAD TLEs above regardless of cache age.
-            crate::sidebar::orbcomm_panel::refresh_orbcomm_tles(&state_done, true);
-        });
+        finish_tle_refresh(&panel, &deps.config, &deps.recompute, result);
+        // Also refresh the Orbcomm TLE group — same refresh, same
+        // "fresh elements" intent. Off the GTK thread; a no-op if the
+        // platform never gave us a cache. It takes the same `force`: a
+        // manual click always hits the network, an automatic check
+        // skips a group cache that is still fresh.
+        crate::sidebar::orbcomm_panel::refresh_orbcomm_tles(&deps.state, force);
     });
 }
 
@@ -136,18 +153,25 @@ const TLE_AUTO_REFRESH_CHECK: std::time::Duration = std::time::Duration::from_se
 /// checked at launch and hourly while running. Previously they were only
 /// refreshed by hand, so pass predictions and the Doppler tracker (which
 /// reads cached TLEs only) could run on elements weeks out of date. This
-/// drives the Refresh button's own handler — spinner, timestamp, pass
-/// recompute, Orbcomm group — so a manual and an automatic refresh can't
+/// runs the Refresh button's own code (`start`: spinner, timestamp, pass
+/// recompute, Orbcomm group) so a manual and an automatic refresh can't
 /// diverge, and skips a check while a refresh is already running (the
-/// handler makes the button insensitive). Wired only with a TLE cache.
+/// button is insensitive for its length).
+///
+/// The one difference from a click is that it does not force: a
+/// satellite whose cache file is still fresh is skipped. A sweep that
+/// only partly succeeds leaves the "last refreshed" stamp alone, so the
+/// next hourly check runs again and refetches just the satellites still
+/// stale: one that keeps failing costs one request an hour, not a full
+/// sweep. `start` is `None` without a TLE cache; nothing is scheduled.
 pub(super) fn schedule_tle_auto_refresh(
     panel_weak: &sidebar::satellites_panel::SatellitesPanelWeak,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
-    has_cache: bool,
+    start: Option<StartTleRefresh>,
 ) {
-    if !has_cache {
+    let Some(start) = start else {
         return;
-    }
+    };
     let check = {
         let panel_weak = panel_weak.clone();
         let config = std::sync::Arc::clone(config);
@@ -156,11 +180,13 @@ pub(super) fn schedule_tle_auto_refresh(
                 return glib::ControlFlow::Break;
             };
             let last = sidebar::satellites_panel::load_tle_last_refresh(&config);
-            if panel.refresh_button.is_sensitive()
-                && sidebar::satellites_panel::tle_refresh_due(last, chrono::Utc::now())
-            {
+            if sidebar::satellites_panel::tle_auto_refresh_should_start(
+                panel.refresh_button.is_sensitive(),
+                last,
+                chrono::Utc::now(),
+            ) {
                 tracing::info!(?last, "TLEs are stale — refreshing automatically");
-                panel.refresh_button.emit_clicked();
+                start(false);
             }
             glib::ControlFlow::Continue
         }
@@ -335,60 +361,74 @@ fn apply_zip_result(
     panel.zip_status_row.set_title(&status);
 }
 
-/// Force-refresh every catalog satellite's TLE. `force_refresh` — NOT
-/// `tle_text` — because the user clicked Refresh and a fresh-cache
-/// fast-path would let us mark "Last refreshed: now" without any
-/// actual network fetch; a successful return means a real round trip
-/// happened. A per-satellite failure is logged and skipped so a
-/// single decommissioned / rate-limited entry can't break the whole
-/// refresh; only an all-fail sweep surfaces the last error.
-fn force_refresh_all_tles(
+/// Refresh every catalog satellite's TLE and tally the sweep. Blocking
+/// (network + disk): runs on the blocking pool.
+///
+/// With `force` (a manual Refresh click) every satellite is fetched —
+/// NOT `tle_text`, whose fresh-cache fast path would let a click mark
+/// "Last refreshed: now" without any network round trip. Without it (an
+/// automatic check) a satellite whose cache file is still fresh is
+/// skipped, so the retry after a partial sweep refetches only what is
+/// still stale. Either way a satellite counts as refreshed only once its
+/// elements are on disk, which is all pass prediction and Doppler read.
+///
+/// A per-satellite failure is logged and tallied, not fatal, so a single
+/// decommissioned / rate-limited entry can't break the whole refresh;
+/// only a sweep that refreshed nothing is an `Err` (the last error).
+fn refresh_all_tles(
     cache: &std::sync::Arc<sdr_sat::TleCache>,
-) -> Result<(), sdr_sat::TleCacheError> {
-    use sdr_sat::KNOWN_SATELLITES;
-
-    let mut last_err: Option<sdr_sat::TleCacheError> = None;
-    let mut succeeded = 0usize;
-    for known in KNOWN_SATELLITES {
-        match cache.force_refresh(known.norad_id) {
-            Ok(_) => succeeded += 1,
-            Err(e) => {
-                tracing::warn!(
-                    "TLE refresh for {} (NORAD {}) failed: {e}",
-                    known.name,
-                    known.norad_id,
-                );
-                last_err = Some(e);
-            }
-        }
-    }
-    if succeeded == 0 {
-        Err(last_err.unwrap_or_else(|| {
-            sdr_sat::TleCacheError::Fetch("refresh produced no successful fetches".to_string())
-        }))
-    } else {
-        Ok(())
-    }
+    force: bool,
+) -> Result<sidebar::satellites_panel::TleSweep, sdr_sat::TleCacheError> {
+    sidebar::satellites_panel::sweep_tles(sdr_sat::KNOWN_SATELLITES, |known| {
+        let refreshed = if force {
+            cache.force_refresh_persisted(known.norad_id)
+        } else {
+            cache.refresh_if_stale_persisted(known.norad_id)
+        };
+        refreshed.inspect_err(|e| {
+            tracing::warn!(
+                "TLE refresh for {} (NORAD {}) failed: {e}",
+                known.name,
+                known.norad_id,
+            );
+        })
+    })
 }
 
-/// Completion side of a TLE refresh: persist + show the new timestamp
-/// and re-enumerate passes on success; surface the failure (or a
-/// panicked background task) on the last-refresh row otherwise.
+/// Completion side of a TLE refresh: re-enumerate passes whenever any
+/// satellite was refreshed, and persist + show the new timestamp only
+/// for a complete sweep. A partial one says so on the last-refresh row
+/// and leaves the stamp alone, so the hourly check retries; a failed
+/// sweep (or a panicked background task) surfaces its error there.
 fn finish_tle_refresh(
     panel: &sidebar::satellites_panel::SatellitesPanel,
     config: &std::sync::Arc<sdr_config::ConfigManager>,
     recompute: &Rc<dyn Fn()>,
-    result: Result<Result<(), sdr_sat::TleCacheError>, Box<dyn std::any::Any + Send>>,
+    result: Result<
+        Result<sidebar::satellites_panel::TleSweep, sdr_sat::TleCacheError>,
+        Box<dyn std::any::Any + Send>,
+    >,
 ) {
-    use sidebar::satellites_panel::{format_last_refresh, save_tle_last_refresh};
+    use sidebar::satellites_panel::{
+        format_last_refresh, format_partial_refresh, save_tle_last_refresh,
+    };
 
     match result {
-        Ok(Ok(())) => {
-            let now = chrono::Utc::now();
-            save_tle_last_refresh(config, now);
-            panel
-                .last_refresh_row
-                .set_subtitle(&format_last_refresh(config));
+        Ok(Ok(sweep)) => {
+            if sweep.is_complete() {
+                save_tle_last_refresh(config, chrono::Utc::now());
+                panel
+                    .last_refresh_row
+                    .set_subtitle(&format_last_refresh(config));
+            } else {
+                tracing::warn!(
+                    ?sweep,
+                    "TLE refresh incomplete — not advancing the last-refresh stamp"
+                );
+                panel
+                    .last_refresh_row
+                    .set_subtitle(&format_partial_refresh(sweep));
+            }
             recompute();
         }
         Ok(Err(e)) => {

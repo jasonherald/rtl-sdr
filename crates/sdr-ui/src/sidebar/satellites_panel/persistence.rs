@@ -243,6 +243,98 @@ pub fn tle_refresh_due(last: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool 
     })
 }
 
+/// Whether an automatic-refresh check should start a refresh now: the
+/// TLEs are due ([`tle_refresh_due`]) and no refresh is already running.
+/// `refresh_idle` is the Refresh button's sensitivity — its handler
+/// makes the button insensitive for the length of a refresh, manual or
+/// automatic, so a check that lands mid-refresh must not start a second.
+#[must_use]
+pub fn tle_auto_refresh_should_start(
+    refresh_idle: bool,
+    last: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    refresh_idle && tle_refresh_due(last, now)
+}
+
+/// Tally of one TLE refresh sweep: how many satellites have fresh
+/// elements in the cache afterwards and how many do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TleSweep {
+    /// Satellites whose elements are fresh on disk (fetched and
+    /// written, or already fresh and skipped by an automatic sweep).
+    pub refreshed: usize,
+    /// Satellites whose fetch or cache write failed.
+    pub failed: usize,
+}
+
+impl TleSweep {
+    /// Whether every satellite was refreshed. Only a complete sweep
+    /// advances the "last refreshed" stamp: the hourly automatic check
+    /// reads that stamp ([`tle_auto_refresh_should_start`]), so
+    /// stamping a partial sweep would leave the failed satellites on
+    /// old elements for a full day.
+    #[must_use]
+    pub fn is_complete(self) -> bool {
+        self.failed == 0
+    }
+}
+
+/// Run `refresh` once per item and tally the results. One satellite
+/// failing does not fail the sweep: the others still get fresh
+/// elements, and the tally says how many did not.
+///
+/// # Errors
+///
+/// The last error seen, when no satellite was refreshed at all.
+pub fn sweep_tles<T>(
+    items: impl IntoIterator<Item = T>,
+    mut refresh: impl FnMut(T) -> Result<(), sdr_sat::TleCacheError>,
+) -> Result<TleSweep, sdr_sat::TleCacheError> {
+    let mut sweep = TleSweep {
+        refreshed: 0,
+        failed: 0,
+    };
+    let mut last_err = None;
+    for item in items {
+        match refresh(item) {
+            Ok(()) => sweep.refreshed += 1,
+            Err(e) => {
+                sweep.failed += 1;
+                last_err = Some(e);
+            }
+        }
+    }
+    if sweep.refreshed == 0 {
+        return Err(last_err.unwrap_or_else(|| {
+            sdr_sat::TleCacheError::Fetch("refresh produced no successful fetches".to_string())
+        }));
+    }
+    Ok(sweep)
+}
+
+/// Last-refresh row subtitle after a sweep that left some satellites
+/// on old elements. The stamp is not advanced for such a sweep, so the
+/// next automatic check retries the ones still stale.
+#[must_use]
+pub fn format_partial_refresh(sweep: TleSweep) -> String {
+    format!(
+        "{} of {} satellites failed to refresh — will retry",
+        sweep.failed,
+        sweep.refreshed + sweep.failed
+    )
+}
+
+/// The Doppler preference to write back when a pass overrides the
+/// switch to `want`. The switch persists whatever it is set to, so the
+/// override must be followed by re-saving the user's own value
+/// (`previous`). `None` when the switch already matches: nothing is
+/// overridden and the stored preference is left alone.
+#[must_use]
+pub fn doppler_pref_to_keep(previous: bool, want: bool) -> Option<bool> {
+    (previous != want).then_some(previous)
+}
+
 pub(super) fn read_f64_or(config: &Arc<ConfigManager>, key: &str, default: f64) -> f64 {
     config.read(|v| {
         v.get(key)

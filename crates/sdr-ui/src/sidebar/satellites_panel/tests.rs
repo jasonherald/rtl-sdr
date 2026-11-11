@@ -593,6 +593,137 @@ fn tle_refresh_is_due_when_never_refreshed_or_a_day_old() {
     );
 }
 
+/// An automatic check starts a refresh only when the TLEs are due and
+/// the Refresh button is idle: a check that lands while a refresh is
+/// running (button insensitive) must not start a second one.
+#[test]
+fn tle_auto_refresh_starts_only_when_due_and_idle() {
+    use chrono::{Duration, TimeZone, Utc};
+    let now = Utc.with_ymd_and_hms(2026, 10, 21, 12, 0, 0).unwrap();
+    let stale = Some(now - Duration::days(16));
+    let fresh = Some(now - Duration::hours(1));
+    assert!(tle_auto_refresh_should_start(true, stale, now));
+    assert!(
+        tle_auto_refresh_should_start(true, None, now),
+        "never refreshed"
+    );
+    assert!(
+        !tle_auto_refresh_should_start(false, stale, now),
+        "a refresh is already running"
+    );
+    assert!(
+        !tle_auto_refresh_should_start(false, None, now),
+        "the first refresh is already running"
+    );
+    assert!(!tle_auto_refresh_should_start(true, fresh, now));
+}
+
+/// The automatic check is due after `TLE_AUTO_REFRESH_MAX_AGE_HOURS`,
+/// and an automatic sweep skips satellites whose cache file is still
+/// inside the cache's own freshness window. If the cache window were
+/// the longer of the two, a due sweep would skip everything, count as
+/// complete and advance the stamp without fetching anything.
+#[test]
+fn tle_auto_refresh_age_is_not_shorter_than_the_cache_window() {
+    let auto = std::time::Duration::from_secs(
+        u64::try_from(TLE_AUTO_REFRESH_MAX_AGE_HOURS).expect("a positive age") * 3600,
+    );
+    assert!(auto >= sdr_sat::tle_cache::DEFAULT_REFRESH_MAX_AGE);
+}
+
+fn fetch_err() -> sdr_sat::TleCacheError {
+    sdr_sat::TleCacheError::Fetch("test".to_string())
+}
+
+/// A sweep tallies per-satellite results; only a sweep with no
+/// failures is complete (and may advance the "last refreshed" stamp).
+#[test]
+fn tle_sweep_tallies_successes_and_failures() {
+    let all = sweep_tles([1_u32, 2, 3], |_| Ok(())).expect("all refreshed");
+    assert_eq!(
+        all,
+        TleSweep {
+            refreshed: 3,
+            failed: 0
+        }
+    );
+    assert!(all.is_complete());
+
+    let mut visited = Vec::new();
+    let partial = sweep_tles([1_u32, 2, 3], |id| {
+        visited.push(id);
+        if id == 2 { Err(fetch_err()) } else { Ok(()) }
+    })
+    .expect("two refreshed");
+    assert_eq!(visited, [1, 2, 3], "a failure does not stop the sweep");
+    assert_eq!(
+        partial,
+        TleSweep {
+            refreshed: 2,
+            failed: 1
+        }
+    );
+    assert!(!partial.is_complete());
+}
+
+/// Nothing refreshed is an error (the last one seen), including the
+/// degenerate empty catalog.
+#[test]
+fn tle_sweep_with_no_successes_is_an_error() {
+    let err = sweep_tles([1_u32, 2], |id| {
+        Err(sdr_sat::TleCacheError::Fetch(format!("sat {id}")))
+    })
+    .expect_err("nothing refreshed");
+    assert!(
+        matches!(&err, sdr_sat::TleCacheError::Fetch(m) if m == "sat 2"),
+        "got {err:?}"
+    );
+    assert!(sweep_tles(std::iter::empty::<u32>(), |_| Ok(())).is_err());
+}
+
+#[test]
+fn partial_refresh_subtitle_counts_failures_out_of_the_total() {
+    let sweep = TleSweep {
+        refreshed: 5,
+        failed: 1,
+    };
+    assert_eq!(
+        format_partial_refresh(sweep),
+        "1 of 6 satellites failed to refresh — will retry"
+    );
+}
+
+/// A pass's Doppler override keeps the user's stored preference: the
+/// value written back is the pre-pass one, never the override, and
+/// nothing is rewritten when the switch already matches.
+#[test]
+fn doppler_override_keeps_the_users_preference() {
+    assert_eq!(
+        doppler_pref_to_keep(false, true),
+        Some(false),
+        "SSTV forces on"
+    );
+    assert_eq!(
+        doppler_pref_to_keep(true, false),
+        Some(true),
+        "APT/LRPT force off"
+    );
+    assert_eq!(doppler_pref_to_keep(true, true), None);
+    assert_eq!(doppler_pref_to_keep(false, false), None);
+
+    // What `apply_pass_doppler_policy` does to the config: the switch's
+    // notify chain saves the override, then the kept value is saved over
+    // it, so a relaunch mid-pass still loads the user's own setting.
+    for (previous, want) in [(false, true), (true, false)] {
+        let config = make_config();
+        save_doppler_tracking_enabled(&config, previous);
+        save_doppler_tracking_enabled(&config, want);
+        let keep = doppler_pref_to_keep(previous, want).expect("an override");
+        save_doppler_tracking_enabled(&config, keep);
+        assert_eq!(load_doppler_tracking_enabled(&config), previous);
+    }
+}
+
 #[test]
 fn load_tle_last_refresh_round_trips_and_tolerates_garbage() {
     use chrono::{TimeZone, Utc};

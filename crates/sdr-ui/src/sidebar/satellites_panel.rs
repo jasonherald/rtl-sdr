@@ -470,13 +470,14 @@ pub use passes::{
     format_pass_title, norad_id_for_pass, pass_quality_label, tune_target_for_pass,
 };
 pub use persistence::{
-    TLE_AUTO_REFRESH_MAX_AGE_HOURS, format_last_refresh, load_auto_record_apt,
-    load_auto_record_audio, load_auto_record_composites, load_auto_record_quality,
-    load_doppler_tracking_enabled, load_notify_lead_min, load_station_alt_m, load_station_lat_deg,
-    load_station_lon_deg, load_tle_last_refresh, load_watched_satellites, save_auto_record_apt,
-    save_auto_record_audio, save_auto_record_composites, save_auto_record_quality,
-    save_doppler_tracking_enabled, save_f64, save_notify_lead_min, save_tle_last_refresh,
-    save_watched_satellites, tle_refresh_due,
+    TLE_AUTO_REFRESH_MAX_AGE_HOURS, TleSweep, doppler_pref_to_keep, format_last_refresh,
+    format_partial_refresh, load_auto_record_apt, load_auto_record_audio,
+    load_auto_record_composites, load_auto_record_quality, load_doppler_tracking_enabled,
+    load_notify_lead_min, load_station_alt_m, load_station_lat_deg, load_station_lon_deg,
+    load_tle_last_refresh, load_watched_satellites, save_auto_record_apt, save_auto_record_audio,
+    save_auto_record_composites, save_auto_record_quality, save_doppler_tracking_enabled, save_f64,
+    save_notify_lead_min, save_tle_last_refresh, save_watched_satellites, sweep_tles,
+    tle_auto_refresh_should_start, tle_refresh_due,
 };
 
 #[cfg(test)]
