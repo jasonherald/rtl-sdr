@@ -280,6 +280,15 @@ subtitle says how it started:
 - **"PD120 (no VIS, from sync)"** — no header was heard at all; the
   image was found from the rhythm of its line-sync pulses
 
+An image found from sync starts at the first line the decoder heard
+and still runs for a full image's length. If you joined the
+transmission partway through, the rows after its real end are noise.
+The decoder also doesn't listen for a new header while it is drawing
+an image, so if the next image begins before that overrun finishes,
+its header is missed and it too can only be picked up from sync, late.
+That needs the gap between images to be shorter than the part you
+missed; an image whose header was heard always ends on time.
+
 Each ARISS image takes a substantial fraction of an ISS pass to
 transmit, so a typical pass produces 1-3 complete images depending
 on the mode and pass duration. The **Pause** and **Clear** buttons

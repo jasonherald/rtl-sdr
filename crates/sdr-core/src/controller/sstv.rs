@@ -205,6 +205,15 @@ pub(super) fn handle_sstv_event(
 /// An image started without a decoded VIS — the header's bits were lost
 /// (`VisFallback`, with the leader's mistuning) or no header was heard at
 /// all (`SyncStart`): log it and start the image in the last-seen mode.
+///
+/// Known limit of a `SyncStart` that joins a transmission mid-image:
+/// slowrx starts at the first synced line and decodes a full image's
+/// worth of lines from there, without watching for a new header while
+/// it decodes. The image therefore overruns the transmission's real end
+/// by the part that was missed, and a header arriving in that overrun
+/// is not heard. Nothing at this layer can see the transmission
+/// boundary, so the SSTV guide documents the limit; bounding a
+/// sync-started image belongs in slowrx (jasonherald/slowrx.rs#144).
 fn on_headerless_start(
     state: &mut DspState,
     dsp_tx: &mpsc::Sender<DspToUi>,
