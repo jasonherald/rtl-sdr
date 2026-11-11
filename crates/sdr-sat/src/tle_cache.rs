@@ -315,6 +315,24 @@ impl TleCache {
         !is_stale(&self.group_cache_path(slug), self.refresh_max_age)
     }
 
+    /// Whether the group cache for `slug` should be refetched: the file
+    /// is missing or older than the freshness window
+    /// ([`TleCache::group_cache_is_fresh`]), or it is recent but holds
+    /// no usable TLE (unreadable, hand-edited, or left by an older
+    /// build). Trusting only the mtime of such a file would suppress the
+    /// refetch until it aged out. The group counterpart of
+    /// [`TleCache::needs_refresh`].
+    ///
+    /// Disk only: a `stat`, plus a read and parse of one small file when
+    /// it is recent, so it is safe on the GTK main loop.
+    #[must_use]
+    pub fn group_needs_refresh(&self, slug: &str) -> bool {
+        !self.group_cache_is_fresh(slug)
+            || !self
+                .cached_group_tles(slug)
+                .is_ok_and(|tles| !tles.is_empty())
+    }
+
     /// Forced network round trip: fetch the group body, write it
     /// atomically to the group cache file, and return the parsed
     /// triples. Call off-thread (blocking) — same contract as

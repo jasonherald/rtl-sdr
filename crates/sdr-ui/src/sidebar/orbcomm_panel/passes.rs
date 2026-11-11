@@ -196,13 +196,14 @@ pub(crate) fn wire_orbcomm_passes(handles: &Rc<OrbcommPanelHandles>, state: &Rc<
 /// `force` selects staleness behaviour:
 ///
 /// * `false` — staleness-gated. If the on-disk group cache is still
-///   fresh (per `TleCache::group_cache_is_fresh`, the same
-///   `refresh_max_age` window the per-NORAD path uses), the network
-///   fetch is skipped entirely — `seed_orbcomm_state` already loaded
-///   the cached candidates, so there's nothing to gain from
-///   re-fetching on every decode-enable toggle. The freshness check
-///   is a cheap filesystem `stat`, safe on the GTK thread; only the
-///   fetch itself needs `spawn_blocking`.
+///   fresh and usable (per `TleCache::group_needs_refresh`: inside the
+///   same `refresh_max_age` window the per-NORAD path uses, and
+///   holding at least one valid TLE), the network fetch is skipped
+///   entirely — `seed_orbcomm_state` already loaded the cached
+///   candidates, so there's nothing to gain from re-fetching on every
+///   decode-enable toggle. The check is disk only (a `stat` and a read
+///   of one small file), safe on the GTK thread; only the fetch itself
+///   needs `spawn_blocking`.
 /// * `true` — always fetches, bypassing the staleness check. The
 ///   manual "Refresh TLEs" button uses this: a user-initiated refresh
 ///   means "do the network round trip now", matching how that same
@@ -219,7 +220,7 @@ pub(crate) fn refresh_orbcomm_tles(state: &Rc<AppState>, force: bool) {
     let Some(cache) = state.orbcomm_tle_cache.borrow().clone() else {
         return;
     };
-    if !force && cache.group_cache_is_fresh(sdr_sat::ORBCOMM_TLE_GROUP) {
+    if !force && !cache.group_needs_refresh(sdr_sat::ORBCOMM_TLE_GROUP) {
         return;
     }
     let state = Rc::clone(state);
@@ -231,19 +232,20 @@ pub(crate) fn refresh_orbcomm_tles(state: &Rc<AppState>, force: bool) {
     });
 }
 
-/// Whether the Orbcomm TLE group cache is stale or missing: exactly
-/// when a staleness-gated [`refresh_orbcomm_tles`] (`force = false`)
-/// would fetch. The automatic TLE refresh asks this so a group fetch
-/// that failed is retried at the next hourly check instead of waiting
-/// for the per-satellite TLEs to go stale. `false` when the platform
-/// never gave us a cache (nothing to refresh). A filesystem `stat`,
-/// safe on the GTK thread.
+/// Whether the Orbcomm TLE group cache is stale, missing or unusable:
+/// exactly when a staleness-gated [`refresh_orbcomm_tles`]
+/// (`force = false`) would fetch, since both ask
+/// `TleCache::group_needs_refresh`. The automatic TLE refresh asks this
+/// so a group fetch that failed is retried at the next hourly check
+/// instead of waiting for the per-satellite TLEs to go stale. `false`
+/// when the platform never gave us a cache (nothing to refresh). Disk
+/// only, safe on the GTK thread.
 pub(crate) fn orbcomm_tles_stale(state: &Rc<AppState>) -> bool {
     state
         .orbcomm_tle_cache
         .borrow()
         .as_ref()
-        .is_some_and(|cache| !cache.group_cache_is_fresh(sdr_sat::ORBCOMM_TLE_GROUP))
+        .is_some_and(|cache| cache.group_needs_refresh(sdr_sat::ORBCOMM_TLE_GROUP))
 }
 
 /// Completion side of [`refresh_orbcomm_tles`]: parse a successful
