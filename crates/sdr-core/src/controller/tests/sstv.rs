@@ -376,7 +376,10 @@ fn a_double_height_line_fills_two_rows_of_the_image() {
     assert_eq!((snap.width, snap.height), (320, 240));
     assert_eq!(snap.lines_written, 4);
     let row = |r: usize| snap.pixels[r * 320];
-    assert_eq!([row(0), row(1), row(2), row(3)], [[10; 3], [10; 3], [11; 3], [11; 3]]);
+    assert_eq!(
+        [row(0), row(1), row(2), row(3)],
+        [[10; 3], [10; 3], [11; 3], [11; 3]]
+    );
 }
 
 /// The image handed to the UI for saving is the double-height one, both
@@ -415,7 +418,11 @@ fn a_double_height_image_is_saved_at_display_height() {
             _ => None,
         });
         let (width, height, pixels) = saved.expect("image queued for saving");
-        assert_eq!((width, height, pixels.len()), (320, 240, 320 * 240), "wired={wired}");
+        assert_eq!(
+            (width, height, pixels.len()),
+            (320, 240, 320 * 240),
+            "wired={wired}"
+        );
         assert_eq!(pixels[239 * 320], [119; 3], "wired={wired}");
     }
 }
