@@ -576,97 +576,77 @@ fn auto_record_composites_save_load_round_trips() {
     assert!(!load_auto_record_composites(&config));
 }
 
+/// An automatic check starts a refresh only when something is stale or
+/// missing and the Refresh button is idle: a check that lands while a
+/// refresh is running (button insensitive) must not start a second one.
 #[test]
-fn tle_refresh_is_due_when_never_refreshed_or_a_day_old() {
-    use chrono::{Duration, TimeZone, Utc};
-    let now = Utc.with_ymd_and_hms(2026, 10, 21, 12, 0, 0).unwrap();
-    assert!(tle_refresh_due(None, now), "never refreshed");
-    assert!(!tle_refresh_due(Some(now - Duration::hours(23)), now));
-    assert!(tle_refresh_due(
-        Some(now - Duration::hours(TLE_AUTO_REFRESH_MAX_AGE_HOURS)),
-        now
-    ));
-    assert!(tle_refresh_due(Some(now - Duration::days(16)), now));
+fn tle_auto_refresh_starts_only_when_stale_and_idle() {
+    assert!(tle_auto_refresh_should_start(true, true));
     assert!(
-        !tle_refresh_due(Some(now + Duration::hours(2)), now),
-        "a future stamp (clock change) is not stale"
-    );
-}
-
-/// An automatic check starts a refresh only when the TLEs are due and
-/// the Refresh button is idle: a check that lands while a refresh is
-/// running (button insensitive) must not start a second one.
-#[test]
-fn tle_auto_refresh_starts_only_when_due_and_idle() {
-    use chrono::{Duration, TimeZone, Utc};
-    let now = Utc.with_ymd_and_hms(2026, 10, 21, 12, 0, 0).unwrap();
-    let stale = Some(now - Duration::days(16));
-    let fresh = Some(now - Duration::hours(1));
-    assert!(tle_auto_refresh_should_start(true, stale, now));
-    assert!(
-        tle_auto_refresh_should_start(true, None, now),
-        "never refreshed"
-    );
-    assert!(
-        !tle_auto_refresh_should_start(false, stale, now),
+        !tle_auto_refresh_should_start(false, true),
         "a refresh is already running"
     );
     assert!(
-        !tle_auto_refresh_should_start(false, None, now),
-        "the first refresh is already running"
+        !tle_auto_refresh_should_start(true, false),
+        "every cache file is fresh"
     );
-    assert!(!tle_auto_refresh_should_start(true, fresh, now));
-}
-
-/// The automatic check is due after `TLE_AUTO_REFRESH_MAX_AGE_HOURS`,
-/// and an automatic sweep skips satellites whose cache file is still
-/// inside the cache's own freshness window. If the cache window were
-/// the longer of the two, a due sweep would skip everything, count as
-/// complete and advance the stamp without fetching anything.
-#[test]
-fn tle_auto_refresh_age_is_not_shorter_than_the_cache_window() {
-    let auto = std::time::Duration::from_secs(
-        u64::try_from(TLE_AUTO_REFRESH_MAX_AGE_HOURS).expect("a positive age") * 3600,
-    );
-    assert!(auto >= sdr_sat::tle_cache::DEFAULT_REFRESH_MAX_AGE);
+    assert!(!tle_auto_refresh_should_start(false, false));
 }
 
 fn fetch_err() -> sdr_sat::TleCacheError {
     sdr_sat::TleCacheError::Fetch("test".to_string())
 }
 
-/// A sweep tallies per-satellite results; only a sweep with no
-/// failures is complete (and may advance the "last refreshed" stamp).
+/// A sweep tallies fetched, already-fresh and failed satellites, and a
+/// failure does not stop it.
 #[test]
-fn tle_sweep_tallies_successes_and_failures() {
-    let all = sweep_tles([1_u32, 2, 3], |_| Ok(())).expect("all refreshed");
-    assert_eq!(
-        all,
-        TleSweep {
-            refreshed: 3,
-            failed: 0
-        }
-    );
-    assert!(all.is_complete());
-
+fn tle_sweep_tallies_fetched_fresh_and_failed() {
     let mut visited = Vec::new();
-    let partial = sweep_tles([1_u32, 2, 3], |id| {
+    let sweep = sweep_tles([1_u32, 2, 3, 4], |id| {
         visited.push(id);
-        if id == 2 { Err(fetch_err()) } else { Ok(()) }
+        match id {
+            1 | 4 => Ok(true),
+            2 => Ok(false),
+            _ => Err(fetch_err()),
+        }
     })
-    .expect("two refreshed");
-    assert_eq!(visited, [1, 2, 3], "a failure does not stop the sweep");
+    .expect("some refreshed");
+    assert_eq!(visited, [1, 2, 3, 4], "a failure does not stop the sweep");
     assert_eq!(
-        partial,
+        sweep,
         TleSweep {
-            refreshed: 2,
+            fetched: 2,
+            fresh: 1,
             failed: 1
         }
     );
-    assert!(!partial.is_complete());
+    assert_eq!(sweep.total(), 4);
+    assert!(!sweep.is_complete());
+    assert!(!sweep.advances_stamp(), "a partial sweep never stamps");
 }
 
-/// Nothing refreshed is an error (the last one seen), including the
+/// The "last refreshed" stamp means a real, complete refresh: every
+/// satellite accounted for and at least one actually fetched.
+#[test]
+fn tle_sweep_advances_the_stamp_only_when_complete_and_fetched() {
+    let forced = sweep_tles([1_u32, 2], |_| Ok(true)).expect("all fetched");
+    assert!(forced.is_complete());
+    assert!(forced.advances_stamp());
+
+    let one_retried = sweep_tles([1_u32, 2], |id| Ok(id == 2)).expect("one fetched");
+    assert!(one_retried.advances_stamp(), "the last stale one came in");
+
+    // An automatic sweep that ran for the Orbcomm group alone: every
+    // satellite file was already fresh, so nothing was fetched here.
+    let all_fresh = sweep_tles([1_u32, 2], |_| Ok(false)).expect("all fresh");
+    assert!(all_fresh.is_complete());
+    assert!(
+        !all_fresh.advances_stamp(),
+        "no network round trip to report"
+    );
+}
+
+/// Every satellite failing is an error (the last one seen), as is the
 /// degenerate empty catalog.
 #[test]
 fn tle_sweep_with_no_successes_is_an_error() {
@@ -678,13 +658,14 @@ fn tle_sweep_with_no_successes_is_an_error() {
         matches!(&err, sdr_sat::TleCacheError::Fetch(m) if m == "sat 2"),
         "got {err:?}"
     );
-    assert!(sweep_tles(std::iter::empty::<u32>(), |_| Ok(())).is_err());
+    assert!(sweep_tles(std::iter::empty::<u32>(), |_| Ok(true)).is_err());
 }
 
 #[test]
 fn partial_refresh_subtitle_counts_failures_out_of_the_total() {
     let sweep = TleSweep {
-        refreshed: 5,
+        fetched: 1,
+        fresh: 4,
         failed: 1,
     };
     assert_eq!(

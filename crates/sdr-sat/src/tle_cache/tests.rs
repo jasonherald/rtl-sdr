@@ -525,7 +525,11 @@ fn refresh_if_stale_persisted_skips_a_fresh_cache_file() {
         calls_for_fetcher.fetch_add(1, Ordering::Relaxed);
         Ok(SAMPLE_TLE_3LINE.to_string())
     });
-    cache.refresh_if_stale_persisted(5).unwrap();
+    assert!(!cache.needs_refresh(5));
+    assert!(
+        !cache.refresh_if_stale_persisted(5).unwrap(),
+        "reports that it did not fetch"
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 0, "fresh file: no fetch");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -548,12 +552,26 @@ fn refresh_if_stale_persisted_fetches_a_stale_or_missing_file() {
             calls_for_fetcher.fetch_add(1, Ordering::Relaxed);
             Ok(SAMPLE_TLE_3LINE.to_string())
         });
-    cache.refresh_if_stale_persisted(5).unwrap();
+    assert!(cache.needs_refresh(5), "stale file");
+    assert!(cache.refresh_if_stale_persisted(5).unwrap(), "fetched");
     assert_eq!(calls.load(Ordering::Relaxed), 1, "stale file: fetched");
-    // ISS has no cache file at all.
-    cache.refresh_if_stale_persisted(25_544).unwrap();
+    // ISS has no cache file at all (e.g. a cleared cache directory).
+    assert!(cache.needs_refresh(25_544), "missing file");
+    assert!(cache.refresh_if_stale_persisted(25_544).unwrap(), "fetched");
     assert_eq!(calls.load(Ordering::Relaxed), 2, "missing file: fetched");
     assert!(cache.cached_tle_for(25_544).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fresh-by-mtime file that is not a valid TLE for the satellite
+/// needs a refresh too, the same as `tle_text` treats it.
+#[test]
+fn needs_refresh_is_true_for_a_corrupted_fresh_file() {
+    let dir = unique_temp_dir("needs-refresh-corrupted");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("5.tle"), "<html>captive portal</html>").unwrap();
+    let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
+    assert!(cache.needs_refresh(5));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

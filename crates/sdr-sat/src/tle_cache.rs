@@ -453,7 +453,9 @@ impl TleCache {
     /// Bring one satellite's cached elements up to date **on disk**.
     /// While the cache file is still inside the freshness window (and
     /// valid) this does nothing and touches no network; otherwise it is
-    /// a [`TleCache::force_refresh_persisted`].
+    /// a [`TleCache::force_refresh_persisted`]. Returns whether it
+    /// fetched: `Ok(true)` after a fetch and write, `Ok(false)` when the
+    /// file was already fresh.
     ///
     /// The automatic refresh uses this, so a retry after a sweep that
     /// only partly succeeded refetches just the satellites that are
@@ -464,11 +466,25 @@ impl TleCache {
     /// # Errors
     ///
     /// As [`TleCache::force_refresh_persisted`], when a fetch was needed.
-    pub fn refresh_if_stale_persisted(&self, norad_id: u32) -> Result<(), TleCacheError> {
-        if self.fresh_cached_text(norad_id).is_some() {
-            return Ok(());
+    pub fn refresh_if_stale_persisted(&self, norad_id: u32) -> Result<bool, TleCacheError> {
+        if !self.needs_refresh(norad_id) {
+            return Ok(false);
         }
-        self.force_refresh_persisted(norad_id)
+        self.force_refresh_persisted(norad_id).map(|()| true)
+    }
+
+    /// Whether `norad_id` has no fresh, valid cache file: exactly when
+    /// [`TleCache::refresh_if_stale_persisted`] would go to the network.
+    /// The automatic refresh asks this to decide whether to start a
+    /// sweep at all, so a missing file (a cleared cache directory) or a
+    /// satellite whose last fetch failed is noticed without waiting for
+    /// any separate timestamp to age out.
+    ///
+    /// Disk only, like [`TleCache::cached_tle_for`]: a `stat` and a read
+    /// of one small file, so it is safe on the GTK main loop.
+    #[must_use]
+    pub fn needs_refresh(&self, norad_id: u32) -> bool {
+        self.fresh_cached_text(norad_id).is_none()
     }
 
     /// The cached text for `norad_id` when the file is inside the

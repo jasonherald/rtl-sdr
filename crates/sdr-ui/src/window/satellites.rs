@@ -388,7 +388,7 @@ fn wire_satellites_behaviors(
     //      so there's nothing for the *behavior* to do.
     wire_doppler(panels, state, config, cache.as_ref(), status_bar);
 
-    let start_tle_refresh = wire_tle_refresh_button(
+    let tle_refresher = wire_tle_refresh_button(
         panel,
         cache.as_ref(),
         config,
@@ -397,7 +397,7 @@ fn wire_satellites_behaviors(
         state,
     );
 
-    schedule_tle_auto_refresh(&panel_weak, config, start_tle_refresh);
+    schedule_tle_auto_refresh(tle_refresher);
 
     wire_zip_lookup(panel, &panel_weak);
 
