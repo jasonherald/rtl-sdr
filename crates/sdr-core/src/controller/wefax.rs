@@ -388,7 +388,7 @@ mod tests {
         );
         // The completion flag is one-shot: a second check sends nothing.
         emit_complete_if_ready(&mut state, &dsp_tx, false);
-        assert!(completed_heights(&dsp_rx).is_empty());
+        assert_eq!(completed_heights(&dsp_rx), [] as [u32; 0]);
     }
 
     #[test]

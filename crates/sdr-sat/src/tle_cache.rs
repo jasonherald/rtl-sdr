@@ -315,6 +315,24 @@ impl TleCache {
         !is_stale(&self.group_cache_path(slug), self.refresh_max_age)
     }
 
+    /// Whether the group cache for `slug` should be refetched: the file
+    /// is missing or older than the freshness window
+    /// ([`TleCache::group_cache_is_fresh`]), or it is recent but holds
+    /// no usable TLE (unreadable, hand-edited, or left by an older
+    /// build). Trusting only the mtime of such a file would suppress the
+    /// refetch until it aged out. The group counterpart of
+    /// [`TleCache::needs_refresh`].
+    ///
+    /// Disk only: a `stat`, plus a read and parse of one small file when
+    /// it is recent, so it is safe on the GTK main loop.
+    #[must_use]
+    pub fn group_needs_refresh(&self, slug: &str) -> bool {
+        !self.group_cache_is_fresh(slug)
+            || !self
+                .cached_group_tles(slug)
+                .is_ok_and(|tles| !tles.is_empty())
+    }
+
     /// Forced network round trip: fetch the group body, write it
     /// atomically to the group cache file, and return the parsed
     /// triples. Call off-thread (blocking) — same contract as
@@ -430,6 +448,79 @@ impl TleCache {
         Ok(text)
     }
 
+    /// [`TleCache::force_refresh`] for callers that need the fresh
+    /// elements **on disk**, not just in memory: a failed cache write
+    /// is an error here instead of a logged warning.
+    ///
+    /// The Refresh sweep uses this. Pass prediction and the Doppler
+    /// tracker read the cache file only ([`TleCache::cached_tle_for`]),
+    /// so a fetch whose write failed (read-only directory, full disk)
+    /// refreshed nothing they can see, and the "last refreshed" stamp
+    /// must not advance for it.
+    ///
+    /// # Errors
+    ///
+    /// * [`TleCacheError::Fetch`] — as [`TleCache::force_refresh`].
+    /// * [`TleCacheError::Io`] — the fetch succeeded but the cache
+    ///   write failed; the on-disk copy is unchanged.
+    pub fn force_refresh_persisted(&self, norad_id: u32) -> Result<(), TleCacheError> {
+        let text = self.fetch_validated(norad_id)?;
+        self.write_cache(&self.cache_path(norad_id), &text)
+    }
+
+    /// Bring one satellite's cached elements up to date **on disk**.
+    /// While the cache file is still inside the freshness window (and
+    /// valid) this does nothing and touches no network; otherwise it is
+    /// a [`TleCache::force_refresh_persisted`]. Returns whether it
+    /// fetched: `Ok(true)` after a fetch and write, `Ok(false)` when the
+    /// file was already fresh.
+    ///
+    /// The automatic refresh uses this, so a retry after a sweep that
+    /// only partly succeeded refetches just the satellites that are
+    /// still stale instead of all of them. Unlike [`TleCache::tle_text`]
+    /// there is no stale-copy fallback: a failed fetch is an error, so
+    /// the caller knows that satellite is still on old elements.
+    ///
+    /// # Errors
+    ///
+    /// As [`TleCache::force_refresh_persisted`], when a fetch was needed.
+    pub fn refresh_if_stale_persisted(&self, norad_id: u32) -> Result<bool, TleCacheError> {
+        if !self.needs_refresh(norad_id) {
+            return Ok(false);
+        }
+        self.force_refresh_persisted(norad_id).map(|()| true)
+    }
+
+    /// Whether `norad_id` has no fresh, valid cache file: exactly when
+    /// [`TleCache::refresh_if_stale_persisted`] would go to the network.
+    /// The automatic refresh asks this to decide whether to start a
+    /// sweep at all, so a missing file (a cleared cache directory) or a
+    /// satellite whose last fetch failed is noticed without waiting for
+    /// any separate timestamp to age out.
+    ///
+    /// Disk only, like [`TleCache::cached_tle_for`]: a `stat` and a read
+    /// of one small file, so it is safe on the GTK main loop.
+    #[must_use]
+    pub fn needs_refresh(&self, norad_id: u32) -> bool {
+        self.fresh_cached_text(norad_id).is_none()
+    }
+
+    /// The cached text for `norad_id` when the file is inside the
+    /// freshness window, readable, and a valid TLE for that satellite;
+    /// `None` (a miss, with a warning for a corrupted file) otherwise.
+    fn fresh_cached_text(&self, norad_id: u32) -> Option<String> {
+        let path = self.cache_path(norad_id);
+        if is_stale(&path, self.refresh_max_age) {
+            return None;
+        }
+        let cached = read_file_or_miss(&path, norad_id)?;
+        if has_valid_tle_for(&cached, norad_id) {
+            return Some(cached);
+        }
+        tracing::warn!("ignoring corrupted fresh TLE cache for NORAD {norad_id}; refetching");
+        None
+    }
+
     /// Get the raw TLE text for one satellite, refreshing on disk if
     /// the cached copy is stale (or missing).
     ///
@@ -452,13 +543,8 @@ impl TleCache {
         // is treated like a miss on this path: the network is the
         // authority here, and an I/O error must neither block the
         // fetch nor replace a real fetch error (#720).
-        if !is_stale(&path, self.refresh_max_age)
-            && let Some(cached) = read_file_or_miss(&path, norad_id)
-        {
-            if has_valid_tle_for(&cached, norad_id) {
-                return Ok(cached);
-            }
-            tracing::warn!("ignoring corrupted fresh TLE cache for NORAD {norad_id}; refetching");
+        if let Some(cached) = self.fresh_cached_text(norad_id) {
+            return Ok(cached);
         }
 
         // Slow path: fetch from upstream, validate, write to disk.

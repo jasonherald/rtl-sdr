@@ -53,6 +53,47 @@ fn group_cache_is_fresh_false_when_missing() {
     assert!(!cache.group_cache_is_fresh("ORBCOMM"));
 }
 
+/// A valid group body for the `group_needs_refresh` tests.
+const GROUP_BODY: &str = "\
+ORBCOMM FM06
+1 25118U 97084G   26248.14598269  .00000608  00000+0  20228-3 0  9991
+2 25118  45.0146  27.7326 0001119 213.3371 317.0700 14.47727064505974
+";
+
+/// A recent group file with usable TLEs needs no refetch; a missing
+/// one does.
+#[test]
+fn group_needs_refresh_follows_presence_and_freshness() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = TleCache::with_dir(dir.path().to_path_buf());
+    assert!(cache.group_needs_refresh("ORBCOMM"), "missing file");
+
+    let path = cache.group_cache_path("ORBCOMM");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, GROUP_BODY).unwrap();
+    assert!(!cache.group_needs_refresh("ORBCOMM"), "recent and usable");
+
+    // The same file, past a 1 ns freshness window, is stale.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let stale = TleCache::with_dir(dir.path().to_path_buf())
+        .with_refresh_max_age(std::time::Duration::from_nanos(1));
+    assert!(stale.group_needs_refresh("ORBCOMM"), "stale by mtime");
+}
+
+/// `CodeRabbit` review on #940: a group file with a recent mtime but
+/// no usable TLE must not suppress the refetch until it ages out. The
+/// mtime-only `group_cache_is_fresh` still calls it fresh.
+#[test]
+fn group_needs_refresh_is_true_for_a_recent_but_unusable_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = TleCache::with_dir(dir.path().to_path_buf());
+    let path = cache.group_cache_path("ORBCOMM");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "<html>captive portal</html>").unwrap();
+    assert!(cache.group_cache_is_fresh("ORBCOMM"), "recent by mtime");
+    assert!(cache.group_needs_refresh("ORBCOMM"), "but nothing usable");
+}
+
 /// `CodeRabbit` review on #903: back-to-back nameless 2LE entries (no
 /// name line between them at all) must never let one entry's `2 …`
 /// data line get mistaken for the *next* entry's name — it must fall

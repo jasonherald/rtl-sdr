@@ -14,7 +14,7 @@ use crate::backend::{TranscriptionEvent, TranscriptionInput};
 use crate::{denoise, resampler};
 
 use super::super::host::{AUDIO_RECV_TIMEOUT, SessionParams};
-use super::decode::{DecodeRequest, decoder_service_loop};
+use super::decode::DecodeRequest;
 
 /// Safety cap: if squelch stays open longer than this, flush anyway.
 /// Protects against pathological stuck-open situations (bad auto-squelch,

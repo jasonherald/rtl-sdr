@@ -25,7 +25,7 @@ mod tests {
     fn empty_input_produces_empty_output() {
         let mut out = Vec::new();
         downsample_stereo_to_mono_16k(&[], &mut out);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [f32; 0]);
     }
 
     #[test]

@@ -99,7 +99,7 @@ Two mutually exclusive backends, selected at build time (see the install section
 ### Dependencies
 
 **Always required:**
-- **Rust** — stable 1.95.0 is pinned via [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` picks it up automatically on first `cargo` invocation. The workspace is 2024 edition.
+- **Rust** — stable 1.99.1 is pinned via [`rust-toolchain.toml`](rust-toolchain.toml); `rustup` picks it up automatically on first `cargo` invocation. The workspace is 2024 edition.
 - **GTK 4.10+** and **libadwaita 1.5+**
 - **PipeWire** development libraries (Linux audio)
 - **libusb** (for RTL-SDR USB access)

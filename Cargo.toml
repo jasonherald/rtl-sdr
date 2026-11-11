@@ -190,7 +190,7 @@ smol = "2"
 # `cargo test -p <crate>` still has a process-level CryptoProvider.
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-quick-xml = "0.41"
+quick-xml = "0.42"
 
 # Secure credential storage. keyring 4 is a ground-up rewrite: a
 # `keyring-core` runtime plus pluggable backend "store" crates. The
@@ -338,7 +338,7 @@ tempfile = "3"
 # `slowrx::resample::MAX_INPUT_SAMPLE_RATE_HZ` and internally resamples to
 # 11_025 Hz. Both `rustfft` and `thiserror` that slowrx brings are already
 # in the workspace dep tree, so no new transitive deps are added.
-slowrx = "0.5.3"
+slowrx = "0.9.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -292,6 +292,7 @@ pub(super) fn wire_recorder(
     let interpret_action = build_recorder_interpreter(
         panels,
         state,
+        config,
         cache,
         toast_overlay,
         tune_to_satellite,

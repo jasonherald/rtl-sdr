@@ -589,6 +589,13 @@ struct DspState {
     /// like ARISS Series 32 where a pass might yield 1-3 complete
     /// images out of 3-4 detected VIS bursts. Per #648.
     sstv_pass_stats: SstvPassStats,
+    /// Mode of the most recent SSTV VIS the decoder identified, kept for
+    /// the app's lifetime (NOT reset between passes). Applied as the
+    /// decoder's lost-VIS fallback (`SstvDecoder::set_fallback_mode`): if
+    /// a fade wipes out a later header's VIS bits, the image still
+    /// decodes in this mode. `None` until a VIS has been seen, so the
+    /// fallback never guesses.
+    sstv_last_vis_mode: Option<slowrx::SstvMode>,
     /// Most recent audio sample rate that `SstvDecoder::new` rejected,
     /// or `None` if every prior init succeeded / hasn't been tried.
     /// Guards against the audio-block hot loop retrying on a rate the
@@ -863,6 +870,7 @@ impl DspState {
             sstv_mono_buf: Vec::new(),
             sstv_init_failed_at_rate: None,
             sstv_pass_stats: SstvPassStats::default(),
+            sstv_last_vis_mode: None,
             sstv_image: None,
             wefax_decoder: None,
             wefax_mono_buf: Vec::new(),
@@ -1600,7 +1608,10 @@ fn reset_imaging_decoders(state: &mut DspState) {
         let pass_stats = &state.sstv_pass_stats;
         tracing::info!(
             vis_count = pass_stats.vis_count,
+            vis_fallback_count = pass_stats.vis_fallback_count,
+            sync_start_count = pass_stats.sync_start_count,
             image_complete_count = pass_stats.image_complete_count,
+            noise_images_dropped = pass_stats.noise_images_dropped,
             lines_decoded = pass_stats.lines_decoded,
             "SSTV pass summary"
         );

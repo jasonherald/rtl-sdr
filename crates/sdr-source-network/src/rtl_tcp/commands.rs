@@ -109,12 +109,12 @@ impl RtlTcpSource {
         // Single read-modify-write: clear the sibling and set our own bit
         // together, so two concurrent gain setters can't interleave into
         // "both bits set" (CR round 1 on PR #792).
-        let _ =
-            self.shared
-                .replay_mask
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mask| {
-                    Some((mask & sibling_clear) | own_bit)
-                });
+        let _ = self
+            .shared
+            .replay_mask
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |mask| {
+                Some((mask & sibling_clear) | own_bit)
+            });
     }
 
     /// Per-stage `SetIfGain` recording (the stage number rides the

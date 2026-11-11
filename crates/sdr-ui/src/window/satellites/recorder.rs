@@ -20,6 +20,7 @@ use super::{
 pub(super) fn build_recorder_interpreter(
     panels: &SidebarPanels,
     state: &Rc<AppState>,
+    config: &std::sync::Arc<sdr_config::ConfigManager>,
     cache: Option<&std::sync::Arc<sdr_sat::TleCache>>,
     toast_overlay: &adw::ToastOverlay,
     tune_to_satellite: &Rc<TuneFn>,
@@ -46,6 +47,7 @@ pub(super) fn build_recorder_interpreter(
     {
         let deps = Rc::new(RecorderDeps {
             state: Rc::clone(state),
+            config: std::sync::Arc::clone(config),
             tune: Rc::clone(tune_to_satellite),
             set_playing: Rc::clone(set_playing),
             // Optional TLE cache — used by the SavePng wiring to
@@ -77,6 +79,10 @@ pub(super) fn build_recorder_interpreter(
 /// and this is the wiring layer that gives each action its widgets.
 pub(in crate::window) struct RecorderDeps {
     pub(super) state: Rc<AppState>,
+    /// Config handle so a pass's temporary Doppler override can keep
+    /// the user's persisted preference intact (see
+    /// [`apply_pass_doppler_policy`]).
+    pub(super) config: std::sync::Arc<sdr_config::ConfigManager>,
     pub(super) tune: Rc<TuneFn>,
     pub(super) set_playing: Rc<dyn Fn(bool)>,
     pub(super) cache: Option<std::sync::Arc<sdr_sat::TleCache>>,
@@ -473,10 +479,18 @@ fn aos_sstv(
 /// LRPT, ON for SSTV — through the widget's own notify chain, so the
 /// tracker model follows and LOS restore (`on_restore_tune`) replays the
 /// user's pre-AOS value the same way a user flip would.
+///
+/// The override is for this pass only, but the switch's notify chain
+/// also persists whatever it is set to. Re-saving the pre-AOS value
+/// straight after keeps the stored preference unchanged, so an app
+/// close mid-pass (before LOS restore runs) can't leave the user's next
+/// launch with the pass's temporary setting.
 fn apply_pass_doppler_policy(deps: &RecorderDeps, protocol: sdr_sat::ImagingProtocol) {
     let want = protocol.wants_doppler_tracking();
-    if deps.doppler_switch.is_active() != want {
+    let previous = deps.doppler_switch.is_active();
+    if let Some(keep) = sidebar::satellites_panel::doppler_pref_to_keep(previous, want) {
         deps.doppler_switch.set_active(want);
+        sidebar::satellites_panel::save_doppler_tracking_enabled(&deps.config, keep);
     }
 }
 

@@ -252,8 +252,8 @@ fn missing_lrpt_apids_returns_empty_when_no_expected_set() {
         .iter()
         .find(|s| s.norad_id == ISS_NORAD_ID)
         .expect("ISS should be in KNOWN_SATELLITES");
-    assert!(iss.missing_lrpt_apids(&[1, 2, 3]).is_empty());
-    assert!(iss.missing_lrpt_apids(&[]).is_empty());
+    assert_eq!(iss.missing_lrpt_apids(&[1, 2, 3]), [] as [u16; 0]);
+    assert_eq!(iss.missing_lrpt_apids(&[]), [] as [u16; 0]);
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn missing_lrpt_apids_returns_empty_on_silent_pass() {
         .iter()
         .find(|s| s.norad_id == METEOR_M2_3_NORAD_ID)
         .expect("METEOR-M2 3 should be in KNOWN_SATELLITES");
-    assert!(m2_3.missing_lrpt_apids(&[]).is_empty());
+    assert_eq!(m2_3.missing_lrpt_apids(&[]), [] as [u16; 0]);
 }
 
 #[test]
@@ -301,11 +301,11 @@ fn missing_lrpt_apids_returns_empty_when_full_set_received() {
         .iter()
         .find(|s| s.norad_id == METEOR_M2_3_NORAD_ID)
         .expect("METEOR-M2 3 should be in KNOWN_SATELLITES");
-    assert!(m2_3.missing_lrpt_apids(&[64, 65, 66]).is_empty());
+    assert_eq!(m2_3.missing_lrpt_apids(&[64, 65, 66]), [] as [u16; 0]);
     // Extra received APIDs (e.g., M2-3 unexpectedly transmitting
     // an IR channel) are fine — the function returns the
     // complement of expected over received, ignoring extras.
-    assert!(m2_3.missing_lrpt_apids(&[64, 65, 66, 70]).is_empty());
+    assert_eq!(m2_3.missing_lrpt_apids(&[64, 65, 66, 70]), [] as [u16; 0]);
 }
 
 #[test]

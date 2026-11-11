@@ -24,7 +24,7 @@ fn test_estimate_tap_count_invalid() {
 #[test]
 fn test_low_pass_basic() {
     let taps = low_pass(5_000.0, 1_000.0, TEST_SAMPLE_RATE, false).unwrap();
-    assert!(!taps.is_empty());
+    assert_ne!(taps, [] as [f32; 0]);
     assert_symmetric(&taps);
 }
 
@@ -44,7 +44,7 @@ fn test_low_pass_dc_gain() {
 #[test]
 fn test_high_pass_basic() {
     let taps = high_pass(5_000.0, 1_000.0, TEST_SAMPLE_RATE).unwrap();
-    assert!(!taps.is_empty());
+    assert_ne!(taps, [] as [f32; 0]);
     // Always odd tap count
     assert!(taps.len() % 2 == 1, "expected odd, got {}", taps.len());
     // DC gain ~0
@@ -61,7 +61,7 @@ fn test_high_pass_symmetry() {
 #[test]
 fn test_band_pass_basic() {
     let taps = band_pass(5_000.0, 10_000.0, 1_000.0, TEST_SAMPLE_RATE, false).unwrap();
-    assert!(!taps.is_empty());
+    assert_ne!(taps, [] as [f32; 0]);
     let sum: f32 = taps.iter().sum();
     assert!(sum.abs() < 0.2, "BP DC gain should be ~0, got {sum}");
 }

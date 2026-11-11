@@ -34,7 +34,7 @@ use crate::sidebar::satellites_heard::HeardRow;
 use crate::state::AppState;
 
 mod passes;
-pub(crate) use passes::refresh_orbcomm_tles;
+pub(crate) use passes::{orbcomm_tles_stale, refresh_orbcomm_tles};
 
 /// Heard-list aging tick (seconds) — matches the old heard-group tick.
 const HEARD_TICK_SECS: u32 = 5;

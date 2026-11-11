@@ -16,7 +16,18 @@ feature-depth = 1
 # Advisories — check for known vulnerabilities
 # =============================================================================
 [advisories]
-ignore = []
+ignore = [
+    # `zvariant`, `zvariant_derive` and `zbus_names` were folded into `zbus`
+    # itself and are no longer maintained as standalone crates (advisories
+    # dated 2026-10-16). They are "unmaintained" notices, not
+    # vulnerabilities, and have no upgrade path from here: they arrive via
+    # zbus 5, which `ksni` (the tray icon) and `secret-service` (the
+    # keyring's Linux backend) both still require. Revisit when those move
+    # to a zbus release that drops the standalone crates.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained (merged into zbus); transitive via zbus 5, no upgrade path yet" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained (merged into zbus); transitive via zbus 5, no upgrade path yet" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained (merged into zbus); transitive via zbus 5, no upgrade path yet" },
+]
 
 # =============================================================================
 # Licenses — only allow known-good open source licenses

@@ -52,7 +52,7 @@ fn device_enumerate() {
 
     let name = librtlsdr_rs::get_device_name(0);
     tracing::info!("Device 0: {name}");
-    assert!(!name.is_empty());
+    assert_ne!(name, "");
 }
 
 #[test]

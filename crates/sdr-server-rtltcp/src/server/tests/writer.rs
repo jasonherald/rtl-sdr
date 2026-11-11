@@ -98,7 +98,7 @@ fn tcp_writer_gives_up_after_the_stall_budget() {
     };
     tcp_writer(&mut w, rx, slot.clone(), registry, shutdown, true);
     assert!(slot.is_disconnected());
-    assert!(w.written.is_empty());
+    assert_eq!(w.written, [] as [u8; 0]);
 }
 
 /// A compressed stream cannot resume mid-block: its first stall
@@ -121,7 +121,7 @@ fn tcp_writer_closes_a_compressed_stream_on_its_first_stall() {
     };
     tcp_writer(&mut w, rx, slot.clone(), registry, shutdown, false);
     assert!(slot.is_disconnected());
-    assert!(w.written.is_empty());
+    assert_eq!(w.written, [] as [u8; 0]);
 }
 
 /// Socket stand-in that alternates one byte of progress with a

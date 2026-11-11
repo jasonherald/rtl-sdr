@@ -462,6 +462,135 @@ fn force_refresh_does_not_fall_back_to_stale_cache_on_failure() {
     assert!(matches!(err, TleCacheError::Fetch(_)));
 }
 
+/// The Refresh sweep's variant: fresh elements must reach the cache
+/// file, because pass prediction and Doppler read only that.
+#[test]
+fn force_refresh_persisted_writes_the_cache_file() {
+    let dir = unique_temp_dir("force-refresh-persisted");
+    let cache = TleCache::with_dir(dir.clone()).with_fetcher(|_| Ok(SAMPLE_TLE_3LINE.to_string()));
+    cache.force_refresh_persisted(5).unwrap();
+    assert!(cache.cached_tle_for(5).is_ok(), "elements are on disk");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fetch that succeeds but cannot be written is an error for the
+/// sweep (so the "last refreshed" stamp does not advance), while plain
+/// `force_refresh` still hands back the in-memory copy.
+#[test]
+fn force_refresh_persisted_fails_when_the_cache_cannot_be_written() {
+    // A regular file where the cache directory should be: creating
+    // the directory fails, so no cache file can be written.
+    let blocker = unique_temp_dir("force-refresh-unwritable");
+    std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let cache =
+        TleCache::with_dir(blocker.clone()).with_fetcher(|_| Ok(SAMPLE_TLE_3LINE.to_string()));
+
+    let err = cache.force_refresh_persisted(5).unwrap_err();
+    assert!(matches!(err, TleCacheError::Io { .. }), "got {err:?}");
+    assert!(
+        cache.force_refresh(5).is_ok(),
+        "force_refresh keeps returning the in-memory copy"
+    );
+    assert!(cache.cached_tle_for(5).is_err(), "nothing reached the disk");
+    let _ = std::fs::remove_file(&blocker);
+}
+
+/// A failed fetch is a `Fetch` error and leaves the cached copy alone.
+#[test]
+fn force_refresh_persisted_surfaces_a_failed_fetch() {
+    let dir = unique_temp_dir("force-refresh-persisted-fetch-fail");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("5.tle"), SAMPLE_TLE_3LINE).unwrap();
+    let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
+    let err = cache.force_refresh_persisted(5).unwrap_err();
+    assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+    assert!(cache.cached_tle_for(5).is_ok(), "old copy untouched");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The automatic refresh's variant: a fresh cache file means no
+/// network at all, so a retry after a partial sweep only refetches the
+/// satellites that are still stale.
+#[test]
+fn refresh_if_stale_persisted_skips_a_fresh_cache_file() {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let dir = unique_temp_dir("refresh-if-stale-fresh");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("5.tle"), SAMPLE_TLE_3LINE).unwrap();
+    let calls = StdArc::new(AtomicU32::new(0));
+    let calls_for_fetcher = StdArc::clone(&calls);
+    let cache = TleCache::with_dir(dir.clone()).with_fetcher(move |_| {
+        calls_for_fetcher.fetch_add(1, Ordering::Relaxed);
+        Ok(SAMPLE_TLE_3LINE.to_string())
+    });
+    assert!(!cache.needs_refresh(5));
+    assert!(
+        !cache.refresh_if_stale_persisted(5).unwrap(),
+        "reports that it did not fetch"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "fresh file: no fetch");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stale or missing cache file is fetched and written.
+#[test]
+fn refresh_if_stale_persisted_fetches_a_stale_or_missing_file() {
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let dir = unique_temp_dir("refresh-if-stale-stale");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("5.tle"), SAMPLE_TLE_3LINE).unwrap();
+    // A 1 ns freshness window (after a tick) makes the file stale.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let calls = StdArc::new(AtomicU32::new(0));
+    let calls_for_fetcher = StdArc::clone(&calls);
+    let cache = TleCache::with_dir(dir.clone())
+        .with_refresh_max_age(std::time::Duration::from_nanos(1))
+        .with_fetcher(move |_| {
+            calls_for_fetcher.fetch_add(1, Ordering::Relaxed);
+            Ok(SAMPLE_TLE_3LINE.to_string())
+        });
+    assert!(cache.needs_refresh(5), "stale file");
+    assert!(cache.refresh_if_stale_persisted(5).unwrap(), "fetched");
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "stale file: fetched");
+    // ISS has no cache file at all (e.g. a cleared cache directory).
+    assert!(cache.needs_refresh(25_544), "missing file");
+    assert!(cache.refresh_if_stale_persisted(25_544).unwrap(), "fetched");
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "missing file: fetched");
+    assert!(cache.cached_tle_for(25_544).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fresh-by-mtime file that is not a valid TLE for the satellite
+/// needs a refresh too, the same as `tle_text` treats it.
+#[test]
+fn needs_refresh_is_true_for_a_corrupted_fresh_file() {
+    let dir = unique_temp_dir("needs-refresh-corrupted");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("5.tle"), "<html>captive portal</html>").unwrap();
+    let cache = TleCache::with_dir(dir.clone()).with_fetcher(always_fail_fetcher());
+    assert!(cache.needs_refresh(5));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// No stale-copy fallback: a failed fetch for a stale file is an
+/// error, so the sweep knows that satellite is still on old elements.
+#[test]
+fn refresh_if_stale_persisted_reports_a_failed_fetch_of_a_stale_file() {
+    let dir = unique_temp_dir("refresh-if-stale-fetch-fail");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("5.tle"), SAMPLE_TLE_3LINE).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let cache = TleCache::with_dir(dir.clone())
+        .with_refresh_max_age(std::time::Duration::from_nanos(1))
+        .with_fetcher(always_fail_fetcher());
+    let err = cache.refresh_if_stale_persisted(5).unwrap_err();
+    assert!(matches!(err, TleCacheError::Fetch(_)), "got {err:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn has_any_tle_pair_accepts_real_tle_text() {
     assert!(has_any_tle_pair(SAMPLE_TLE_3LINE));

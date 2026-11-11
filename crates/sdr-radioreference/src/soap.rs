@@ -210,7 +210,7 @@ pub fn extract_soap_fault(xml: &str) -> Option<String> {
             Ok(Event::Start(ref e)) => {
                 let name = e.name();
                 let local = local_name(name.as_ref());
-                if local == b"faultstring" {
+                if local == "faultstring" {
                     // `read_text_content` accumulates the split
                     // Text / GeneralRef events up to `</faultstring>`.
                     // An empty element yields `""`, which is treated
@@ -310,10 +310,8 @@ pub fn get_subcat_freqs(
 
 /// Extracts the local name from a potentially namespace-prefixed element name.
 /// For example, `ns1:faultstring` becomes `faultstring`.
-fn local_name(full: &[u8]) -> &[u8] {
-    full.iter()
-        .position(|&b| b == b':')
-        .map_or(full, |pos| &full[pos + 1..])
+fn local_name(full: &str) -> &str {
+    full.split_once(':').map_or(full, |(_, local)| local)
 }
 
 /// Reads the text content of the current element (caller has just seen
@@ -337,16 +335,13 @@ fn read_text_content<'a>(reader: &mut Reader<&'a [u8]>) -> Result<Cow<'a, str>, 
     let mut text = String::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Text(e)) => {
-                let decoded = e.xml10_content().map_err(quick_xml::Error::from)?;
-                text.push_str(&decoded);
-            }
+            // quick-xml 0.42 events are already `str` (the reader
+            // validates UTF-8 up front), so neither accessor can fail.
+            Ok(Event::Text(e)) => text.push_str(&e.xml10_content()),
             Ok(Event::GeneralRef(e)) => text.push_str(&resolve_general_ref(&e)?),
-            // CDATA is literal — no entity resolution, no EOL rules.
-            Ok(Event::CData(e)) => {
-                let decoded = e.decode().map_err(quick_xml::Error::from)?;
-                text.push_str(&decoded);
-            }
+            // CDATA is literal — no entity resolution, no EOL rules:
+            // the event's raw `str`, not `xml10_content()`.
+            Ok(Event::CData(e)) => text.push_str(&e),
             Ok(Event::End(_)) => break,
             Ok(Event::Eof) => {
                 return Err(SoapError::Unexpected(
@@ -369,8 +364,8 @@ fn resolve_general_ref(r: &BytesRef<'_>) -> Result<Cow<'static, str>, SoapError>
     if let Some(c) = r.resolve_char_ref()? {
         return Ok(Cow::Owned(c.to_string()));
     }
-    let name = r.decode().map_err(quick_xml::Error::from)?;
-    resolve_predefined_entity(&name)
+    let name: &str = r;
+    resolve_predefined_entity(name)
         .map(Cow::Borrowed)
         .ok_or_else(|| SoapError::Unexpected(format!("unknown entity reference: &{name};")))
 }
@@ -391,27 +386,27 @@ pub fn parse_zip_info(xml: &str) -> Result<ZipInfo, SoapError> {
                 let name = e.name();
                 let local = local_name(name.as_ref());
                 match local {
-                    b"ctid" => {
+                    "ctid" => {
                         let t = read_text_content(&mut reader)?;
                         county_id = Some(
                             t.parse::<u32>()
                                 .map_err(|e| SoapError::Unexpected(format!("bad ctid: {e}")))?,
                         );
                     }
-                    b"stid" => {
+                    "stid" => {
                         let t = read_text_content(&mut reader)?;
                         state_id = Some(
                             t.parse::<u32>()
                                 .map_err(|e| SoapError::Unexpected(format!("bad stid: {e}")))?,
                         );
                     }
-                    b"city" => {
+                    "city" => {
                         city = Some(read_text_content(&mut reader)?.into_owned());
                     }
-                    b"lat" => {
+                    "lat" => {
                         lat = Some(read_text_content(&mut reader)?.into_owned());
                     }
-                    b"lon" => {
+                    "lon" => {
                         lon = Some(read_text_content(&mut reader)?.into_owned());
                     }
                     _ => {}
@@ -473,41 +468,41 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                     // `End` right here so entity-split text (quick-xml
                     // ≥ 0.38 emits `GeneralRef` events between `Text`
                     // fragments) is reassembled before use.
-                    (Top, b"countyName") => {
+                    (Top, "countyName") => {
                         county_name = Some(read_text_content(&mut reader)?.into_owned());
                     }
-                    (Top, b"stid") => {
+                    (Top, "stid") => {
                         state_id = Some(
                             read_text_content(&mut reader)?
                                 .parse()
                                 .map_err(|e| SoapError::Unexpected(format!("bad stid: {e}")))?,
                         );
                     }
-                    (InCat, b"cid") => {
+                    (InCat, "cid") => {
                         current_cat_id = read_text_content(&mut reader)?
                             .parse()
                             .map_err(|e| SoapError::Unexpected(format!("bad cid: {e}")))?;
                     }
-                    (InCat, b"cName") => {
+                    (InCat, "cName") => {
                         current_cat_name = read_text_content(&mut reader)?.into_owned();
                     }
-                    (InSubcat, b"scid") => {
+                    (InSubcat, "scid") => {
                         current_scid = read_text_content(&mut reader)?
                             .parse()
                             .map_err(|e| SoapError::Unexpected(format!("bad scid: {e}")))?;
                     }
-                    (InSubcat, b"scName") => {
+                    (InSubcat, "scName") => {
                         current_sc_name = read_text_content(&mut reader)?.into_owned();
                     }
-                    (Top, b"cats") => state = InCats,
-                    (InCats, b"item") => {
+                    (Top, "cats") => state = InCats,
+                    (InCats, "item") => {
                         state = InCat;
                         current_cat_id = 0;
                         current_cat_name.clear();
                         current_subcats.clear();
                     }
-                    (InCat, b"subcats") => state = InSubcats,
-                    (InSubcats, b"item") => {
+                    (InCat, "subcats") => state = InSubcats,
+                    (InSubcats, "item") => {
                         state = InSubcat;
                         current_scid = 0;
                         current_sc_name.clear();
@@ -520,7 +515,7 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                 let name_ref = name.as_ref();
                 let local = local_name(name_ref);
                 match (&state, local) {
-                    (InSubcat, b"item") => {
+                    (InSubcat, "item") => {
                         if current_scid > 0 {
                             current_subcats.push(RrSubcategory {
                                 scid: current_scid,
@@ -529,8 +524,8 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                         }
                         state = InSubcats;
                     }
-                    (InSubcats, b"subcats") => state = InCat,
-                    (InCat, b"item") => {
+                    (InSubcats, "subcats") => state = InCat,
+                    (InCat, "item") => {
                         if current_cat_id > 0 {
                             categories.push(RrCategory {
                                 id: current_cat_id,
@@ -542,7 +537,7 @@ pub fn parse_county_info(xml: &str, county_id: u32) -> Result<CountyInfo, SoapEr
                         }
                         state = InCats;
                     }
-                    (InCats, b"cats") => state = Top,
+                    (InCats, "cats") => state = Top,
                     _ => {}
                 }
             }
@@ -637,12 +632,12 @@ impl FreqBuilder {
     /// Handles a `Start` event while inside a frequency `<item>`.
     fn handle_freq_field(
         &mut self,
-        local: &[u8],
+        local: &str,
         reader: &mut Reader<&[u8]>,
     ) -> Result<Option<FreqParseState>, SoapError> {
         match local {
-            b"fid" => self.fid = Some(read_text_content(reader)?.into_owned()),
-            b"out" => {
+            "fid" => self.fid = Some(read_text_content(reader)?.into_owned()),
+            "out" => {
                 let t = read_text_content(reader)?;
                 let mhz = t
                     .parse::<f64>()
@@ -652,8 +647,8 @@ impl FreqBuilder {
                 }
                 self.freq_mhz = Some(mhz);
             }
-            b"mode" => self.mode = Some(read_text_content(reader)?.into_owned()),
-            b"tone" => {
+            "mode" => self.mode = Some(read_text_content(reader)?.into_owned()),
+            "tone" => {
                 let t = read_text_content(reader)?;
                 // Tone field is xsd:string — may be a float ("110.9"), empty,
                 // or text like "CSQ". Parse as float, ignore failures.
@@ -661,9 +656,9 @@ impl FreqBuilder {
                     self.tone_val = Some(val);
                 }
             }
-            b"descr" => self.description = Some(read_text_content(reader)?.into_owned()),
-            b"alpha" => self.alpha_tag = Some(read_text_content(reader)?.into_owned()),
-            b"tags" => return Ok(Some(FreqParseState::InTags)),
+            "descr" => self.description = Some(read_text_content(reader)?.into_owned()),
+            "alpha" => self.alpha_tag = Some(read_text_content(reader)?.into_owned()),
+            "tags" => return Ok(Some(FreqParseState::InTags)),
             _ => {}
         }
         Ok(None)
@@ -672,18 +667,18 @@ impl FreqBuilder {
     /// Handles a `Start` event while inside a tag `<item>`.
     fn handle_tag_field(
         &mut self,
-        local: &[u8],
+        local: &str,
         reader: &mut Reader<&[u8]>,
     ) -> Result<(), SoapError> {
         match local {
-            b"tagId" => {
+            "tagId" => {
                 let t = read_text_content(reader)?;
                 self.tag_id = Some(
                     t.parse::<u32>()
                         .map_err(|e| SoapError::Unexpected(format!("bad tagId: {e}")))?,
                 );
             }
-            b"tagDescr" => self.tag_descr = Some(read_text_content(reader)?.into_owned()),
+            "tagDescr" => self.tag_descr = Some(read_text_content(reader)?.into_owned()),
             _ => {}
         }
         Ok(())
@@ -709,7 +704,7 @@ pub fn parse_frequencies(xml: &str) -> Result<Vec<RrFrequency>, SoapError> {
                 let name = e.name();
                 let local = local_name(name.as_ref());
                 match state {
-                    FreqParseState::TopLevel if local == b"item" => {
+                    FreqParseState::TopLevel if local == "item" => {
                         state = FreqParseState::InFreqItem;
                         builder.reset();
                     }
@@ -718,7 +713,7 @@ pub fn parse_frequencies(xml: &str) -> Result<Vec<RrFrequency>, SoapError> {
                             state = new;
                         }
                     }
-                    FreqParseState::InTags if local == b"item" => {
+                    FreqParseState::InTags if local == "item" => {
                         state = FreqParseState::InTagItem;
                         builder.tag_id = None;
                         builder.tag_descr = None;
@@ -733,14 +728,14 @@ pub fn parse_frequencies(xml: &str) -> Result<Vec<RrFrequency>, SoapError> {
                 let name = e.name();
                 let local = local_name(name.as_ref());
                 match state {
-                    FreqParseState::InTagItem if local == b"item" => {
+                    FreqParseState::InTagItem if local == "item" => {
                         builder.push_tag();
                         state = FreqParseState::InTags;
                     }
-                    FreqParseState::InTags if local == b"tags" => {
+                    FreqParseState::InTags if local == "tags" => {
                         state = FreqParseState::InFreqItem;
                     }
-                    FreqParseState::InFreqItem if local == b"item" => {
+                    FreqParseState::InFreqItem if local == "item" => {
                         // Log before finish() consumes fields
                         let fid_dbg = builder.fid.clone();
                         let has_freq = builder.freq_mhz.is_some();

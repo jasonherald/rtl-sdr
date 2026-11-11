@@ -183,7 +183,7 @@ mod tests {
         img.push_line(APID_TEST, &vec![TEST_PIXEL; IMAGE_WIDTH]);
         img.clear();
         assert!(img.snapshot_channel(APID_TEST).is_none());
-        assert!(img.channel_apids().is_empty());
+        assert_eq!(img.channel_apids(), [] as [u16; 0]);
     }
 
     #[test]

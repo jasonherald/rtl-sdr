@@ -134,7 +134,7 @@ fn disable_restores_the_tune_captured_at_enable_not_the_disable_ticks_ctx() {
 fn disable_while_already_idle_is_a_noop() {
     let mut c = WefaxCatcher::new();
     let acts = c.tick(ctx(false, false, WefaxState::Idle));
-    assert!(acts.is_empty());
+    assert_eq!(acts, [] as [Action; 0]);
     assert!(matches!(c.state(), CatcherState::Idle));
 }
 
@@ -194,7 +194,7 @@ fn imaging_brief_presence_flicker_does_not_abort() {
     // blank/white image region) must NOT abort the in-progress chart.
     let acts = c.tick(ctx(true, false, WefaxState::Imaging)); // lost=1
     assert!(matches!(c.state(), CatcherState::Imaging { .. }));
-    assert!(acts.is_empty());
+    assert_eq!(acts, [] as [Action; 0]);
 
     // Presence returns before the debounce threshold; `lost` resets.
     c.tick(ctx(true, true, WefaxState::Imaging));
@@ -288,7 +288,7 @@ fn pinned_choice_filters_candidates_to_one_station() {
     c.tick(tctx);
     match c.state() {
         CatcherState::Scanning { candidates, .. } => {
-            assert!(!candidates.is_empty());
+            assert_ne!(candidates.as_slice(), []);
             assert!(candidates.iter().all(|c| c.station == "NMG New Orleans"));
         }
         other => panic!("expected Scanning, got {other:?}"),

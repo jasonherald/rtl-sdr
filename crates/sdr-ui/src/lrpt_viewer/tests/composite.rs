@@ -5,7 +5,7 @@ fn composite_catalog_is_non_empty() {
     // Defensive — if a future maintainer ever empties the
     // catalog the dropdown silently loses every composite
     // option. Catch that loud-and-early.
-    assert!(!COMPOSITE_CATALOG.is_empty());
+    assert_ne!(COMPOSITE_CATALOG, []);
 }
 
 #[test]

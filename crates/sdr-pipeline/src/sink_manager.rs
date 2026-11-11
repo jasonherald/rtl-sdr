@@ -238,7 +238,7 @@ mod tests {
         mgr.register_stream("main", 48_000.0);
         assert_eq!(mgr.stream_names(), vec!["main"]);
         mgr.unregister_stream("main");
-        assert!(mgr.stream_names().is_empty());
+        assert_eq!(mgr.stream_names(), [] as [&str; 0]);
     }
 
     #[test]

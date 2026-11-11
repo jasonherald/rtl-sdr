@@ -358,7 +358,7 @@ mod tests {
         let mut bad_region = vec![0_u8; MPDU_HEADER_LEN + MPDU_DATA_LEN];
         bad_region[0..2].copy_from_slice(&FHP_NO_HEADER.to_be_bytes());
         let out = r.push(&bad_region).expect("push noheader");
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [std::vec::Vec<u8>; 0]);
     }
 
     #[test]
@@ -416,7 +416,7 @@ mod tests {
         let bad_fhp: u16 = 0x05DC & FHP_MASK;
         region[0..2].copy_from_slice(&bad_fhp.to_be_bytes());
         let out = r.push(&region).expect("push");
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [std::vec::Vec<u8>; 0]);
         assert!(!r.is_in_sync());
     }
 
@@ -464,7 +464,10 @@ mod tests {
             .expect("push");
         assert!(r.is_in_sync());
         let bad = build_region(FHP_IDLE_FILL - 1, &[]);
-        assert!(r.push(&bad).expect("push bad").is_empty());
+        assert_eq!(
+            r.push(&bad).expect("push bad"),
+            [] as [std::vec::Vec<u8>; 0]
+        );
         assert!(!r.is_in_sync());
     }
 
@@ -501,7 +504,7 @@ mod tests {
         idle[0..2].copy_from_slice(&FHP_IDLE_FILL.to_be_bytes());
         idle[MPDU_HEADER_LEN..].fill(0x55);
         let out = r.push(&idle).expect("push idle");
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [std::vec::Vec<u8>; 0]);
         assert!(r.is_in_sync(), "idle frames do not disturb sync");
         let next = make_packet(0x101, b"next");
         let out = r
